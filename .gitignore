@@ -1,0 +1,66 @@
+# RPI Deployment Package - Git Ignore Rules
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+.Thumbs.db
+*.log
+*.tmp
+
+# Temporary files
+.git_temp/
+temp/
+tmp/
+*.bak
+
+# Firmware binaries (if copying here)
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+
+# Test outputs
+test_output.txt
+*.pcap
+*.log
+
+# Local configuration
+.env
+secrets.json
+config.local.json
