@@ -1,24 +1,24 @@
 # Issue Tracker for BMI30 Oscilloscope Project
 
-**Последнее обновление**: 2025-10-21
+**Последнее обновление**: 2025-10-21 ~19:00
 
 ---
 
 ## 🔴 CURRENT ISSUES (Blocking)
 
-### Issue #1: EP0 Bulk OUT Commands Failing (Device Firmware Bug)
+### Issue #1: EP0 IN (GET_STATUS) Timeout + Device Firmware Regression
 
 **Status**: 🔴 OPEN - Blocking oscilloscope GUI
 
 **Severity**: Critical (blocks BMI30.200.py GUI)
 
-**Update**: New firmware HAS BEEN FLASHED (2025-10-21 ~17:37)
-- ✅ IF#2 (Vendor Bulk) now appears in lsusb
+**Latest Status** (2025-10-21 ~19:00):
+- ✅ IF#2 (Vendor Bulk) **STILL PRESENT** in lsusb
 - ✅ Interfaces: 3 (IF#0 CDC Control, IF#1 CDC Data, IF#2 Vendor Bulk)
 - ✅ IF#2 has alt=0 (no endpoints) and alt=1 (with EP 0x03 OUT, EP 0x83 IN)
-- ✅ alt=1 switching works (vendor SET_ALT command succeeds)
-- ✅ STAT v1 polling works (EP0 GET_STATUS returns 64 bytes)
-- ❌ **EP0 Bulk OUT commands all fail with errno 5 (I/O Error)**
+- ✅ EP0 OUT commands **WORKING**: SET_PROFILE, START_STREAM, STOP_STREAM all succeed
+- ❌ **EP0 IN (GET_STATUS) BROKEN**: errno 110 timeout on EVERY attempt
+- ❌ **IN endpoint (0x83) NOT TESTED**: Cannot test due to PyUSB alt=1 switch error
 
 **Description**:
 After device developer flashed new firmware, the Vendor Bulk interface (IF#2) has disappeared.
@@ -40,36 +40,44 @@ After device developer flashed new firmware, the Vendor Bulk interface (IF#2) ha
       EP 0x83 (IN, Bulk)   ✅
 ```
 
-**Problem Details** (CRITICAL UPDATE 2025-10-21 ~18:50):
+**Problem Details** (CONFIRMED PERSISTENT 2025-10-21 ~19:00):
 ```
-USB Endpoint Test Results (LATEST):
+DEVICE STATUS CHECK (Re-verified):
+- lsusb: Device 009 (was Device 008 - re-enumeration after testing)
+- bNumInterfaces: 3 ✅
+- Endpoints visible: 0x03 (OUT), 0x83 (IN) ✅
 
-REGRESSION DISCOVERED: GET_STATUS is NOW COMPLETELY BROKEN
-
+Test Results (CURRENT):
 [tx] ✅ EP0 OUT commands WORK:
-    - SET_PROFILE (0x14) ✅
-    - START_STREAM (0x20) ✅  
-    - STOP_STREAM (0x21) ✅
+    - SET_PROFILE (0x14) ✅ (errno=0, successful)
+    - Additional attempts: All succeed
     
-[ep0] ❌ GET_STATUS (EP0 IN) - ALWAYS TIMEOUT:
-    - BEFORE any commands: timeout ✗
-    - AFTER SET_PROFILE: timeout ✗
-    - AFTER START_STREAM: timeout ✗
-    - AFTER STOP_STREAM: timeout ✗
-    - All return errno 110 (Operation timed out)
+[ep0] ❌ GET_STATUS (EP0 IN) - CONSISTENT FAILURES:
+    - Attempt 1: errno 110 timeout ✗
+    - Attempt 2: errno 110 timeout ✗
+    - Attempt 3: errno 110 timeout ✗
+    - 100% failure rate
     
-[rx] ❌ IN endpoint (0x83) not tested due to alt=1 switch error
+[rx] ❌ IN endpoint (0x83) NOT TESTED:
+    - Cannot establish alt=1 via PyUSB (error: "Other error")
+    - Unknown if endpoint would receive data
 ```
+
+**Timeline**:
+- 18:34 - GET_STATUS: WORKING (returned 64 bytes) ✓
+- 18:45 - GET_STATUS: BROKEN (errno 110 timeout) ✗
+- 18:50 - GET_STATUS: Confirmed broken across multiple attempts ✗
+- 19:00 - GET_STATUS: STILL BROKEN, device re-enumerated but issue persists ✗
+
+**GitHub Status**:
+- Last firmware commit: 2025-10-21 10:53 (Added BMI30.stm32h7.elf)
+- Firmware deleted: 2025-10-21 15:37 (Delete firmware/BMI30.stm32h7.elf)
+- No new firmware or updates since deletion ⏳
 
 **Previous Test Results** (2025-10-21 ~18:34):
 ```
 [ep0] ✅ STAT v1 readable (64 bytes, alt1=True, out_armed=True)
 ```
-
-**REGRESSION TIMELINE**:
-- 18:34 - STAT v1 (GET_STATUS) was WORKING ✅
-- 18:45 - STAT v1 (GET_STATUS) now BROKEN ❌ (errno 110 timeout)
-- 18:50 - Confirmed: GET_STATUS broken across ALL test cases
 
 **Root Cause Analysis**:
 
@@ -85,15 +93,14 @@ REGRESSION DISCOVERED: GET_STATUS is NOW COMPLETELY BROKEN
 - Commands now send successfully: SET_PROFILE (0x14), START_STREAM (0x20), etc.
 - errno 5 I/O Error no longer appears
 
-❌ **What's Broken Now** (CRITICAL - NEW REGRESSION):
-- **MAJOR**: EP0 GET_STATUS (IN) is completely broken - 100% timeout rate
-  - Returns errno 110 "Operation timed out" on every attempt
-  - No delay between calls - happens immediately
-  - Was working earlier (~18:34), now broken (~18:50)
-  - Indicates device firmware EP0 handler may have crashed or is stuck
-- EP0 OUT commands (SET_PROFILE, START_STREAM, STOP_STREAM) still work
-- IN endpoint (0x83) cannot be tested due to alt=1 switching error in PyUSB
-- Device may be in inconsistent state requiring firmware reload
+❌ **What's Broken Now** (PERSISTENT REGRESSION):
+- **CRITICAL**: EP0 GET_STATUS (IN) is completely broken - 100% timeout rate (errno 110)
+  - Persists across device re-enumeration
+  - Does NOT recover even after STOP_STREAM command
+  - Suggests: Hardware EP0 IN pipeline stuck or firmware handler crashed
+- IN endpoint (0x83) cannot be tested due to PyUSB alt=1 switch error ("Other error")
+  - Workaround needed: Use vendor SET_ALT control command instead of PyUSB
+- Device firmware appears unstable or in corrupted state
 
 **Likely Device Firmware Issues** (Updated):
 
