@@ -6,58 +6,76 @@
 
 ## 🔴 CURRENT ISSUES (Blocking)
 
-### Issue #1: IF#2 Vendor Bulk Not Available (Firmware Needs Flashing)
+### Issue #1: EP0 Bulk OUT Commands Failing (Device Firmware Bug)
 
-**Status**: 🔴 OPEN - Blocking oscilloscope GUI (Action Required)
+**Status**: 🔴 OPEN - Blocking oscilloscope GUI
 
 **Severity**: Critical (blocks BMI30.200.py GUI)
 
-**Update**: New firmware added (BMI30.stm32h7.elf at 2025-10-21 12:53)
-- Firmware file is compiled and ready
-- **Physical device still running old CDC-only version**
-- Needs to be flashed to device via ST-Link programmer
+**Update**: New firmware HAS BEEN FLASHED (2025-10-21 ~17:37)
+- ✅ IF#2 (Vendor Bulk) now appears in lsusb
+- ✅ Interfaces: 3 (IF#0 CDC Control, IF#1 CDC Data, IF#2 Vendor Bulk)
+- ✅ IF#2 has alt=0 (no endpoints) and alt=1 (with EP 0x03 OUT, EP 0x83 IN)
+- ✅ alt=1 switching works (vendor SET_ALT command succeeds)
+- ✅ STAT v1 polling works (EP0 GET_STATUS returns 64 bytes)
+- ❌ **EP0 Bulk OUT commands all fail with errno 5 (I/O Error)**
 
 **Description**:
 After device developer flashed new firmware, the Vendor Bulk interface (IF#2) has disappeared.
 
-**Current State**:
+**Current State** (After Flashing):
 ```
-lsusb -d cafe:4001 -v shows:
-bNumInterfaces: 2  ❌ (was 3)
+✅ Device Configuration 1:
+  Interface 0: CDC Control (class=2)
+    EP 0x82 (IN, Interrupt)
 
-Interface 0: CDC Control (class=2)
-  EP 0x82 (IN, Interrupt)
+  Interface 1: CDC Data (class=10)
+    EP 0x01 (OUT, Bulk)
+    EP 0x81 (IN, Bulk)
 
-Interface 1: CDC Data (class=10)
-  EP 0x01 (OUT, Bulk)
-  EP 0x81 (IN, Bulk)
-
-Interface 2: MISSING ❌
-  (Previously: Vendor Bulk with EP 0x03 OUT, EP 0x83 IN)
+  Interface 2: Vendor Bulk (class=255)
+    alt=0: bNumEndpoints=0 (initialization state)
+    alt=1: bNumEndpoints=2
+      EP 0x03 (OUT, Bulk)  ✅
+      EP 0x83 (IN, Bulk)   ✅
 ```
 
-**Expected State**:
+**Problem Details**:
 ```
-bNumInterfaces: 3  ✅
-
-Interface 0: CDC Control (class=2)
-Interface 1: CDC Data (class=10)  
-Interface 2: Vendor Bulk (class=255) ← MISSING NOW
-  EP 0x03 (OUT, Bulk)
-  EP 0x83 (IN, Bulk)
+USB Handshake Progress:
+[open] ✅ IF#2 found with EP 0x03/0x83
+[alt] ✅ alt=1 set via vendor SET_ALT(0x40)
+[ep0] ✅ STAT v1 readable (64 bytes, alt1=True, out_armed=True)
+[tx] ❌ ALL EP0 Bulk OUT commands fail with errno 5
+    - 0x20 START_STREAM ❌
+    - 0x21 STOP_STREAM ❌
+    - 0x14 SET_PROFILE ❌
+    - 0x13 SET_FULL_MODE ❌
+[retry] ✅ CLEAR_HALT triggered automatically
+[tx-retry] ❌ Retry also fails with errno 5
 ```
 
 **Root Cause Analysis**:
-- Project architecture supports BOTH modes (Vendor Bulk recommended, CDC fallback)
-- Vendor Bulk is required for oscilloscope GUI (`BMI30.200.py`)
-- CDC mode works but slower, no high-frequency display
-- Device now defaults to CDC only (Vendor Bulk descriptor missing)
 
-**Possible Causes**:
-1. Firmware not fully written to device (incomplete flash)
-2. Firmware source code missing Vendor Bulk descriptor
-3. Device has fallback logic (boots to CDC on error)
-4. Compilation error in firmware build
+✅ **What Works**:
+- IF#2 USB descriptor correctly defined (class 255, 2 alt settings)
+- alt=0→alt=1 switching functional (vendor SET_ALT command)
+- Bulk endpoints (0x03/0x83) active on alt=1
+- EP0 GET_STATUS working (STAT v1 readable)
+- Firmware compilation and flashing successful
+
+❌ **What's Broken**:
+- Device firmware **EP0 Bulk OUT handler** (control endpoint request handler)
+- ALL OUT control requests to EP0 fail with I/O Error
+- Pattern: Every command type (0x13, 0x14, 0x20, 0x21) fails identically
+- Suggests: Bug in device firmware's USB control request processing
+
+**Likely Device Firmware Issues**:
+1. EP0 OUT data phase not implemented or broken
+2. Control transfer handler missing or incorrect
+3. Request validation too strict (rejecting valid commands)
+4. Interrupt/DMA handler conflict on EP0
+5. Endpoint HALT condition persisting despite CLEAR_HALT
 
 **Test Command**:
 ```bash
@@ -86,29 +104,40 @@ lsusb -d cafe:4001 -v | grep "bNumInterfaces\|Interface"
 - This suggests firmware update may have reverted or failed
 - Both Vendor Bulk and CDC code paths exist in project (confirmed in `usb_vendor/usb_stream.py` and `USB_receiver.py`)
 
-### Action Items (For Flashing New Firmware)
+### Action Items (For Device Developer)
 
-**New firmware ready** (as of 2025-10-21 12:53):
-- Location: `firmware/BMI30.stm32h7.elf`
-- Size: 2,460,668 bytes
-- Status: Compiled and ready
-- Documentation: See `DEVICE_STATUS.md` for flashing instructions
+**Firmware Status**:
+- ✅ New firmware flashed successfully (2025-10-21 ~17:37)
+- ✅ IF#2 Vendor Bulk interface now present
+- ✅ Endpoints (0x03/0x83) accessible
+- ❌ EP0 control request handler broken
 
-**Hardware Required**:
-- ST-Link v2 programmer (device developer's responsibility)
-- GPIO pins on Raspberry Pi (Pin 11, 13, 9/25 for SWDIO/SWDCLK/GND)
-- USB cable for device
+**Issue Found**:
+All EP0 Bulk OUT control commands fail with errno 5 (I/O Error).
+This is a **firmware bug** that needs fixing, not a flashing issue.
 
-**Flashing Steps** (device developer):
-1. Connect ST-Link to RPi GPIO
-2. Run OpenOCD commands or `flash_firmware.sh` script
-3. Device will reboot in Vendor Bulk mode (IF#2 will appear)
-4. Verify: `lsusb -d cafe:4001 -v` shows bNumInterfaces=3
+**Action Required** (device developer):
+1. ✅ Review device firmware source code
+2. ✅ Find EP0 control OUT request handler implementation
+3. ✅ Check:
+   - Data phase handling for control transfers
+   - Request parsing/validation logic
+   - Endpoint HALT/stall conditions
+   - Interrupt/DMA conflict on EP0
+4. ✅ Fix the bug (likely in stm32 USB driver configuration)
+5. ✅ Re-compile firmware
+6. ✅ Re-flash device
+7. ✅ Test: `python3 BMI30.200.py` should connect and stream data
 
-**Next Steps After Flashing**:
-1. Device reconnects → IF#2 appears with EP 0x03/0x83
-2. Host runs: `python3 BMI30.200.py`
-3. GUI displays oscilloscope at ~200 FPS
+**Expected Output After Fix**:
+```
+[open] ✅ IF#2 found
+[alt] ✅ alt=1 set
+[ep0] ✅ STAT v1 readable
+[tx] ✅ Commands succeed (no errno 5!)
+[stream] ✅ Data flowing from IN endpoint
+[gui] ✅ Oscilloscope displays at ~200 FPS
+```
 
 ---
 
@@ -132,15 +161,16 @@ lsusb -d cafe:4001 -v | grep "bNumInterfaces\|Interface"
 
 ## 📋 TRACKING CHECKLIST
 
-### For Current Issue #1:
-- [ ] ✅ Developer adds compiled firmware to repo (DONE: 2025-10-21 12:53)
-- [ ] Developer connects ST-Link to RPi GPIO
-- [ ] Developer flashes firmware via OpenOCD
-- [ ] Device reboots and shows IF#2 in lsusb
-- [ ] Host runs BMI30.200.py
-- [ ] GUI connects to IF#2 (Vendor Bulk)
-- [ ] Data stream flows (~200 FPS)
-- [ ] Oscilloscope displays ADC0 and ADC1 synchronized
+### For Current Issue #1 (EP0 Command Handler):
+- [x] ✅ Developer adds compiled firmware to repo (DONE: 2025-10-21 12:53)
+- [x] ✅ Developer flashes device via ST-Link (DONE: 2025-10-21 ~17:37)
+- [x] ✅ Device shows IF#2 Vendor Bulk (VERIFIED: 3 interfaces, alt=1 works)
+- [ ] ⏳ Developer fixes EP0 Bulk OUT control request handler (IN PROGRESS)
+- [ ] Developer re-compiles firmware with fix
+- [ ] Developer re-flashes device with new binary
+- [ ] Test: EP0 commands succeed (no errno 5)
+- [ ] Host runs BMI30.200.py and streams data
+- [ ] GUI displays ADC0 and ADC1 at ~200 FPS
 - [ ] Issue marked RESOLVED
 
 ### Post-Resolution Validation:
