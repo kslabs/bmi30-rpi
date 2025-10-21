@@ -1,0 +1,208 @@
+from numba import jit
+import numpy as np
+
+@jit(nopython=True)
+def callback(in_data, frame_count, time_info, status):
+    led_line.set_value(1)
+    global dataADC, dataADC1, dataADC2, dataADC3, dataADC4, dataADC5, dataADC6, dataADC7
+    global start_adr, count_start, data_to_sum_p, data_to_sum_n, start_adress, stop_adress, tau_start_adr
+    flag_synchro = 0
+    ADCmax = 0
+
+    # ?????????????
+    if len(dataADC1) > CHUNK:
+        for i in range(0, CHUNK):
+            if flag_synchro or (dataADC1[i] < 7000 and dataADC1[i+1] > 7000 and dataADC1[i+31] < -3000):
+                flag_synchro = 1
+                if dataADC1[i] > ADCmax:
+                    ADCmax = dataADC1[i]
+                else:
+                    start_adr = i
+                    # ??????? ?????? ???????
+                    dataADC7, dataADC6, dataADC5, dataADC4, dataADC3 = np.roll([dataADC6, dataADC5, dataADC4, dataADC3, dataADC2], shift=1) 
+                    if i > 16:
+                        dataADC2[:CHUNK] = dataADC1[:CHUNK]  # ???????? ??????
+                        dataADC1 = dataADC1[CHUNK + int(i / 1.2):]  # ????????? ??????
+                    else:
+                        if i > 8:
+                            dataADC2[:CHUNK] = dataADC1[:CHUNK]
+                            dataADC1 = dataADC1[CHUNK + 1:]
+                        else:
+                            if i > 3:
+                                dataADC2[:CHUNK] = dataADC1[:CHUNK]
+                                dataADC1 = dataADC1[CHUNK:]
+                            else:
+                                dataADC2[:CHUNK] = dataADC1[:CHUNK]
+                                dataADC1 = dataADC1[CHUNK - 1:]
+                    break 
+            if i > CHUNK0:
+                dataADC7, dataADC6, dataADC5, dataADC4, dataADC3 = np.roll([dataADC6, dataADC5, dataADC4, dataADC3, dataADC2], shift=1)
+                dataADC2[:CHUNK] = dataADC1[:CHUNK]
+                dataADC1 = dataADC1[CHUNK:]
+                break
+
+    new_data = np.frombuffer(in_data, dtype=np.int16)
+    
+    # ???????? ?????? ?????????? ????? ??????
+    new_size = dataADC1.size + new_data.size
+    dataADC1 = np.empty(new_size, dtype=np.int16)  # ??????? ????? ??????
+    dataADC1[:dataADC1.size - new_data.size] = dataADC1  # ???????? ?????? ??????
+    dataADC1[-new_data.size:] = new_data  # ????????? ????? ??????
+
+    if start_adr < 10 and tau_start_adr == 0:
+        count_start += 1
+        
+        dataADC = np.empty(dataADC7.size + dataADC6.size + dataADC5.size + dataADC4.size + dataADC3.size + dataADC2.size + dataADC1.size, dtype=np.int16)
+        dataADC[:dataADC7.size] = dataADC7
+        dataADC[dataADC7.size:dataADC7.size + dataADC6.size] = dataADC6
+        dataADC[dataADC7.size + dataADC6.size:dataADC7.size + dataADC6.size + dataADC5.size] = dataADC5
+        dataADC[dataADC7.size + dataADC6.size + dataADC5.size:dataADC7.size + dataADC6.size + dataADC5.size + dataADC4.size] = dataADC4
+        dataADC[dataADC7.size + dataADC6.size + dataADC5.size + dataADC4.size:dataADC7.size + dataADC6.size + dataADC5.size + dataADC4.size + dataADC3.size] = dataADC3
+        dataADC[dataADC7.size + dataADC6.size + dataADC5.size + dataADC4.size + dataADC3.size:] = dataADC2
+        dataADC[dataADC.size - dataADC1.size:] = dataADC1
+
+        y_indices_p = np.arange(int(len(dataADC) / 1920)) * 1920
+        y_indices_n = np.arange(int(len(dataADC) / 1920)) * 1920 + 955
+        
+        data_to_sum_p = np.mean([dataADC[start_adress + y : stop_adress + y] for y in y_indices_p], axis=0)
+        data_to_sum_n = np.mean([dataADC[start_adress + y : stop_adress + y] for y in y_indices_n], axis=0)
+
+    else:
+        count_start = 0
+
+    led_line.set_value(0)
+    return (in_data, pyaudio.paContinue)
+
+
+
+
+
+@njit
+def callback(in_data, frame_count, time_info, status):
+    led_line.set_value(1)
+
+    global dataADC, dataADC1, dataADC2, dataADC3, dataADC4, dataADC5, dataADC6, dataADC7
+    global start_adr, count_start, data_to_sum_p, data_to_sum_n, start_adress, stop_adress, tau_start_adr
+
+    MAX_SIZE = 1000000 # ????????? ?????????? ????????. ?????????? ??????? ???????????? ?????? ??????.
+    CHUNK = 23040
+    CHUNK0 = CHUNK//2 # ??? ?????????? CHUNK0 ? ????????? - ?????????? ???????? CHUNK
+
+    flag_synchro = 0
+    ADCmax = 0
+
+    new_data = np.frombuffer(in_data, dtype=np.int16)
+
+    # ??????????????? ????????? ??????
+    if dataADC1.size == 0:
+        dataADC1 = np.empty(MAX_SIZE, dtype=np.int16)
+        dataADC2 = np.empty(MAX_SIZE, dtype=np.int16)
+        dataADC3 = np.empty(MAX_SIZE, dtype=np.int16)
+        dataADC4 = np.empty(MAX_SIZE, dtype=np.int16)
+        dataADC5 = np.empty(MAX_SIZE, dtype=np.int16)
+        dataADC6 = np.empty(MAX_SIZE, dtype=np.int16)
+        dataADC7 = np.empty(MAX_SIZE, dtype=np.int16)
+
+    # ??????????? ????? ??????
+    data_size = min(MAX_SIZE - len(dataADC1), len(new_data))
+    dataADC1[:data_size] = new_data[:data_size]
+
+
+    # ????? ?????????????
+    if len(dataADC1) > CHUNK:
+        for i in range(CHUNK):
+            if flag_synchro or (dataADC1[i] < 7000 and dataADC1[i + 1] > 7000 and dataADC1[i + 31] < -3000):
+                flag_synchro = 1
+                ADCmax = max(ADCmax, dataADC1[i])
+                start_adr = i
+                # ???????????????? ????? -  ?????? np.roll
+                dataADC7 = np.copy(dataADC6)
+                dataADC6 = np.copy(dataADC5)
+                dataADC5 = np.copy(dataADC4)
+                dataADC4 = np.copy(dataADC3)
+                dataADC3 = np.copy(dataADC2)
+                dataADC2[:CHUNK] = dataADC1[:CHUNK]
+                shift_amount = CHUNK + (int(i / 1.2) if i > 16 else (1 if i > 8 else (0 if i > 3 else -1)))
+                dataADC1 = np.roll(dataADC1, -shift_amount) #np.copy(dataADC1[shift_amount:]) - ????????????
+                break
+            if i > CHUNK0:
+                # ... (??????????? ??????????? ?????? ??? ?????? i > CHUNK0) ...
+                break
+
+    # ... (????????? ???,  ?????????? ???????????? ??? ????? ?????? ?????? ? ?????????) ...
+    led_line.set_value(0)
+    return (in_data, pyaudio.paContinue)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+from numba import njit
+
+@njit
+def callback(in_data, frame_count, time_info, status, dataADC1, dataADC2, dataADC3, dataADC4, dataADC5, dataADC6, dataADC7,
+             start_adr, count_start, data_to_sum_p, data_to_sum_n, start_adress, stop_adress, tau_start_adr, CHUNK, CHUNK0):
+    led_line.set_value(1) #led_line ?????? ???? ????????? ??? ???????
+
+    flag_synchro = 0
+    ADCmax = 0
+
+    if len(dataADC1) > CHUNK:
+        for i in range(CHUNK):
+            if flag_synchro or (dataADC1[i] < 7000 and dataADC1[i + 1] > 7000 and dataADC1[i + 31] < -3000):
+                flag_synchro = 1
+                ADCmax = max(ADCmax, dataADC1[i])
+                start_adr = i
+
+                dataADC7 = np.copy(dataADC6)
+                dataADC6 = np.copy(dataADC5)
+                dataADC5 = np.copy(dataADC4)
+                dataADC4 = np.copy(dataADC3)
+                dataADC3 = np.copy(dataADC2)
+                dataADC2[:CHUNK] = dataADC1[:CHUNK]
+
+                shift_amount = CHUNK + (int(i / 1.2) if i > 16 else (1 if i > 8 else (0 if i > 3 else -1)))
+                dataADC1 = np.roll(dataADC1, -shift_amount)
+                break
+
+            if i > CHUNK0:
+                dataADC7, dataADC6, dataADC5, dataADC4, dataADC3 = np.roll([dataADC6, dataADC5, dataADC4, dataADC3, dataADC2], shift=1)
+                dataADC2[:] = dataADC1[:CHUNK]
+                dataADC1[:] = dataADC1[CHUNK:]
+                break
+
+    new_data = np.frombuffer(in_data, dtype=np.int16)
+    dataADC1[:CHUNK] = new_data
+
+    if start_adr < 10 and tau_start_adr == 0:
+        count_start += 1
+        dataADC = np.concatenate((dataADC7, dataADC6, dataADC5, dataADC4, dataADC3, dataADC2, dataADC1))
+        y_indices_p = np.arange(int(len(dataADC) / 1920)) * 1920
+        y_indices_n = np.arange(int(len(dataADC) / 1920)) * 1920 + 955
+        data_to_sum_p = np.mean([dataADC[start_adress + y:stop_adress + y] for y in y_indices_p], axis=0)
+        data_to_sum_n = np.mean([dataADC[start_adress + y:stop_adress + y] for y in y_indices_n], axis=0)
+    else:
+        count_start = 0
+
+    led_line.set_value(0)
+    return (in_data, pyaudio.paContinue), dataADC1, dataADC2, dataADC3, dataADC4, dataADC5, dataADC6, dataADC7, start_adr, count_start, data_to_sum_p, data_to_sum_n
+
+
+
+
+
+
+
+
+

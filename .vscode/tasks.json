@@ -1,0 +1,31 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run BMI30.200.py",
+			"type": "shell",
+			"command": "/home/techaid/Documents/.usbvenv/bin/python",
+			"args": [
+				"/home/techaid/Documents/BMI30.200.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$python"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run BMI30.200.py",
+			"type": "shell",
+			"command": "/home/techaid/Documents/.usbvenv/bin/python",
+			"args": [
+				"/home/techaid/Documents/BMI30.200.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$python"
+			],
+			"group": "build"
+		}
+	]
+}

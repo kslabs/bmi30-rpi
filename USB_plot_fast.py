@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import numpy as np  # type: ignore[import-not-found]
+
+import USB_io
+import USB_proto
+import USB_frame
+
+
+def _qt_import():
+    import pyqtgraph as pg  # type: ignore[import-not-found]
+    try:
+        from PyQt6 import QtWidgets, QtCore  # type: ignore[import-not-found]
+    except Exception:
+        try:
+            from PyQt5 import QtWidgets, QtCore  # type: ignore[import-not-found]
+        except Exception:
+            from PySide6 import QtWidgets, QtCore  # type: ignore[import-not-found]
+    return pg, QtWidgets, QtCore
+
+
+def run_plot_fast(
+    port: str,
+    *,
+    raw_samples: int = 1000,
+    target_hz: int = 20,
+    baudrate: int | None = None,
+    ser=None,
+) -> int:
+    try:
+        pg, QtWidgets, QtCore = _qt_import()
+    except Exception as e:
+        print("[plot-fast] Требуются pyqtgraph и PyQt6/5 или PySide6:", e)
+        return 2
+
+    own_ser = ser is None
+    if ser is None:
+        ser = USB_io.open_serial(port, timeout=0.2, baudrate=baudrate)
+    try:
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        pg.setConfigOptions(antialias=False, useOpenGL=False)
+
+        win = QtWidgets.QMainWindow(); win.setWindowTitle("USB RAW Oscilloscope (PyQtGraph)")
+        cw = QtWidgets.QWidget(); win.setCentralWidget(cw)
+        layout = QtWidgets.QVBoxLayout(cw)
+
+        plot = pg.PlotWidget(); plot.setLabel('bottom', 'samples'); plot.setLabel('left', 'amplitude', units='int16')
+        plot.showGrid(x=True, y=True, alpha=0.25); plot.setYRange(-33000, 33000)
+        layout.addWidget(plot)
+
+        samples = int(max(16, raw_samples))
+        x = np.arange(samples, dtype=np.float32)
+        yL = np.zeros(samples, dtype=np.float32)
+        yR = np.zeros(samples, dtype=np.float32)
+        cL = plot.plot(x, yL, pen=pg.mkPen('#1f77b4', width=1))
+        cR = plot.plot(x, yR, pen=pg.mkPen('#ff7f0e', width=1))
+
+        import threading, queue
+        q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=4)
+        stop = False
+
+        def reader():
+            nonlocal stop
+            while not stop:
+                try:
+                    raw = USB_io.read_exact(ser, samples * 4, timeout_s=1.0)
+                    arr = np.frombuffer(raw, dtype='<i2').reshape(-1, 2)
+                    q.put(arr, timeout=0.1)
+                except Exception:
+                    pass
+        threading.Thread(target=reader, daemon=True).start()
+
+        def on_timer():
+            nonlocal yL, yR
+            got = False
+            while True:
+                try:
+                    arr = q.get_nowait()
+                except Exception:
+                    break
+                n = min(samples, arr.shape[0])
+                if n < samples:
+                    yL = np.roll(yL, -n); yR = np.roll(yR, -n)
+                    yL[-n:] = arr[-n:, 0]
+                    yR[-n:] = arr[-n:, 1]
+                else:
+                    yL[:] = arr[-samples:, 0]
+                    yR[:] = arr[-samples:, 1]
+                got = True
+            if got:
+                cL.setData(y=yL, _callSync='off'); cR.setData(y=yR, _callSync='off')
+
+        timer = QtCore.QTimer(); timer.setInterval(max(1, int(1000 / max(1, int(target_hz)))))
+        timer.timeout.connect(on_timer); timer.start()
+
+        win.resize(900, 360); win.show()
+        try:
+            app.exec()
+        except KeyboardInterrupt:
+            stop = True
+        stop = True
+        return 0
+    finally:
+        if own_ser:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+
+def run_plot_fast_frames(
+    port: str,
+    *,
+    window_samples: int = 2000,
+    target_hz: int = 30,
+    crc_none: bool = True,
+    frame_timeout_sec: float = 2.0,
+    win0: tuple[int, int] | None = None,
+    win1: tuple[int, int] | None = None,
+    block_hz: int | None = None,
+    block_rate_max: bool = False,
+    start_stream: bool = False,
+    stop_stream: bool = False,
+    q_max: int = 8,
+    drop_policy: str = 'drop_new',
+    frames_to_display: int = 2,
+    align_to_frame_start: bool = True,
+    data_samples_limit_per_ch: int | None = None,
+    baudrate: int | None = None,
+    render_max_hz: float | None = None,
+    render_decimate_frames: int = 0,
+    slider_min: int = 60,
+    slider_max: int = 600,
+    ser=None,
+) -> int:
+    """Плот по кадрам: 2 кадра, начало по границе кадра; слайдер 60..600 только для отображения; 8 квадратных кнопок 0–7 без действия."""
+    try:
+        pg, QtWidgets, QtCore = _qt_import()
+    except Exception as e:
+        print("[plot-fast-frames] Требуются pyqtgraph и PyQt6/5 или PySide6:", e)
+        return 2
+
+    own_ser = ser is None
+    if ser is None:
+        ser = USB_io.open_serial(port, timeout=1.0, baudrate=baudrate)  # Увеличенный таймаут для восстановления
+    try:
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        pg.setConfigOptions(antialias=False, useOpenGL=False)
+
+        # UI
+        win = QtWidgets.QMainWindow(); win.setWindowTitle("USB Frame-Sync Oscilloscope (PyQtGraph)")
+        cw = QtWidgets.QWidget(); win.setCentralWidget(cw)
+        layout = QtWidgets.QVBoxLayout(cw)
+
+        plot = pg.PlotWidget(); plot.setLabel('bottom', 'samples'); plot.setLabel('left', 'amplitude', units='int16')
+        plot.showGrid(x=True, y=True, alpha=0.25); plot.setYRange(-33000, 33000)
+        layout.addWidget(plot)
+
+        # Верхняя панель: слайдер + кнопки
+        slider_box = QtWidgets.QWidget(); slider_layout = QtWidgets.QHBoxLayout(slider_box); slider_layout.setContentsMargins(4, 0, 4, 0)
+        lbl = QtWidgets.QLabel("Семплов:"); slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        try:
+            slider.setMinimum(int(slider_min)); slider.setMaximum(int(slider_max))
+        except Exception:
+            slider.setMinimum(30); slider.setMaximum(300)
+        try:
+            slider.setTickPosition(QtWidgets.QSlider.TickPosition.TicksBelow)
+        except Exception:
+            try:
+                slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+            except Exception:
+                pass
+        slider.setSingleStep(1); slider.setPageStep(10); val_lbl = QtWidgets.QLabel("-")
+        slider_layout.addWidget(lbl); slider_layout.addWidget(slider, stretch=1); slider_layout.addWidget(val_lbl)
+
+        # Загрузка конфигурации кнопок
+        import json, os
+        config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plot_config.json")
+        saved_button = None
+        try:
+            if os.path.exists(config_file):
+                with open(config_file, 'r') as f:
+                    config = json.load(f)
+                    saved_button = config.get('selected_button')
+        except Exception:
+            pass
+
+        btn_bar = QtWidgets.QWidget(); btn_layout = QtWidgets.QHBoxLayout(btn_bar); btn_layout.setContentsMargins(8, 0, 0, 0)
+        buttons = []
+        for i in range(8):
+            b = QtWidgets.QPushButton(str(i))
+            if i == 0:
+                b.setCheckable(True)  # кнопка 0 - переключатель видимости
+            else:
+                b.setCheckable(True)  # кнопки 1-7 - радиокнопки
+                if saved_button == i:
+                    b.setChecked(True)
+                    b.setStyleSheet("background-color: #90EE90;")
+            try:
+                b.setFixedSize(24, 24)
+            except Exception:
+                b.setMinimumWidth(24)
+            buttons.append(b)
+            btn_layout.addWidget(b)
+        slider_layout.addWidget(btn_bar, stretch=0)
+        layout.addWidget(slider_box)
+
+        # Состояния
+        last_starts = [0, 0]
+        last_len_detected: int | None = None
+        import time as _t
+        updating_slider = False
+        ui_display_limit: int | None = None
+        ui_dirty = False  # принудительная перерисовка без новых кадров
+        plot_visible = True  # состояние видимости графика
+
+        import threading as _thr, queue, signal
+
+        # Обработчики кнопок
+        def on_button_clicked(button_id):
+            nonlocal plot_visible, saved_button
+            if button_id == 0:
+                # Кнопка 0 - полное отключение plot окна для освобождения ресурсов
+                plot_visible = not plot_visible
+                buttons[0].setChecked(not plot_visible)  # инвертируем состояние
+                if plot_visible:
+                    plot.show()
+                else:
+                    plot.hide()  # Полностью скрываем окно plot
+            else:
+                # Кнопки 1-7 - радиокнопки с сохранением
+                # Сначала сбрасываем все кнопки 1-7
+                for i in range(1, 8):
+                    buttons[i].setChecked(False)
+                    buttons[i].setStyleSheet("")
+                # Включаем выбранную
+                buttons[button_id].setChecked(True)
+                buttons[button_id].setStyleSheet("background-color: #90EE90;")
+                saved_button = button_id
+                # Сохраняем в файл
+                try:
+                    config = {'selected_button': button_id}
+                    with open(config_file, 'w') as f:
+                        json.dump(config, f)
+                except Exception:
+                    pass
+
+        # Подключаем обработчики к кнопкам
+        for i, btn in enumerate(buttons):
+            btn.clicked.connect(lambda checked, btn_id=i: on_button_clicked(btn_id))
+
+        # Начальная конфигурация устройства (NO-ACK)
+        if (win0 is not None) or (win1 is not None) or (block_hz is not None) or block_rate_max or stop_stream or start_stream:
+            try:
+                if stop_stream:
+                    USB_proto.send_cmd_no_ack(ser, USB_proto.CMD_STOP)
+                if win0 is not None and win1 is not None:
+                    payload = np.asarray([win0[0], win0[1], win1[0], win1[1]], dtype=np.uint16).tobytes()
+                    USB_proto.send_cmd_no_ack(ser, USB_proto.CMD_SET_WINDOWS, payload=payload)
+                elif win0 is not None:
+                    payload = np.asarray([win0[0], win0[1], 0, 0], dtype=np.uint16).tobytes()
+                    USB_proto.send_cmd_no_ack(ser, USB_proto.CMD_SET_WINDOWS, payload=payload)
+                if (block_hz is not None) and (not block_rate_max):
+                    USB_proto.send_cmd_no_ack(ser, USB_proto.CMD_SET_BLOCK_HZ, payload=np.asarray([int(block_hz)], dtype=np.uint16).tobytes())
+                if block_rate_max:
+                    USB_proto.send_cmd_no_ack(ser, USB_proto.CMD_SET_BLOCK_HZ, payload=np.asarray([0xFFFF], dtype=np.uint16).tobytes())
+                if start_stream:
+                    USB_proto.send_cmd_no_ack(ser, USB_proto.CMD_START)
+            except Exception:
+                pass
+
+        # Буферы и кривые
+        samples = int(max(16, window_samples))
+        x = np.arange(samples, dtype=np.float32)
+        yL = np.zeros(samples, dtype=np.float32)
+        yR = np.zeros(samples, dtype=np.float32)
+        cL = plot.plot(x, yL, pen=pg.mkPen('#1f77b4', width=1))
+        cR = plot.plot(x, yR, pen=pg.mkPen('#ff7f0e', width=1))
+
+        # Линии границ кадров
+        try:
+            style = QtCore.Qt.PenStyle.DotLine
+        except Exception:
+            try:
+                style = QtCore.Qt.DotLine
+            except Exception:
+                style = None
+        frame_lines = []
+
+        # Очередь кадров и статистика
+        q: "queue.Queue[dict]" = queue.Queue(maxsize=max(1, int(q_max)))
+        stop = False
+        stat_lock = _thr.Lock()
+        from collections import deque
+        rx = {
+            'count': 0, 'bytes': 0, 'bytes_total': 0, 'last_t': None,
+            'dt_hist': deque(maxlen=512), 'lost': 0, 'last_seq': None, 'last_ch': 2,
+            'parse_ms_acc': 0.0, 'send_ms_acc': 0.0, 'q_ms_acc': 0.0, 'timed_frames': 0,
+        }
+
+        def reader():
+            nonlocal stop
+            err_since = 0; last_log = 0.0
+            while not stop:
+                try:
+                    # Ветвление: если это VendorIO (PyUSB), читаем вендорный поток (магия 0xA55A, 32-байтный заголовок)
+                    if hasattr(ser, 'dev') and hasattr(ser, 'read'):
+                        import struct as _st
+                        import numpy as _np
+                        # Внутренняя сборка стереопары по seq
+                        if not hasattr(reader, '_vn_half'):
+                            reader._vn_half = {}
+                        half = reader._vn_half  # type: ignore[attr-defined]
+
+                        # Синхронизация по 0x5A 0xA5 (LE от 0xA55A)
+                        USB_io.sync_to_magic(ser, max_wait_s=2.0)
+                        hdr = USB_io.read_exact(ser, 32, 'vnd-hdr', timeout_s=1.0)
+                        (magic, ver, flags, seq, ts, total_samples,
+                         zone_count, zone1_off, zone1_len, reserved, reserved2, crc16v) = _st.unpack('<H B B I I H H I I I H H', hdr)
+                        if magic != 0xA55A:
+                            # неверная магия — ресинхронизация
+                            raise TimeoutError('bad vendor magic')
+                        payload_len = int(total_samples) * 2
+                        payload = USB_io.read_exact(ser, payload_len, 'vnd-payload', timeout_s=1.0)
+                        # Флаги АЦП: ровно один из {0x01 (ADC0), 0x02 (ADC1)} установлен в рабочих кадрах
+                        if (flags & 0x01):
+                            adc_id = 0
+                        elif (flags & 0x02):
+                            adc_id = 1
+                        else:
+                            # неизвестный/тестовый кадр без маркировки канала — пропустим
+                            continue
+                        seq16 = int(seq & 0xFFFF)
+                        ent = half.get(seq16)
+                        if ent is None:
+                            ent = {}
+                            half[seq16] = ent
+                        ent[adc_id] = payload
+                        # Пытаемся собрать пару
+                        if 0 in ent and 1 in ent:
+                            a = _np.frombuffer(ent[0], dtype='<i2')
+                            b = _np.frombuffer(ent[1], dtype='<i2')
+                            n = min(a.size, b.size)
+                            if n > 0:
+                                data = _np.stack((a[:n], b[:n]), axis=1)
+                                frame = {
+                                    'magic': b'\x5A\xA5',
+                                    'seq': seq16,
+                                    'win_count': 1,
+                                    'msec': int(ts & 0xFFFFFFFF),
+                                    'total_samples': int(n),
+                                    'total_samples_hdr': int(n),
+                                    'channels': 2,
+                                    'fmt': 0x0080,
+                                    'ver': int(ver),
+                                    'wins': [(0, int(n))],
+                                    'data': data,
+                                    'crc_variant': 'none',
+                                    'raw': b''
+                                }
+                                try:
+                                    q.put_nowait(frame)
+                                except Exception:
+                                    if drop_policy == 'drop_old':
+                                        try:
+                                            _ = q.get_nowait(); q.put_nowait(frame)
+                                        except Exception:
+                                            pass
+                            # очистим собранный seq
+                            try:
+                                del half[seq16]
+                            except Exception:
+                                pass
+                        # Прополем старые хвосты, чтобы не пухли
+                        if len(half) > 64:
+                            oldest_keys = sorted(half.keys())[:-32]
+                            for k in oldest_keys:
+                                half.pop(k, None)
+                    else:
+                        # Обычный путь: читаем общий формат кадра через USB_frame.read_frame
+                        frame = USB_frame.read_frame(
+                            ser,
+                            crc_strategy=('none' if crc_none else 'auto'),
+                            sync_wait_s=2.0,  # Увеличенный таймаут для восстановления связи
+                            frame_timeout_s=2.0,  # Увеличенный таймаут для восстановления связи
+                            fast_drop=True,
+                            max_retries=3,  # Больше ретраев для надежности
+                        )
+
+                        try:
+                            q.put_nowait(frame)  # Только неблокирующая постановка
+                        except Exception:
+                            if drop_policy == 'drop_old':
+                                try:
+                                    _ = q.get_nowait()
+                                    q.put_nowait(frame)
+                                except Exception:
+                                    pass
+                            if drop_policy == 'drop_old':
+                                try:
+                                    _ = q.get_nowait()
+                                    q.put_nowait(frame)
+                                except Exception:
+                                    pass
+                except Exception as e:
+                    err_since += 1
+                    now = _t.time()
+                    if now - last_log > 1.0:
+                        try:
+                            print(f"[reader] errors: {err_since} (resync): {type(e).__name__}: {e}")
+                        except Exception:
+                            pass
+                        last_log = now
+                    continue
+
+        _thr.Thread(target=reader, daemon=True).start()
+
+        t0 = _t.time(); frames_tick = 0; bytes_tick = 0
+        last_draw_t = t0; frames_since_draw = 0
+        last_display_total = 0; last_display_perframe: list[int] = []
+        from collections import deque as _deque
+        last_frames: "_deque[dict]" = _deque(maxlen=max(1, int(frames_to_display)))
+
+        def _on_sigint(signum, frame):
+            nonlocal stop
+            stop = True
+            try:
+                app.quit()
+            except Exception:
+                pass
+        try:
+            signal.signal(signal.SIGINT, _on_sigint)
+        except Exception:
+            pass
+
+        # Слайдер только отображение + немедленная перерисовка
+        def on_slider_changed(val: int):
+            nonlocal updating_slider, ui_display_limit, ui_dirty
+            if updating_slider:
+                try:
+                    val_lbl.setText(str(int(val)))
+                except Exception:
+                    pass
+                return
+            ui_display_limit = int(val)
+            ui_dirty = True
+            try:
+                val_lbl.setText(str(int(val)))
+            except Exception:
+                pass
+        slider.valueChanged.connect(on_slider_changed)
+        
+        # Установить начальное значение слайдера на максимум (показать полный кадр)
+        try:
+            slider.setValue(slider.maximum())
+            val_lbl.setText(str(slider.maximum()))
+        except Exception:
+            pass
+
+        def on_timer():
+            nonlocal yL, yR, frames_tick, bytes_tick, t0, x, frame_lines, last_draw_t, frames_since_draw, last_display_total, last_display_perframe, ui_dirty
+            
+            # Кнопка 0 полностью отключает все операции с plot для освобождения ресурсов
+            if not plot_visible:
+                # Просто освобождаем очередь без обработки и увеличиваем интервал таймера
+                try:
+                    while True:
+                        q.get_nowait()
+                except Exception:
+                    pass
+                return
+                
+            any_new = False; added = 0
+            latest = None
+            try:
+                latest = q.get_nowait()
+                while True:
+                    latest = q.get_nowait()
+            except Exception:
+                pass
+            if latest is not None:
+                frame = latest
+                data = frame.get('data')
+                if getattr(data, 'ndim', 1) == 2:
+                    ch = int(frame.get('channels', data.shape[1]))
+                    n = int(data.shape[0])
+                    bytes_tick += (n * ch * 2)
+                    last_frames.append(frame)
+                    any_new = True
+                    added = 1
+                try:
+                    wins = frame.get('wins') or []
+                    if isinstance(wins, list) and len(wins) >= 1:
+                        try:
+                            last_len_detected = int(wins[0][1]) if (isinstance(wins[0], (list, tuple)) and len(wins[0]) >= 2) else int(frame.get('total_samples', data.shape[0]))
+                        except Exception:
+                            last_len_detected = int(frame.get('total_samples', data.shape[0]))
+                        try:
+                            starts = [int(wins[i][0]) for i in range(min(2, len(wins)))]
+                            last_starts[:] = starts + ([0] * max(0, 2 - len(starts)))
+                        except Exception:
+                            last_starts[:] = [0, 0]
+                    else:
+                        last_starts[:] = [0, 0]
+                        last_len_detected = int(frame.get('total_samples', data.shape[0]))
+                except Exception:
+                    pass
+
+            frames_since_draw += added
+            should_draw = True
+            now = _t.time()
+            
+            if render_max_hz and render_max_hz > 0:
+                min_dt = 1.0 / float(render_max_hz)
+                if (now - last_draw_t) < (min_dt - 1e-4) and not ui_dirty:
+                    should_draw = False
+            if render_decimate_frames and render_decimate_frames > 1 and frames_since_draw < int(render_decimate_frames) and not ui_dirty:
+                should_draw = False
+
+            if should_draw and ui_dirty:
+                ui_dirty = False
+
+            if should_draw and align_to_frame_start and frames_to_display >= 1 and len(last_frames) > 0:
+                valid = [f for f in list(last_frames) if getattr(f.get('data', None), 'ndim', 1) == 2]
+                if valid:
+                    ch = int(valid[-1].get('channels', valid[-1]['data'].shape[1]))
+                    parts_L = []; parts_R = []; boundaries = [0]; total = 0
+                    for f in valid[-int(frames_to_display):]:
+                        d = f['data']; wins = f.get('wins') or []
+                        # Всегда используем полную длину данных кадра, игнорируя ограничения устройства
+                        full_frame_samples = int(d.shape[0])  # полная длина кадра
+                        
+                        if isinstance(ui_display_limit, int) and ui_display_limit > 0:
+                            # Пользователь задал ограничение слайдером
+                            samples_per_ch = min(int(ui_display_limit), full_frame_samples)
+                        else:
+                            # Показываем полный кадр если слайдер не установлен
+                            samples_per_ch = full_frame_samples
+                        samples_per_ch = max(0, min(samples_per_ch, int(d.shape[0])))
+                        if samples_per_ch <= 0:
+                            continue
+                        dd = d[:samples_per_ch, :]
+                        parts_L.append(dd[:, 0].astype(np.float32, copy=False))
+                        if ch >= 2:
+                            parts_R.append(dd[:, 1].astype(np.float32, copy=False))
+                        total += samples_per_ch; boundaries.append(total)
+                    if total > 0:
+                        yL_new = np.concatenate(parts_L) if len(parts_L) > 1 else (parts_L[0] if parts_L else np.zeros(1, np.float32))
+                        yR_new = (np.concatenate(parts_R) if len(parts_R) > 1 else parts_R[0]) if (ch >= 2 and parts_R) else np.zeros_like(yL_new)
+                        x = np.arange(total, dtype=np.float32)
+                        if plot_visible:  # Только если plot активен
+                            cL.setData(x=x, y=yL_new, _callSync='off'); cR.setData(x=x, y=yR_new, _callSync='off')
+                        if style is not None and plot_visible:  # Только если plot активен
+                            for ln in frame_lines:
+                                try:
+                                    plot.removeItem(ln)
+                                except Exception:
+                                    pass
+                            frame_lines.clear()
+                            pen = pg.mkPen('#2ca02c', style=style)
+                            for pos in boundaries:
+                                ln = pg.InfiniteLine(pos=pos, angle=90, pen=pen)
+                                plot.addItem(ln); frame_lines.append(ln)
+                        try:
+                            last_display_total = int(total)
+                            last_display_perframe = [int(b - a) for a, b in zip(boundaries[:-1], boundaries[1:])]
+                        except Exception:
+                            last_display_total = int(total); last_display_perframe = []
+                        # обновляем буферы для метрик
+                        yL = yL_new if yL_new.shape[0] == yL.shape[0] else yL_new.copy()
+                        yR = yR_new if yR_new.shape[0] == yR.shape[0] else yR_new.copy()
+            elif should_draw and any_new:
+                try:
+                    f = last_frames[-1]; data = f['data']; ch = int(f.get('channels', data.shape[1])); n = data.shape[0]
+                    take = min(n, samples)
+                    if take < samples:
+                        yL = np.roll(yL, -take); yR = np.roll(yR, -take)
+                        yL[-take:] = data[-take:, 0].astype(np.float32)
+                        if ch >= 2:
+                            yR[-take:] = data[-take:, 1].astype(np.float32)
+                    else:
+                        yL[:] = data[-samples:, 0].astype(np.float32)
+                        if ch >= 2:
+                            yR[:] = data[-samples:, 1].astype(np.float32)
+                    if plot_visible:  # Только если plot активен
+                        cL.setData(y=yL, _callSync='off'); cR.setData(y=yR, _callSync='off')
+                except Exception:
+                    pass
+
+            if should_draw and (any_new or frames_since_draw > 0):
+                last_draw_t = now; frames_since_draw = 0; frames_tick += 1
+
+            # Ежесекундная телеметрия в терминал (расширенная), заголовок — короткий
+            if now - t0 >= 1.0:
+                dur = now - t0; draw_fps = frames_tick / max(1e-6, dur)
+                with stat_lock:
+                    rx_count = rx['count']; rx_bytes = rx['bytes']; rx_bytes_total = rx.get('bytes_total', 0)
+                    rx_lost = rx.get('lost', 0); last_ch = int(rx.get('last_ch', 2))
+                    # вычисление rx_fps и джиттера
+                    if len(rx['dt_hist']) >= 2:
+                        import numpy as _np
+                        dt_arr = _np.fromiter(rx['dt_hist'], dtype=_np.float64)
+                        dt_mean = float(dt_arr.mean()); dt_std = float(dt_arr.std())
+                        rx_fps = (1.0 / dt_mean) if dt_mean > 0 else 0.0; jitter_ms = dt_std * 1000.0
+                    else:
+                        rx_fps = rx_count / max(1e-6, dur); jitter_ms = 0.0
+                    parse_ms_avg = (rx['parse_ms_acc'] / max(1, rx['timed_frames']))
+                    q_ms_avg = (rx['q_ms_acc'] / max(1, rx['timed_frames']))
+                    send_ms_avg = (rx['send_ms_acc'] / max(1, rx['timed_frames']))
+                    # reset
+                    rx['count'] = 0; rx['bytes'] = 0; rx['bytes_total'] = 0
+                    rx['parse_ms_acc'] = 0.0; rx['q_ms_acc'] = 0.0; rx['send_ms_acc'] = 0.0; rx['timed_frames'] = 0
+                rx_kSps = ((rx_bytes / 2.0) / max(1e-6, dur) / max(1, last_ch)) / 1000.0
+                rx_kBps_total = (rx_bytes_total / max(1e-6, dur)) / 1000.0
+                qlen = q.qsize()
+                # pk-pk и rms по текущему отображению
+                try:
+                    pkpkL = float(yL.max() - yL.min()) if yL.size else 0.0
+                    rmsL = float(np.sqrt(np.mean((yL.astype(np.float64) ** 2)))) if yL.size else 0.0
+                    pkpkR = float(yR.max() - yR.min()) if yR.size else 0.0
+                    rmsR = float(np.sqrt(np.mean((yR.astype(np.float64) ** 2)))) if yR.size else 0.0
+                except Exception:
+                    pkpkL = pkpkR = rmsL = rmsR = 0.0
+
+                # Заголовок — краткий
+                title = f"USB in {rx_fps:.1f} fps; render {draw_fps:.1f} fps"
+                plot.setTitle(title)
+                # Терминал — подробный
+                disp = f"disp {len(last_display_perframe)}x{(last_display_perframe[-1] if last_display_perframe else 0)}"
+                try:
+                    print(
+                        f"[plot-fast-frames] {title} | jitter {jitter_ms:.2f} ms | lost {rx_lost} | q {qlen} | "
+                        f"{rx_kSps:.1f} kS/s/ch | {rx_kBps_total:.1f} kB/s | parse {parse_ms_avg:.3f} ms | "
+                        f"queue {q_ms_avg:.3f} ms | send {send_ms_avg:.3f} ms | {disp} | "
+                        f"pkpk(L/R) {pkpkL:.0f}/{pkpkR:.0f} | rms(L/R) {rmsL:.1f}/{rmsR:.1f}"
+                    )
+                except Exception:
+                    pass
+                frames_tick = 0; bytes_tick = 0; t0 = now
+
+        timer = QtCore.QTimer(); timer.setInterval(max(1, int(1000 / max(1, int(target_hz)))))
+        timer.timeout.connect(on_timer); timer.start()
+
+        win.resize(900, 360); win.show()
+        try:
+            app.exec()
+        except KeyboardInterrupt:
+            stop = True
+        stop = True
+        return 0
+    finally:
+        if own_ser:
+            try:
+                ser.close()
+            except Exception:
+                pass

@@ -1,0 +1,15 @@
+{
+  "mode": "plot-fast-frames",
+  "port": "auto",
+  "warmup_frames": 1,
+  "warmup_timeout_sec": 5.0,
+  "plot": {
+    "block_hz": 50,
+    "win0": [0, 256],
+    "win1": null,
+    "frame_timeout_sec": 2.0,
+  "crc_none": true,
+  "apply_device_cfg": false,
+  "data_samples_limit_per_ch": 0
+  }
+}
