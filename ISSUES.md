@@ -40,19 +40,22 @@ After device developer flashed new firmware, the Vendor Bulk interface (IF#2) ha
       EP 0x83 (IN, Bulk)   ✅
 ```
 
-**Problem Details**:
+**Problem Details** (Updated 2025-10-21 after device testing):
 ```
 USB Handshake Progress:
 [open] ✅ IF#2 found with EP 0x03/0x83
 [alt] ✅ alt=1 set via vendor SET_ALT(0x40)
 [ep0] ✅ STAT v1 readable (64 bytes, alt1=True, out_armed=True)
-[tx] ❌ ALL EP0 Bulk OUT commands fail with errno 5
-    - 0x20 START_STREAM ❌
-    - 0x21 STOP_STREAM ❌
-    - 0x14 SET_PROFILE ❌
-    - 0x13 SET_FULL_MODE ❌
-[retry] ✅ CLEAR_HALT triggered automatically
-[tx-retry] ❌ Retry also fails with errno 5
+[tx] ✅ EP0 commands now SUCCEED!
+    - 0x20 START_STREAM ✅ (no errno 5!)
+    - 0x21 STOP_STREAM ✅
+    - 0x14 SET_PROFILE ✅
+    - 0x13 SET_FULL_MODE ✅
+[rx] ❌ IN endpoint TIMEOUT on read
+    - After sending START_STREAM
+    - Waits 300ms with no response
+    - No data bytes received
+    - Suggests device not actually sending
 ```
 
 **Root Cause Analysis**:
@@ -64,18 +67,30 @@ USB Handshake Progress:
 - EP0 GET_STATUS working (STAT v1 readable)
 - Firmware compilation and flashing successful
 
-❌ **What's Broken**:
+✅ **Fixed**:
 - Device firmware **EP0 Bulk OUT handler** (control endpoint request handler)
-- ALL OUT control requests to EP0 fail with I/O Error
-- Pattern: Every command type (0x13, 0x14, 0x20, 0x21) fails identically
-- Suggests: Bug in device firmware's USB control request processing
+- Commands now send successfully: SET_PROFILE (0x14), START_STREAM (0x20), etc.
+- errno 5 I/O Error no longer appears
 
-**Likely Device Firmware Issues**:
-1. EP0 OUT data phase not implemented or broken
-2. Control transfer handler missing or incorrect
-3. Request validation too strict (rejecting valid commands)
-4. Interrupt/DMA handler conflict on EP0
-5. Endpoint HALT condition persisting despite CLEAR_HALT
+❌ **What's Broken Now**:
+- IN endpoint (0x83) is not receiving data from device
+- Sends timeout after 300ms with no response
+- Device may not be actually streaming data despite START_STREAM command
+- Suggests: Issue in device firmware's data transmission layer (DMA/FIFO)
+
+**Likely Device Firmware Issues** (Updated):
+
+✅ **Fixed** (as of 2025-10-21 ~17:37):
+1. EP0 OUT data phase handler - NOW WORKING
+2. Control transfer implementation - NOW WORKING
+3. Command request validation - NOW WORKING
+
+❌ **Needs Fixing**:
+1. IN endpoint (0x83) data transmission not active
+2. DMA/FIFO configuration for Bulk IN transfers
+3. Data buffering/queuing after START_STREAM
+4. May need additional initialization command
+5. Check if device firmware actually triggers data stream on START_STREAM
 
 **Test Command**:
 ```bash
