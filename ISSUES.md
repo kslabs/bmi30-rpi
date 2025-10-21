@@ -6,11 +6,16 @@
 
 ## 🔴 CURRENT ISSUES (Blocking)
 
-### Issue #1: Vendor Bulk Interface (IF#2) Missing After Firmware Update
+### Issue #1: IF#2 Vendor Bulk Not Available (Firmware Needs Flashing)
 
-**Status**: 🔴 OPEN - Blocking oscilloscope GUI
+**Status**: 🔴 OPEN - Blocking oscilloscope GUI (Action Required)
 
 **Severity**: Critical (blocks BMI30.200.py GUI)
+
+**Update**: New firmware added (BMI30.stm32h7.elf at 2025-10-21 12:53)
+- Firmware file is compiled and ready
+- **Physical device still running old CDC-only version**
+- Needs to be flashed to device via ST-Link programmer
 
 **Description**:
 After device developer flashed new firmware, the Vendor Bulk interface (IF#2) has disappeared.
@@ -81,6 +86,30 @@ lsusb -d cafe:4001 -v | grep "bNumInterfaces\|Interface"
 - This suggests firmware update may have reverted or failed
 - Both Vendor Bulk and CDC code paths exist in project (confirmed in `usb_vendor/usb_stream.py` and `USB_receiver.py`)
 
+### Action Items (For Flashing New Firmware)
+
+**New firmware ready** (as of 2025-10-21 12:53):
+- Location: `firmware/BMI30.stm32h7.elf`
+- Size: 2,460,668 bytes
+- Status: Compiled and ready
+- Documentation: See `DEVICE_STATUS.md` for flashing instructions
+
+**Hardware Required**:
+- ST-Link v2 programmer (device developer's responsibility)
+- GPIO pins on Raspberry Pi (Pin 11, 13, 9/25 for SWDIO/SWDCLK/GND)
+- USB cable for device
+
+**Flashing Steps** (device developer):
+1. Connect ST-Link to RPi GPIO
+2. Run OpenOCD commands or `flash_firmware.sh` script
+3. Device will reboot in Vendor Bulk mode (IF#2 will appear)
+4. Verify: `lsusb -d cafe:4001 -v` shows bNumInterfaces=3
+
+**Next Steps After Flashing**:
+1. Device reconnects → IF#2 appears with EP 0x03/0x83
+2. Host runs: `python3 BMI30.200.py`
+3. GUI displays oscilloscope at ~200 FPS
+
 ---
 
 ## 🟡 RESOLVED ISSUES (For Reference)
@@ -104,13 +133,14 @@ lsusb -d cafe:4001 -v | grep "bNumInterfaces\|Interface"
 ## 📋 TRACKING CHECKLIST
 
 ### For Current Issue #1:
-- [ ] Device developer receives notification
-- [ ] Device developer checks firmware source
-- [ ] Device developer re-flashes device
-- [ ] Device shows 3 interfaces on fresh connect
-- [ ] GUI (`BMI30.200.py`) connects successfully
+- [ ] ✅ Developer adds compiled firmware to repo (DONE: 2025-10-21 12:53)
+- [ ] Developer connects ST-Link to RPi GPIO
+- [ ] Developer flashes firmware via OpenOCD
+- [ ] Device reboots and shows IF#2 in lsusb
+- [ ] Host runs BMI30.200.py
+- [ ] GUI connects to IF#2 (Vendor Bulk)
 - [ ] Data stream flows (~200 FPS)
-- [ ] Oscilloscope displays ADC0 and ADC1
+- [ ] Oscilloscope displays ADC0 and ADC1 synchronized
 - [ ] Issue marked RESOLVED
 
 ### Post-Resolution Validation:
