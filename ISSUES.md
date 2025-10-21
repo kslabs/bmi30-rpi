@@ -40,23 +40,36 @@ After device developer flashed new firmware, the Vendor Bulk interface (IF#2) ha
       EP 0x83 (IN, Bulk)   ✅
 ```
 
-**Problem Details** (Updated 2025-10-21 after device testing):
+**Problem Details** (CRITICAL UPDATE 2025-10-21 ~18:50):
 ```
-USB Handshake Progress:
-[open] ✅ IF#2 found with EP 0x03/0x83
-[alt] ✅ alt=1 set via vendor SET_ALT(0x40)
+USB Endpoint Test Results (LATEST):
+
+REGRESSION DISCOVERED: GET_STATUS is NOW COMPLETELY BROKEN
+
+[tx] ✅ EP0 OUT commands WORK:
+    - SET_PROFILE (0x14) ✅
+    - START_STREAM (0x20) ✅  
+    - STOP_STREAM (0x21) ✅
+    
+[ep0] ❌ GET_STATUS (EP0 IN) - ALWAYS TIMEOUT:
+    - BEFORE any commands: timeout ✗
+    - AFTER SET_PROFILE: timeout ✗
+    - AFTER START_STREAM: timeout ✗
+    - AFTER STOP_STREAM: timeout ✗
+    - All return errno 110 (Operation timed out)
+    
+[rx] ❌ IN endpoint (0x83) not tested due to alt=1 switch error
+```
+
+**Previous Test Results** (2025-10-21 ~18:34):
+```
 [ep0] ✅ STAT v1 readable (64 bytes, alt1=True, out_armed=True)
-[tx] ✅ EP0 commands now SUCCEED!
-    - 0x20 START_STREAM ✅ (no errno 5!)
-    - 0x21 STOP_STREAM ✅
-    - 0x14 SET_PROFILE ✅
-    - 0x13 SET_FULL_MODE ✅
-[rx] ❌ IN endpoint TIMEOUT on read
-    - After sending START_STREAM
-    - Waits 300ms with no response
-    - No data bytes received
-    - Suggests device not actually sending
 ```
+
+**REGRESSION TIMELINE**:
+- 18:34 - STAT v1 (GET_STATUS) was WORKING ✅
+- 18:45 - STAT v1 (GET_STATUS) now BROKEN ❌ (errno 110 timeout)
+- 18:50 - Confirmed: GET_STATUS broken across ALL test cases
 
 **Root Cause Analysis**:
 
@@ -72,11 +85,15 @@ USB Handshake Progress:
 - Commands now send successfully: SET_PROFILE (0x14), START_STREAM (0x20), etc.
 - errno 5 I/O Error no longer appears
 
-❌ **What's Broken Now**:
-- IN endpoint (0x83) is not receiving data from device
-- Sends timeout after 300ms with no response
-- Device may not be actually streaming data despite START_STREAM command
-- Suggests: Issue in device firmware's data transmission layer (DMA/FIFO)
+❌ **What's Broken Now** (CRITICAL - NEW REGRESSION):
+- **MAJOR**: EP0 GET_STATUS (IN) is completely broken - 100% timeout rate
+  - Returns errno 110 "Operation timed out" on every attempt
+  - No delay between calls - happens immediately
+  - Was working earlier (~18:34), now broken (~18:50)
+  - Indicates device firmware EP0 handler may have crashed or is stuck
+- EP0 OUT commands (SET_PROFILE, START_STREAM, STOP_STREAM) still work
+- IN endpoint (0x83) cannot be tested due to alt=1 switching error in PyUSB
+- Device may be in inconsistent state requiring firmware reload
 
 **Likely Device Firmware Issues** (Updated):
 
