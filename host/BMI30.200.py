@@ -3,11 +3,13 @@
 from __future__ import annotations
 import os
 import sys, time, json, os as _os_alias
+import threading
 # Qt env: avoid GTK theme/plugin conflicts on RPi (Bookworm)
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 os.environ.setdefault("QT_STYLE_OVERRIDE", "Fusion")
 os.environ.pop("QT_QPA_PLATFORMTHEME", None)
 import numpy as np  # type: ignore
+import serial, glob
 
 try:
 	from usb_vendor.usb_stream import USBStream, CMD_SET_PROFILE, CMD_STOP_STREAM, CMD_START_STREAM  # type: ignore
@@ -37,17 +39,40 @@ except Exception as e1:  # pragma: no cover
 		PG_IMPORT_ERR = e1
 
 
+def load_config():
+	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+	try:
+		with open(config_file, "r") as f:
+			data = json.load(f)
+		return data.get("desired_profile", 1)
+	except Exception:
+		return 1
+
+
+def save_config(desired_profile):
+	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+	try:
+		with open(config_file, "w") as f:
+			json.dump({"desired_profile": desired_profile}, f)
+	except Exception:
+		pass
+
+
 class ScopeWindow:
 	def __init__(self):
+		print("[INIT] BMI30 GUI starting...", flush=True)
 		if PG_IMPORT_ERR:
 			print(f"[ERR] pyqtgraph/Qt import failed: {PG_IMPORT_ERR}")
 			sys.exit(2)
 		self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 		self.win = QtWidgets.QMainWindow()
-		self.win.setWindowTitle("BMI30 Vendor Bulk Oscilloscope")
+		self.win.setWindowTitle("BMI30 Vendor Bulk Oscilloscope - Thread Mode")
+		print("[INIT] Window created", flush=True)
 		central = QtWidgets.QWidget()
 		self.win.setCentralWidget(central)
 		layout = QtWidgets.QVBoxLayout(central)
+		# Загружаем desired_profile из config
+		self.desired_profile = load_config()  # 1=>200 Гц, 2=>300 Гц
 		# legend (вместо верхних кнопок)
 		self.legend_lbl = QtWidgets.QLabel("--")
 		font = self.legend_lbl.font()
@@ -58,7 +83,16 @@ class ScopeWindow:
 		# выбор частоты
 		self.freq_box = QtWidgets.QComboBox()
 		self.freq_box.addItems(["200 Hz","300 Hz"])
-		self.freq_box.setCurrentIndex(0)  # по умолчанию 200 Гц
+		# Не триггерить _on_freq_change при установке значения по умолчанию
+		try:
+			self.freq_box.blockSignals(True)
+		except Exception:
+			pass
+		self.freq_box.setCurrentIndex(0 if self.desired_profile == 1 else 1)  # загружаем из config
+		try:
+			self.freq_box.blockSignals(False)
+		except Exception:
+			pass
 		self.freq_box.currentIndexChanged.connect(self._on_freq_change)
 		legend_bar.addWidget(self.freq_box, 0)
 		self.btn_reconnect = QtWidgets.QPushButton("↻")
@@ -95,15 +129,16 @@ class ScopeWindow:
 		self.p1.disableAutoRange(axis=pg.ViewBox.XAxis)
 		self.p0.enableAutoRange(y=True)
 		self.p1.enableAutoRange(y=True)
-		self.expected_len_map = {1:1360, 2:912}
-		self.initial_expected = self.expected_len_map.get(1, 1360)
+		self.expected_len_map = {1:1100, 2:912}
+		self.initial_expected = self.expected_len_map.get(1, 1100)
 		# рекомендуемые размеры кадра для ~20 FPS по профилям
 		self.ns_map = {1:10, 2:15}
 		# По умолчанию не навязываем Ns устройству (макс. FPS). Включить подсказку Ns: BMI30_SEND_NS=1
 		try:
-			self.send_ns = str(os.getenv("BMI30_SEND_NS", "0")).lower() not in ("0","false","no")
+			# Всегда отправляем FRAME_SAMPLES в рабочем режиме, чтобы поток был стабильным и быстрым
+			self.send_ns = str(os.getenv("BMI30_SEND_NS", "1")).lower() not in ("0","false","no")
 		except Exception:
-			self.send_ns = False
+			self.send_ns = True
 		# Тестовые кадры как данные выключены по умолчанию (включить: BMI30_TEST_AS_DATA=1)
 		try:
 			self.test_as_data = str(os.getenv("BMI30_TEST_AS_DATA", "0")).lower() not in ("0","false","no")
@@ -137,29 +172,43 @@ class ScopeWindow:
 		except Exception:
 			pass
 		# plots идут здесь, нижние элементы добавим после
-		# data
-		self.base_buf_len: int | None = None  # будет 1360 или 912 (или иное) после первого кадра
+		# data - shared buffers между reader thread и GUI thread
+		self.base_buf_len: int | None = None  # будет 1100 или 912 (или иное) после первого кадра
 		self.base_buf_len_bytes: int | None = None
 		self.freq_hz: int | None = None
 		self.ring_factor = 1  # фиксированный один буфер (последний кадр)
+		# Shared buffers для двух каналов - инициализируем сразу с максимальным размером
+		self.max_samples = 1100  # максимум для профиля 1
+		self.data0 = np.zeros(self.max_samples, dtype=np.int16)
+		self.data1 = np.zeros(self.max_samples, dtype=np.int16)
+		self.timestamps = np.zeros(self.max_samples, dtype=np.float64)
+		self.data_lock = threading.Lock()  # защита shared buffers
+		self.reader_thread = None
+		self.reader_running = False
+		# Инициализируем view параметры сразу чтобы показывать данные
+		self.view_start = 0
+		self.view_len = self.max_samples
 		try:
 			self.initial_view_mult = float(os.getenv("BMI30_INITIAL_VIEW_MULT", "0.25"))  # сколько буферов показывать изначально (0.25 для ~340 семплов, но для осциллографа - последние)
 		except Exception:
 			self.initial_view_mult = 0.25
 		# Диагностику остановки выводим в консоль (а не в GUI) по умолчанию
 		self.diag_to_console = str(os.getenv("BMI30_DIAG_TO_CONSOLE", "1")).lower() not in ("0","false","no")
+		# Скрывать полностью нулевые кадры (если это артефакт отображения/потока): по умолчанию ВКЛ (BMI30_HIDE_ALL_ZERO=1)
+		try:
+			self.hide_all_zero = str(os.getenv("BMI30_HIDE_ALL_ZERO", "1")).lower() not in ("0","false","no")
+		except Exception:
+			self.hide_all_zero = True
 		# Ось X всегда в семплах (по ТЗ): фиксируем индексную шкалу, без времени
 		self.use_time_axis = False
 		# Оригинальные форматтеры оси X, чтобы можно было восстанавливать режим времени
 		self._axis0_tickStrings_orig = None
 		self._axis1_tickStrings_orig = None
-		self.max_samples = 0  # станет равным размеру кадра после первого пакета
-		self.data0 = np.zeros(0, dtype=np.int16)
-		self.data1 = np.zeros(0, dtype=np.int16)
-		self.timestamps = np.zeros(0, dtype=np.float64)  # timestamps для каждого семпла
+		# max_samples, data0, data1, timestamps уже инициализированы выше для shared buffers
 		self.last_seq = None
 		self.gap_count = 0
 		self.frames_sec_pairs = 0
+		self.zero_blocks = 0  # счётчик полностью нулевых кадров, скрытых из отображения
 		self.last_fps_t = time.time()
 		self.fps = 0.0
 		self.last_range_t = 0.0
@@ -168,7 +217,6 @@ class ScopeWindow:
 		# окно отображения
 		self.view_start = 0
 		self.view_len = 0  # выставим когда узнаем длину буфера
-		self.desired_profile = 1  # 1=>200 Гц, 2=>300 Гц (по умолчанию 200 Гц)
 		self.connect_t = 0.0
 		self.last_frame_t = 0.0
 		self.no_data_warned = False
@@ -187,7 +235,7 @@ class ScopeWindow:
 			self.stop_warn_after = 5.0
 		self._instr = ("Инструкция: 1) Прошивка должна обрабатывать START_STREAM (0x20) и слать кадры vendor bulk на EP IN 0x83. "
 			"SET_PROFILE (0x14) 1=200Гц / 2=300Гц используйте по необходимости (переключатель в GUI). "
-			"Каждый кадр: заголовок 32 байта (magic 0xA55A LE), флаги 0x01 (ADC0) и 0x02 (ADC1) чередуются, total_samples=1360 для 200Гц или 912 для 300Гц, payload = samples*2 байт. "
+			"Каждый кадр: заголовок 32 байта (magic 0xA55A LE), флаги 0x01 (ADC0) и 0x02 (ADC1) чередуются, total_samples=1100 для 200Гц или 912 для 300Гц, payload = samples*2 байт. "
 			"Тестовый кадр (flag 0x80) может быть один в начале и пропускается. 4) Проверьте права доступа (udev) если устройство не открывается. 5) Кнопка 1 в GUI запускает поток.")
 		# статус: удержание сообщений, чтобы не мигали
 		self._status_hold_text: str | None = None
@@ -221,12 +269,12 @@ class ScopeWindow:
 		# Ось X уже зафиксирована как индексы семплов
 		# Старт
 		row_start = QtWidgets.QHBoxLayout()
-		self.lbl_start_value = QtWidgets.QLabel("0")
+		self.lbl_start_value = QtWidgets.QLabel(str(self.view_start))
 		self.slider_start = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-		self.slider_start.setEnabled(False)
+		self.slider_start.setEnabled(True)
 		self.slider_start.setMinimum(0)
-		self.slider_start.setMaximum(0)
-		self.slider_start.setValue(0)
+		self.slider_start.setMaximum(max(0, self.max_samples - self.view_len))
+		self.slider_start.setValue(self.view_start)
 		lbl_start_name = QtWidgets.QLabel("Старт")
 		row_start.addWidget(self.lbl_start_value)
 		row_start.addWidget(self.slider_start, 1)
@@ -234,12 +282,12 @@ class ScopeWindow:
 		sliders_box.addLayout(row_start)
 		# Семплов
 		row_len = QtWidgets.QHBoxLayout()
-		self.lbl_len_value = QtWidgets.QLabel("0")
+		self.lbl_len_value = QtWidgets.QLabel(str(self.view_len))
 		self.slider_len = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-		self.slider_len.setEnabled(False)
-		self.slider_len.setMinimum(0)
-		self.slider_len.setMaximum(0)
-		self.slider_len.setValue(0)
+		self.slider_len.setEnabled(True)
+		self.slider_len.setMinimum(1)
+		self.slider_len.setMaximum(self.max_samples)
+		self.slider_len.setValue(self.view_len)
 		lbl_len_name = QtWidgets.QLabel("Семплов")
 		row_len.addWidget(self.lbl_len_value)
 		row_len.addWidget(self.slider_len, 1)
@@ -289,8 +337,46 @@ class ScopeWindow:
 			if self.num_group.checkedId() != 1:
 				self.num_buttons[1].setChecked(True)
 			self._activate_stream()
+		
+		# Тестовый режим без устройства
+		try:
+			_test_mode = str(os.getenv("BMI30_TEST_MODE", "0")).lower() not in ("0","false","no")
+		except Exception:
+			_test_mode = False
+		if _test_mode:
+			print("[TEST] Test mode enabled - simulating data")
+			self._test_mode = True
+			# Имитируем получение данных
+			self.base_buf_len = 912  # 300Hz mode
+			self.base_buf_len_bytes = self.base_buf_len * 2
+			self.freq_hz = 300
+			# Заполняем тестовыми данными
+			import math
+			for i in range(self.base_buf_len):
+				self.data0[i] = int(1000 * math.sin(2 * math.pi * i / 100))
+				self.data1[i] = int(800 * math.cos(2 * math.pi * i / 150))
+			self._set_status("Тестовый режим - данные сгенерированы")
 
 	# (кнопки управления стримом удалены по ТЗ)
+
+	def _find_cdc_port(self):
+		ports = sorted(glob.glob('/dev/ttyACM*'))
+		if not ports:
+			return None
+		return ports[0]
+
+	def _send_soft_reset_via_cdc(self):
+		try:
+			port = self._find_cdc_port()
+			if port is None:
+				print("[RESET] CDC порт не найден, пропускаем SOFT_RESET")
+				return
+			with serial.Serial(port, 115200, timeout=1) as ser:
+				ser.write(bytes([CMD_SOFT_RESET]))
+				time.sleep(0.1)
+				print("[RESET] SOFT_RESET sent via CDC")
+		except Exception as e:
+			print(f"[RESET] SOFT_RESET via CDC failed: {e}")
 
 	# --- numeric buttons persistence ---
 	def _num_clicked(self, idx: int):
@@ -337,7 +423,77 @@ class ScopeWindow:
 		except Exception:
 			return None
 
+	def _reader_thread_func(self):
+		"""Поток чтения USB: получает пакеты и заполняет data0/data1"""
+		print("[READER] Thread started", flush=True)
+		while self.reader_running:
+			if self.stream is None:
+				time.sleep(0.1)
+				continue
+			try:
+				pair = self.stream.get_stereo(timeout=0.1)
+				if not pair:
+					continue
+				a, b = pair
+				ch0 = np.frombuffer(a.payload, dtype='<i2')
+				ch1 = np.frombuffer(b.payload, dtype='<i2')
+				
+				# Инициализация base_buf_len при первом кадре
+				if self.base_buf_len is None:
+					with self.data_lock:
+						self.base_buf_len = len(ch0)
+						self.base_buf_len_bytes = self.base_buf_len * 2
+						if self.base_buf_len == 1100:
+							self.freq_hz = 200
+						elif self.base_buf_len == 912:
+							self.freq_hz = 300
+						else:
+							self.freq_hz = None
+						print(f"[READER] Initialized: buf_len={self.base_buf_len}, freq={self.freq_hz}Hz", flush=True)
+				
+				# Копируем данные в shared buffers
+				with self.data_lock:
+					self.data0[:len(ch0)] = ch0
+					self.data1[:len(ch1)] = ch1
+					if len(ch0) < self.max_samples:
+						self.data0[len(ch0):] = 0
+					if len(ch1) < self.max_samples:
+						self.data1[len(ch1):] = 0
+					if self.freq_hz:
+						dt = 1.0 / self.freq_hz
+						ts_start = a.timestamp / 1_000_000.0
+						ts = ts_start + np.arange(len(ch0)) * dt
+						self.timestamps[:len(ts)] = ts
+						if len(ts) < self.max_samples:
+							self.timestamps[len(ts):] = 0.0
+					self.last_frame_t = time.time()
+					if self.last_seq is not None:
+						exp = (self.last_seq + 2) & 0xFFFFFFFF  # seq увеличивается на 2 (A и B каналы)
+						if a.seq != exp:
+							print(f"[GAP] Expected seq {exp}, got {a.seq} (diff: {a.seq - exp})", flush=True)
+							self.gap_count += 1
+					self.last_seq = a.seq
+					self.frames_sec_pairs += 1
+					
+					# Диагностика каждые 100 кадров
+					if not hasattr(self, '_reader_count'):
+						self._reader_count = 0
+					self._reader_count += 1
+					if self._reader_count % 100 == 0:
+						print(f"[READER] Received {self._reader_count} frames, ch0[0:5]={ch0[:5]}, ch1[0:5]={ch1[:5]}", flush=True)
+				
+			except Exception as e:
+				if "Resource busy" in str(e) or "[Errno" in str(e):
+					print(f"[READER] USB error: {e}", flush=True)
+					time.sleep(0.5)
+					continue
+				print(f"[READER] Exception: {e}", flush=True)
+				time.sleep(0.1)
+		print("[READER] Thread stopped", flush=True)
+	
 	def _tick(self):
+		"""GUI thread: читает из shared buffers и отображает данные ВСЕГДА"""
+		# Обработка статуса подключения
 		if self.stream is None:
 			self._last_sample_ts = None
 			if self.num_group.checkedId() == 1:
@@ -345,137 +501,57 @@ class ScopeWindow:
 					self._set_status("Подключение…", hold_sec=1.5)
 			else:
 				self._set_status("Нажмите кнопку 1 для запуска потока")
-			# до данных выставим ожидаемый X диапазон
-			self._apply_x_range(0, self.initial_expected)
-			return
-		got = 0
-		try:
-			# если поток в фоне сообщил disconnected (EPIPE/ENODEV/EBUSY), мягко переподключимся
-			if getattr(self.stream, 'disconnected', False):
-				try:
-					self.stream.close()
-				except Exception:
-					pass
-				self.stream = None
-				self._last_sample_ts = None
-				self._set_status("USB занят/отключён, переподключение…", hold_sec=2.0)
-				self.usb_retry_timer.start()
-				return
-			# обновим отметку последнего приёма вообще (STAT/TEST/данные)
-			rx_t = float(getattr(self.stream, 'last_rx_t', 0.0))
-			if rx_t > self._last_rx_seen:
-				# если ранее висело предупреждение об остановке/нет приёма — сбросим его при новом трафике
-				if self._status_hold_text and any(x in self._status_hold_text for x in ("Поток остановился", "Нет приёма данных", "Нет новых стереопар")):
-					self._status_hold_text = None
-				self._last_rx_seen = rx_t
-			while True:
-				pair = self.stream.get_stereo(timeout=0.0)
-				if not pair:
-					break
-				a, b = pair
-				self.last_frame_t = time.time()
-				ch0 = np.frombuffer(a.payload, dtype='<i2')
-				ch1 = np.frombuffer(b.payload, dtype='<i2')
-				if self.base_buf_len is None:
-					# Базовая длина = фактическое количество семплов
-					length_guess = len(ch0)
-					self.base_buf_len = length_guess
-					self.base_buf_len_bytes = self.base_buf_len * 2
-					if self.base_buf_len == 1360:
-						self.freq_hz = 200
-					elif self.base_buf_len == 912:
-						self.freq_hz = 300
-					else:
-						self.freq_hz = None
-					self.max_samples = self.base_buf_len
-					self.data0 = np.zeros(self.max_samples, dtype=np.int16)
-					self.data1 = np.zeros(self.max_samples, dtype=np.int16)
-					self.timestamps = np.zeros(self.max_samples, dtype=np.float64)
-					# Показать весь буфер по умолчанию
-					self.view_start = 0
-					self.view_len = self.base_buf_len
-					self.slider_start.setEnabled(True)
-					self.slider_len.setEnabled(True)
-					self.slider_len.setMinimum(1)
-					self.slider_len.setMaximum(self.base_buf_len)
-					self.slider_len.setValue(self.view_len)
-					self.slider_start.setMaximum(self.base_buf_len - self.view_len)
-					self.slider_start.setValue(self.view_start)
-					self.lbl_start_value.setText(str(self.view_start))
-					self.lbl_len_value.setText(str(self.view_len))
-				self.data0[:len(ch0)] = ch0
-				self.data1[:len(ch1)] = ch1
-				if len(ch0) < self.base_buf_len:
-					self.data0[len(ch0):] = 0
-				if len(ch1) < self.base_buf_len:
-					self.data1[len(ch1):] = 0
-				if self.freq_hz:
-					dt = 1.0 / self.freq_hz
-					ts_start = a.timestamp / 1_000_000.0
-					ts = ts_start + np.arange(len(ch0)) * dt
-					self.timestamps[:len(ts)] = ts
-					if len(ts) < self.base_buf_len:
-						self.timestamps[len(ts):] = 0.0
-					# Проверить на паузы внутри блока (между семплами)
-					if len(ts) > 1 and ts[-1] - ts[-2] > dt * 2:
-						pause_ms = (ts[-1] - ts[-2]) * 1000
-						print(f"[pause] Обнаружена пауза внутри блока: {pause_ms:.1f}мс")
-					if len(ch0):
-						if self._last_sample_ts is not None:
-							gap = ts_start - self._last_sample_ts
-							if gap > dt * 2:
-								pause_ms = gap * 1000
-								print(f"[pause] Обнаружена пауза между блоками данных: {pause_ms:.1f}мс")
-						self._last_sample_ts = ts[len(ch0)-1]
-				else:
-					self._last_sample_ts = None
-				if self.last_seq is not None:
-					exp = (self.last_seq + 1) & 0xFFFFFFFF
-					if a.seq != exp:
-						self.gap_count += 1
-				self.last_seq = a.seq
-				got += 1
-				# если ранее висело предупреждение об остановке — сбросить его сразу
-				if self._status_hold_text and "Поток остановился" in self._status_hold_text:
-					self._status_hold_text = None
-		except Exception as e:
-			# если EBUSY/EPIPE — инициируем переподключение, чтобы не мигал текст
-			msg = str(e)
-			if any(x in msg for x in ("Resource busy", "[Errno 16]", "[Errno 32]", "[Errno 19]")):
-				try:
-					self.stream.close()
-				except Exception:
-					pass
-				self.stream = None
-				self._set_status("USB занят, переподключение…", hold_sec=2.0)
-				self.usb_retry_timer.start()
-				return
-			self._set_status(f"Ошибка чтения: {e}", hold_sec=2.0)
-			return
-		# обновить окно
-		if self.base_buf_len is not None:
-			vlen = max(1, min(int(self.slider_len.value()), self.base_buf_len))
-			max_start = max(0, len(self.data0) - vlen)
-			self.slider_start.setMaximum(max(0, self.base_buf_len - vlen))
-			vstart = min(int(self.slider_start.value()), max_start)
-			vlen = min(vlen, len(self.data0) - vstart)  # не больше доступных данных
+		
+		# Проверка disconnected (но продолжаем отображать данные)
+		if self.stream is not None and getattr(self.stream, 'disconnected', False):
+			try:
+				self.stream.close()
+			except Exception:
+				pass
+			self.stream = None
+			self._last_sample_ts = None
+			self._set_status("USB занят/отключён, переподключение…", hold_sec=2.0)
+			self.usb_retry_timer.start()
+		
+		# Читаем данные из shared buffers с блокировкой (ВСЕГДА, даже если stream=None)
+		with self.data_lock:
+			# Настраиваем слайдеры при первой инициализации (когда base_buf_len установлен reader thread)
+			if self.base_buf_len is not None and not hasattr(self, '_sliders_initialized'):
+				self._sliders_initialized = True
+				self.view_start = 0
+				self.view_len = self.base_buf_len
+				self.slider_start.setEnabled(True)
+				self.slider_len.setEnabled(True)
+				self.slider_len.setMinimum(1)
+				self.slider_len.setMaximum(self.base_buf_len)
+				self.slider_len.setValue(self.view_len)
+				self.slider_start.setMaximum(self.base_buf_len - self.view_len)
+				self.slider_start.setValue(self.view_start)
+				self.lbl_start_value.setText(str(self.view_start))
+				self.lbl_len_value.setText(str(self.view_len))
+			
+			# Используем base_buf_len если установлен, иначе max_samples
+			buf_len = self.base_buf_len if self.base_buf_len is not None else self.max_samples
+			
+			# Вычисляем окно отображения
+			slider_val = int(self.slider_len.value())
+			vlen_calc = buf_len if not hasattr(self, '_sliders_initialized') else slider_val
+			vlen = max(1, min(vlen_calc, buf_len))
+			if hasattr(self, '_sliders_initialized'):
+				self.slider_start.setMaximum(max(0, buf_len - vlen))
+			vstart = min(int(self.slider_start.value()) if hasattr(self, '_sliders_initialized') else 0, max(0, buf_len - vlen))
+			vlen = min(vlen, self.max_samples - vstart)
+			if vlen <= 0:
+				vlen = buf_len  # Fallback
 			self.view_start = vstart
 			self.view_len = vlen
-			seg0 = self.data0[vstart:vstart+vlen]
-			seg1 = self.data1[vstart:vstart+vlen]
-			x = np.arange(vlen)
-			if len(seg0) > 0 and (self.show_zero or not np.all(seg0 == 0)):
-				self.curve0.setData(x, seg0)
-			else:
-				self.curve0.setData([], [])
-			if len(seg1) > 0 and (self.show_zero or not np.all(seg1 == 0)):
-				self.curve1.setData(x, seg1)
-			else:
-				self.curve1.setData([], [])
-			self._apply_x_range(0, self.view_len or self.initial_expected)
-			self.lbl_start_value.setText(str(vstart))
-			self.lbl_len_value.setText(str(vlen))
-			self.frames_sec_pairs += got
+			
+			# Копируем сегменты данных из shared buffers
+			seg0 = self.data0[vstart:vstart+vlen].copy()
+			seg1 = self.data1[vstart:vstart+vlen].copy()
+		
+		# Отображаем данные через _update_view
+		self._update_view()
 		now = time.time()
 		if now - self.last_fps_t >= 1.0:
 			self.fps = self.frames_sec_pairs / (now - self.last_fps_t)
@@ -509,7 +585,8 @@ class ScopeWindow:
 			freq_part = f" FREQ:{self.freq_hz}Hz" if self.freq_hz else ""
 			buf_info = f" BUF:{self.base_buf_len}({self.base_buf_len_bytes}B){freq_part}"
 		self.legend_lbl.setWordWrap(True)
-		_default_status = f"FPS:{self.fps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}"
+		_zero_part = f" ZERO:{self.zero_blocks}" if getattr(self, 'zero_blocks', 0) else ""
+		_default_status = f"FPS:{self.fps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}"
 		# Печатаем дефолтный статус не чаще 1 раза в секунду и только если нет активного hold
 		_now_for_default = time.time()
 		if (self._status_hold_text is None or _now_for_default >= self._status_hold_until) and (_now_for_default - self._last_default_update_t >= 1.0):
@@ -567,8 +644,12 @@ class ScopeWindow:
 			if self.base_buf_len is not None:
 				freq_part = f" FREQ:{self.freq_hz}Hz" if self.freq_hz else ""
 				buf_info = f" BUF:{self.base_buf_len}({self.base_buf_len_bytes}B){freq_part}"
-			_default_status = f"FPS:{self.fps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}"
+			_zero_part = f" ZERO:{self.zero_blocks}" if getattr(self, 'zero_blocks', 0) else ""
+			_default_status = f"FPS:{self.fps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}"
 			self._set_status(_default_status)
+		
+		# Обновить view после всех изменений данных
+		self._update_view()
 
 	def _update_view(self):
 		"""Перерисовать окно по текущим параметрам (без чтения новых данных)."""
@@ -666,6 +747,9 @@ class ScopeWindow:
 			pass
 
 	def _on_slider_start(self, val:int):
+		if self.base_buf_len and val > self.base_buf_len - self.view_len:
+			val = max(0, self.base_buf_len - self.view_len)
+			self.slider_start.setValue(val)
 		self.view_start = val
 		self._update_view()
 
@@ -742,6 +826,17 @@ class ScopeWindow:
 					_t.sleep(0.02)
 				except Exception:
 					pass
+			# частота блока 200/300 Гц
+			try:
+				if hasattr(self.stream, 'set_block_rate'):
+					self.stream.set_block_rate(200 if self.desired_profile == 1 else 300)
+					try:
+						import time as _t
+						_t.sleep(0.1)
+					except Exception:
+						pass
+			except Exception:
+				pass
 			# старт
 			self.stream.send_cmd(CMD_START_STREAM, b"")
 		except Exception as e:
@@ -992,20 +1087,44 @@ class ScopeWindow:
 					_usm.running = True
 			except Exception:
 				pass
-			# Не ограничиваем устройство Ns по умолчанию (максимальный FPS). Подсказку Ns включаем через BMI30_SEND_NS=1
+			# Рабочий режим всегда быстрый: profile=2/1 и соответствующий NS
 			fs = self.ns_map.get(self.desired_profile) if self.send_ns else None
-			self.stream = USBStream(profile=self.desired_profile, full=True, test_as_data=self.test_as_data, frame_samples=fs)
+			# Если задан profile=2, но ns_map даёт 15, для рабочего режима используем полный размер 912
+			if self.desired_profile == 2:
+				fs = 912
+			elif self.desired_profile == 1:
+				fs = 1100
+			# Для 200 Гц некоторые прошивки ожидают явной установки block rate — включим отправку частоты на старте
+			try:
+				os.environ['BMI30_SEND_BLOCK_RATE'] = '1'
+			except Exception:
+				pass
+			print(f"[CONNECT] Creating USBStream, profile={self.desired_profile}, fs={fs}", flush=True)
+			self.stream = USBStream(profile=self.desired_profile, full=True, test_as_data=self.test_as_data, frame_samples=fs, fast_mode=True)
 			# Сохраним порт info для power cycle без stream
 			self.last_port_info = self.stream.port_info
 			self._set_status("Устройство подключено, ожидание данных…", hold_sec=1.5)
 			self.connect_t = time.time()
 			self.last_frame_t = 0
 			self.no_data_warned = False
+			# Запускаем reader thread
+			print(f"[CONNECT] reader_running={self.reader_running}, starting thread...", flush=True)
+			if not self.reader_running:
+				self.reader_running = True
+				self.reader_thread = threading.Thread(target=self._reader_thread_func, daemon=True)
+				self.reader_thread.start()
+				print("[GUI] Reader thread started", flush=True)
+			else:
+				print("[GUI] Reader thread already running", flush=True)
 		except SystemExit as se:
 			self.stream = None
+			print(f"[ERROR] SystemExit: {se}", flush=True)
 			self._set_status(str(se), hold_sec=2.0)
 		except Exception as e:
 			self.stream = None
+			print(f"[ERROR] Exception during connect: {e}", flush=True)
+			import traceback
+			traceback.print_exc()
 			self._set_status(f"Нет устройства ({e})", hold_sec=2.0)
 		finally:
 			self._connecting = False
@@ -1018,6 +1137,7 @@ class ScopeWindow:
 	def _activate_stream(self):
 		if not self.usb_retry_timer.isActive():
 			self.usb_retry_timer.start()
+		self._send_soft_reset_via_cdc()
 		self._try_connect(first=True)
 		# Транспорт при подключении посылает минимальный START сам.
 		# Не дублируем SET_PROFILE/START здесь, чтобы не подавить первые A/B кадры.
@@ -1037,17 +1157,24 @@ class ScopeWindow:
 	def _on_freq_change(self, idx:int):
 		# 0 -> 200Hz (profile 1), 1 -> 300Hz (profile 2)
 		self.desired_profile = 1 if idx == 0 else 2
+		save_config(self.desired_profile)  # сохраняем выбор
 		if self.stream is None:
 			self._set_status(f"Выбрана частота {200 if idx==0 else 300} Гц (нажмите 1 для запуска)")
 			return
-		# Переключение на лету: остановим и запустим снова быстро
+		# Переключение на лету: остановим поток, отправим профиль и соответствующий NS и старт
 		try:
-			# Мягкий ре-старт без явного STOP, чтобы не ронять интерфейс (ENODEV)
+			# Остановим поток перед переключением
+			self.stream.send_cmd(CMD_STOP_STREAM, b"")
+			try:
+				import time as _t
+				_t.sleep(0.05)
+			except Exception:
+				pass
 			self.stream.send_cmd(CMD_SET_PROFILE, bytes([self.desired_profile]))
 			# небольшая пауза даёт прошивке переключить профиль
 			try:
 				import time as _t
-				_t.sleep(0.02)
+				_t.sleep(0.1)
 			except Exception:
 				pass
 			# Обновим желаемый размер кадра под новый профиль (для ~20 FPS)
@@ -1055,25 +1182,36 @@ class ScopeWindow:
 				from usb_vendor.usb_stream import CMD_SET_FRAME_SAMPLES  # type: ignore
 			except Exception:
 				CMD_SET_FRAME_SAMPLES = 0x17
-			ns = self.ns_map.get(self.desired_profile)
-			if ns:
-				self.stream.send_cmd(CMD_SET_FRAME_SAMPLES, int(ns).to_bytes(2,'little'))
-				try:
-					import time as _t
-					_t.sleep(0.02)
-				except Exception:
-					pass
+			# В рабочем режиме задаём полный размер кадра для профиля
+			ns = 912 if self.desired_profile == 2 else 1100
+			self.stream.send_cmd(CMD_SET_FRAME_SAMPLES, int(ns).to_bytes(2,'little'))
+			try:
+				import time as _t
+				_t.sleep(0.1)
+			except Exception:
+				pass
+			# Явно задаём частоту блока под профиль
+			try:
+				if hasattr(self.stream, 'set_block_rate'):
+					self.stream.set_block_rate(200 if self.desired_profile == 1 else 300)
+					try:
+						import time as _t
+						_t.sleep(0.1)
+					except Exception:
+						pass
+			except Exception:
+				pass
 			self.stream.send_cmd(CMD_START_STREAM, b"")
 			self._set_status(f"Переключена частота {200 if idx==0 else 300} Гц, ожидание данных…", hold_sec=1.5)
 			self.base_buf_len = None
 			self.base_buf_len_bytes = None
 			self.freq_hz = None
-			self.max_samples = 0
-			self.data0 = np.zeros(0, dtype=np.int16)
-			self.data1 = np.zeros(0, dtype=np.int16)
-			self.timestamps = np.zeros(0, dtype=np.float64)
+			self.max_samples = 912 if self.desired_profile == 2 else 1100
+			self.data0 = np.zeros(self.max_samples, dtype=np.int16)
+			self.data1 = np.zeros(self.max_samples, dtype=np.int16)
+			self.timestamps = np.zeros(self.max_samples, dtype=np.float64)
 			self._last_sample_ts = None
-			self.view_len = 0
+			self.view_len = self.max_samples
 			self.slider_start.setEnabled(False)
 			self.slider_len.setEnabled(False)
 			self.connect_t = time.time()
