@@ -333,10 +333,12 @@ class ScopeWindow:
 		except Exception:
 			_autostart = True
 		if _autostart:
-			# Переключим выбор на кнопку 1 и запустим поток
-			if self.num_group.checkedId() != 1:
-				self.num_buttons[1].setChecked(True)
+			# Переключим выбор на кнопку 4 и запустим поток
+			if self.num_group.checkedId() != 4:
+				self.num_buttons[4].setChecked(True)
 			self._activate_stream()
+		# режим отображения: 0=оба, 1=только канал 1, 2=только канал 2
+		self.view_mode = 0
 		
 		# Тестовый режим без устройства
 		try:
@@ -380,10 +382,13 @@ class ScopeWindow:
 
 	# --- numeric buttons persistence ---
 	def _num_clicked(self, idx: int):
-		if idx == 1:
+		if idx == 4:
 			if self.stream is None and not self._connecting:
 				self._activate_stream()
-		elif self.stream is not None and idx != 1:
+		elif idx in (1, 2, 3):
+			mode_map = {1: 0, 2: 1, 3: 2}  # 1: оба, 2: канал 1, 3: канал 2
+			self._set_view_mode(mode_map[idx])
+		elif self.stream is not None and idx != 4:
 			try:
 				self.stream.close()
 			except Exception:
@@ -399,7 +404,7 @@ class ScopeWindow:
 			self.view_len = 0
 			self.slider_start.setEnabled(False)
 			self.slider_len.setEnabled(False)
-			self._set_status("Поток остановлен (нажмите 1 для запуска)", hold_sec=2.0)
+			self._set_status("Поток остановлен (нажмите 4 для запуска)", hold_sec=2.0)
 		if idx == 0:
 			try:
 				if os.path.exists(self.state_file):
@@ -664,17 +669,44 @@ class ScopeWindow:
 		seg0 = self.data0[self.view_start:self.view_start+vlen]
 		seg1 = self.data1[self.view_start:self.view_start+vlen]
 		x = np.arange(vlen)
-		if len(seg0) > 0 and (self.show_zero or not np.all(seg0 == 0)):
-			self.curve0.setData(x, seg0)
-		else:
-			self.curve0.setData([], [])
-		if len(seg1) > 0 and (self.show_zero or not np.all(seg1 == 0)):
-			self.curve1.setData(x, seg1)
-		else:
+		# --- режимы отображения ---
+		if self.view_mode == 0:
+			# оба канала
+			if len(seg0) > 0 and (self.show_zero or not np.all(seg0 == 0)):
+				self.curve0.setData(x, seg0)
+			else:
+				self.curve0.setData([], [])
+			if len(seg1) > 0 and (self.show_zero or not np.all(seg1 == 0)):
+				self.curve1.setData(x, seg1)
+			else:
+				self.curve1.setData([], [])
+			self.p0.show()
+			self.p1.show()
+		elif self.view_mode == 1:
+			# только канал 1
+			if len(seg0) > 0 and (self.show_zero or not np.all(seg0 == 0)):
+				self.curve0.setData(x, seg0)
+			else:
+				self.curve0.setData([], [])
 			self.curve1.setData([], [])
+			self.p0.show()
+			self.p1.hide()
+		elif self.view_mode == 2:
+			# только канал 2
+			self.curve0.setData([], [])
+			if len(seg1) > 0 and (self.show_zero or not np.all(seg1 == 0)):
+				self.curve1.setData(x, seg1)
+			else:
+				self.curve1.setData([], [])
+			self.p0.hide()
+			self.p1.show()
 		self.lbl_start_value.setText(str(self.view_start))
 		self.lbl_len_value.setText(str(vlen))
 		self._apply_x_range(0, self.view_len or self.initial_expected)
+	def _set_view_mode(self, mode:int):
+		"""Установить режим отображения: 0=оба, 1=только канал 1, 2=только канал 2"""
+		self.view_mode = mode
+		self._update_view()
 
 	def _apply_x_range(self, start: float, end: float):
 		"""Принудительно зафиксировать диапазон X, чтобы график не 'улетал'."""
