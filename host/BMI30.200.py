@@ -208,9 +208,13 @@ class ScopeWindow:
 		self.last_seq = None
 		self.gap_count = 0
 		self.frames_sec = 0
+		self.frames_a = 0
+		self.frames_b = 0
 		self.zero_blocks = 0  # счётчик полностью нулевых кадров, скрытых из отображения
 		self.last_fps_t = time.time()
 		self.fps = 0.0
+		self.afps = 0.0
+		self.bfps = 0.0
 		self.last_range_t = 0.0
 		self.max_int16_span = 33000  # предельное окно по амплитуде
 		self._y_span_smooth = None  # сглаженный спан по Y
@@ -479,6 +483,8 @@ class ScopeWindow:
 							self.gap_count += 1
 					self.last_seq = a.seq
 					self.frames_sec += 2
+					self.frames_a += 1
+					self.frames_b += 1
 					
 					# Диагностика каждые 100 кадров
 					if not hasattr(self, '_reader_count'):
@@ -560,7 +566,11 @@ class ScopeWindow:
 		now = time.time()
 		if now - self.last_fps_t >= 1.0:
 			self.fps = self.frames_sec / (now - self.last_fps_t)
+			self.afps = self.frames_a / (now - self.last_fps_t)
+			self.bfps = self.frames_b / (now - self.last_fps_t)
 			self.frames_sec = 0
+			self.frames_a = 0
+			self.frames_b = 0
 			self.last_fps_t = now
 		# auto symmetric y-range update (0.5s throttle) — ТОЛЬКО если включено BMI30_Y_AUTO=1
 		if self.y_auto and (now - self.last_range_t > 0.5) and (len(self.data0) or len(self.data1)):
@@ -591,7 +601,7 @@ class ScopeWindow:
 			buf_info = f" BUF:{self.base_buf_len}({self.base_buf_len_bytes}B){freq_part}"
 		self.legend_lbl.setWordWrap(True)
 		_zero_part = f" ZERO:{self.zero_blocks}" if getattr(self, 'zero_blocks', 0) else ""
-		_default_status = f"FPS:{self.fps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}"
+		_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}"
 		# Печатаем дефолтный статус не чаще 1 раза в секунду и только если нет активного hold
 		_now_for_default = time.time()
 		if (self._status_hold_text is None or _now_for_default >= self._status_hold_until) and (_now_for_default - self._last_default_update_t >= 1.0):
@@ -650,7 +660,7 @@ class ScopeWindow:
 				freq_part = f" FREQ:{self.freq_hz}Hz" if self.freq_hz else ""
 				buf_info = f" BUF:{self.base_buf_len}({self.base_buf_len_bytes}B){freq_part}"
 			_zero_part = f" ZERO:{self.zero_blocks}" if getattr(self, 'zero_blocks', 0) else ""
-			_default_status = f"FPS:{self.fps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}"
+			_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}"
 			self._set_status(_default_status)
 		
 		# Обновить view после всех изменений данных
