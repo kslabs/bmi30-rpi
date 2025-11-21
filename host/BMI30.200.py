@@ -333,9 +333,10 @@ class ScopeWindow:
 		except Exception:
 			_autostart = True
 		if _autostart:
-			# Переключим выбор на кнопку 4 и запустим поток
-			if self.num_group.checkedId() != 4:
-				self.num_buttons[4].setChecked(True)
+			# Установить режим оба канала и запустить поток
+			self.view_mode = 0
+			if self.num_group.checkedId() != 3:
+				self.num_buttons[3].setChecked(True)
 			self._activate_stream()
 		# режим отображения: 0=оба, 1=только канал 1, 2=только канал 2
 		self.view_mode = 0
@@ -382,13 +383,12 @@ class ScopeWindow:
 
 	# --- numeric buttons persistence ---
 	def _num_clicked(self, idx: int):
-		if idx == 4:
-			if self.stream is None and not self._connecting:
-				self._activate_stream()
-		elif idx in (1, 2, 3):
+		if idx in (1, 2, 3):
 			mode_map = {1: 1, 2: 2, 3: 0}  # 1: канал 1, 2: канал 2, 3: оба
 			self._set_view_mode(mode_map[idx])
-		elif self.stream is not None and idx != 4:
+			if self.stream is None and not self._connecting:
+				self._activate_stream()
+		elif self.stream is not None and idx not in (1, 2, 3):
 			try:
 				self.stream.close()
 			except Exception:
@@ -404,7 +404,7 @@ class ScopeWindow:
 			self.view_len = 0
 			self.slider_start.setEnabled(False)
 			self.slider_len.setEnabled(False)
-			self._set_status("Поток остановлен (нажмите 4 для запуска)", hold_sec=2.0)
+			self._set_status("Поток остановлен (нажмите 1,2 или 3 для запуска)", hold_sec=2.0)
 		if idx == 0:
 			try:
 				if os.path.exists(self.state_file):
