@@ -688,9 +688,12 @@ class ScopeWindow:
 		self.view_len = vlen
 		seg0 = self.data0[self.view_start:self.view_start+vlen]
 		seg1 = self.data1[self.view_start:self.view_start+vlen]
-		# Поменять положительную и отрицательную части местами
-		seg0 = -seg0
-		seg1 = -seg1
+		# Для отрицательных: перевернуть и переместить наверх
+		# Для положительных: переместить вниз без переворота
+		max0 = np.max(seg0) if len(seg0) > 0 else 0
+		max1 = np.max(seg1) if len(seg1) > 0 else 0
+		seg0 = np.where(seg0 < 0, -seg0, seg0 - 2 * max0)
+		seg1 = np.where(seg1 < 0, -seg1, seg1 - 2 * max1)
 		x = np.arange(vlen)
 		# DEBUG: проверка диапазона
 		print(f"[DEBUG] view_start={self.view_start}, view_len={self.view_len}, vlen={vlen}, base_buf_len={self.base_buf_len}, len(data0)={len(self.data0)}, x_range=0 to {vlen}", flush=True)
