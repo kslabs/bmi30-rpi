@@ -449,8 +449,8 @@ class ScopeWindow:
 				if not pair:
 					continue
 				a, b = pair
-				ch0 = np.frombuffer(a.payload, dtype='<i2')
-				ch1 = np.frombuffer(b.payload, dtype='<i2')
+				ch0 = np.frombuffer(a.payload, dtype='<u2').astype(np.int16)
+				ch1 = np.frombuffer(b.payload, dtype='<u2').astype(np.int16)
 				
 				# Инициализация base_buf_len при первом кадре
 				if self.base_buf_len is None:
