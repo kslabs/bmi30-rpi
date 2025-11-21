@@ -386,7 +386,7 @@ class ScopeWindow:
 			if self.stream is None and not self._connecting:
 				self._activate_stream()
 		elif idx in (1, 2, 3):
-			mode_map = {1: 0, 2: 1, 3: 2}  # 1: оба, 2: канал 1, 3: канал 2
+			mode_map = {1: 1, 2: 2, 3: 0}  # 1: канал 1, 2: канал 2, 3: оба
 			self._set_view_mode(mode_map[idx])
 		elif self.stream is not None and idx != 4:
 			try:
