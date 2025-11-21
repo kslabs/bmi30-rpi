@@ -1,4 +1,4 @@
-"""BMI30.200.py — единая точка входа: сразу открывает живую осциллограмму Vendor Bulk стерео потока."""
+"""BMI30.200.py — единая точка входа: сразу открывает живую осциллограмму Vendor Bulk двухканального потока."""
 
 from __future__ import annotations
 import os
@@ -207,7 +207,7 @@ class ScopeWindow:
 		# max_samples, data0, data1, timestamps уже инициализированы выше для shared buffers
 		self.last_seq = None
 		self.gap_count = 0
-		self.frames_sec_pairs = 0
+		self.frames_sec = 0
 		self.zero_blocks = 0  # счётчик полностью нулевых кадров, скрытых из отображения
 		self.last_fps_t = time.time()
 		self.fps = 0.0
@@ -478,7 +478,7 @@ class ScopeWindow:
 							print(f"[GAP] Expected seq {exp}, got {a.seq} (diff: {a.seq - exp})", flush=True)
 							self.gap_count += 1
 					self.last_seq = a.seq
-					self.frames_sec_pairs += 1
+					self.frames_sec += 2
 					
 					# Диагностика каждые 100 кадров
 					if not hasattr(self, '_reader_count'):
@@ -559,8 +559,8 @@ class ScopeWindow:
 		self._update_view()
 		now = time.time()
 		if now - self.last_fps_t >= 1.0:
-			self.fps = self.frames_sec_pairs / (now - self.last_fps_t)
-			self.frames_sec_pairs = 0
+			self.fps = self.frames_sec / (now - self.last_fps_t)
+			self.frames_sec = 0
 			self.last_fps_t = now
 		# auto symmetric y-range update (0.5s throttle) — ТОЛЬКО если включено BMI30_Y_AUTO=1
 		if self.y_auto and (now - self.last_range_t > 0.5) and (len(self.data0) or len(self.data1)):
