@@ -688,6 +688,8 @@ class ScopeWindow:
 		self.view_len = vlen
 		seg0 = self.data0[self.view_start:self.view_start+vlen]
 		seg1 = self.data1[self.view_start:self.view_start+vlen]
+		# Перевернуть нижнюю часть (канал 1)
+		seg1 = -seg1
 		x = np.arange(vlen)
 		# DEBUG: проверка диапазона
 		print(f"[DEBUG] view_start={self.view_start}, view_len={self.view_len}, vlen={vlen}, base_buf_len={self.base_buf_len}, len(data0)={len(self.data0)}, x_range=0 to {vlen}", flush=True)
