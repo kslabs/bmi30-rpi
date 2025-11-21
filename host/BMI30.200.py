@@ -683,6 +683,10 @@ class ScopeWindow:
 		self.view_len = vlen
 		seg0 = self.data0[self.view_start:self.view_start+vlen]
 		seg1 = self.data1[self.view_start:self.view_start+vlen]
+		# Перевернуть положительную часть: 0 -> 32767, 32767 -> 0
+		# Перевернуть отрицательную часть: -32768 -> 0, 0 -> -32768
+		seg0 = np.where(seg0 >= 0, 32767 - seg0, -32768 - seg0)
+		seg1 = np.where(seg1 >= 0, 32767 - seg1, -32768 - seg1)
 		x = np.arange(vlen)
 		# --- режимы отображения ---
 		if self.view_mode == 0:
