@@ -258,8 +258,13 @@ class ScopeWindow:
 		# timer
 		self.timer = QtWidgets.QApplication.instance().thread()  # dummy keep
 		self.qtimer = QtCore.QTimer()
-		# Чуть реже тикаем, чтобы снизить мерцание и нагрузку на CPU
-		self.qtimer.setInterval(60)
+		# Настраиваемая частота GUI: BMI30_GUI_FPS (по умолчанию 16 FPS для снижения нагрузки)
+		try:
+			gui_fps = int(os.getenv("BMI30_GUI_FPS", "16"))
+		except Exception:
+			gui_fps = 16
+		interval = max(10, int(1000 / gui_fps))  # минимум 10мс
+		self.qtimer.setInterval(interval)
 		self.qtimer.timeout.connect(self._tick)
 		self.qtimer.start()
 		# авто-кик при зависании
