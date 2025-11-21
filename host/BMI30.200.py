@@ -129,6 +129,9 @@ class ScopeWindow:
 		self.p1.disableAutoRange(axis=pg.ViewBox.XAxis)
 		self.p0.enableAutoRange(y=True)
 		self.p1.enableAutoRange(y=True)
+		# Инвертировать Y-ось для правильного отображения (верх/низ)
+		self.p0.invertY(True)
+		self.p1.invertY(True)
 		self.expected_len_map = {1:1100, 2:912}
 		self.initial_expected = self.expected_len_map.get(1, 1100)
 		# рекомендуемые размеры кадра для ~20 FPS по профилям
@@ -685,9 +688,6 @@ class ScopeWindow:
 		self.view_len = vlen
 		seg0 = self.data0[self.view_start:self.view_start+vlen]
 		seg1 = self.data1[self.view_start:self.view_start+vlen]
-		# Инвертировать сигнал для правильного отображения (верх/низ)
-		seg0 = -seg0
-		seg1 = -seg1
 		x = np.arange(vlen)
 		# DEBUG: проверка диапазона
 		print(f"[DEBUG] view_start={self.view_start}, view_len={self.view_len}, vlen={vlen}, base_buf_len={self.base_buf_len}, len(data0)={len(self.data0)}, x_range=0 to {vlen}", flush=True)
