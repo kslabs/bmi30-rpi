@@ -449,8 +449,8 @@ class ScopeWindow:
 				if not pair:
 					continue
 				a, b = pair
-				ch0 = np.frombuffer(a.payload, dtype='<u2').astype(np.int16)
-				ch1 = np.frombuffer(b.payload, dtype='<u2').astype(np.int16)
+				ch0 = np.frombuffer(a.payload, dtype='<i2')
+				ch1 = np.frombuffer(b.payload, dtype='<i2')
 				# DEBUG: проверка диапазона данных
 				print(f"[DEBUG DATA] ch0 min={ch0.min()}, max={ch0.max()}, ch1 min={ch1.min()}, max={ch1.max()}", flush=True)
 				
@@ -685,6 +685,9 @@ class ScopeWindow:
 		self.view_len = vlen
 		seg0 = self.data0[self.view_start:self.view_start+vlen]
 		seg1 = self.data1[self.view_start:self.view_start+vlen]
+		# Инвертировать сигнал для правильного отображения (верх/низ)
+		seg0 = -seg0
+		seg1 = -seg1
 		x = np.arange(vlen)
 		# DEBUG: проверка диапазона
 		print(f"[DEBUG] view_start={self.view_start}, view_len={self.view_len}, vlen={vlen}, base_buf_len={self.base_buf_len}, len(data0)={len(self.data0)}, x_range=0 to {vlen}", flush=True)
