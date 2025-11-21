@@ -451,6 +451,8 @@ class ScopeWindow:
 				a, b = pair
 				ch0 = np.frombuffer(a.payload, dtype='<u2').astype(np.int16)
 				ch1 = np.frombuffer(b.payload, dtype='<u2').astype(np.int16)
+				# DEBUG: проверка диапазона данных
+				print(f"[DEBUG DATA] ch0 min={ch0.min()}, max={ch0.max()}, ch1 min={ch1.min()}, max={ch1.max()}", flush=True)
 				
 				# Инициализация base_buf_len при первом кадре
 				if self.base_buf_len is None:
