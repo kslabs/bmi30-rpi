@@ -129,9 +129,6 @@ class ScopeWindow:
 		self.p1.disableAutoRange(axis=pg.ViewBox.XAxis)
 		self.p0.enableAutoRange(y=True)
 		self.p1.enableAutoRange(y=True)
-		# Инвертировать Y-ось для правильного отображения (верх/низ)
-		self.p0.invertY(True)
-		self.p1.invertY(True)
 		self.expected_len_map = {1:1100, 2:912}
 		self.initial_expected = self.expected_len_map.get(1, 1100)
 		# рекомендуемые размеры кадра для ~20 FPS по профилям
@@ -454,8 +451,6 @@ class ScopeWindow:
 				a, b = pair
 				ch0 = np.frombuffer(a.payload, dtype='<i2')
 				ch1 = np.frombuffer(b.payload, dtype='<i2')
-				# DEBUG: проверка диапазона данных
-				print(f"[DEBUG DATA] ch0 min={ch0.min()}, max={ch0.max()}, ch1 min={ch1.min()}, max={ch1.max()}", flush=True)
 				
 				# Инициализация base_buf_len при первом кадре
 				if self.base_buf_len is None:
@@ -688,15 +683,7 @@ class ScopeWindow:
 		self.view_len = vlen
 		seg0 = self.data0[self.view_start:self.view_start+vlen]
 		seg1 = self.data1[self.view_start:self.view_start+vlen]
-		# Для отрицательных: перевернуть и переместить наверх
-		# Для положительных: переместить вниз без переворота
-		max0 = np.max(seg0) if len(seg0) > 0 else 0
-		max1 = np.max(seg1) if len(seg1) > 0 else 0
-		seg0 = np.where(seg0 < 0, -seg0, seg0 - 2 * max0)
-		seg1 = np.where(seg1 < 0, -seg1, seg1 - 2 * max1)
 		x = np.arange(vlen)
-		# DEBUG: проверка диапазона
-		print(f"[DEBUG] view_start={self.view_start}, view_len={self.view_len}, vlen={vlen}, base_buf_len={self.base_buf_len}, len(data0)={len(self.data0)}, x_range=0 to {vlen}", flush=True)
 		# --- режимы отображения ---
 		if self.view_mode == 0:
 			# оба канала
