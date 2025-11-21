@@ -208,13 +208,13 @@ class ScopeWindow:
 		self.last_seq = None
 		self.gap_count = 0
 		self.frames_sec = 0
-		self.frames_a = 0
-		self.frames_b = 0
+		self.frames_a = 0  # счетчик кадров канала A (ADC0)
+		self.frames_b = 0  # счетчик кадров канала B (ADC1)
 		self.zero_blocks = 0  # счётчик полностью нулевых кадров, скрытых из отображения
 		self.last_fps_t = time.time()
-		self.fps = 0.0
-		self.afps = 0.0
-		self.bfps = 0.0
+		self.fps = 0.0  # общая частота кадров (для совместимости)
+		self.afps = 0.0  # частота кадров канала A
+		self.bfps = 0.0  # частота кадров канала B
 		self.last_range_t = 0.0
 		self.max_int16_span = 33000  # предельное окно по амплитуде
 		self._y_span_smooth = None  # сглаженный спан по Y
@@ -482,9 +482,9 @@ class ScopeWindow:
 							print(f"[GAP] Expected seq {exp}, got {a.seq} (diff: {a.seq - exp})", flush=True)
 							self.gap_count += 1
 					self.last_seq = a.seq
-					self.frames_sec += 2
-					self.frames_a += 1
-					self.frames_b += 1
+					self.frames_sec += 2  # общий счетчик кадров (A + B)
+					self.frames_a += 1    # счетчик кадров канала A
+					self.frames_b += 1    # счетчик кадров канала B
 					
 					# Диагностика каждые 100 кадров
 					if not hasattr(self, '_reader_count'):
@@ -565,9 +565,9 @@ class ScopeWindow:
 		self._update_view()
 		now = time.time()
 		if now - self.last_fps_t >= 1.0:
-			self.fps = self.frames_sec / (now - self.last_fps_t)
-			self.afps = self.frames_a / (now - self.last_fps_t)
-			self.bfps = self.frames_b / (now - self.last_fps_t)
+			self.fps = self.frames_sec / (now - self.last_fps_t)  # общая FPS (для совместимости)
+			self.afps = self.frames_a / (now - self.last_fps_t)   # FPS канала A
+			self.bfps = self.frames_b / (now - self.last_fps_t)   # FPS канала B
 			self.frames_sec = 0
 			self.frames_a = 0
 			self.frames_b = 0
