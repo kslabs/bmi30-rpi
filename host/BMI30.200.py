@@ -688,7 +688,8 @@ class ScopeWindow:
 		self.view_len = vlen
 		seg0 = self.data0[self.view_start:self.view_start+vlen]
 		seg1 = self.data1[self.view_start:self.view_start+vlen]
-		# Перевернуть нижнюю часть (канал 1)
+		# Поменять положительную и отрицательную части местами
+		seg0 = -seg0
 		seg1 = -seg1
 		x = np.arange(vlen)
 		# DEBUG: проверка диапазона
