@@ -45,34 +45,117 @@ class Frame:
         self.seq=seq; self.timestamp=timestamp; self.adc_id=adc_id; self.flags=flags; self.samples=samples; self.payload=payload
 
 class StereoAssembler:
-    def __init__(self):
-        self.bufA={}; self.bufB={}; self.q=queue.Queue(maxsize=256)
+    def __init__(self, relaxed: bool | None = None, relaxed_order: bool | None = None, ts_pairing: bool | None = None, ts_tol: float | None = None, independent: bool | None = None):
+        self.bufA = {}
+        self.bufB = {}
+        self.q = queue.Queue(maxsize=256)
+        # Relaxed mode: allow pairing with seq+1/seq-1 if exact seq not present
+        # If param is None, respect environment variables (backwards compatibility)
         try:
-            self.relaxed = str(os.getenv('BMI30_RELAXED_PAIRING','1')).lower() not in ('0','false','no')
+            if relaxed is None:
+                self.relaxed = str(os.getenv('BMI30_RELAXED_PAIRING', '1')).lower() not in ('0', 'false', 'no')
+            else:
+                self.relaxed = bool(relaxed)
         except Exception:
             self.relaxed = True
         # Дополнительный сверх-терпимый режим: если строгая состыковка по seq не найдена,
         # будем собирать пары по порядку прихода (первый A с первым B), игнорируя seq.
         # Это полезно, если прошивка использует независимый счётчик seq для каналов.
         try:
-            self.relaxed_order = str(os.getenv('BMI30_RELAXED_ORDER','1')).lower() not in ('0','false','no')
+            if relaxed_order is None:
+                self.relaxed_order = str(os.getenv('BMI30_RELAXED_ORDER', '1')).lower() not in ('0', 'false', 'no')
+            else:
+                self.relaxed_order = bool(relaxed_order)
         except Exception:
             self.relaxed_order = True
+        # Timestamp-based pairing fallback: if exact seq matching fails, try pairing A/B by closeness of timestamps
+        try:
+            if ts_pairing is None:
+                self.ts_pairing = str(os.getenv('BMI30_TS_PAIRING', '1')).lower() not in ('0', 'false', 'no')
+            else:
+                self.ts_pairing = bool(ts_pairing)
+        except Exception:
+            self.ts_pairing = True
+        try:
+            if ts_tol is None:
+                # default tolerance in seconds (1ms)
+                self.ts_tol = float(os.getenv('BMI30_TS_TOL', '0.001'))
+            else:
+                self.ts_tol = float(ts_tol)
+        except Exception:
+            self.ts_tol = 0.001
+        self._ts_pair_count = 0
+        self._seq_neighbor_pairs = 0
+        # Independent channels mode: do not attempt to pair A/B, instead expose per-channel queues
+        try:
+            if independent is None:
+                # Channels are independent by default — prefer not to auto-pair.
+                self.independent = str(os.getenv('BMI30_INDEPENDENT_CHANNELS', '1')).lower() not in ('0', 'false', 'no')
+            else:
+                self.independent = bool(independent)
+        except Exception:
+            self.independent = False
+        if self.independent:
+            # queues for each channel (A=0,B=1)
+            self.qA = queue.Queue(maxsize=256)
+            self.qB = queue.Queue(maxsize=256)
     def _emit_pair(self, a: 'Frame', b: 'Frame'):
         try:
             self.q.put((a, b))
         except Exception:
             pass
+    def _emit_frame_a(self, a: 'Frame'):
+        try:
+            self.qA.put(a)
+        except Exception:
+            pass
+    def _emit_frame_b(self, b: 'Frame'):
+        try:
+            self.qB.put(b)
+        except Exception:
+            pass
     def push(self,f:Frame):
+        # independent mode: just enqueue frames per-channel
+        if self.independent:
+            if f.adc_id == 0:
+                self._emit_frame_a(f)
+            else:
+                self._emit_frame_b(f)
+            # keep some minimal buffer cleanup
+            if len(self.bufA) > 2048:
+                self.bufA.clear()
+            if len(self.bufB) > 2048:
+                self.bufB.clear()
+            return
+
         if f.adc_id==0:
             self.bufA[f.seq]=f
             if f.seq in self.bufB:
                 a=self.bufA.pop(f.seq); b=self.bufB.pop(f.seq)
                 self._emit_pair(a,b)
-            elif self.relaxed and (f.seq+1) in self.bufB:
-                # Допуск: устройство может инкрементировать seq на каждом кадре (A->B)
-                a=self.bufA.pop(f.seq); b=self.bufB.pop(f.seq+1)
-                self._emit_pair(a,b)
+            elif ((f.seq-1) in self.bufB or (f.seq+1) in self.bufB) and (self.relaxed or self.ts_pairing):
+                # allow neighbor seq pairing (seq-1 or seq+1) when relaxed or when ts close
+                if (f.seq-1) in self.bufB:
+                    candidate_key = f.seq-1
+                else:
+                    candidate_key = f.seq+1
+                candidate = self.bufB.get(candidate_key)
+                if candidate is not None and not self.relaxed:
+                    # strict mode requires timestamp closeness
+                    if getattr(candidate, 'timestamp', None) is not None and getattr(f, 'timestamp', None) is not None:
+                        dt = abs((candidate.timestamp - f.timestamp) / 1_000_000.0)
+                        if dt > self.ts_tol:
+                            candidate = None
+                if candidate is not None:
+                    a = self.bufA.pop(f.seq)
+                    b = self.bufB.pop(candidate_key)
+                    self._emit_pair(a, b)
+                    self._seq_neighbor_pairs += 1
+                elif self.relaxed and (f.seq+1) in self.bufB:
+                    # relaxed fallback: pair with seq+1 if present
+                    a = self.bufA.pop(f.seq);
+                    b = self.bufB.pop(f.seq+1)
+                    self._emit_pair(a,b)
             elif self.relaxed_order and self.bufB:
                 # Сверх-терпимый: возьмём ближайший по seq B (или просто первый) и спарим
                 try:
@@ -83,14 +166,53 @@ class StereoAssembler:
                 a=self.bufA.pop(f.seq)
                 b=self.bufB.pop(kb)
                 self._emit_pair(a,b)
+            elif self.ts_pairing and self.bufB:
+                # Last-resort: try to find B whose timestamp is close to this A
+                try:
+                    cand = None
+                    best_dt = None
+                    for k,bv in self.bufB.items():
+                        if getattr(bv, 'timestamp', None) is None or getattr(f, 'timestamp', None) is None:
+                            continue
+                        dt = abs((bv.timestamp - f.timestamp) / 1_000_000.0)
+                        if dt <= self.ts_tol and (best_dt is None or dt < best_dt):
+                            cand = k; best_dt = dt
+                    if cand is not None:
+                        a = self.bufA.pop(f.seq)
+                        b = self.bufB.pop(cand)
+                        self._emit_pair(a,b)
+                        self._ts_pair_count += 1
+                        if self._ts_pair_count % 100 == 0:
+                            try:
+                                print(f"[ASM] timestamp-paired {self._ts_pair_count} times; last dt={best_dt:.6f}s", flush=True)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
         else:
             self.bufB[f.seq]=f
             if f.seq in self.bufA:
                 a=self.bufA.pop(f.seq); b=self.bufB.pop(f.seq)
                 self._emit_pair(a,b)
-            elif self.relaxed and (f.seq-1) in self.bufA:
-                a=self.bufA.pop(f.seq-1); b=self.bufB.pop(f.seq)
-                self._emit_pair(a,b)
+            elif ((f.seq-1) in self.bufA or (f.seq+1) in self.bufA) and (self.relaxed or self.ts_pairing):
+                candidate_key = None
+                if (f.seq-1) in self.bufA:
+                    candidate_key = f.seq-1
+                elif (f.seq+1) in self.bufA:
+                    candidate_key = f.seq+1
+                candidate = self.bufA.get(candidate_key)
+                if candidate is not None and not self.relaxed:
+                    if getattr(candidate,'timestamp',None) is not None and getattr(f,'timestamp',None) is not None:
+                        dt = abs((candidate.timestamp - f.timestamp) / 1_000_000.0)
+                        if dt > self.ts_tol:
+                            candidate = None
+                if candidate is not None:
+                    a=self.bufA.pop(candidate_key); b=self.bufB.pop(f.seq)
+                    self._emit_pair(a,b)
+                    self._seq_neighbor_pairs += 1
+                elif self.relaxed and (f.seq-1) in self.bufA:
+                    a=self.bufA.pop(f.seq-1); b=self.bufB.pop(f.seq)
+                    self._emit_pair(a,b)
             elif self.relaxed_order and self.bufA:
                 try:
                     ka = min(self.bufA.keys(), key=lambda k: abs(int(k) - int(f.seq)))
@@ -99,6 +221,29 @@ class StereoAssembler:
                 a=self.bufA.pop(ka)
                 b=self.bufB.pop(f.seq)
                 self._emit_pair(a,b)
+            elif self.ts_pairing and self.bufA:
+                # Last-resort: try to find A whose timestamp is close to this B
+                try:
+                    cand = None
+                    best_dt = None
+                    for k,av in self.bufA.items():
+                        if getattr(av, 'timestamp', None) is None or getattr(f, 'timestamp', None) is None:
+                            continue
+                        dt = abs((av.timestamp - f.timestamp) / 1_000_000.0)
+                        if dt <= self.ts_tol and (best_dt is None or dt < best_dt):
+                            cand = k; best_dt = dt
+                    if cand is not None:
+                        a = self.bufA.pop(cand)
+                        b = self.bufB.pop(f.seq)
+                        self._emit_pair(a,b)
+                        self._ts_pair_count += 1
+                        if self._ts_pair_count % 100 == 0:
+                            try:
+                                print(f"[ASM] timestamp-paired {self._ts_pair_count} times; last dt={best_dt:.6f}s", flush=True)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
         # Простейшая защита от разрастания при редких несостыковках
         if len(self.bufA) > 2048:
             self.bufA.clear()
@@ -106,7 +251,7 @@ class StereoAssembler:
             self.bufB.clear()
 
 class USBStream:
-    def __init__(self, profile=1, full=True, vid=VID, pid=PID, interactive=False, allow_any=False, iface_prefer=None, test_as_data: bool=False, frame_samples: int | None = None, fast_mode: bool | None = None):
+    def __init__(self, profile=1, full=True, vid=VID, pid=PID, interactive=False, allow_any=False, iface_prefer=None, test_as_data: bool=False, frame_samples: int | None = None, fast_mode: bool | None = None, assembler_relaxed: bool | None = None, assembler_relaxed_order: bool | None = None, assembler_ts_pairing: bool | None = None, assembler_ts_tol: float | None = None, assembler_independent: bool | None = None):
         self._running = True
         self.dev=None
         self.intf=None
@@ -122,6 +267,13 @@ class USBStream:
             fm_env_val = None
         # По умолчанию быстрый режим ВКЛЮЧЕН (всегда рабочий режим)
         self.fast_mode = True if fast_mode is None and fm_env_val is None else bool(fast_mode if fast_mode is not None else fm_env_val)
+
+        # Save assembler pairing overrides (None -> use env)
+        self._asm_relaxed_override = assembler_relaxed
+        self._asm_relaxed_order_override = assembler_relaxed_order
+        self._asm_ts_pair_override = assembler_ts_pairing
+        self._asm_ts_tol_override = assembler_ts_tol
+        self._asm_independent_override = assembler_independent
         # Поведение можно ослабить через переменные окружения (уменьшаем «тряску» EP0/ALT/CDC у текущей прошивки)
         try:
             self.ignore_ready_flags = str(os.getenv('BMI30_IGNORE_ALT_READY','1')).lower() not in ('0','false','no')
@@ -476,7 +628,20 @@ class USBStream:
         self.frames = 0; self.bytes = 0; self.crc_bad = 0; self.magic_bad = 0
         self.test_seen = 0
         self.last_stat = None
-        self.asm = StereoAssembler()
+        # allow overriding pairing policy via constructor params
+        try:
+            asm_relaxed = getattr(self, '_asm_relaxed_override', None)
+            asm_relaxed_order = getattr(self, '_asm_relaxed_order_override', None)
+            asm_ts_pair = getattr(self, '_asm_ts_pair_override', None)
+            asm_ts_tol = getattr(self, '_asm_ts_tol_override', None)
+            asm_indep = getattr(self, '_asm_independent_override', None)
+        except Exception:
+            asm_relaxed = asm_relaxed_order = asm_ts_pair = asm_ts_tol = asm_indep = None
+        self.asm = StereoAssembler(relaxed=asm_relaxed, relaxed_order=asm_relaxed_order, ts_pairing=asm_ts_pair, ts_tol=asm_ts_tol, independent=asm_indep)
+        try:
+            print(f"[USBStream] StereoAssembler relaxed={self.asm.relaxed}, relaxed_order={self.asm.relaxed_order} independent={getattr(self.asm,'independent',False)}", flush=True)
+        except Exception:
+            pass
         self.stat_t = time.time()
         self.th = threading.Thread(target=self._rx_loop, daemon=True)
         self.th.start()
@@ -1133,14 +1298,49 @@ class USBStream:
             # Если видим только STAT и нет рабочих кадров — один раз пробуем fallback
             if (not self._working_seen) and (not self._fallback_done) and (now - self.connected_t > 1.6):
                 self._do_fallback_start()
-            if now - self.stat_t >=1.0:
+            if now - self.stat_t >= 1.0:
                 with self.lock:
-                    fps=self.frames; bps=self.bytes
-                    print(f"fps={fps} bytes={bps} crc_bad={self.crc_bad} magic_bad={self.magic_bad} stereo_ready={self.asm.q.qsize()}")
-                    self.frames=0; self.bytes=0; self.stat_t=now
+                    fps = self.frames; bps = self.bytes
+                    try:
+                        if getattr(self.asm, 'independent', False):
+                            qszA = self.asm.qA.qsize() if hasattr(self.asm, 'qA') else 0
+                            qszB = self.asm.qB.qsize() if hasattr(self.asm, 'qB') else 0
+                            print(f"fps={fps} bytes={bps} crc_bad={self.crc_bad} magic_bad={self.magic_bad} qA={qszA} qB={qszB}")
+                        else:
+                            print(f"fps={fps} bytes={bps} crc_bad={self.crc_bad} magic_bad={self.magic_bad} stereo_ready={self.asm.q.qsize()}")
+                    except Exception:
+                        print(f"fps={fps} bytes={bps} crc_bad={self.crc_bad} magic_bad={self.magic_bad}")
+                    self.frames = 0; self.bytes = 0; self.stat_t = now
     def get_stereo(self, timeout=0.0):
         try:
-            return self.asm.q.get(timeout=timeout)
+            if getattr(self.asm, 'independent', False):
+                # In independent mode, return a single frame dict {'adc_id':0/1, 'frame':Frame}
+                try:
+                    a = self.asm.qA.get(timeout=timeout)
+                    return ('A', a)
+                except queue.Empty:
+                    try:
+                        b = self.asm.qB.get(timeout=timeout)
+                        return ('B', b)
+                    except queue.Empty:
+                        return None
+            else:
+                return self.asm.q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def get_frame(self, adc_id:int, timeout=0.0):
+        """Return a single frame for adc_id (0 or 1) or None.
+
+        adc_id can be 0 (A) or 1 (B).
+        """
+        try:
+            if not getattr(self.asm, 'independent', False):
+                return None
+            if int(adc_id) == 0:
+                return self.asm.qA.get(timeout=timeout)
+            else:
+                return self.asm.qB.get(timeout=timeout)
         except queue.Empty:
             return None
 

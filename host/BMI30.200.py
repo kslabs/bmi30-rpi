@@ -115,8 +115,9 @@ class ScopeWindow:
 		layout.addWidget(self.plotw, 1)
 		self.p0 = self.plotw.addPlot(row=0, col=0, title="ADC0")
 		self.p1 = self.plotw.addPlot(row=1, col=0, title="ADC1")
-		self.curve0 = self.p0.plot(pen=None, symbol='o', symbolSize=2, symbolPen=None, symbolBrush=pg.mkBrush('#2ecc71'))
-		self.curve1 = self.p1.plot(pen=None, symbol='o', symbolSize=2, symbolPen=None, symbolBrush=pg.mkBrush('#3498db'))
+		# Use fast line plots instead of many symbols to reduce CPU and increase FPS
+		self.curve0 = self.p0.plot(pen=pg.mkPen('#2ecc71', width=1), symbol=None)
+		self.curve1 = self.p1.plot(pen=pg.mkPen('#3498db', width=1), symbol=None)
 		self.p0.showGrid(x=True, y=True, alpha=0.3)
 		self.p1.showGrid(x=True, y=True, alpha=0.3)
 		# Синхронизируем X-оси между графиками
@@ -194,6 +195,33 @@ class ScopeWindow:
 			self.initial_view_mult = 0.25
 		# Диагностику остановки выводим в консоль (а не в GUI) по умолчанию
 		self.diag_to_console = str(os.getenv("BMI30_DIAG_TO_CONSOLE", "1")).lower() not in ("0","false","no")
+		# Режим независимых каналов: по умолчанию включён — не связывать A/B
+		try:
+			self.independent_channels = str(os.getenv('BMI30_INDEPENDENT_CHANNELS', '1')).lower() not in ('0','false','no')
+		except Exception:
+			self.independent_channels = True
+		# Capture diagnostic mode: write a short capture file when the first mismatch occurs
+		try:
+			cap_env = os.getenv('BMI30_CAPTURE_DIAG', None)
+			if cap_env is None:
+				self.capture_diag_path = None
+			elif isinstance(cap_env, str) and cap_env.strip() == '1':
+				self.capture_diag_path = os.path.join('/tmp', f'bmi30_capture_{int(time.time())}.log')
+			else:
+				self.capture_diag_path = cap_env
+		except Exception:
+			self.capture_diag_path = None
+		try:
+			self.capture_diag_seconds = float(os.getenv('BMI30_CAPTURE_SECONDS', '10'))
+		except Exception:
+			self.capture_diag_seconds = 10.0
+		try:
+			self.capture_diag_limit = int(os.getenv('BMI30_CAPTURE_LIMIT', '2000'))
+		except Exception:
+			self.capture_diag_limit = 2000
+		self._capture_diag_fp = None
+		self._capture_diag_started = 0.0
+		self._capture_diag_lines = 0
 		# Скрывать полностью нулевые кадры (если это артефакт отображения/потока): по умолчанию ВКЛ (BMI30_HIDE_ALL_ZERO=1)
 		try:
 			self.hide_all_zero = str(os.getenv("BMI30_HIDE_ALL_ZERO", "1")).lower() not in ("0","false","no")
@@ -448,14 +476,93 @@ class ScopeWindow:
 				pair = self.stream.get_stereo(timeout=0.1)
 				if not pair:
 					continue
-				a, b = pair
-				ch0 = np.frombuffer(a.payload, dtype='<i2')
-				ch1 = np.frombuffer(b.payload, dtype='<i2')
+
+				# Normalize: get_stereo returns either (a,b) pair (old behavior) or
+				# ('A', frame) / ('B', frame) when independent mode active.
+				if isinstance(pair, tuple) and isinstance(pair[0], str) and pair[0] in ('A', 'B'):
+					chan, frame = pair
+					if chan == 'A':
+						a = frame; b = None
+					else:
+						a = None; b = frame
+				else:
+					a, b = pair
+
+				ch0 = np.frombuffer(a.payload, dtype='<i2') if a is not None else None
+				ch1 = np.frombuffer(b.payload, dtype='<i2') if b is not None else None
 				
-				# Инициализация base_buf_len при первом кадре
+				# --- diagnostics: compute sequence/timestamps early to detect pairing issues ---
+				if a is not None and b is not None:
+					try:
+						seq_a = int(a.seq)
+						seq_b = int(b.seq)
+					except Exception:
+						seq_a = getattr(a, 'seq', None)
+						seq_b = getattr(b, 'seq', None)
+					try:
+						ts_a = a.timestamp / 1_000_000.0
+						ts_b = b.timestamp / 1_000_000.0
+					except Exception:
+						ts_a = ts_b = None
+
+					# If mismatch, record diagnostics and optionally capture to file
+					if seq_a != seq_b:
+						self._pair_mismatch_count = getattr(self, '_pair_mismatch_count', 0) + 1
+						self._pair_mismatch_count = int(self._pair_mismatch_count)
+					nowp = time.time()
+					last_pair_t = getattr(self, '_last_pair_mismatch_t', 0.0)
+					if (self._pair_mismatch_count % 200) == 0 or (nowp - last_pair_t) > 4.0:
+						asm_info = ''
+						try:
+							asm = getattr(self.stream, 'asm', None)
+							if asm is not None:
+								asm_info = f" ts_pairs={getattr(asm, '_ts_pair_count', 0)} seq_neigh_pairs={getattr(asm, '_seq_neighbor_pairs', 0)} q={asm.q.qsize()}"
+						except Exception:
+							asm_info = ''
+						print(f"[PAIR_MISMATCH] count={self._pair_mismatch_count} last seqA={seq_a} seqB={seq_b} lenA={len(ch0)} lenB={len(ch1)} flagsA={getattr(a,'flags',None)} flagsB={getattr(b,'flags',None)}{asm_info}", flush=True)
+						self._last_pair_mismatch_t = nowp
+					# capture to file if configured
+					try:
+						if getattr(self, 'capture_diag_path', None):
+							if self._capture_diag_fp is None:
+								self._capture_diag_fp = open(self.capture_diag_path, 'a', encoding='utf-8', errors='replace')
+								self._capture_diag_started = time.time()
+								self._capture_diag_lines = 0
+								self._capture_diag_fp.write('#ts_unix,seqA,seqB,lenA,lenB,flagsA,flagsB,tsA,tsB,asm_ts_pairs,asm_seq_neigh_pairs,last_stat_hex\n')
+								self._capture_diag_fp.flush()
+							# write one line per mismatch while capture window open
+							if self._capture_diag_fp is not None and (time.time() - self._capture_diag_started) <= float(self.capture_diag_seconds) and self._capture_diag_lines < int(self.capture_diag_limit):
+								try:
+									last_stat = getattr(self.stream, 'last_stat', None)
+									stat_hex = last_stat.hex() if isinstance(last_stat, (bytes, bytearray)) else ''
+									asm = getattr(self.stream, 'asm', None)
+									ts_pairs = getattr(asm, '_ts_pair_count', 0) if asm else 0
+									neigh = getattr(asm, '_seq_neighbor_pairs', 0) if asm else 0
+									line = f"{time.time():.6f},{seq_a},{seq_b},{len(ch0)},{len(ch1)},{getattr(a,'flags',None)},{getattr(b,'flags',None)},{ts_a if ts_a is not None else ''},{ts_b if ts_b is not None else ''},{ts_pairs},{neigh},\"{stat_hex}\"\n"
+									self._capture_diag_fp.write(line)
+									self._capture_diag_fp.flush()
+									self._capture_diag_lines += 1
+								except Exception:
+									pass
+							# close if time or limit exceeded
+							try:
+								if self._capture_diag_fp is not None and ((time.time() - self._capture_diag_started) > float(self.capture_diag_seconds) or self._capture_diag_lines >= int(self.capture_diag_limit)):
+									try:
+										self._capture_diag_fp.close()
+									except Exception:
+										pass
+									self._capture_diag_fp = None
+							except Exception:
+								pass
+					except Exception:
+						pass
+
+				# Инициализация base_buf_len при первом кадре (используем доступный канал)
 				if self.base_buf_len is None:
 					with self.data_lock:
-						self.base_buf_len = len(ch0)
+						first_len = len(ch0) if ch0 is not None else (len(ch1) if ch1 is not None else None)
+						if first_len is not None:
+							self.base_buf_len = first_len
 						self.base_buf_len_bytes = self.base_buf_len * 2
 						if self.base_buf_len == 1100:
 							self.freq_hz = 200
@@ -465,38 +572,64 @@ class ScopeWindow:
 							self.freq_hz = None
 						print(f"[READER] Initialized: buf_len={self.base_buf_len}, freq={self.freq_hz}Hz", flush=True)
 				
-				# Копируем данные в shared buffers
+				# Копируем данные в shared buffers (поддержка независимых каналов)
 				with self.data_lock:
-					self.data0[:len(ch0)] = ch0
-					self.data1[:len(ch1)] = ch1
-					if len(ch0) < self.max_samples:
-						self.data0[len(ch0):] = 0
-					if len(ch1) < self.max_samples:
-						self.data1[len(ch1):] = 0
+					if ch0 is not None:
+						self.data0[:len(ch0)] = ch0
+						if len(ch0) < self.max_samples:
+							self.data0[len(ch0):] = 0
+					if ch1 is not None:
+						self.data1[:len(ch1)] = ch1
+						if len(ch1) < self.max_samples:
+							self.data1[len(ch1):] = 0
 					if self.freq_hz:
 						dt = 1.0 / self.freq_hz
-						ts_start = a.timestamp / 1_000_000.0
-						ts = ts_start + np.arange(len(ch0)) * dt
-						self.timestamps[:len(ts)] = ts
-						if len(ts) < self.max_samples:
-							self.timestamps[len(ts):] = 0.0
+						# choose available frame to compute timestamps
+						src = a if a is not None else b
+						how_many = len(ch0) if ch0 is not None else (len(ch1) if ch1 is not None else 0)
+						if how_many > 0 and getattr(src, 'timestamp', None) is not None:
+							ts_start = src.timestamp / 1_000_000.0
+							ts = ts_start + np.arange(how_many) * dt
+							self.timestamps[:len(ts)] = ts
+							if len(ts) < self.max_samples:
+								self.timestamps[len(ts):] = 0.0
 					self.last_frame_t = time.time()
-					if self.last_seq is not None:
-						exp = (self.last_seq + 2) & 0xFFFFFFFF  # seq увеличивается на 2 (A и B каналы)
-						if a.seq != exp:
-							print(f"[GAP] Expected seq {exp}, got {a.seq} (diff: {a.seq - exp})", flush=True)
-							self.gap_count += 1
-					self.last_seq = a.seq
-					self.frames_sec += 2  # общий счетчик кадров (A + B)
-					self.frames_a += 1    # счетчик кадров канала A
-					self.frames_b += 1    # счетчик кадров канала B
+					# Обновим счетчики и проверим разрывы в режиме пар (если оба канала пришли одновременно)
+					if a is not None and b is not None:
+						if not getattr(self.stream, 'asm', None) or not getattr(self.stream.asm, 'independent', False):
+							if self.last_seq is not None:
+								exp = (self.last_seq + 2) & 0xFFFFFFFF  # seq увеличивается на 2 (A и B каналы)
+								if a.seq != exp:
+									print(f"[GAP] Expected seq {exp}, got {a.seq} (diff: {a.seq - exp})", flush=True)
+									self.gap_count += 1
+							self.last_seq = a.seq
+						self.frames_sec += 2
+						self.frames_a += 1
+						self.frames_b += 1
+					else:
+						# independent mode: increment only the channel(s) that arrived
+						if a is not None:
+							self.frames_sec += 1
+							self.frames_a += 1
+						if b is not None:
+							self.frames_sec += 1
+							self.frames_b += 1
 					
 					# Диагностика каждые 100 кадров
 					if not hasattr(self, '_reader_count'):
 						self._reader_count = 0
 					self._reader_count += 1
 					if self._reader_count % 100 == 0:
-						print(f"[READER] Received {self._reader_count} frames, ch0[0:5]={ch0[:5]}, ch1[0:5]={ch1[:5]}", flush=True)
+						extra = ''
+						try:
+							s0 = ch0[:5] if ch0 is not None else 'None'
+						except Exception:
+							s0 = 'ERR'
+						try:
+							s1 = ch1[:5] if ch1 is not None else 'None'
+						except Exception:
+							s1 = 'ERR'
+						print(f"[READER] Received {self._reader_count} frames, ch0[0:5]={s0}, ch1[0:5]={s1}", flush=True)
 				
 			except Exception as e:
 				if "Resource busy" in str(e) or "[Errno" in str(e):
@@ -606,7 +739,14 @@ class ScopeWindow:
 			buf_info = f" BUF:{self.base_buf_len}({self.base_buf_len_bytes}B){freq_part}"
 		self.legend_lbl.setWordWrap(True)
 		_zero_part = f" ZERO:{self.zero_blocks}" if getattr(self, 'zero_blocks', 0) else ""
-		_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}"
+		asm_stat = ''
+		try:
+			asm = getattr(self.stream, 'asm', None)
+			if asm is not None:
+				asm_stat = f" ASM(ts_pairs={getattr(asm, '_ts_pair_count', 0)} neigh={getattr(asm, '_seq_neighbor_pairs', 0)} q={asm.q.qsize()})"
+		except Exception:
+			asm_stat = ''
+		_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}{asm_stat}"
 		# Печатаем дефолтный статус не чаще 1 раза в секунду и только если нет активного hold
 		_now_for_default = time.time()
 		if (self._status_hold_text is None or _now_for_default >= self._status_hold_until) and (_now_for_default - self._last_default_update_t >= 1.0):
@@ -1151,7 +1291,7 @@ class ScopeWindow:
 			except Exception:
 				pass
 			print(f"[CONNECT] Creating USBStream, profile={self.desired_profile}, fs={fs}", flush=True)
-			self.stream = USBStream(profile=self.desired_profile, full=True, test_as_data=self.test_as_data, frame_samples=fs, fast_mode=True)
+			self.stream = USBStream(profile=self.desired_profile, full=True, test_as_data=self.test_as_data, frame_samples=fs, fast_mode=True, assembler_independent=self.independent_channels)
 			# Сохраним порт info для power cycle без stream
 			self.last_port_info = self.stream.port_info
 			self._set_status("Устройство подключено, ожидание данных…", hold_sec=1.5)
