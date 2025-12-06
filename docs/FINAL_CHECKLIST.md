@@ -117,7 +117,7 @@ python3 BMI30.200.py
 2. **STAT v1 Firmware**: Device firmware must support STAT v1 format (64 bytes, alt1/out_armed flags at specified offsets)
 3. **USB Controller**: Requires libusb-compatible USB controller (most modern systems have this)
 4. **Power Button**: ⚡ requires `uhubctl` package and `sudo` access to cycle USB ports
-5. **Performance**: Max ~200 FPS at profile=1, ~300 FPS at profile=2 (before network/display lag)
+5. **Performance**: Max ~176 FPS at profile=1, ~280 FPS at profile=2 (measured real values)
 
 ---
 
