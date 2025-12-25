@@ -1491,6 +1491,19 @@ class ScopeWindow:
 			_t.sleep(0.01)
 		except Exception:
 			pass
+		# SET_WINDOWS: (0,0,0,0) - полный буфер для режима LATEST
+		try:
+			windows_data = struct.pack('<HHHH', 0, 0, 0, 0)
+			self.stream.send_cmd(CMD_SET_WINDOWS, windows_data)
+			print("[initseq] SET_WINDOWS(0,0,0,0) - полный буфер")
+		except Exception as e:
+			print("[initseq] SET_WINDOWS err", e)
+		# SET_STREAM_MODE: 0 (LATEST) - по умолчанию запускаем в режиме LATEST
+		try:
+			self.stream.send_cmd(CMD_SET_STREAM_MODE, b"\x00")
+			print("[initseq] SET_STREAM_MODE=0 (LATEST)")
+		except Exception as e:
+			print("[initseq] SET_STREAM_MODE err", e)
 		# FULL mode
 		try:
 			self.stream.send_cmd(0x13 if 'CMD_FULL_MODE' not in globals() else CMD_FULL_MODE, b"\x01")
