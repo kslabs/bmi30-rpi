@@ -560,6 +560,18 @@ class ScopeWindow:
 			return
 		
 		try:
+			# Отключаем DC removal если был включен
+			if getattr(self, 'dc_removal_enabled', False):
+				self.dc_removal_enabled = False
+				# Восстанавливаем нормальную частоту GUI
+				try:
+					gui_fps = int(os.getenv("BMI30_GUI_FPS", "16"))
+				except Exception:
+					gui_fps = 16
+				interval = max(10, int(1000 / gui_fps))
+				self.qtimer.setInterval(interval)
+				print(f"[LATEST] GUI восстановлен до {gui_fps} FPS")
+			
 			print("[LATEST] Переключение в режим LATEST (600 семплов, STREAM_MODE=0)...")
 			
 			# Остановка потока
@@ -615,6 +627,18 @@ class ScopeWindow:
 				return
 		
 		try:
+			# Отключаем DC removal если был включен (режим LOSSLESS_ROI без DC)
+			if getattr(self, 'dc_removal_enabled', False):
+				self.dc_removal_enabled = False
+				# Восстанавливаем нормальную частоту GUI
+				try:
+					gui_fps = int(os.getenv("BMI30_GUI_FPS", "16"))
+				except Exception:
+					gui_fps = 16
+				interval = max(10, int(1000 / gui_fps))
+				self.qtimer.setInterval(interval)
+				print(f"[LOSSLESS_ROI] GUI восстановлен до {gui_fps} FPS")
+			
 			print("[LOSSLESS_ROI] Переключение в режим LOSSLESS_ROI (200 семплов из окна 280..480)...")
 			self._set_status("Переключение в LOSSLESS_ROI...", hold_sec=1.0)
 			
@@ -670,8 +694,14 @@ class ScopeWindow:
 		
 		# Включаем режим удаления DC
 		self.dc_removal_enabled = True
+		
+		# Снижаем частоту отрисовки GUI для уменьшения блокировок data_lock
+		# В режиме DC removal не нужна быстрая отрисовка (5 FPS достаточно)
+		self.qtimer.setInterval(200)  # 200 мс = 5 FPS
+		print("[DC_REMOVAL] Режим активирован: GUI снижен до 5 FPS для минимизации блокировок")
+		
 		self._set_status("DC Removal: вычитание постоянной составляющей (10 мин), уровень = 32767", hold_sec=3.0)
-		print("[DC_REMOVAL] Режим активирован: вычитание DC offset, накопление за 10 минут")
+		print("[DC_REMOVAL] Вычитание DC offset, накопление адаптивное")
 	
 	def _update_dc_offset_adaptive(self, data_arr, dc_arr, length):
 		"""Адаптивное обновление DC offset: для каждого семпла корректировка на ±1"""
