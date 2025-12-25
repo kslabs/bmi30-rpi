@@ -217,6 +217,20 @@ class ScopeWindow:
 		self.seq0_odd = None
 		self.seq1_even = None
 		self.seq1_odd = None
+		
+		# DC offset removal (кнопка 5): накопление данных за 10 минут для вычисления среднего
+		self.dc_removal_enabled = False  # Флаг: включен ли режим удаления DC
+		self.dc_window_minutes = 10  # Окно усреднения: 10 минут
+		self.dc_history_ch0_even = []  # История значений для ch0 even
+		self.dc_history_ch0_odd = []   # История значений для ch0 odd
+		self.dc_history_ch1_even = []  # История значений для ch1 even
+		self.dc_history_ch1_odd = []   # История значений для ch1 odd
+		self.dc_offset_ch0_even = 0.0  # Текущий DC offset для ch0 even
+		self.dc_offset_ch0_odd = 0.0   # Текущий DC offset для ch0 odd
+		self.dc_offset_ch1_even = 0.0  # Текущий DC offset для ch1 even
+		self.dc_offset_ch1_odd = 0.0   # Текущий DC offset для ch1 odd
+		self.dc_last_update = time.time()  # Время последнего обновления DC offset
+		
 		# How to split packets into two phases (even/odd).
 		# Firmware may encode phase in seq LSB, timestamp LSB, or reserved fields.
 		try:
@@ -648,6 +662,44 @@ class ScopeWindow:
 			print(f"[LOSSLESS_ROI] Ошибка переключения: {e}")
 			self._set_status(f"Ошибка LOSSLESS_ROI: {e}", hold_sec=3.0)
 
+	def _switch_to_dc_removal_mode(self):
+		"""Переключение в режим LOSSLESS_ROI с удалением постоянной составляющей (DC removal)"""
+		# Сначала переключаемся в LOSSLESS_ROI режим
+		self._switch_to_lossless_roi()
+		
+		# Включаем режим удаления DC
+		self.dc_removal_enabled = True
+		self._set_status("DC Removal: вычитание постоянной составляющей (10 мин), уровень = 32767", hold_sec=3.0)
+		print("[DC_REMOVAL] Режим активирован: вычитание DC offset, накопление за 10 минут")
+	
+	def _update_dc_offset(self):
+		"""Обновление DC offset на основе накопленных данных за последние 10 минут"""
+		try:
+			current_time = time.time()
+			window_seconds = self.dc_window_minutes * 60
+			
+			# Удаляем старые данные (старше 10 минут)
+			cutoff_time = current_time - window_seconds
+			self.dc_history_ch0_even = [(t, v) for t, v in self.dc_history_ch0_even if t > cutoff_time]
+			self.dc_history_ch0_odd = [(t, v) for t, v in self.dc_history_ch0_odd if t > cutoff_time]
+			self.dc_history_ch1_even = [(t, v) for t, v in self.dc_history_ch1_even if t > cutoff_time]
+			self.dc_history_ch1_odd = [(t, v) for t, v in self.dc_history_ch1_odd if t > cutoff_time]
+			
+			# Вычисляем среднее значение (DC offset) для каждого канала/фазы
+			if len(self.dc_history_ch0_even) > 0:
+				self.dc_offset_ch0_even = np.mean([v for _, v in self.dc_history_ch0_even])
+			if len(self.dc_history_ch0_odd) > 0:
+				self.dc_offset_ch0_odd = np.mean([v for _, v in self.dc_history_ch0_odd])
+			if len(self.dc_history_ch1_even) > 0:
+				self.dc_offset_ch1_even = np.mean([v for _, v in self.dc_history_ch1_even])
+			if len(self.dc_history_ch1_odd) > 0:
+				self.dc_offset_ch1_odd = np.mean([v for _, v in self.dc_history_ch1_odd])
+			
+			self.dc_last_update = current_time
+			
+		except Exception as e:
+			print(f"[DC_REMOVAL] Ошибка обновления DC offset: {e}")
+
 	# --- numeric buttons persistence ---
 	def _num_clicked(self, idx: int):
 		if idx in (1, 2, 3):
@@ -664,11 +716,17 @@ class ScopeWindow:
 			# Переключить в режим LATEST (600 семплов, STREAM_MODE=0)
 			if self.stream is not None:
 				self._switch_to_latest_mode()
+			# Выключить режим DC removal
+			self.dc_removal_enabled = False
 			self._set_view_mode(mode_map[idx])
 		elif idx == 4:
 			# Кнопка 4: переключение в LOSSLESS_ROI режим (STREAM_MODE=1), показ 2 каналов × 2 осциллограммы × 200 семплов
+			self.dc_removal_enabled = False  # Выключить DC removal
 			self._switch_to_lossless_roi()
-		elif self.stream is not None and idx not in (1, 2, 3, 4):
+		elif idx == 5:
+			# Кнопка 5: переключение в LOSSLESS_ROI режим с удалением постоянной составляющей (DC removal)
+			self._switch_to_dc_removal_mode()
+		elif self.stream is not None and idx not in (1, 2, 3, 4, 5):
 			try:
 				self.stream.close()
 			except Exception:
@@ -1025,6 +1083,7 @@ class ScopeWindow:
 				
 				# Копируем данные в shared buffers (поддержка независимых каналов)
 				with self.data_lock:
+					current_time = time.time()
 					if ch0 is not None:
 						# even/odd selection by detected phase bit
 						try:
@@ -1041,6 +1100,15 @@ class ScopeWindow:
 							self.seq0_odd = seqv
 						else:
 							self.seq0_even = seqv
+						
+						# Накопление данных для DC offset (усреднение по всему буферу)
+						if len(ch0) > 0:
+							mean_val = np.mean(ch0)
+							if par:
+								self.dc_history_ch0_odd.append((current_time, mean_val))
+							else:
+								self.dc_history_ch0_even.append((current_time, mean_val))
+					
 					if ch1 is not None:
 						try:
 							par = _phase_bit(b) if b is not None else 0
@@ -1056,6 +1124,18 @@ class ScopeWindow:
 							self.seq1_odd = seqv
 						else:
 							self.seq1_even = seqv
+						
+						# Накопление данных для DC offset
+						if len(ch1) > 0:
+							mean_val = np.mean(ch1)
+							if par:
+								self.dc_history_ch1_odd.append((current_time, mean_val))
+							else:
+								self.dc_history_ch1_even.append((current_time, mean_val))
+					
+					# Обновление DC offset каждые 5 секунд
+					if current_time - self.dc_last_update > 5.0:
+						self._update_dc_offset()
 
 					# Phase sync diagnostics: expected even ~= -odd (after DC removal) at lag=0
 					if getattr(self, 'phase_diag', False) and self.base_buf_len is not None:
@@ -1376,6 +1456,18 @@ class ScopeWindow:
 		seg1 = (self.data1_even if hasattr(self, 'data1_even') else self.data1)[self.view_start:self.view_start+vlen]
 		seg0b = (self.data0_odd if hasattr(self, 'data0_odd') else np.zeros_like(seg0))[self.view_start:self.view_start+vlen]
 		seg1b = (self.data1_odd if hasattr(self, 'data1_odd') else np.zeros_like(seg1))[self.view_start:self.view_start+vlen]
+		
+		# DC removal: вычитание постоянной составляющей и сдвиг на 32767
+		if getattr(self, 'dc_removal_enabled', False):
+			try:
+				# Применяем DC removal: data - DC_offset + 32767
+				seg0 = seg0 - self.dc_offset_ch0_even + 32767
+				seg0b = seg0b - self.dc_offset_ch0_odd + 32767
+				seg1 = seg1 - self.dc_offset_ch1_even + 32767
+				seg1b = seg1b - self.dc_offset_ch1_odd + 32767
+			except Exception as e:
+				print(f"[DC_REMOVAL] Ошибка применения DC removal: {e}")
+		
 		# Инверсию можно включить через BMI30_INVERT=1; для маркеров инверсия не нужна
 		if not getattr(self, 'debug_markers', False) and not getattr(self, 'no_invert', False):
 			# Для беззнаковых данных разворачиваем вокруг середины 32767.5
