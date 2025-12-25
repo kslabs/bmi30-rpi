@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 import os
-import sys, time, json, os as _os_alias
+import sys, time, json, os as _os_alias, struct
 import threading
 # Qt env: avoid GTK theme/plugin conflicts on RPi (Bookworm)
 # Choose backend safely:
@@ -35,6 +35,8 @@ except Exception:
 	CMD_CHMODE = 0x19
 	CMD_ASYNC = 0x18
 	CMD_BLOCK_HZ = 0x11
+	CMD_SET_WINDOWS = 0x10
+	CMD_SET_STREAM_MODE = 0x1A
 	CMD_SOFT_RESET = 0x7E
 	CMD_DEEP_RESET = 0x7F
 	CMD_SET_ALT = 0x31
@@ -537,6 +539,51 @@ class ScopeWindow:
 		except Exception as e:
 			print(f"[RESET] SOFT_RESET via CDC failed: {e}")
 
+	def _switch_to_lossless_roi(self):
+		"""Переключение в режим LOSSLESS_ROI (STREAM_MODE=1): строгий FIFO, ROI 280..480 (200 семплов)"""
+		if self.stream is None:
+			print("[LOSSLESS_ROI] Поток не запущен, сначала запустите через кнопку 1/2/3")
+			self._set_status("Сначала запустите поток (кнопка 1/2/3)", hold_sec=2.0)
+			return
+		
+		try:
+			print("[LOSSLESS_ROI] Переключение в режим LOSSLESS_ROI (200 семплов из окна 280..480)...")
+			self._set_status("Переключение в LOSSLESS_ROI...", hold_sec=1.0)
+			
+			# Остановка потока
+			self.stream.send_cmd(CMD_STOP_STREAM, b"")
+			time.sleep(0.05)
+			print("[LOSSLESS_ROI] STOP отправлен")
+			
+			# SET_WINDOWS: start0=280, len0=200, start1=0, len1=0 (только канал A)
+			# Формат: u16 start0 + u16 len0 + u16 start1 + u16 len1 (little-endian)
+			windows_data = struct.pack('<HHHH', 280, 200, 0, 0)
+			self.stream.send_cmd(CMD_SET_WINDOWS, windows_data)
+			time.sleep(0.02)
+			print("[LOSSLESS_ROI] SET_WINDOWS(280, 200, 0, 0) отправлен")
+			
+			# SET_STREAM_MODE: 1 (LOSSLESS_ROI)
+			self.stream.send_cmd(CMD_SET_STREAM_MODE, b"\x01")
+			time.sleep(0.02)
+			print("[LOSSLESS_ROI] SET_STREAM_MODE=1 отправлен")
+			
+			# SET_ASYNC_MODE: 0 (строгие пары A/B)
+			self.stream.send_cmd(CMD_ASYNC, b"\x00")
+			time.sleep(0.02)
+			print("[LOSSLESS_ROI] SET_ASYNC_MODE=0 отправлен")
+			
+			# Запуск потока
+			self.stream.send_cmd(CMD_START_STREAM, b"")
+			time.sleep(0.05)
+			print("[LOSSLESS_ROI] START отправлен")
+			
+			self._set_status("LOSSLESS_ROI активирован (ROI 280..480, 200 семплов)", hold_sec=3.0)
+			print("[LOSSLESS_ROI] Режим активирован: ROI окно 280..480, 200 семплов, без пропусков")
+			
+		except Exception as e:
+			print(f"[LOSSLESS_ROI] Ошибка переключения: {e}")
+			self._set_status(f"Ошибка LOSSLESS_ROI: {e}", hold_sec=3.0)
+
 	# --- numeric buttons persistence ---
 	def _num_clicked(self, idx: int):
 		if idx in (1, 2, 3):
@@ -544,7 +591,10 @@ class ScopeWindow:
 			self._set_view_mode(mode_map[idx])
 			if self.stream is None and not self._connecting:
 				self._activate_stream()
-		elif self.stream is not None and idx not in (1, 2, 3):
+		elif idx == 4:
+			# Кнопка 4: переключение в LOSSLESS_ROI режим (STREAM_MODE=1)
+			self._switch_to_lossless_roi()
+		elif self.stream is not None and idx not in (1, 2, 3, 4):
 			try:
 				self.stream.close()
 			except Exception:
