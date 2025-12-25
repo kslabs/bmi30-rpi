@@ -630,6 +630,14 @@ class ScopeWindow:
 			time.sleep(0.05)
 			print("[LOSSLESS_ROI] START отправлен")
 			
+			# Сбросить параметры буфера для переинициализации с новым размером (200 семплов)
+			with self.data_lock:
+				self.base_buf_len = None
+				self.base_buf_len_bytes = None
+				self.freq_hz = None
+				self._sliders_initialized = False
+			print("[LOSSLESS_ROI] Параметры буфера сброшены для переинициализации с 200 семплами")
+			
 			# Переключить на отображение обоих каналов
 			self._set_view_mode(0)  # 0 = оба канала
 			
