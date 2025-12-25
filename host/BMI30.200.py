@@ -568,6 +568,13 @@ class ScopeWindow:
 			time.sleep(0.02)
 			print("[LATEST] SET_ASYNC_MODE=1 отправлен")
 			
+			# Сбросить параметры буфера для переинициализации с новым размером (600 семплов)
+			with self.data_lock:
+				self.base_buf_len = None
+				self.base_buf_len_bytes = None
+				self._sliders_initialized = False
+			print("[LATEST] Параметры буфера сброшены для переинициализации")
+			
 			# Запуск потока
 			self.stream.send_cmd(CMD_START_STREAM, b"")
 			time.sleep(0.05)
