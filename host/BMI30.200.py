@@ -218,8 +218,11 @@ class ScopeWindow:
 		self.seq1_even = None
 		self.seq1_odd = None
 		
+		# Отслеживание текущего STREAM_MODE
+		self.stream_mode = 0  # 0 = LATEST (кнопки 1-3), 1 = LOSSLESS_ROI (кнопки 4-5)
+		
 		# DC offset removal (кнопка 5): адаптивная коррекция DC по каждому семплу
-		self.dc_removal_enabled = False  # Флаг: включен ли режим удаления DC
+		self.dc_removal_enabled = False  # Флаг: применять ли DC removal (вычитание)
 		# Массивы DC offset для каждого семпла (инициализируем нулями, будут обновляться адаптивно)
 		self.dc_offset_ch0_even = np.zeros(self.max_samples, dtype=np.float32)
 		self.dc_offset_ch0_odd = np.zeros(self.max_samples, dtype=np.float32)
@@ -608,6 +611,8 @@ class ScopeWindow:
 			time.sleep(0.05)
 			print("[LATEST] START отправлен")
 			
+			# Устанавливаем stream_mode=0
+			self.stream_mode = 0
 			print("[LATEST] Режим активирован: 600 семплов, STREAM_MODE=0")
 			
 		except Exception as e:
@@ -680,6 +685,8 @@ class ScopeWindow:
 			# Переключить на отображение обоих каналов
 			self._set_view_mode(0)  # 0 = оба канала
 			
+			# Устанавливаем stream_mode=1 (накопление DC offset активно)
+			self.stream_mode = 1
 			self._set_status("LOSSLESS_ROI: 2 канала × 2 осциллограммы × 200 семплов", hold_sec=3.0)
 			print("[LOSSLESS_ROI] Режим активирован: ROI 280..480, 200 семплов, 2 канала по 2 кривых, без пропусков")
 			
@@ -689,7 +696,7 @@ class ScopeWindow:
 
 	def _switch_to_dc_removal_mode(self):
 		"""Переключение в режим LOSSLESS_ROI с удалением постоянной составляющей (DC removal)"""
-		# Сначала переключаемся в LOSSLESS_ROI режим
+		# Сначала переключаемся в LOSSLESS_ROI режим (stream_mode=1 устанавливается там)
 		self._switch_to_lossless_roi()
 		
 		# Включаем режим удаления DC
@@ -1179,8 +1186,8 @@ class ScopeWindow:
 							self.seq0_even = seqv
 						
 						# Адаптивное обновление DC offset (±1 на каждый семпл каждый кадр)
-						# ТОЛЬКО в режиме DC removal (STREAM_MODE=1)
-						if getattr(self, 'dc_removal_enabled', False) and len(ch0) > 0:
+						# Накопление работает ТОЛЬКО при STREAM_MODE=1 (кнопки 4 и 5)
+						if getattr(self, 'stream_mode', 0) == 1 and len(ch0) > 0:
 							if par:
 								self._update_dc_offset_adaptive(ch0, self.dc_offset_ch0_odd, len(ch0))
 							else:
@@ -1203,15 +1210,15 @@ class ScopeWindow:
 							self.seq1_even = seqv
 						
 						# Адаптивное обновление DC offset
-						# ТОЛЬКО в режиме DC removal (STREAM_MODE=1)
-						if getattr(self, 'dc_removal_enabled', False) and len(ch1) > 0:
+						# Накопление работает ТОЛЬКО при STREAM_MODE=1 (кнопки 4 и 5)
+						if getattr(self, 'stream_mode', 0) == 1 and len(ch1) > 0:
 							if par:
 								self._update_dc_offset_adaptive(ch1, self.dc_offset_ch1_odd, len(ch1))
 							else:
 								self._update_dc_offset_adaptive(ch1, self.dc_offset_ch1_even, len(ch1))
 					
-					# Сохранять DC offset в файл каждые 10 минут (только если режим активен)
-					if getattr(self, 'dc_removal_enabled', False) and (current_time - self.dc_last_save >= self.dc_save_interval):
+					# Сохранять DC offset в файл каждые 10 минут (при STREAM_MODE=1)
+					if getattr(self, 'stream_mode', 0) == 1 and (current_time - self.dc_last_save >= self.dc_save_interval):
 						self._save_dc_offset()
 						self.dc_last_save = current_time
 
