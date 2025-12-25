@@ -218,22 +218,18 @@ class ScopeWindow:
 		self.seq1_even = None
 		self.seq1_odd = None
 		
-		# DC offset removal (кнопка 5): накопление данных за 10 минут для вычисления среднего
+		# DC offset removal (кнопка 5): адаптивная коррекция DC по каждому семплу
 		self.dc_removal_enabled = False  # Флаг: включен ли режим удаления DC
-		self.dc_window_minutes = 10  # Окно усреднения: 10 минут
-		self.dc_history_ch0_even = []  # История значений для ch0 even
-		self.dc_history_ch0_odd = []   # История значений для ch0 odd
-		self.dc_history_ch1_even = []  # История значений для ch1 even
-		self.dc_history_ch1_odd = []   # История значений для ch1 odd
-		self.dc_offset_ch0_even = 0.0  # Текущий DC offset для ch0 even
-		self.dc_offset_ch0_odd = 0.0   # Текущий DC offset для ch0 odd
-		self.dc_offset_ch1_even = 0.0  # Текущий DC offset для ch1 even
-		self.dc_offset_ch1_odd = 0.0   # Текущий DC offset для ch1 odd
-		self.dc_last_update = time.time()  # Время последнего обновления DC offset
+		# Массивы DC offset для каждого семпла (инициализируем нулями, будут обновляться адаптивно)
+		self.dc_offset_ch0_even = np.zeros(self.max_samples, dtype=np.float32)
+		self.dc_offset_ch0_odd = np.zeros(self.max_samples, dtype=np.float32)
+		self.dc_offset_ch1_even = np.zeros(self.max_samples, dtype=np.float32)
+		self.dc_offset_ch1_odd = np.zeros(self.max_samples, dtype=np.float32)
 		self.dc_last_save = time.time()  # Время последнего сохранения DC offset в файл
 		self.dc_save_interval = 600  # Интервал сохранения: 600 секунд (10 минут)
-		self.dc_save_file = os.path.join(os.path.dirname(__file__), 'dc_offset_values.json')
-		# Загрузить сохраненные DC offset значения при старте
+		self.dc_save_file = os.path.join(os.path.dirname(__file__), 'dc_offset_samples.npz')
+		self.dc_update_step = 1.0  # Шаг адаптивной коррекции: ±1 единица на кадр
+		# Загрузить сохраненные DC offset массивы при старте
 		self._load_dc_offset()
 		
 		# How to split packets into two phases (even/odd).
@@ -677,74 +673,77 @@ class ScopeWindow:
 		self._set_status("DC Removal: вычитание постоянной составляющей (10 мин), уровень = 32767", hold_sec=3.0)
 		print("[DC_REMOVAL] Режим активирован: вычитание DC offset, накопление за 10 минут")
 	
-	def _update_dc_offset(self):
-		"""Обновление DC offset на основе накопленных данных за последние 10 минут"""
+	def _update_dc_offset_adaptive(self, data_arr, dc_arr, length):
+		"""Адаптивное обновление DC offset: для каждого семпла корректировка на ±1"""
 		try:
-			current_time = time.time()
-			window_seconds = self.dc_window_minutes * 60
-			
-			# Удаляем старые данные (старше 10 минут)
-			cutoff_time = current_time - window_seconds
-			self.dc_history_ch0_even = [(t, v) for t, v in self.dc_history_ch0_even if t > cutoff_time]
-			self.dc_history_ch0_odd = [(t, v) for t, v in self.dc_history_ch0_odd if t > cutoff_time]
-			self.dc_history_ch1_even = [(t, v) for t, v in self.dc_history_ch1_even if t > cutoff_time]
-			self.dc_history_ch1_odd = [(t, v) for t, v in self.dc_history_ch1_odd if t > cutoff_time]
-			
-			# Вычисляем среднее значение (DC offset) для каждого канала/фазы
-			if len(self.dc_history_ch0_even) > 0:
-				self.dc_offset_ch0_even = np.mean([v for _, v in self.dc_history_ch0_even])
-			if len(self.dc_history_ch0_odd) > 0:
-				self.dc_offset_ch0_odd = np.mean([v for _, v in self.dc_history_ch0_odd])
-			if len(self.dc_history_ch1_even) > 0:
-				self.dc_offset_ch1_even = np.mean([v for _, v in self.dc_history_ch1_even])
-			if len(self.dc_history_ch1_odd) > 0:
-				self.dc_offset_ch1_odd = np.mean([v for _, v in self.dc_history_ch1_odd])
-			
-			self.dc_last_update = current_time
-			
-			# Сохранять DC offset в файл каждые 10 минут
-			if current_time - self.dc_last_save >= self.dc_save_interval:
-				self._save_dc_offset()
-				self.dc_last_save = current_time
-			
+			for i in range(min(length, len(data_arr), len(dc_arr))):
+				if data_arr[i] > dc_arr[i]:
+					dc_arr[i] += self.dc_update_step  # Увеличиваем DC если данные больше
+				elif data_arr[i] < dc_arr[i]:
+					dc_arr[i] -= self.dc_update_step  # Уменьшаем DC если данные меньше
+				# Если равны - не меняем
 		except Exception as e:
-			print(f"[DC_REMOVAL] Ошибка обновления DC offset: {e}")
+			print(f"[DC_REMOVAL] Ошибка адаптивного обновления DC: {e}")
 	
 	def _save_dc_offset(self):
-		"""Сохранить текущие DC offset значения в файл"""
+		"""Сохранить текущие DC offset массивы в файл"""
 		try:
-			dc_data = {
-				'timestamp': time.time(),
-				'dc_offset_ch0_even': float(self.dc_offset_ch0_even),
-				'dc_offset_ch0_odd': float(self.dc_offset_ch0_odd),
-				'dc_offset_ch1_even': float(self.dc_offset_ch1_even),
-				'dc_offset_ch1_odd': float(self.dc_offset_ch1_odd),
-				'samples_ch0_even': len(self.dc_history_ch0_even),
-				'samples_ch0_odd': len(self.dc_history_ch0_odd),
-				'samples_ch1_even': len(self.dc_history_ch1_even),
-				'samples_ch1_odd': len(self.dc_history_ch1_odd)
-			}
-			with open(self.dc_save_file, 'w') as f:
-				json.dump(dc_data, f, indent=2)
-			print(f"[DC_REMOVAL] DC offset сохранен в {self.dc_save_file}: ch0_even={self.dc_offset_ch0_even:.1f}, ch0_odd={self.dc_offset_ch0_odd:.1f}, ch1_even={self.dc_offset_ch1_even:.1f}, ch1_odd={self.dc_offset_ch1_odd:.1f}")
+			# Сохраняем массивы в numpy формате (npz)
+			np.savez_compressed(
+				self.dc_save_file,
+				dc_offset_ch0_even=self.dc_offset_ch0_even,
+				dc_offset_ch0_odd=self.dc_offset_ch0_odd,
+				dc_offset_ch1_even=self.dc_offset_ch1_even,
+				dc_offset_ch1_odd=self.dc_offset_ch1_odd,
+				timestamp=np.array([time.time()])
+			)
+			# Вычисляем средние значения для логирования
+			mean_ch0_even = np.mean(self.dc_offset_ch0_even[:200]) if len(self.dc_offset_ch0_even) >= 200 else 0
+			mean_ch0_odd = np.mean(self.dc_offset_ch0_odd[:200]) if len(self.dc_offset_ch0_odd) >= 200 else 0
+			mean_ch1_even = np.mean(self.dc_offset_ch1_even[:200]) if len(self.dc_offset_ch1_even) >= 200 else 0
+			mean_ch1_odd = np.mean(self.dc_offset_ch1_odd[:200]) if len(self.dc_offset_ch1_odd) >= 200 else 0
+			print(f"[DC_REMOVAL] DC offset массивы сохранены в {self.dc_save_file}")
+			print(f"[DC_REMOVAL] Средние значения (первые 200 семплов): ch0_even={mean_ch0_even:.1f}, ch0_odd={mean_ch0_odd:.1f}, ch1_even={mean_ch1_even:.1f}, ch1_odd={mean_ch1_odd:.1f}")
 		except Exception as e:
 			print(f"[DC_REMOVAL] Ошибка сохранения DC offset: {e}")
 	
 	def _load_dc_offset(self):
-		"""Загрузить сохраненные DC offset значения из файла"""
+		"""Загрузить сохраненные DC offset массивы из файла"""
 		try:
 			if os.path.exists(self.dc_save_file):
-				with open(self.dc_save_file, 'r') as f:
-					dc_data = json.load(f)
-				self.dc_offset_ch0_even = float(dc_data.get('dc_offset_ch0_even', 0.0))
-				self.dc_offset_ch0_odd = float(dc_data.get('dc_offset_ch0_odd', 0.0))
-				self.dc_offset_ch1_even = float(dc_data.get('dc_offset_ch1_even', 0.0))
-				self.dc_offset_ch1_odd = float(dc_data.get('dc_offset_ch1_odd', 0.0))
-				saved_time = dc_data.get('timestamp', 0)
+				data = np.load(self.dc_save_file)
+				# Загружаем массивы, при необходимости расширяем или обрезаем до max_samples
+				self.dc_offset_ch0_even[:] = 0
+				self.dc_offset_ch0_odd[:] = 0
+				self.dc_offset_ch1_even[:] = 0
+				self.dc_offset_ch1_odd[:] = 0
+				
+				if 'dc_offset_ch0_even' in data:
+					n = min(len(data['dc_offset_ch0_even']), self.max_samples)
+					self.dc_offset_ch0_even[:n] = data['dc_offset_ch0_even'][:n]
+				if 'dc_offset_ch0_odd' in data:
+					n = min(len(data['dc_offset_ch0_odd']), self.max_samples)
+					self.dc_offset_ch0_odd[:n] = data['dc_offset_ch0_odd'][:n]
+				if 'dc_offset_ch1_even' in data:
+					n = min(len(data['dc_offset_ch1_even']), self.max_samples)
+					self.dc_offset_ch1_even[:n] = data['dc_offset_ch1_even'][:n]
+				if 'dc_offset_ch1_odd' in data:
+					n = min(len(data['dc_offset_ch1_odd']), self.max_samples)
+					self.dc_offset_ch1_odd[:n] = data['dc_offset_ch1_odd'][:n]
+				
+				saved_time = float(data['timestamp'][0]) if 'timestamp' in data else 0
 				age_minutes = (time.time() - saved_time) / 60
-				print(f"[DC_REMOVAL] DC offset загружен из файла (возраст: {age_minutes:.1f} мин): ch0_even={self.dc_offset_ch0_even:.1f}, ch0_odd={self.dc_offset_ch0_odd:.1f}, ch1_even={self.dc_offset_ch1_even:.1f}, ch1_odd={self.dc_offset_ch1_odd:.1f}")
+				
+				# Вычисляем средние значения для логирования
+				mean_ch0_even = np.mean(self.dc_offset_ch0_even[:200]) if len(self.dc_offset_ch0_even) >= 200 else 0
+				mean_ch0_odd = np.mean(self.dc_offset_ch0_odd[:200]) if len(self.dc_offset_ch0_odd) >= 200 else 0
+				mean_ch1_even = np.mean(self.dc_offset_ch1_even[:200]) if len(self.dc_offset_ch1_even) >= 200 else 0
+				mean_ch1_odd = np.mean(self.dc_offset_ch1_odd[:200]) if len(self.dc_offset_ch1_odd) >= 200 else 0
+				
+				print(f"[DC_REMOVAL] DC offset массивы загружены из файла (возраст: {age_minutes:.1f} мин)")
+				print(f"[DC_REMOVAL] Средние значения (первые 200 семплов): ch0_even={mean_ch0_even:.1f}, ch0_odd={mean_ch0_odd:.1f}, ch1_even={mean_ch1_even:.1f}, ch1_odd={mean_ch1_odd:.1f}")
 			else:
-				print(f"[DC_REMOVAL] Файл DC offset не найден: {self.dc_save_file}, используются нулевые значения")
+				print(f"[DC_REMOVAL] Файл DC offset не найден: {self.dc_save_file}, используются нулевые массивы")
 		except Exception as e:
 			print(f"[DC_REMOVAL] Ошибка загрузки DC offset: {e}")
 
@@ -1149,13 +1148,12 @@ class ScopeWindow:
 						else:
 							self.seq0_even = seqv
 						
-						# Накопление данных для DC offset (усреднение по всему буферу)
+						# Адаптивное обновление DC offset (±1 на каждый семпл каждый кадр)
 						if len(ch0) > 0:
-							mean_val = np.mean(ch0)
 							if par:
-								self.dc_history_ch0_odd.append((current_time, mean_val))
+								self._update_dc_offset_adaptive(ch0, self.dc_offset_ch0_odd, len(ch0))
 							else:
-								self.dc_history_ch0_even.append((current_time, mean_val))
+								self._update_dc_offset_adaptive(ch0, self.dc_offset_ch0_even, len(ch0))
 					
 					if ch1 is not None:
 						try:
@@ -1173,17 +1171,17 @@ class ScopeWindow:
 						else:
 							self.seq1_even = seqv
 						
-						# Накопление данных для DC offset
+						# Адаптивное обновление DC offset
 						if len(ch1) > 0:
-							mean_val = np.mean(ch1)
 							if par:
-								self.dc_history_ch1_odd.append((current_time, mean_val))
+								self._update_dc_offset_adaptive(ch1, self.dc_offset_ch1_odd, len(ch1))
 							else:
-								self.dc_history_ch1_even.append((current_time, mean_val))
+								self._update_dc_offset_adaptive(ch1, self.dc_offset_ch1_even, len(ch1))
 					
-					# Обновление DC offset каждые 5 секунд
-					if current_time - self.dc_last_update > 5.0:
-						self._update_dc_offset()
+					# Сохранять DC offset в файл каждые 10 минут
+					if current_time - self.dc_last_save >= self.dc_save_interval:
+						self._save_dc_offset()
+						self.dc_last_save = current_time
 
 					# Phase sync diagnostics: expected even ~= -odd (after DC removal) at lag=0
 					if getattr(self, 'phase_diag', False) and self.base_buf_len is not None:
@@ -1508,11 +1506,16 @@ class ScopeWindow:
 		# DC removal: вычитание постоянной составляющей и сдвиг на 32767
 		if getattr(self, 'dc_removal_enabled', False):
 			try:
-				# Применяем DC removal: data - DC_offset + 32767
-				seg0 = seg0 - self.dc_offset_ch0_even + 32767
-				seg0b = seg0b - self.dc_offset_ch0_odd + 32767
-				seg1 = seg1 - self.dc_offset_ch1_even + 32767
-				seg1b = seg1b - self.dc_offset_ch1_odd + 32767
+				# Применяем DC removal поэлементно: data - DC_offset[view] + 32767
+				dc0_even_view = self.dc_offset_ch0_even[self.view_start:self.view_start+vlen]
+				dc0_odd_view = self.dc_offset_ch0_odd[self.view_start:self.view_start+vlen]
+				dc1_even_view = self.dc_offset_ch1_even[self.view_start:self.view_start+vlen]
+				dc1_odd_view = self.dc_offset_ch1_odd[self.view_start:self.view_start+vlen]
+				
+				seg0 = seg0 - dc0_even_view[:len(seg0)] + 32767
+				seg0b = seg0b - dc0_odd_view[:len(seg0b)] + 32767
+				seg1 = seg1 - dc1_even_view[:len(seg1)] + 32767
+				seg1b = seg1b - dc1_odd_view[:len(seg1b)] + 32767
 			except Exception as e:
 				print(f"[DC_REMOVAL] Ошибка применения DC removal: {e}")
 		
