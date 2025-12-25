@@ -230,6 +230,11 @@ class ScopeWindow:
 		self.dc_offset_ch1_even = 0.0  # Текущий DC offset для ch1 even
 		self.dc_offset_ch1_odd = 0.0   # Текущий DC offset для ch1 odd
 		self.dc_last_update = time.time()  # Время последнего обновления DC offset
+		self.dc_last_save = time.time()  # Время последнего сохранения DC offset в файл
+		self.dc_save_interval = 600  # Интервал сохранения: 600 секунд (10 минут)
+		self.dc_save_file = os.path.join(os.path.dirname(__file__), 'dc_offset_values.json')
+		# Загрузить сохраненные DC offset значения при старте
+		self._load_dc_offset()
 		
 		# How to split packets into two phases (even/odd).
 		# Firmware may encode phase in seq LSB, timestamp LSB, or reserved fields.
@@ -697,8 +702,51 @@ class ScopeWindow:
 			
 			self.dc_last_update = current_time
 			
+			# Сохранять DC offset в файл каждые 10 минут
+			if current_time - self.dc_last_save >= self.dc_save_interval:
+				self._save_dc_offset()
+				self.dc_last_save = current_time
+			
 		except Exception as e:
 			print(f"[DC_REMOVAL] Ошибка обновления DC offset: {e}")
+	
+	def _save_dc_offset(self):
+		"""Сохранить текущие DC offset значения в файл"""
+		try:
+			dc_data = {
+				'timestamp': time.time(),
+				'dc_offset_ch0_even': float(self.dc_offset_ch0_even),
+				'dc_offset_ch0_odd': float(self.dc_offset_ch0_odd),
+				'dc_offset_ch1_even': float(self.dc_offset_ch1_even),
+				'dc_offset_ch1_odd': float(self.dc_offset_ch1_odd),
+				'samples_ch0_even': len(self.dc_history_ch0_even),
+				'samples_ch0_odd': len(self.dc_history_ch0_odd),
+				'samples_ch1_even': len(self.dc_history_ch1_even),
+				'samples_ch1_odd': len(self.dc_history_ch1_odd)
+			}
+			with open(self.dc_save_file, 'w') as f:
+				json.dump(dc_data, f, indent=2)
+			print(f"[DC_REMOVAL] DC offset сохранен в {self.dc_save_file}: ch0_even={self.dc_offset_ch0_even:.1f}, ch0_odd={self.dc_offset_ch0_odd:.1f}, ch1_even={self.dc_offset_ch1_even:.1f}, ch1_odd={self.dc_offset_ch1_odd:.1f}")
+		except Exception as e:
+			print(f"[DC_REMOVAL] Ошибка сохранения DC offset: {e}")
+	
+	def _load_dc_offset(self):
+		"""Загрузить сохраненные DC offset значения из файла"""
+		try:
+			if os.path.exists(self.dc_save_file):
+				with open(self.dc_save_file, 'r') as f:
+					dc_data = json.load(f)
+				self.dc_offset_ch0_even = float(dc_data.get('dc_offset_ch0_even', 0.0))
+				self.dc_offset_ch0_odd = float(dc_data.get('dc_offset_ch0_odd', 0.0))
+				self.dc_offset_ch1_even = float(dc_data.get('dc_offset_ch1_even', 0.0))
+				self.dc_offset_ch1_odd = float(dc_data.get('dc_offset_ch1_odd', 0.0))
+				saved_time = dc_data.get('timestamp', 0)
+				age_minutes = (time.time() - saved_time) / 60
+				print(f"[DC_REMOVAL] DC offset загружен из файла (возраст: {age_minutes:.1f} мин): ch0_even={self.dc_offset_ch0_even:.1f}, ch0_odd={self.dc_offset_ch0_odd:.1f}, ch1_even={self.dc_offset_ch1_even:.1f}, ch1_odd={self.dc_offset_ch1_odd:.1f}")
+			else:
+				print(f"[DC_REMOVAL] Файл DC offset не найден: {self.dc_save_file}, используются нулевые значения")
+		except Exception as e:
+			print(f"[DC_REMOVAL] Ошибка загрузки DC offset: {e}")
 
 	# --- numeric buttons persistence ---
 	def _num_clicked(self, idx: int):
