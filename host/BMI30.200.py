@@ -219,9 +219,9 @@ class ScopeWindow:
 		self.seq1_odd = None
 		
 		# Отслеживание текущего STREAM_MODE
-		self.stream_mode = 0  # 0 = LATEST (кнопки 1-3), 1 = LOSSLESS_ROI (кнопки 4-5)
+		self.stream_mode = 0  # 0 = LATEST (600 семплов, last-buffer-wins), 1 = LOSSLESS_ROI (200 семплов, FIFO)
 		
-		# DC offset removal (кнопка 5): адаптивная коррекция DC по каждому семплу
+		# DC offset removal: адаптивная коррекция DC по каждому семплу (накопление при STREAM_MODE=1)
 		self.dc_removal_enabled = False  # Флаг: применять ли DC removal (вычитание)
 		# Массивы DC offset для каждого семпла (инициализируем нулями, будут обновляться адаптивно)
 		self.dc_offset_ch0_even = np.zeros(self.max_samples, dtype=np.float32)
@@ -687,6 +687,12 @@ class ScopeWindow:
 			
 			# Устанавливаем stream_mode=1 (накопление DC offset активно)
 			self.stream_mode = 1
+			
+			# Снижаем частоту отрисовки GUI для уменьшения блокировок data_lock
+			# В LOSSLESS_ROI не нужна быстрая отрисовка (5 FPS достаточно для накопления DC)
+			self.qtimer.setInterval(200)  # 200 мс = 5 FPS
+			print("[LOSSLESS_ROI] GUI снижен до 5 FPS для минимизации блокировок")
+			
 			self._set_status("LOSSLESS_ROI: 2 канала × 2 осциллограммы × 200 семплов", hold_sec=3.0)
 			print("[LOSSLESS_ROI] Режим активирован: ROI 280..480, 200 семплов, 2 канала по 2 кривых, без пропусков")
 			
@@ -699,16 +705,11 @@ class ScopeWindow:
 		# Сначала переключаемся в LOSSLESS_ROI режим (stream_mode=1 устанавливается там)
 		self._switch_to_lossless_roi()
 		
-		# Включаем режим удаления DC
+		# Включаем режим удаления DC (отображение скорректированных данных)
 		self.dc_removal_enabled = True
 		
-		# Снижаем частоту отрисовки GUI для уменьшения блокировок data_lock
-		# В режиме DC removal не нужна быстрая отрисовка (5 FPS достаточно)
-		self.qtimer.setInterval(200)  # 200 мс = 5 FPS
-		print("[DC_REMOVAL] Режим активирован: GUI снижен до 5 FPS для минимизации блокировок")
-		
-		self._set_status("DC Removal: вычитание постоянной составляющей (10 мин), уровень = 32767", hold_sec=3.0)
-		print("[DC_REMOVAL] Вычитание DC offset, накопление адаптивное")
+		self._set_status("DC Removal: вычитание постоянной составляющей, уровень = 32767", hold_sec=3.0)
+		print("[DC_REMOVAL] Режим активирован: отображение скорректированных данных без DC")
 	
 	def _update_dc_offset_adaptive(self, data_arr, dc_arr, length):
 		"""Адаптивное обновление DC offset: для каждого семпла корректировка на ±1"""
@@ -1186,7 +1187,7 @@ class ScopeWindow:
 							self.seq0_even = seqv
 						
 						# Адаптивное обновление DC offset (±1 на каждый семпл каждый кадр)
-						# Накопление работает ТОЛЬКО при STREAM_MODE=1 (кнопки 4 и 5)
+						# Накопление работает ТОЛЬКО при STREAM_MODE=1 (LOSSLESS_ROI)
 						if getattr(self, 'stream_mode', 0) == 1 and len(ch0) > 0:
 							if par:
 								self._update_dc_offset_adaptive(ch0, self.dc_offset_ch0_odd, len(ch0))
@@ -1210,7 +1211,7 @@ class ScopeWindow:
 							self.seq1_even = seqv
 						
 						# Адаптивное обновление DC offset
-						# Накопление работает ТОЛЬКО при STREAM_MODE=1 (кнопки 4 и 5)
+						# Накопление работает ТОЛЬКО при STREAM_MODE=1 (LOSSLESS_ROI)
 						if getattr(self, 'stream_mode', 0) == 1 and len(ch1) > 0:
 							if par:
 								self._update_dc_offset_adaptive(ch1, self.dc_offset_ch1_odd, len(ch1))
