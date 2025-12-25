@@ -572,8 +572,9 @@ class ScopeWindow:
 			with self.data_lock:
 				self.base_buf_len = None
 				self.base_buf_len_bytes = None
+				self.freq_hz = None
 				self._sliders_initialized = False
-			print("[LATEST] Параметры буфера сброшены для переинициализации")
+			print("[LATEST] Параметры буфера сброшены для переинициализации с 600 семплами")
 			
 			# Запуск потока
 			self.stream.send_cmd(CMD_START_STREAM, b"")
