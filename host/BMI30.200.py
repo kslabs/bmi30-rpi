@@ -1011,6 +1011,7 @@ class ScopeWindow:
 				if first_len is not None:
 					with self.data_lock:
 						if (self.base_buf_len is None) or (self.base_buf_len != first_len):
+							old_len = self.base_buf_len
 							self.base_buf_len = first_len
 							self.base_buf_len_bytes = self.base_buf_len * 2
 							self._sliders_initialized = False
@@ -1020,7 +1021,7 @@ class ScopeWindow:
 								self.freq_hz = 300
 							else:
 								self.freq_hz = None
-							print(f"[READER] Initialized: buf_len={self.base_buf_len}, freq={self.freq_hz}Hz", flush=True)
+							print(f"[READER] Buffer size changed: {old_len} -> {self.base_buf_len} семплов, freq={self.freq_hz}Hz", flush=True)
 				
 				# Копируем данные в shared buffers (поддержка независимых каналов)
 				with self.data_lock:
