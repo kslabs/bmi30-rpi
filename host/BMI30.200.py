@@ -1,3 +1,4 @@
+
 """BMI30.200.py — единая точка входа: сразу открывает живую осциллограмму Vendor Bulk двухканального потока."""
 
 from __future__ import annotations
@@ -5,20 +6,35 @@ import os
 import sys, time, json, os as _os_alias
 import threading
 # Qt env: avoid GTK theme/plugin conflicts on RPi (Bookworm)
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+# Choose backend safely:
+# - if user set QT_QPA_PLATFORM explicitly, respect it
+# - prefer xcb when DISPLAY exists
+# - prefer wayland when WAYLAND_DISPLAY exists
+# - otherwise use offscreen (headless smoke-tests)
+if "QT_QPA_PLATFORM" not in os.environ:
+	if os.getenv("DISPLAY"):
+		os.environ["QT_QPA_PLATFORM"] = "xcb"
+	elif os.getenv("WAYLAND_DISPLAY"):
+		os.environ["QT_QPA_PLATFORM"] = "wayland"
+	else:
+		os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ.setdefault("QT_STYLE_OVERRIDE", "Fusion")
 os.environ.pop("QT_QPA_PLATFORMTHEME", None)
 import numpy as np  # type: ignore
 import serial, glob
 
 try:
-	from usb_vendor.usb_stream import USBStream, CMD_SET_PROFILE, CMD_STOP_STREAM, CMD_START_STREAM  # type: ignore
+	from usb_vendor.usb_stream import USBStream, CMD_SET_PROFILE, CMD_STOP_STREAM, CMD_START_STREAM, CMD_SOFT_RESET, CMD_DEEP_RESET  # type: ignore
 except Exception:
 	from usb_vendor.usb_stream import USBStream  # type: ignore
 	CMD_SET_PROFILE = 0x14
 	CMD_STOP_STREAM = 0x21
 	CMD_START_STREAM = 0x20
 	CMD_GET_STATUS = 0x30
+	CMD_FULL_MODE = 0x13
+	CMD_CHMODE = 0x19
+	CMD_ASYNC = 0x18
+	CMD_BLOCK_HZ = 0x11
 	CMD_SOFT_RESET = 0x7E
 	CMD_DEEP_RESET = 0x7F
 	CMD_SET_ALT = 0x31
@@ -116,8 +132,11 @@ class ScopeWindow:
 		self.p0 = self.plotw.addPlot(row=0, col=0, title="ADC0")
 		self.p1 = self.plotw.addPlot(row=1, col=0, title="ADC1")
 		# Use fast line plots instead of many symbols to reduce CPU and increase FPS
-		self.curve0 = self.p0.plot(pen=pg.mkPen('#2ecc71', width=1), symbol=None)
-		self.curve1 = self.p1.plot(pen=pg.mkPen('#3498db', width=1), symbol=None)
+		# Two packets per channel => draw even/odd oscillograms per plot (different colors)
+		self.curve0_a = self.p0.plot(pen=pg.mkPen('#2ecc71', width=1), symbol=None)  # even
+		self.curve0_b = self.p0.plot(pen=pg.mkPen('#1abc9c', width=1), symbol=None)  # odd
+		self.curve1_a = self.p1.plot(pen=pg.mkPen('#3498db', width=1), symbol=None)  # even
+		self.curve1_b = self.p1.plot(pen=pg.mkPen('#9b59b6', width=1), symbol=None)  # odd
 		self.p0.showGrid(x=True, y=True, alpha=0.3)
 		self.p1.showGrid(x=True, y=True, alpha=0.3)
 		# Синхронизируем X-оси между графиками
@@ -130,14 +149,17 @@ class ScopeWindow:
 		self.p1.disableAutoRange(axis=pg.ViewBox.XAxis)
 		self.p0.enableAutoRange(y=True)
 		self.p1.enableAutoRange(y=True)
-		self.expected_len_map = {1:1100, 2:912}
-		self.initial_expected = self.expected_len_map.get(1, 1100)
-		# рекомендуемые размеры кадра для ~20 FPS по профилям
-		self.ns_map = {1:10, 2:15}
+		# Обновлённые размеры кадров: профиль 1 ~1360 семплов, профиль 2 ~912
+		# Не полагаемся на жёсткие размеры: устройство авто-фиксирует total_samples по первому рабочему кадру.
+		# Эти значения используются только как "подсказка"/резерв.
+		self.expected_len_map = {1: 912, 2: 912}
+		self.initial_expected = self.expected_len_map.get(1, 912)
+		# Рекомендуемые FRAME_SAMPLES для стабильных ~20 FPS (используем фактические длины кадров)
+		self.ns_map = {1: 912, 2: 912}
 		# По умолчанию не навязываем Ns устройству (макс. FPS). Включить подсказку Ns: BMI30_SEND_NS=1
 		try:
-			# Всегда отправляем FRAME_SAMPLES в рабочем режиме, чтобы поток был стабильным и быстрым
-			self.send_ns = str(os.getenv("BMI30_SEND_NS", "1")).lower() not in ("0","false","no")
+			# Важно: SET_FRAME_SAMPLES ломает профиль 1, поэтому по умолчанию НЕ отправляем.
+			self.send_ns = str(os.getenv("BMI30_SEND_NS", "0")).lower() not in ("0","false","no")
 		except Exception:
 			self.send_ns = True
 		# Тестовые кадры как данные выключены по умолчанию (включить: BMI30_TEST_AS_DATA=1)
@@ -156,13 +178,13 @@ class ScopeWindow:
 		except Exception:
 			self.y_auto = False
 		try:
-			self.y_min = float(os.getenv("BMI30_Y_MIN", "-32768"))
+			self.y_min = float(os.getenv("BMI30_Y_MIN", "0"))
 		except Exception:
-			self.y_min = -32768.0
+			self.y_min = 0.0
 		try:
-			self.y_max = float(os.getenv("BMI30_Y_MAX", "32767"))
+			self.y_max = float(os.getenv("BMI30_Y_MAX", "65535"))
 		except Exception:
-			self.y_max = 32767.0
+			self.y_max = 65535.0
 		# Применим параметры Y сразу
 		try:
 			self.p0.enableAutoRange(y=self.y_auto)
@@ -174,14 +196,47 @@ class ScopeWindow:
 			pass
 		# plots идут здесь, нижние элементы добавим после
 		# data - shared buffers между reader thread и GUI thread
-		self.base_buf_len: int | None = None  # будет 1100 или 912 (или иное) после первого кадра
+		self.base_buf_len: int | None = None  # будет 1200 (или иное) после первого кадра
 		self.base_buf_len_bytes: int | None = None
 		self.freq_hz: int | None = None
 		self.ring_factor = 1  # фиксированный один буфер (последний кадр)
 		# Shared buffers для двух каналов - инициализируем сразу с максимальным размером
-		self.max_samples = 1100  # максимум для профиля 1
-		self.data0 = np.zeros(self.max_samples, dtype=np.int16)
-		self.data1 = np.zeros(self.max_samples, dtype=np.int16)
+		# Резерв под максимальный буфер (не жёстко завязан на профиль)
+		self.max_samples = 2048
+		# Two buffers per channel: even/odd packets keyed by seq&1
+		self.data0 = np.zeros(self.max_samples, dtype=np.int32)  # совместимость (используем как even)
+		self.data1 = np.zeros(self.max_samples, dtype=np.int32)  # совместимость (используем как even)
+		self.data0_even = self.data0
+		self.data0_odd = np.zeros(self.max_samples, dtype=np.int32)
+		self.data1_even = self.data1
+		self.data1_odd = np.zeros(self.max_samples, dtype=np.int32)
+		# phase diagnostics (even/odd should be same magnitude, opposite phase)
+		self.seq0_even = None
+		self.seq0_odd = None
+		self.seq1_even = None
+		self.seq1_odd = None
+		# How to split packets into two phases (even/odd).
+		# Firmware may encode phase in seq LSB, timestamp LSB, or reserved fields.
+		try:
+			self.phase_key = str(os.getenv('BMI30_PHASE_KEY', 'auto')).strip().lower()
+		except Exception:
+			self.phase_key = 'auto'
+		self._phase_key_chosen = None
+		self._phase_key_stats = {}
+		self._phase_key_seen = 0
+		try:
+			self.phase_diag = str(os.getenv('BMI30_PHASE_DIAG', '0')).lower() not in ('0','false','no')
+		except Exception:
+			self.phase_diag = False
+		try:
+			self.phase_diag_every = int(os.getenv('BMI30_PHASE_DIAG_EVERY', '50'))
+		except Exception:
+			self.phase_diag_every = 50
+		try:
+			self.phase_diag_maxlag = int(os.getenv('BMI30_PHASE_DIAG_MAXLAG', '20'))
+		except Exception:
+			self.phase_diag_maxlag = 20
+		self._phase_diag_frames = 0
 		self.timestamps = np.zeros(self.max_samples, dtype=np.float64)
 		self.data_lock = threading.Lock()  # защита shared buffers
 		self.reader_thread = None
@@ -195,11 +250,65 @@ class ScopeWindow:
 			self.initial_view_mult = 0.25
 		# Диагностику остановки выводим в консоль (а не в GUI) по умолчанию
 		self.diag_to_console = str(os.getenv("BMI30_DIAG_TO_CONSOLE", "1")).lower() not in ("0","false","no")
-		# Режим независимых каналов: по умолчанию включён — не связывать A/B
+		# Всегда показываем полный кадр (start=0, len=buf)
+		self.lock_full_view = True
+		# По умолчанию не инвертируем сигнал в GUI (включить старую инверсию можно через BMI30_INVERT=1)
+		self.no_invert = str(os.getenv("BMI30_INVERT", "0")).lower() in ("0","false","no")
+		# Отладочные маркеры: каждые 100-й семпл отмечаем линейкой [-30000..30000] для проверки целостности буфера
 		try:
-			self.independent_channels = str(os.getenv('BMI30_INDEPENDENT_CHANNELS', '1')).lower() not in ('0','false','no')
+			self.debug_markers = str(os.getenv("BMI30_DEBUG_MARKERS", "0")).lower() not in ("0","false","no")
 		except Exception:
-			self.independent_channels = True
+			self.debug_markers = False
+		# Режим независимых каналов: по умолчанию ВЫКЛЮЧЕН — берём пары A/B без накопления хвоста
+		try:
+			self.independent_channels = str(os.getenv('BMI30_INDEPENDENT_CHANNELS', '0')).lower() not in ('0','false','no')
+		except Exception:
+			self.independent_channels = False
+		# Диагностика размеров кадров: включить лог seq/lenA/lenB через BMI30_LOG_FRAME_LEN=1
+		try:
+			self.log_frame_len = str(os.getenv('BMI30_LOG_FRAME_LEN', '0')).lower() not in ('0','false','no')
+		except Exception:
+			self.log_frame_len = False
+		try:
+			self.log_frame_len_limit = int(os.getenv('BMI30_LOG_FRAME_LEN_LIMIT', '200'))
+		except Exception:
+			self.log_frame_len_limit = 200
+		self._log_frame_len_count = 0
+		# Трассировка содержимого по блокам (каждые 100 семплов): BMI30_CHUNK_TRACE=1, лимит кадров BMI30_CHUNK_TRACE_LIMIT
+		try:
+			self.chunk_trace = str(os.getenv('BMI30_CHUNK_TRACE', '0')).lower() not in ('0','false','no')
+		except Exception:
+			self.chunk_trace = False
+		try:
+			self.chunk_trace_limit = int(os.getenv('BMI30_CHUNK_TRACE_LIMIT', '50'))
+		except Exception:
+			self.chunk_trace_limit = 50
+		self._chunk_trace_count = 0
+		# Явная инициализация по последовательности разработчика (STOP→FULL→PROFILE→CHMODE→ASYNC→BLOCK_HZ→START)
+		try:
+			self.apply_init_sequence = str(os.getenv('BMI30_INIT_SEQUENCE', '1')).lower() not in ('0','false','no')
+		except Exception:
+			self.apply_init_sequence = True
+		try:
+			self.block_hz = int(os.getenv('BMI30_BLOCK_HZ', '200'))
+		except Exception:
+			self.block_hz = 200
+		# Мониторинг конкретного семпла для ловли редких сбоев: BMI30_MON_SAMPLE=1, индекс BMI30_MON_INDEX (по умолчанию 300)
+		try:
+			self.monitor_sample = str(os.getenv('BMI30_MON_SAMPLE', '0')).lower() not in ('0','false','no')
+		except Exception:
+			self.monitor_sample = False
+		try:
+			self.monitor_index = int(os.getenv('BMI30_MON_INDEX', '300'))
+		except Exception:
+			self.monitor_index = 300
+		self._last_mon_a = None
+		self._last_mon_b = None
+		# Опционально: срезать хвост внутренней очереди ассемблера (независимые каналы) чтобы не было лага
+		try:
+			self.flush_asm_queue = str(os.getenv('BMI30_FLUSH_ASM_QUEUE', '0')).lower() not in ('0','false','no')
+		except Exception:
+			self.flush_asm_queue = False
 		# Capture diagnostic mode: write a short capture file when the first mismatch occurs
 		try:
 			cap_env = os.getenv('BMI30_CAPTURE_DIAG', None)
@@ -256,6 +365,9 @@ class ScopeWindow:
 		# отслеживание общего приёма данных (по транспорту), чтобы не ругаться на "остановку" при отсутствии пар
 		self._last_rx_seen = 0.0
 		self._last_sample_ts: float | None = None
+		# счётчики диагностики парирования (чтобы не падать при отсутствии mismatch)
+		self._pair_mismatch_count = 0
+		self._last_pair_mismatch_t = 0.0
 		# интервалы можно настроить через переменные окружения
 		try:
 			self.diag_interval = float(os.getenv("BMI30_DIAG_INTERVAL", "10"))  # не спамить предупреждением чаще, чем раз в 10с
@@ -265,10 +377,12 @@ class ScopeWindow:
 			self.stop_warn_after = float(os.getenv("BMI30_STOP_WARN_AFTER", "5"))  # порог простоя для предупреждения, сек
 		except Exception:
 			self.stop_warn_after = 5.0
-		self._instr = ("Инструкция: 1) Прошивка должна обрабатывать START_STREAM (0x20) и слать кадры vendor bulk на EP IN 0x83. "
+		self._instr = (
+			"Инструкция: 1) Прошивка должна обрабатывать START_STREAM (0x20) и слать кадры vendor bulk на EP IN 0x83. "
 			"SET_PROFILE (0x14) 1=200Гц / 2=300Гц используйте по необходимости (переключатель в GUI). "
-			"Каждый кадр: заголовок 32 байта (magic 0xA55A LE), флаги 0x01 (ADC0) и 0x02 (ADC1) чередуются, total_samples=1100 для 200Гц или 912 для 300Гц, payload = samples*2 байт. "
-			"Тестовый кадр (flag 0x80) может быть один в начале и пропускается. 4) Проверьте права доступа (udev) если устройство не открывается. 5) Кнопка 1 в GUI запускает поток.")
+			"Каждый кадр: заголовок 32 байта (magic 0xA55A LE), флаги 0x01 (ADC0) и 0x02 (ADC1); total_samples авто-фиксируется по первому рабочему кадру, payload = total_samples*2 байт. "
+			"Тестовый кадр (flag 0x80) может быть один в начале и пропускается. 4) Проверьте права доступа (udev) если устройство не открывается. 5) Кнопка 1 в GUI запускает поток."
+		)
 		# статус: удержание сообщений, чтобы не мигали
 		self._status_hold_text: str | None = None
 		self._status_hold_until: float = 0.0
@@ -361,15 +475,24 @@ class ScopeWindow:
 		self.slider_start.valueChanged.connect(self._on_slider_start)
 		self.slider_len.valueChanged.connect(self._on_slider_len)
 
+		# Сбросим состояние слайдеров, чтобы при переподключениях они переинициализировались под свежую длину буфера
+		self._reset_sliders()
+
 		# Применим режим оси X после создания всех элементов
 		self._apply_x_axis_mode()
+
+		# Тестовый режим без устройства (нужно знать до автозапуска)
+		try:
+			_test_mode = str(os.getenv("BMI30_TEST_MODE", "0")).lower() not in ("0","false","no")
+		except Exception:
+			_test_mode = False
 
 		# Автозапуск потока при старте приложения (по умолчанию включён)
 		try:
 			_autostart = str(os.getenv("BMI30_AUTOSTART", "1")).lower() not in ("0","false","no")
 		except Exception:
 			_autostart = True
-		if _autostart:
+		if _autostart and not _test_mode:
 			# Установить режим оба канала и запустить поток
 			self.view_mode = 0
 			if self.num_group.checkedId() != 3:
@@ -379,17 +502,13 @@ class ScopeWindow:
 		self.view_mode = 0
 		
 		# Тестовый режим без устройства
-		try:
-			_test_mode = str(os.getenv("BMI30_TEST_MODE", "0")).lower() not in ("0","false","no")
-		except Exception:
-			_test_mode = False
 		if _test_mode:
 			print("[TEST] Test mode enabled - simulating data")
 			self._test_mode = True
-			# Имитируем получение данных
-			self.base_buf_len = 912  # 300Hz mode
+			# Имитируем получение данных исходя из текущего профиля
+			self.base_buf_len = self.expected_len_map.get(self.desired_profile, self.initial_expected)
 			self.base_buf_len_bytes = self.base_buf_len * 2
-			self.freq_hz = 300
+			self.freq_hz = 200 if self.desired_profile == 1 else 300 if self.desired_profile == 2 else None
 			# Заполняем тестовыми данными
 			import math
 			for i in range(self.base_buf_len):
@@ -436,6 +555,10 @@ class ScopeWindow:
 			self.freq_hz = None
 			self.data0 = np.zeros(0, dtype=np.int16)
 			self.data1 = np.zeros(0, dtype=np.int16)
+			self.data0_even = self.data0
+			self.data1_even = self.data1
+			self.data0_odd = np.zeros(0, dtype=np.int16)
+			self.data1_odd = np.zeros(0, dtype=np.int16)
 			self.timestamps = np.zeros(0, dtype=np.float64)
 			self._last_sample_ts = None
 			self.view_len = 0
@@ -467,6 +590,121 @@ class ScopeWindow:
 
 	def _reader_thread_func(self):
 		"""Поток чтения USB: получает пакеты и заполняет data0/data1"""
+		def _phase_candidates(frame):
+			"""Return candidate phase bits from frame fields."""
+			out = {}
+			try:
+				seqv = int(getattr(frame, 'seq', 0))
+				out['seq'] = seqv & 1
+				out['seq1'] = (seqv >> 1) & 1
+			except Exception:
+				pass
+			try:
+				rv = int(getattr(frame, 'reserved', 0))
+				out['reserved'] = rv & 1
+				out['reserved1'] = (rv >> 1) & 1
+			except Exception:
+				pass
+			try:
+				r2 = int(getattr(frame, 'reserved2', 0))
+				out['reserved2'] = r2 & 1
+				out['reserved2_1'] = (r2 >> 1) & 1
+			except Exception:
+				pass
+			return out
+
+		def _update_phase_key_stats(frame):
+			"""Track which bit toggles like a true phase marker (alternating ~50/50)."""
+			cands = _phase_candidates(frame)
+			for name, bit in cands.items():
+				st = self._phase_key_stats.get(name)
+				if st is None:
+					st = {'n': 0, 'ones': 0, 'toggles': 0, 'last': None, 'mismatch': 0}
+					self._phase_key_stats[name] = st
+				st['n'] += 1
+				st['ones'] += 1 if int(bit) else 0
+				if st['last'] is not None and int(bit) != int(st['last']):
+					st['toggles'] += 1
+				st['last'] = int(bit)
+
+		def _update_phase_key_pair_consistency(a_frame, b_frame):
+			"""In paired mode, phase marker should be identical for A and B of the same seq."""
+			try:
+				ca = _phase_candidates(a_frame)
+				cb = _phase_candidates(b_frame)
+				for name in set(ca.keys()).intersection(cb.keys()):
+					if int(ca[name]) != int(cb[name]):
+						st = self._phase_key_stats.get(name)
+						if st is None:
+							st = {'n': 0, 'ones': 0, 'toggles': 0, 'last': None, 'mismatch': 0}
+							self._phase_key_stats[name] = st
+						st['mismatch'] = int(st.get('mismatch', 0)) + 1
+			except Exception:
+				pass
+
+		def _maybe_choose_phase_key():
+			if self._phase_key_chosen is not None:
+				return
+			forced = getattr(self, 'phase_key', 'auto')
+			if forced and forced != 'auto':
+				self._phase_key_chosen = forced
+				print(f"[PHASE_KEY] forced={self._phase_key_chosen}", flush=True)
+				return
+			# wait for enough samples
+			min_n = 60
+			bias = {
+				'seq': 5.0,
+				'seq1': 3.0,
+				'reserved2': 1.0,
+				'reserved2_1': 1.0,
+				'reserved': 0.0,
+				'reserved1': 0.0,
+			}
+			best = None
+			best_score = None
+			for name, st in self._phase_key_stats.items():
+				n = int(st.get('n', 0))
+				if n < min_n:
+					continue
+				# phase marker must be consistent between channels in the same stereo pair
+				if int(st.get('mismatch', 0)) > 0:
+					continue
+				ones = int(st.get('ones', 0))
+				tog = int(st.get('toggles', 0))
+				# prefer frequent toggling and ~50/50 distribution
+				balance_penalty = abs(ones - (n / 2.0))
+				score = float(tog) - float(balance_penalty) + float(bias.get(name, 0.0))
+				# reject degenerate constant bits
+				if ones == 0 or ones == n:
+					continue
+				if best_score is None or score > best_score:
+					best_score = score
+					best = name
+			if best is not None:
+				self._phase_key_chosen = best
+				try:
+					st = self._phase_key_stats.get(best, {})
+					print(f"[PHASE_KEY] auto={best} n={st.get('n')} ones={st.get('ones')} toggles={st.get('toggles')}", flush=True)
+				except Exception:
+					print(f"[PHASE_KEY] auto={best}", flush=True)
+
+		def _phase_bit(frame):
+			"""Compute phase bit (0/1) using chosen or forced key."""
+			try:
+				_update_phase_key_stats(frame)
+			except Exception:
+				pass
+			try:
+				_maybe_choose_phase_key()
+			except Exception:
+				pass
+			key = self._phase_key_chosen or getattr(self, 'phase_key', 'auto')
+			cands = _phase_candidates(frame)
+			if key in cands:
+				return int(cands[key])
+			# fallback
+			return int(cands.get('seq', 0))
+
 		print("[READER] Thread started", flush=True)
 		while self.reader_running:
 			if self.stream is None:
@@ -488,8 +726,37 @@ class ScopeWindow:
 				else:
 					a, b = pair
 
-				ch0 = np.frombuffer(a.payload, dtype='<i2') if a is not None else None
-				ch1 = np.frombuffer(b.payload, dtype='<i2') if b is not None else None
+				# Help auto-detect phase key: in paired mode, enforce A/B consistency for candidates.
+				if a is not None and b is not None:
+					_update_phase_key_pair_consistency(a, b)
+
+				# При необходимости можно явно сбросить накопленную очередь ассемблера (независимый режим),
+				# чтобы не было задержки из старых кадров. Выключено по умолчанию, включается env BMI30_FLUSH_ASM_QUEUE=1.
+				if getattr(self, 'flush_asm_queue', False) and getattr(self, 'independent_channels', False):
+					try:
+						asm = getattr(self.stream, 'asm', None)
+						q = getattr(asm, 'q', None)
+						if q is not None and hasattr(q, 'qsize'):
+							qs = q.qsize()
+							if qs > 0:
+								last_item = None
+								while True:
+									try:
+										item = q.get_nowait()
+										last_item = item
+									except Exception:
+										break
+								if last_item is not None:
+									try:
+										q.put_nowait(last_item)
+									except Exception:
+										pass
+								print(f"[ASM_FLUSH] queue trimmed (was {qs}), kept latest. new_q={q.qsize() if hasattr(q,'qsize') else '?'}", flush=True)
+					except Exception:
+						pass
+
+				ch0 = np.frombuffer(a.payload, dtype='<u2').astype(np.int32) if a is not None else None
+				ch1 = np.frombuffer(b.payload, dtype='<u2').astype(np.int32) if b is not None else None
 				
 				# --- diagnostics: compute sequence/timestamps early to detect pairing issues ---
 				if a is not None and b is not None:
@@ -507,81 +774,245 @@ class ScopeWindow:
 
 					# If mismatch, record diagnostics and optionally capture to file
 					if seq_a != seq_b:
-						self._pair_mismatch_count = getattr(self, '_pair_mismatch_count', 0) + 1
-						self._pair_mismatch_count = int(self._pair_mismatch_count)
-					nowp = time.time()
-					last_pair_t = getattr(self, '_last_pair_mismatch_t', 0.0)
-					if (self._pair_mismatch_count % 200) == 0 or (nowp - last_pair_t) > 4.0:
-						asm_info = ''
-						try:
-							asm = getattr(self.stream, 'asm', None)
-							if asm is not None:
-								asm_info = f" ts_pairs={getattr(asm, '_ts_pair_count', 0)} seq_neigh_pairs={getattr(asm, '_seq_neighbor_pairs', 0)} q={asm.q.qsize()}"
-						except Exception:
+						self._pair_mismatch_count = int(getattr(self, '_pair_mismatch_count', 0)) + 1
+						nowp = time.time()
+						last_pair_t = float(getattr(self, '_last_pair_mismatch_t', 0.0))
+						if (self._pair_mismatch_count % 200) == 0 or (nowp - last_pair_t) > 4.0:
 							asm_info = ''
-						print(f"[PAIR_MISMATCH] count={self._pair_mismatch_count} last seqA={seq_a} seqB={seq_b} lenA={len(ch0)} lenB={len(ch1)} flagsA={getattr(a,'flags',None)} flagsB={getattr(b,'flags',None)}{asm_info}", flush=True)
-						self._last_pair_mismatch_t = nowp
-					# capture to file if configured
-					try:
-						if getattr(self, 'capture_diag_path', None):
-							if self._capture_diag_fp is None:
-								self._capture_diag_fp = open(self.capture_diag_path, 'a', encoding='utf-8', errors='replace')
-								self._capture_diag_started = time.time()
-								self._capture_diag_lines = 0
-								self._capture_diag_fp.write('#ts_unix,seqA,seqB,lenA,lenB,flagsA,flagsB,tsA,tsB,asm_ts_pairs,asm_seq_neigh_pairs,last_stat_hex\n')
-								self._capture_diag_fp.flush()
-							# write one line per mismatch while capture window open
-							if self._capture_diag_fp is not None and (time.time() - self._capture_diag_started) <= float(self.capture_diag_seconds) and self._capture_diag_lines < int(self.capture_diag_limit):
-								try:
-									last_stat = getattr(self.stream, 'last_stat', None)
-									stat_hex = last_stat.hex() if isinstance(last_stat, (bytes, bytearray)) else ''
-									asm = getattr(self.stream, 'asm', None)
-									ts_pairs = getattr(asm, '_ts_pair_count', 0) if asm else 0
-									neigh = getattr(asm, '_seq_neighbor_pairs', 0) if asm else 0
-									line = f"{time.time():.6f},{seq_a},{seq_b},{len(ch0)},{len(ch1)},{getattr(a,'flags',None)},{getattr(b,'flags',None)},{ts_a if ts_a is not None else ''},{ts_b if ts_b is not None else ''},{ts_pairs},{neigh},\"{stat_hex}\"\n"
-									self._capture_diag_fp.write(line)
-									self._capture_diag_fp.flush()
-									self._capture_diag_lines += 1
-								except Exception:
-									pass
-							# close if time or limit exceeded
 							try:
-								if self._capture_diag_fp is not None and ((time.time() - self._capture_diag_started) > float(self.capture_diag_seconds) or self._capture_diag_lines >= int(self.capture_diag_limit)):
+								asm = getattr(self.stream, 'asm', None)
+								if asm is not None:
+									asm_info = f" ts_pairs={getattr(asm, '_ts_pair_count', 0)} seq_neigh_pairs={getattr(asm, '_seq_neighbor_pairs', 0)} q={asm.q.qsize()}"
+							except Exception:
+								asm_info = ''
+							print(
+								f"[PAIR_MISMATCH] count={self._pair_mismatch_count} last seqA={seq_a} seqB={seq_b} "
+								f"lenA={len(ch0)} lenB={len(ch1)} flagsA={getattr(a,'flags',None)} flagsB={getattr(b,'flags',None)}{asm_info}",
+								flush=True,
+							)
+							self._last_pair_mismatch_t = nowp
+						# capture to file if configured
+						try:
+							if getattr(self, 'capture_diag_path', None):
+								if self._capture_diag_fp is None:
+									self._capture_diag_fp = open(self.capture_diag_path, 'a', encoding='utf-8', errors='replace')
+									self._capture_diag_started = time.time()
+									self._capture_diag_lines = 0
+									self._capture_diag_fp.write('#ts_unix,seqA,seqB,lenA,lenB,flagsA,flagsB,tsA,tsB,asm_ts_pairs,asm_seq_neigh_pairs,last_stat_hex\n')
+									self._capture_diag_fp.flush()
+								# write one line per mismatch while capture window open
+								if self._capture_diag_fp is not None and (time.time() - self._capture_diag_started) <= float(self.capture_diag_seconds) and self._capture_diag_lines < int(self.capture_diag_limit):
 									try:
-										self._capture_diag_fp.close()
+										last_stat = getattr(self.stream, 'last_stat', None)
+										stat_hex = last_stat.hex() if isinstance(last_stat, (bytes, bytearray)) else ''
+										asm = getattr(self.stream, 'asm', None)
+										ts_pairs = getattr(asm, '_ts_pair_count', 0) if asm else 0
+										neigh = getattr(asm, '_seq_neighbor_pairs', 0) if asm else 0
+										line = f"{time.time():.6f},{seq_a},{seq_b},{len(ch0)},{len(ch1)},{getattr(a,'flags',None)},{getattr(b,'flags',None)},{ts_a if ts_a is not None else ''},{ts_b if ts_b is not None else ''},{ts_pairs},{neigh},\"{stat_hex}\"\n"
+										self._capture_diag_fp.write(line)
+										self._capture_diag_fp.flush()
+										self._capture_diag_lines += 1
 									except Exception:
 										pass
-									self._capture_diag_fp = None
-							except Exception:
-								pass
+								# close if time or limit exceeded
+								try:
+									if self._capture_diag_fp is not None and ((time.time() - self._capture_diag_started) > float(self.capture_diag_seconds) or self._capture_diag_lines >= int(self.capture_diag_limit)):
+										try:
+											self._capture_diag_fp.close()
+										except Exception:
+											pass
+										self._capture_diag_fp = None
+								except Exception:
+									pass
+						except Exception:
+							pass
+
+				# Лог размеров кадров (опционально)
+				if getattr(self, 'log_frame_len', False) and getattr(self, '_log_frame_len_count', 0) < getattr(self, 'log_frame_len_limit', 0):
+					try:
+						seq_a = getattr(a, 'seq', None) if a is not None else None
+						seq_b = getattr(b, 'seq', None) if b is not None else None
+						len_a = len(ch0) if ch0 is not None else 0
+						len_b = len(ch1) if ch1 is not None else 0
+						print(f"[FRAME_LEN] seqA={seq_a} seqB={seq_b} lenA={len_a} lenB={len_b} flagsA={getattr(a,'flags',None) if a is not None else None} flagsB={getattr(b,'flags',None) if b is not None else None}", flush=True)
+						self._log_frame_len_count += 1
 					except Exception:
 						pass
 
-				# Инициализация base_buf_len при первом кадре (используем доступный канал)
-				if self.base_buf_len is None:
+				# Трассировка содержимого по блокам (каждые 100 семплов) для диагностики мигания хвоста
+				if getattr(self, 'chunk_trace', False) and getattr(self, '_chunk_trace_count', 0) < getattr(self, 'chunk_trace_limit', 0):
+					try:
+						def _chunk_stats(arr, tag):
+							if arr is None or len(arr) == 0:
+								return f"{tag}:None"
+							# группируем по 100 семплов (12 блоков для 1200)
+							chunks = arr.reshape(-1, 100) if len(arr) % 100 == 0 else np.array_split(arr, max(1, len(arr)//100))
+							parts = []
+							for idx, c in enumerate(chunks):
+								try:
+									parts.append(f"{idx*100}:{int(np.min(c))}-{int(np.max(c))}")
+								except Exception:
+									parts.append(f"{idx*100}:err")
+							return f"{tag}=[" + ' '.join(parts) + "]"
+						msg_a = _chunk_stats(ch0, "A") if ch0 is not None else "A:None"
+						msg_b = _chunk_stats(ch1, "B") if ch1 is not None else "B:None"
+						print(f"[CHUNK] {msg_a} {msg_b}", flush=True)
+						self._chunk_trace_count += 1
+					except Exception:
+						pass
+
+				# Мониторинг редких сбоев по конкретному семплу (по умолчанию индекс 300)
+				if getattr(self, 'monitor_sample', False):
+					idx = max(0, int(getattr(self, 'monitor_index', 300)))
+					try:
+						if ch0 is not None and len(ch0) > idx:
+							val = int(ch0[idx])
+							if self._last_mon_a is None:
+								self._last_mon_a = val
+							elif val != self._last_mon_a:
+								print(f"[MON] A idx={idx} changed {self._last_mon_a}->{val} seqA={getattr(a,'seq',None)} lenA={len(ch0)}", flush=True)
+								self._last_mon_a = val
+						if ch1 is not None and len(ch1) > idx:
+							valb = int(ch1[idx])
+							if self._last_mon_b is None:
+								self._last_mon_b = valb
+							elif valb != self._last_mon_b:
+								print(f"[MON] B idx={idx} changed {self._last_mon_b}->{valb} seqB={getattr(b,'seq',None)} lenB={len(ch1)}", flush=True)
+								self._last_mon_b = valb
+					except Exception:
+						pass
+
+				# Инициализация/обновление base_buf_len при первом кадре или смене длины
+				first_len = len(ch0) if ch0 is not None else (len(ch1) if ch1 is not None else None)
+				if first_len is not None:
 					with self.data_lock:
-						first_len = len(ch0) if ch0 is not None else (len(ch1) if ch1 is not None else None)
-						if first_len is not None:
+						if (self.base_buf_len is None) or (self.base_buf_len != first_len):
 							self.base_buf_len = first_len
-						self.base_buf_len_bytes = self.base_buf_len * 2
-						if self.base_buf_len == 1100:
-							self.freq_hz = 200
-						elif self.base_buf_len == 912:
-							self.freq_hz = 300
-						else:
-							self.freq_hz = None
-						print(f"[READER] Initialized: buf_len={self.base_buf_len}, freq={self.freq_hz}Hz", flush=True)
+							self.base_buf_len_bytes = self.base_buf_len * 2
+							self._sliders_initialized = False
+							if getattr(self, 'desired_profile', None) == 1:
+								self.freq_hz = 200
+							elif getattr(self, 'desired_profile', None) == 2:
+								self.freq_hz = 300
+							else:
+								self.freq_hz = None
+							print(f"[READER] Initialized: buf_len={self.base_buf_len}, freq={self.freq_hz}Hz", flush=True)
 				
 				# Копируем данные в shared buffers (поддержка независимых каналов)
 				with self.data_lock:
 					if ch0 is not None:
-						self.data0[:len(ch0)] = ch0
+						# even/odd selection by detected phase bit
+						try:
+							par = _phase_bit(a) if a is not None else 0
+							seqv = int(getattr(a, 'seq', 0)) if a is not None else 0
+						except Exception:
+							par = 0
+							seqv = 0
+						tgt = self.data0_odd if par else self.data0_even
+						tgt[:len(ch0)] = ch0
 						if len(ch0) < self.max_samples:
-							self.data0[len(ch0):] = 0
+							tgt[len(ch0):] = 0
+						if par:
+							self.seq0_odd = seqv
+						else:
+							self.seq0_even = seqv
 					if ch1 is not None:
-						self.data1[:len(ch1)] = ch1
+						try:
+							par = _phase_bit(b) if b is not None else 0
+							seqv = int(getattr(b, 'seq', 0)) if b is not None else 0
+						except Exception:
+							par = 0
+							seqv = 0
+						tgt = self.data1_odd if par else self.data1_even
+						tgt[:len(ch1)] = ch1
 						if len(ch1) < self.max_samples:
-							self.data1[len(ch1):] = 0
+							tgt[len(ch1):] = 0
+						if par:
+							self.seq1_odd = seqv
+						else:
+							self.seq1_even = seqv
+
+					# Phase sync diagnostics: expected even ~= -odd (after DC removal) at lag=0
+					if getattr(self, 'phase_diag', False) and self.base_buf_len is not None:
+						self._phase_diag_frames += 1
+						if self._phase_diag_frames % max(1, int(getattr(self, 'phase_diag_every', 50))) == 0:
+							try:
+								maxlag = max(0, int(getattr(self, 'phase_diag_maxlag', 20)))
+							except Exception:
+								maxlag = 20
+							def _best_lag(even_arr: np.ndarray, odd_arr: np.ndarray):
+								# compare even to inverted odd; return (corr0, best_lag, best_corr)
+								if even_arr.size == 0 or odd_arr.size == 0:
+									return (None, None, None)
+								a0 = even_arr.astype(np.float64)
+								b0 = odd_arr.astype(np.float64)
+								# DC removal
+								a0 = a0 - float(np.mean(a0))
+								b0 = b0 - float(np.mean(b0))
+								na = float(np.linalg.norm(a0)) + 1e-12
+								nb = float(np.linalg.norm(b0)) + 1e-12
+								corr0 = float(np.dot(a0, b0) / (na * nb))
+								# best lag for a0 ~ -b0 (maximize corr with inverted b)
+								best_lag = 0
+								best_corr = float(np.dot(a0, -b0) / (na * nb))
+								if maxlag > 0 and a0.size > (2 * maxlag + 4):
+									for lag in range(-maxlag, maxlag + 1):
+										if lag == 0:
+											continue
+										if lag > 0:
+											a = a0[lag:]
+											b = -b0[:-lag]
+										else:
+											a = a0[:lag]
+											b = -b0[-lag:]
+										nna = float(np.linalg.norm(a)) + 1e-12
+										nnb = float(np.linalg.norm(b)) + 1e-12
+										c = float(np.dot(a, b) / (nna * nnb))
+										if c > best_corr:
+											best_corr = c
+											best_lag = lag
+								return (corr0, best_lag, best_corr)
+							try:
+								n = int(self.base_buf_len)
+								if n > 0:
+									ch0e = self.data0_even[:n]
+									ch0o = self.data0_odd[:n]
+									ch1e = self.data1_even[:n]
+									ch1o = self.data1_odd[:n]
+									c0, lag0, bc0 = _best_lag(ch0e, ch0o)
+									c1, lag1, bc1 = _best_lag(ch1e, ch1o)
+									print(
+										"[PHASE] "
+										f"CH0 se={self.seq0_even} so={self.seq0_odd} corr0={c0:.3f} best_lag={lag0} best_corr={bc0:.3f} | "
+										f"CH1 se={self.seq1_even} so={self.seq1_odd} corr0={c1:.3f} best_lag={lag1} best_corr={bc1:.3f}",
+										flush=True,
+									)
+							except Exception:
+								pass
+					# Отладочные маркеры: линейный рамп по всему буферу [0..65535]
+					if getattr(self, 'debug_markers', False):
+						try:
+							buf_len = len(ch0) if ch0 is not None else (len(ch1) if ch1 is not None else 0)
+							buf_len = min(buf_len, self.max_samples)
+							if buf_len > 0:
+								vals = np.linspace(0, 65535, num=buf_len, dtype=np.int32)
+								self.data0_even[:buf_len] = vals
+								self.data0_odd[:buf_len] = vals
+								self.data1_even[:buf_len] = vals
+								self.data1_odd[:buf_len] = vals
+								if buf_len < self.max_samples:
+									self.data0_even[buf_len:] = 0
+									self.data0_odd[buf_len:] = 0
+									self.data1_even[buf_len:] = 0
+									self.data1_odd[buf_len:] = 0
+								try:
+									idx_min = int(np.argmin(self.data0[:buf_len]))
+									idx_max = int(np.argmax(self.data0[:buf_len]))
+									print(f"[MARK] buf_len={buf_len} min_idx={idx_min} max_idx={idx_max}")
+								except Exception:
+									pass
+						except Exception:
+							pass
 					if self.freq_hz:
 						dt = 1.0 / self.freq_hz
 						# choose available frame to compute timestamps
@@ -598,7 +1029,7 @@ class ScopeWindow:
 					if a is not None and b is not None:
 						if not getattr(self.stream, 'asm', None) or not getattr(self.stream.asm, 'independent', False):
 							if self.last_seq is not None:
-								exp = (self.last_seq + 2) & 0xFFFFFFFF  # seq увеличивается на 2 (A и B каналы)
+								exp = (self.last_seq + 1) & 0xFFFFFFFF  # seq увеличивается на 1 на каждую стерео-пару (A/B имеют одинаковый seq)
 								if a.seq != exp:
 									print(f"[GAP] Expected seq {exp}, got {a.seq} (diff: {a.seq - exp})", flush=True)
 									self.gap_count += 1
@@ -664,20 +1095,14 @@ class ScopeWindow:
 		
 		# Читаем данные из shared buffers с блокировкой (ВСЕГДА, даже если stream=None)
 		with self.data_lock:
-			# Настраиваем слайдеры при первой инициализации (когда base_buf_len установлен reader thread)
-			if self.base_buf_len is not None and not hasattr(self, '_sliders_initialized'):
-				self._sliders_initialized = True
-				self.view_start = 0
-				self.view_len = self.base_buf_len
-				self.slider_start.setEnabled(True)
-				self.slider_len.setEnabled(True)
-				self.slider_len.setMinimum(1)
-				self.slider_len.setMaximum(self.base_buf_len)
-				self.slider_len.setValue(self.view_len)
-				self.slider_start.setMaximum(self.base_buf_len - self.view_len)
-				self.slider_start.setValue(self.view_start)
-				self.lbl_start_value.setText(str(self.view_start))
-				self.lbl_len_value.setText(str(self.view_len))
+			# Всегда держим окно на весь кадр
+			if self.base_buf_len is not None:
+				try:
+					self.slider_start.blockSignals(True)
+					self.slider_len.blockSignals(True)
+				except Exception:
+					pass
+				self._init_sliders(self.base_buf_len)
 			
 			# Используем base_buf_len если установлен, иначе max_samples
 			buf_len = self.base_buf_len if self.base_buf_len is not None else self.max_samples
@@ -821,42 +1246,69 @@ class ScopeWindow:
 		self.view_start = min(self.view_start, max_start)
 		vlen = min(vlen, len(self.data0) - self.view_start)  # не больше доступных данных
 		self.view_len = vlen
-		seg0 = self.data0[self.view_start:self.view_start+vlen]
-		seg1 = self.data1[self.view_start:self.view_start+vlen]
-		# Перевернуть положительную часть: 0 -> 32767, 32767 -> 0
-		# Перевернуть отрицательную часть: -32768 -> 0, 0 -> -32768
-		seg0 = np.where(seg0 >= 0, 32767 - seg0, -32768 - seg0)
-		seg1 = np.where(seg1 >= 0, 32767 - seg1, -32768 - seg1)
+		# even/odd buffers (fallback to legacy names if needed)
+		seg0 = (self.data0_even if hasattr(self, 'data0_even') else self.data0)[self.view_start:self.view_start+vlen]
+		seg1 = (self.data1_even if hasattr(self, 'data1_even') else self.data1)[self.view_start:self.view_start+vlen]
+		seg0b = (self.data0_odd if hasattr(self, 'data0_odd') else np.zeros_like(seg0))[self.view_start:self.view_start+vlen]
+		seg1b = (self.data1_odd if hasattr(self, 'data1_odd') else np.zeros_like(seg1))[self.view_start:self.view_start+vlen]
+		# Инверсию можно включить через BMI30_INVERT=1; для маркеров инверсия не нужна
+		if not getattr(self, 'debug_markers', False) and not getattr(self, 'no_invert', False):
+			# Для беззнаковых данных разворачиваем вокруг середины 32767.5
+			seg0 = 32767.5 - (seg0 - 32767.5)
+			seg1 = 32767.5 - (seg1 - 32767.5)
+			try:
+				seg0b = 32767.5 - (seg0b - 32767.5)
+				seg1b = 32767.5 - (seg1b - 32767.5)
+			except Exception:
+				pass
 		x = np.arange(vlen)
 		# --- режимы отображения ---
 		if self.view_mode == 0:
 			# оба канала
 			if len(seg0) > 0 and (self.show_zero or not np.all(seg0 == 0)):
-				self.curve0.setData(x, seg0)
+				self.curve0_a.setData(x, seg0)
 			else:
-				self.curve0.setData([], [])
+				self.curve0_a.setData([], [])
+			if len(seg0b) > 0 and (self.show_zero or not np.all(seg0b == 0)):
+				self.curve0_b.setData(x, seg0b)
+			else:
+				self.curve0_b.setData([], [])
 			if len(seg1) > 0 and (self.show_zero or not np.all(seg1 == 0)):
-				self.curve1.setData(x, seg1)
+				self.curve1_a.setData(x, seg1)
 			else:
-				self.curve1.setData([], [])
+				self.curve1_a.setData([], [])
+			if len(seg1b) > 0 and (self.show_zero or not np.all(seg1b == 0)):
+				self.curve1_b.setData(x, seg1b)
+			else:
+				self.curve1_b.setData([], [])
 			self.p0.show()
 			self.p1.show()
 		elif self.view_mode == 1:
 			# только канал 1
 			if len(seg0) > 0 and (self.show_zero or not np.all(seg0 == 0)):
-				self.curve0.setData(x, seg0)
+				self.curve0_a.setData(x, seg0)
 			else:
-				self.curve0.setData([], [])
-			self.curve1.setData([], [])
+				self.curve0_a.setData([], [])
+			if len(seg0b) > 0 and (self.show_zero or not np.all(seg0b == 0)):
+				self.curve0_b.setData(x, seg0b)
+			else:
+				self.curve0_b.setData([], [])
+			self.curve1_a.setData([], [])
+			self.curve1_b.setData([], [])
 			self.p0.show()
 			self.p1.hide()
 		elif self.view_mode == 2:
 			# только канал 2
-			self.curve0.setData([], [])
+			self.curve0_a.setData([], [])
+			self.curve0_b.setData([], [])
 			if len(seg1) > 0 and (self.show_zero or not np.all(seg1 == 0)):
-				self.curve1.setData(x, seg1)
+				self.curve1_a.setData(x, seg1)
 			else:
-				self.curve1.setData([], [])
+				self.curve1_a.setData([], [])
+			if len(seg1b) > 0 and (self.show_zero or not np.all(seg1b == 0)):
+				self.curve1_b.setData(x, seg1b)
+			else:
+				self.curve1_b.setData([], [])
 			self.p0.hide()
 			self.p1.show()
 		self.lbl_start_value.setText(str(self.view_start))
@@ -905,6 +1357,57 @@ class ScopeWindow:
 			ax1.tickStrings = _int_ticks
 		except Exception:
 			pass
+
+	def _run_init_sequence(self):
+		"""Выполнить согласованную с разработчиком последовательность команд USB."""
+		if self.stream is None:
+			raise RuntimeError("нет активного stream")
+		try:
+			import time as _t
+		except Exception:
+			pass
+		# STOP
+		try:
+			self.stream.send_cmd(CMD_STOP_STREAM, b"")
+		except Exception as e:
+			print("[initseq] STOP err", e)
+		try:
+			_t.sleep(0.01)
+		except Exception:
+			pass
+		# FULL mode
+		try:
+			self.stream.send_cmd(0x13 if 'CMD_FULL_MODE' not in globals() else CMD_FULL_MODE, b"\x01")
+		except Exception as e:
+			print("[initseq] FULL err", e)
+		# PROFILE
+		try:
+			prof = self.desired_profile if self.desired_profile in (1,2) else 1
+			self.stream.send_cmd(CMD_SET_PROFILE, bytes([prof]))
+		except Exception as e:
+			print("[initseq] PROFILE err", e)
+		# CHMODE both channels
+		try:
+			self.stream.send_cmd(0x19 if 'CMD_CHMODE' not in globals() else CMD_CHMODE, b"\x02")
+		except Exception as e:
+			print("[initseq] CHMODE err", e)
+		# ASYNC (независимые A/B)
+		try:
+			self.stream.send_cmd(0x18 if 'CMD_ASYNC' not in globals() else CMD_ASYNC, b"\x01")
+		except Exception as e:
+			print("[initseq] ASYNC err", e)
+		# BLOCK_HZ (опционально)
+		try:
+			bhz = int(self.block_hz) if getattr(self, 'block_hz', None) else None
+			if bhz and 1 <= bhz <= 1000:
+				self.stream.send_cmd(0x11 if 'CMD_BLOCK_HZ' not in globals() else CMD_BLOCK_HZ, int(bhz).to_bytes(2,'little'))
+		except Exception as e:
+			print("[initseq] BLOCK_HZ err", e)
+		# START
+		try:
+			self.stream.send_cmd(CMD_START_STREAM, b"")
+		except Exception as e:
+			print("[initseq] START err", e)
 
  
 
@@ -968,17 +1471,61 @@ class ScopeWindow:
 		self._last_sample_ts = None
 		self.view_start = 0
 		self.view_len = 0
-		self.slider_start.setEnabled(False)
-		self.slider_len.setEnabled(False)
-		self.slider_start.setMaximum(0)
-		self.slider_len.setMaximum(0)
-		self.slider_len.setValue(0)
-		self.slider_start.setValue(0)
+		self._reset_sliders()
 		if self.num_group.checkedId() == 1:
 			self._set_status("Переподключение…", hold_sec=1.5)
 			self._activate_stream()
 		else:
 			self.legend_lbl.setText("Нажмите 1 для запуска")
+
+	def _reset_sliders(self):
+		"""Вернуть слайдеры в исходное состояние и разрешить повторную инициализацию."""
+		try:
+			self.slider_start.blockSignals(True)
+			self.slider_len.blockSignals(True)
+		except Exception:
+			pass
+		self.slider_start.setEnabled(False)
+		self.slider_len.setEnabled(False)
+		self.slider_start.setMaximum(0)
+		self.slider_len.setMaximum(0)
+		self.slider_start.setValue(0)
+		self.slider_len.setValue(0)
+		self.lbl_start_value.setText("0")
+		self.lbl_len_value.setText("0")
+		self._sliders_initialized = False
+		try:
+			self.slider_start.blockSignals(False)
+			self.slider_len.blockSignals(False)
+		except Exception:
+			pass
+
+	def _init_sliders(self, buf_len: int):
+		"""Настроить слайдеры под актуальную длину буфера."""
+		if buf_len <= 0:
+			return
+		try:
+			self.slider_start.blockSignals(True)
+			self.slider_len.blockSignals(True)
+		except Exception:
+			pass
+		self.view_start = 0
+		self.view_len = buf_len
+		self.slider_start.setEnabled(True)
+		self.slider_len.setEnabled(True)
+		self.slider_len.setMinimum(1)
+		self.slider_len.setMaximum(buf_len)
+		self.slider_len.setValue(buf_len)
+		self.slider_start.setMaximum(max(0, buf_len - self.view_len))
+		self.slider_start.setValue(0)
+		self.lbl_start_value.setText(str(self.view_start))
+		self.lbl_len_value.setText(str(self.view_len))
+		self._sliders_initialized = True
+		try:
+			self.slider_start.blockSignals(False)
+			self.slider_len.blockSignals(False)
+		except Exception:
+			pass
 
 	def _soft_kick_stream(self):
 		"""Мягко переинициализировать параметры и запустить START без STOP, чтобы не ронять интерфейс."""
@@ -1004,15 +1551,15 @@ class ScopeWindow:
 				_t.sleep(0.02)
 			except Exception:
 				pass
-			# размер кадра для ~20 FPS
-			try:
-				from usb_vendor.usb_stream import CMD_SET_FRAME_SAMPLES  # type: ignore
-			except Exception:
-				CMD_SET_FRAME_SAMPLES = 0x17
-			ns = self.ns_map.get(self.desired_profile)
-			if ns:
-				self.stream.send_cmd(CMD_SET_FRAME_SAMPLES, int(ns).to_bytes(2,'little'))
+			# размер кадра (SET_FRAME_SAMPLES) — ТОЛЬКО для профиля 2 и только если явно включено
+			if getattr(self, 'send_ns', False) and int(getattr(self, 'desired_profile', 2) or 2) == 2:
 				try:
+					from usb_vendor.usb_stream import CMD_SET_FRAME_SAMPLES  # type: ignore
+				except Exception:
+					CMD_SET_FRAME_SAMPLES = 0x17
+				ns = self.ns_map.get(self.desired_profile, self.initial_expected)
+				try:
+					self.stream.send_cmd(CMD_SET_FRAME_SAMPLES, int(ns).to_bytes(2,'little'))
 					import time as _t
 					_t.sleep(0.02)
 				except Exception:
@@ -1263,7 +1810,7 @@ class ScopeWindow:
 			self._set_status(f"Power-cycle ошибка: {e}", hold_sec=3.0)
 
 	def _try_connect(self, first=False):
-		if self.num_group.checkedId() != 1:
+		if self.num_group.checkedId() not in (1, 3):
 			return
 		if self._connecting or self.stream is not None:
 			return
@@ -1278,13 +1825,8 @@ class ScopeWindow:
 					_usm.running = True
 			except Exception:
 				pass
-			# Рабочий режим всегда быстрый: profile=2/1 и соответствующий NS
-			fs = self.ns_map.get(self.desired_profile) if self.send_ns else None
-			# Если задан profile=2, но ns_map даёт 15, для рабочего режима используем полный размер 912
-			if self.desired_profile == 2:
-				fs = 912
-			elif self.desired_profile == 1:
-				fs = 1100
+			# frame_samples (SET_FRAME_SAMPLES) безопасен только для профиля 2; профиль 1 не трогаем
+			fs = self.expected_len_map.get(self.desired_profile, self.initial_expected) if (self.send_ns and int(self.desired_profile or 2) == 2) else None
 			# Для 200 Гц некоторые прошивки ожидают явной установки block rate — включим отправку частоты на старте
 			try:
 				os.environ['BMI30_SEND_BLOCK_RATE'] = '1'
@@ -1294,6 +1836,12 @@ class ScopeWindow:
 			self.stream = USBStream(profile=self.desired_profile, full=True, test_as_data=self.test_as_data, frame_samples=fs, fast_mode=True, assembler_independent=self.independent_channels)
 			# Сохраним порт info для power cycle без stream
 			self.last_port_info = self.stream.port_info
+			# Явная конфигурация устройства по согласованной последовательности
+			if self.apply_init_sequence:
+				try:
+					self._run_init_sequence()
+				except Exception as e_init:
+					print(f"[initseq] failed: {e_init}")
 			self._set_status("Устройство подключено, ожидание данных…", hold_sec=1.5)
 			self.connect_t = time.time()
 			self.last_frame_t = 0
@@ -1368,19 +1916,19 @@ class ScopeWindow:
 				_t.sleep(0.1)
 			except Exception:
 				pass
-			# Обновим желаемый размер кадра под новый профиль (для ~20 FPS)
-			try:
-				from usb_vendor.usb_stream import CMD_SET_FRAME_SAMPLES  # type: ignore
-			except Exception:
-				CMD_SET_FRAME_SAMPLES = 0x17
-			# В рабочем режиме задаём полный размер кадра для профиля
-			ns = 912 if self.desired_profile == 2 else 1100
-			self.stream.send_cmd(CMD_SET_FRAME_SAMPLES, int(ns).to_bytes(2,'little'))
-			try:
-				import time as _t
-				_t.sleep(0.1)
-			except Exception:
-				pass
+			# SET_FRAME_SAMPLES — только профиль 2 и только если явно включено
+			if getattr(self, 'send_ns', False) and int(getattr(self, 'desired_profile', 2) or 2) == 2:
+				try:
+					from usb_vendor.usb_stream import CMD_SET_FRAME_SAMPLES  # type: ignore
+				except Exception:
+					CMD_SET_FRAME_SAMPLES = 0x17
+				ns = self.ns_map.get(self.desired_profile, self.initial_expected)
+				try:
+					self.stream.send_cmd(CMD_SET_FRAME_SAMPLES, int(ns).to_bytes(2,'little'))
+					import time as _t
+					_t.sleep(0.1)
+				except Exception:
+					pass
 			# Явно задаём частоту блока под профиль
 			try:
 				if hasattr(self.stream, 'set_block_rate'):
@@ -1397,9 +1945,13 @@ class ScopeWindow:
 			self.base_buf_len = None
 			self.base_buf_len_bytes = None
 			self.freq_hz = None
-			self.max_samples = 912 if self.desired_profile == 2 else 1100
+			self.max_samples = 1200
 			self.data0 = np.zeros(self.max_samples, dtype=np.int16)
 			self.data1 = np.zeros(self.max_samples, dtype=np.int16)
+			self.data0_even = self.data0
+			self.data1_even = self.data1
+			self.data0_odd = np.zeros(self.max_samples, dtype=np.int16)
+			self.data1_odd = np.zeros(self.max_samples, dtype=np.int16)
 			self.timestamps = np.zeros(self.max_samples, dtype=np.float64)
 			self._last_sample_ts = None
 			self.view_len = self.max_samples

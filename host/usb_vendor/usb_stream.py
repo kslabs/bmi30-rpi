@@ -40,9 +40,12 @@ def crc16_ccitt_false(data:bytes, init=0xFFFF):
     return crc
 
 class Frame:
-    __slots__=("seq","timestamp","adc_id","flags","samples","payload")
-    def __init__(self,seq,timestamp,adc_id,flags,samples,payload):
+    __slots__=("seq","timestamp","adc_id","flags","samples","payload","reserved","reserved2","ver")
+    def __init__(self,seq,timestamp,adc_id,flags,samples,payload,reserved=0,reserved2=0,ver=0):
         self.seq=seq; self.timestamp=timestamp; self.adc_id=adc_id; self.flags=flags; self.samples=samples; self.payload=payload
+        self.reserved = reserved
+        self.reserved2 = reserved2
+        self.ver = ver
 
 class StereoAssembler:
     def __init__(self, relaxed: bool | None = None, relaxed_order: bool | None = None, ts_pairing: bool | None = None, ts_tol: float | None = None, independent: bool | None = None):
@@ -576,15 +579,15 @@ class USBStream:
                     self.send_cmd(CMD_SET_FULL_MODE, bytes([1 if self.full else 0])); time.sleep(0.05)
                 except Exception:
                     pass
-                try:
-                    # ⚠️ Профиль 1: прошивка игнорирует SET_FRAME_SAMPLES (ломает передачу)
-                    # Используем только при профиле 2
-                    if int(self.profile or 2) == 2:
-                        ns = int(self.frame_samples) if self.frame_samples is not None else 912
-                        ns = max(1, ns) & 0xFFFF
-                        self.send_cmd(CMD_SET_FRAME_SAMPLES, ns.to_bytes(2,'little')); time.sleep(0.05)
-                except Exception:
-                    pass
+                # Важно: SET_FRAME_SAMPLES (0x17) нельзя слать для профиля 1 — ломает поток.
+                # Для профиля 2 можно слать только если хост явно попросил (frame_samples!=None).
+                if self.frame_samples is not None and int(self.profile or 2) == 2:
+                    try:
+                        ns = max(1, int(self.frame_samples)) & 0xFFFF
+                        self.send_cmd(CMD_SET_FRAME_SAMPLES, ns.to_bytes(2, 'little'))
+                        time.sleep(0.05)
+                    except Exception:
+                        pass
                 # В fast-режиме дополнительно задаём частоту блока (200/300 Гц) перед START
                 try:
                     rate_hz = 200 if int(self.profile or 1) == 1 else 300
@@ -1221,8 +1224,8 @@ class USBStream:
                     self.test_seen += 1
                     if self.test_as_data:
                         try:
-                            fA = Frame(seq, timestamp, 0, flags, total_samples, payload)
-                            fB = Frame(seq, timestamp, 1, flags, total_samples, payload)
+                            fA = Frame(seq, timestamp, 0, flags, total_samples, payload, reserved=reserved, reserved2=reserved2, ver=ver)
+                            fB = Frame(seq, timestamp, 1, flags, total_samples, payload, reserved=reserved, reserved2=reserved2, ver=ver)
                             self.asm.push(fA)
                             self.asm.push(fB)
                             self.frames += 2
@@ -1240,47 +1243,28 @@ class USBStream:
                     # неизвестный флаг — отбрасываем кадр
                     del buf[:frame_total]
                     continue
-                f = Frame(seq,timestamp,adc_id,flags,total_samples,payload)
-                # Автопроверка: если устройство стартовало не с тем размером кадра (профилем), мягко исправим один раз
+                f = Frame(seq,timestamp,adc_id,flags,total_samples,payload,reserved=reserved,reserved2=reserved2,ver=ver)
+                # Автопроверка: если хост явно задал frame_samples (и это профиль 2),
+                # а устройство пошло с другим total_samples — один раз попробуем пере-применить конфиг.
                 try:
-                    if (not self._rate_mismatch_fixed):
-                        # ⚠️ Изменение контракта: оба профиля теперь используют total_samples=912
-                        # Профиль 1 (200 Гц) → 912 семплов (~5 мс)
-                        # Профиль 2 (300 Гц) → 912 семплов (~3 мс)
-                        # (Ожидание было 1360 для профиля 1, но прошивка этого не поддерживает)
-                        if int(getattr(self, 'profile', 0) or 0) == 1 and int(total_samples) == 1360:
-                            # Странный случай: пришёл размер 1360 при профиле 1 → исправим
+                    if (not self._rate_mismatch_fixed) and self.frame_samples is not None and int(getattr(self, 'profile', 2) or 2) == 2:
+                        exp = int(self.frame_samples)
+                        if int(total_samples) != exp:
                             self._rate_mismatch_fixed = True
-                            print('[verify] mismatch: profile=1 got 1360 (unexpected) → reapply 200Hz config')
+                            print(f"[verify] mismatch: expected {exp}, got {total_samples} → reapply config", flush=True)
                             try:
-                                self.send_cmd(CMD_SET_PROFILE, bytes([1])); time.sleep(0.01)
+                                prof = int(getattr(self, 'profile', 2) or 2)
+                                self.send_cmd(CMD_SET_PROFILE, bytes([prof & 0xFF])); time.sleep(0.01)
                             except Exception:
                                 pass
                             try:
-                                self.set_block_rate(200); time.sleep(0.01)
+                                ns = max(1, exp) & 0xFFFF
+                                self.send_cmd(CMD_SET_FRAME_SAMPLES, ns.to_bytes(2, 'little')); time.sleep(0.01)
                             except Exception:
                                 pass
                             try:
-                                self.send_cmd(CMD_START_STREAM, b""); time.sleep(0.02)
-                            except Exception:
-                                pass
-                        elif int(getattr(self, 'profile', 0) or 0) == 2 and int(total_samples) == 1360:
-                            # Должно быть 300 Гц/912, но пришёл размер 1360 — переинициализируем под 300 Гц
-                            self._rate_mismatch_fixed = True
-                            print('[verify] mismatch: profile=2 expects 912, got 1360 → reapply 300Hz config')
-                            try:
-                                self.send_cmd(CMD_SET_PROFILE, bytes([2])); time.sleep(0.01)
-                            except Exception:
-                                pass
-                            try:
-                                # Профиль 2: отправляем NS=912 (но только если это явно требуется)
-                                if self.frame_samples and int(self.frame_samples) != 912:
-                                    ns = 912 & 0xFFFF
-                                    self.send_cmd(CMD_SET_FRAME_SAMPLES, ns.to_bytes(2, 'little')); time.sleep(0.01)
-                            except Exception:
-                                pass
-                            try:
-                                self.set_block_rate(300); time.sleep(0.01)
+                                rate = 200 if int(getattr(self, 'profile', 1) or 1) == 1 else 300
+                                self.set_block_rate(rate); time.sleep(0.01)
                             except Exception:
                                 pass
                             try:
@@ -1343,6 +1327,41 @@ class USBStream:
                 return self.asm.qB.get(timeout=timeout)
         except queue.Empty:
             return None
+
+    def get_buffer_depths(self) -> dict:
+        """Return current queue/buffer depths for diagnostics.
+
+        Returns dict with keys depending on assembler mode:
+         - 'stereo_q' : number of paired A/B frames waiting
+         - 'qA', 'qB' : per-channel queue sizes when independent
+         - 'bufA', 'bufB' : number of unpaired frames buffered by assembler
+        """
+        try:
+            depths = {}
+            asm = getattr(self, 'asm', None)
+            if asm is None:
+                return {'stereo_q': 0}
+            # paired queue
+            try:
+                depths['stereo_q'] = asm.q.qsize() if hasattr(asm, 'q') else 0
+            except Exception:
+                depths['stereo_q'] = 0
+            # independent queues
+            try:
+                if getattr(asm, 'independent', False):
+                    depths['qA'] = asm.qA.qsize() if hasattr(asm, 'qA') else 0
+                    depths['qB'] = asm.qB.qsize() if hasattr(asm, 'qB') else 0
+            except Exception:
+                depths['qA'] = depths.get('qA', 0); depths['qB'] = depths.get('qB', 0)
+            # internal assembler buffers awaiting pairing
+            try:
+                depths['bufA'] = len(getattr(asm, 'bufA', {}))
+                depths['bufB'] = len(getattr(asm, 'bufB', {}))
+            except Exception:
+                depths['bufA'] = depths.get('bufA', 0); depths['bufB'] = depths.get('bufB', 0)
+            return depths
+        except Exception:
+            return {'stereo_q': 0}
 
     # --- helpers for GUI ---
     def get_port_path_info(self):
