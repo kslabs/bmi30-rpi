@@ -1179,7 +1179,8 @@ class ScopeWindow:
 							self.seq0_even = seqv
 						
 						# Адаптивное обновление DC offset (±1 на каждый семпл каждый кадр)
-						if len(ch0) > 0:
+						# ТОЛЬКО в режиме DC removal (STREAM_MODE=1)
+						if getattr(self, 'dc_removal_enabled', False) and len(ch0) > 0:
 							if par:
 								self._update_dc_offset_adaptive(ch0, self.dc_offset_ch0_odd, len(ch0))
 							else:
@@ -1202,14 +1203,15 @@ class ScopeWindow:
 							self.seq1_even = seqv
 						
 						# Адаптивное обновление DC offset
-						if len(ch1) > 0:
+						# ТОЛЬКО в режиме DC removal (STREAM_MODE=1)
+						if getattr(self, 'dc_removal_enabled', False) and len(ch1) > 0:
 							if par:
 								self._update_dc_offset_adaptive(ch1, self.dc_offset_ch1_odd, len(ch1))
 							else:
 								self._update_dc_offset_adaptive(ch1, self.dc_offset_ch1_even, len(ch1))
 					
-					# Сохранять DC offset в файл каждые 10 минут
-					if current_time - self.dc_last_save >= self.dc_save_interval:
+					# Сохранять DC offset в файл каждые 10 минут (только если режим активен)
+					if getattr(self, 'dc_removal_enabled', False) and (current_time - self.dc_last_save >= self.dc_save_interval):
 						self._save_dc_offset()
 						self.dc_last_save = current_time
 
