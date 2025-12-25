@@ -644,12 +644,19 @@ class ScopeWindow:
 	def _num_clicked(self, idx: int):
 		if idx in (1, 2, 3):
 			mode_map = {1: 1, 2: 2, 3: 0}  # 1: канал 1, 2: канал 2, 3: оба
-			# Переключить в режим LATEST (600 семплов, STREAM_MODE=0) если поток уже запущен
+			# Если поток не запущен - запустить его
+			if self.stream is None and not self._connecting:
+				self._activate_stream()
+				# Дать время на инициализацию
+				try:
+					import time as _t
+					_t.sleep(0.5)
+				except Exception:
+					pass
+			# Переключить в режим LATEST (600 семплов, STREAM_MODE=0)
 			if self.stream is not None:
 				self._switch_to_latest_mode()
 			self._set_view_mode(mode_map[idx])
-			if self.stream is None and not self._connecting:
-				self._activate_stream()
 		elif idx == 4:
 			# Кнопка 4: переключение в LOSSLESS_ROI режим (STREAM_MODE=1), показ 2 каналов × 2 осциллограммы × 200 семплов
 			self._switch_to_lossless_roi()
