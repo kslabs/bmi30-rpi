@@ -41,6 +41,7 @@ htmlcov/
 .Thumbs.db
 *.log
 *.tmp
+*.tmp.npz
 
 # Temporary files
 .git_temp/
@@ -64,3 +65,7 @@ test_output.txt
 .env
 secrets.json
 config.local.json
+
+# Runtime state (GUI)
+host/bmi30_sel.json
+host/dc_offset_samples*.npz

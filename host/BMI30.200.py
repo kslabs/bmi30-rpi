@@ -223,14 +223,35 @@ class ScopeWindow:
 		
 		# DC offset removal: адаптивная коррекция DC по каждому семплу (накопление при STREAM_MODE=1)
 		self.dc_removal_enabled = False  # Флаг: применять ли DC removal (вычитание)
+		# Усреднение осциллограмм (последние N кадров) поверх DC removal
+		self.avg20_enabled = False
+		self.avg20_nframes = 20
+		# Кольцевые буферы усреднения: 2 канала × even/odd
+		self._avg0_even = np.zeros((self.avg20_nframes, self.max_samples), dtype=np.float32)
+		self._avg0_odd = np.zeros((self.avg20_nframes, self.max_samples), dtype=np.float32)
+		self._avg1_even = np.zeros((self.avg20_nframes, self.max_samples), dtype=np.float32)
+		self._avg1_odd = np.zeros((self.avg20_nframes, self.max_samples), dtype=np.float32)
+		self._avg0_even_pos = 0
+		self._avg0_odd_pos = 0
+		self._avg1_even_pos = 0
+		self._avg1_odd_pos = 0
+		self._avg0_even_cnt = 0
+		self._avg0_odd_cnt = 0
+		self._avg1_even_cnt = 0
+		self._avg1_odd_cnt = 0
 		# Массивы DC offset для каждого семпла (инициализируем нулями, будут обновляться адаптивно)
 		self.dc_offset_ch0_even = np.zeros(self.max_samples, dtype=np.float32)
 		self.dc_offset_ch0_odd = np.zeros(self.max_samples, dtype=np.float32)
 		self.dc_offset_ch1_even = np.zeros(self.max_samples, dtype=np.float32)
 		self.dc_offset_ch1_odd = np.zeros(self.max_samples, dtype=np.float32)
 		self.dc_last_save = time.time()  # Время последнего сохранения DC offset в файл
-		self.dc_save_interval = 600  # Интервал сохранения: 600 секунд (10 минут)
-		self.dc_save_file = os.path.join(os.path.dirname(__file__), 'dc_offset_samples.npz')
+		try:
+			self.dc_save_interval = float(os.getenv('BMI30_DC_SAVE_INTERVAL', '600'))
+		except Exception:
+			self.dc_save_interval = 600.0
+		# Основной файл (по умолчанию рядом со скриптом), можно переопределить через BMI30_DC_FILE
+		self.dc_save_file = os.getenv('BMI30_DC_FILE', os.path.join(os.path.dirname(__file__), 'dc_offset_samples.npz'))
+		self.dc_save_file_bak = self.dc_save_file + '.bak'
 		self.dc_update_step = 1.0  # Шаг адаптивной коррекции: ±1 единица на кадр
 		# Загрузить сохраненные DC offset массивы при старте
 		self._load_dc_offset()
@@ -561,6 +582,12 @@ class ScopeWindow:
 		"""Возврат в режим LATEST (STREAM_MODE=0): 600 семплов, допускаются пропуски"""
 		if self.stream is None:
 			return
+		# Если уходим из LOSSLESS_ROI, постараемся сохранить DC offset сразу (на выходе/перезапусках это критично)
+		try:
+			if getattr(self, 'stream_mode', 0) == 1:
+				self._save_dc_offset(force=True)
+		except Exception:
+			pass
 		
 		try:
 			# Отключаем DC removal если был включен
@@ -702,14 +729,60 @@ class ScopeWindow:
 
 	def _switch_to_dc_removal_mode(self):
 		"""Переключение в режим LOSSLESS_ROI с удалением постоянной составляющей (DC removal)"""
-		# Сначала переключаемся в LOSSLESS_ROI режим (stream_mode=1 устанавливается там)
-		self._switch_to_lossless_roi()
+		# Если уже в LOSSLESS_ROI (STREAM_MODE=1), не перезапускаем поток/окна — просто включаем отображение.
+		# Это важно, чтобы не создавать ощущения "сброса" DC при переключениях 5↔6.
+		if getattr(self, 'stream_mode', 0) != 1 or self.stream is None:
+			# Сначала переключаемся в LOSSLESS_ROI режим (stream_mode=1 устанавливается там)
+			self._switch_to_lossless_roi()
 		
 		# Включаем режим удаления DC (отображение скорректированных данных)
 		self.dc_removal_enabled = True
+		# AVG режимы управляются отдельно; здесь не трогаем
 		
 		self._set_status("DC Removal: вычитание постоянной составляющей, уровень = 32767", hold_sec=3.0)
 		print("[DC_REMOVAL] Режим активирован: отображение скорректированных данных без DC")
+
+	def _seed_avg20_buffers_locked(self):
+		"""Заполнить буферы AVG20 текущим кадром, чтобы при включении 6 не было 'разгона с нуля'.
+		Ожидает, что data_lock уже удерживается.
+		"""
+		try:
+			n = int(self.base_buf_len or 0)
+			n = max(0, min(n, int(getattr(self, 'max_samples', 0) or 0)))
+			if n <= 0:
+				# сброс счётчиков, данные придут и сами заполнится
+				self._avg0_even_pos = self._avg0_odd_pos = 0
+				self._avg1_even_pos = self._avg1_odd_pos = 0
+				self._avg0_even_cnt = self._avg0_odd_cnt = 0
+				self._avg1_even_cnt = self._avg1_odd_cnt = 0
+				return
+			def _dc_out(raw_i32, dc_f32):
+				out = raw_i32.astype(np.float32) - dc_f32.astype(np.float32) + np.float32(32767.0)
+				if not getattr(self, 'debug_markers', False) and not getattr(self, 'no_invert', False):
+					out = np.float32(32767.5) - (out - np.float32(32767.5))
+				return out
+			# Сформируем 4 кривые
+			ch0e = _dc_out(self.data0_even[:n], self.dc_offset_ch0_even[:n])
+			ch0o = _dc_out(self.data0_odd[:n], self.dc_offset_ch0_odd[:n])
+			ch1e = _dc_out(self.data1_even[:n], self.dc_offset_ch1_even[:n])
+			ch1o = _dc_out(self.data1_odd[:n], self.dc_offset_ch1_odd[:n])
+			# Заполним все N кадров одним и тем же значением
+			for i in range(int(self.avg20_nframes)):
+				self._avg0_even[i, :n] = ch0e
+				self._avg0_odd[i, :n] = ch0o
+				self._avg1_even[i, :n] = ch1e
+				self._avg1_odd[i, :n] = ch1o
+				if n < self.max_samples:
+					self._avg0_even[i, n:] = 0
+					self._avg0_odd[i, n:] = 0
+					self._avg1_even[i, n:] = 0
+					self._avg1_odd[i, n:] = 0
+			self._avg0_even_pos = self._avg0_odd_pos = 0
+			self._avg1_even_pos = self._avg1_odd_pos = 0
+			self._avg0_even_cnt = self._avg0_odd_cnt = int(self.avg20_nframes)
+			self._avg1_even_cnt = self._avg1_odd_cnt = int(self.avg20_nframes)
+		except Exception as e:
+			print(f"[AVG20] seed ошибка: {e}")
 	
 	def _update_dc_offset_adaptive(self, data_arr, dc_arr, length):
 		"""Адаптивное обновление DC offset: для каждого семпла корректировка на ±1"""
@@ -723,24 +796,62 @@ class ScopeWindow:
 		except Exception as e:
 			print(f"[DC_REMOVAL] Ошибка адаптивного обновления DC: {e}")
 	
-	def _save_dc_offset(self):
-		"""Сохранить текущие DC offset массивы в файл"""
+	def _save_dc_offset(self, force: bool = False):
+		"""Сохранить текущие DC offset массивы в файл.
+		Надёжно: атомарная запись + backup, чтобы при обрыве питания не получался битый .npz.
+		"""
 		try:
-			# Сохраняем массивы в numpy формате (npz)
-			np.savez_compressed(
-				self.dc_save_file,
-				dc_offset_ch0_even=self.dc_offset_ch0_even,
-				dc_offset_ch0_odd=self.dc_offset_ch0_odd,
-				dc_offset_ch1_even=self.dc_offset_ch1_even,
-				dc_offset_ch1_odd=self.dc_offset_ch1_odd,
-				timestamp=np.array([time.time()])
-			)
+			# Подготовим данные под запись (копии — чтобы не держать data_lock/не читать мутирующие массивы)
+			snap = {
+				'dc_offset_ch0_even': np.array(self.dc_offset_ch0_even, dtype=np.float32, copy=True),
+				'dc_offset_ch0_odd': np.array(self.dc_offset_ch0_odd, dtype=np.float32, copy=True),
+				'dc_offset_ch1_even': np.array(self.dc_offset_ch1_even, dtype=np.float32, copy=True),
+				'dc_offset_ch1_odd': np.array(self.dc_offset_ch1_odd, dtype=np.float32, copy=True),
+				'timestamp': np.array([time.time()], dtype=np.float64),
+				'max_samples': np.array([int(getattr(self, 'max_samples', 0) or 0)], dtype=np.int32),
+				'stream_mode': np.array([int(getattr(self, 'stream_mode', 0) or 0)], dtype=np.int32),
+			}
+			# Пишем во временный файл и атомарно подменяем основной
+			base_dir = os.path.dirname(self.dc_save_file) or '.'
+			try:
+				os.makedirs(base_dir, exist_ok=True)
+			except Exception:
+				pass
+			# Важно: numpy добавляет расширение .npz автоматически, если его нет.
+			# Поэтому временный файл ДОЛЖЕН заканчиваться на .npz, иначе получится "...tmp.npz",
+			# а os.replace() будет пытаться заменить несуществующий путь.
+			if str(self.dc_save_file).lower().endswith('.npz'):
+				tmp_path = self.dc_save_file[:-4] + '.tmp.npz'
+			else:
+				tmp_path = self.dc_save_file + '.tmp.npz'
+			try:
+				if os.path.exists(tmp_path):
+					os.remove(tmp_path)
+			except Exception:
+				pass
+			np.savez_compressed(tmp_path, **snap)
+			# Сохраним предыдущую версию как .bak (если есть)
+			try:
+				if os.path.exists(self.dc_save_file):
+					os.replace(self.dc_save_file, self.dc_save_file_bak)
+			except Exception:
+				pass
+			os.replace(tmp_path, self.dc_save_file)
+			# best-effort fsync каталога (не везде поддерживается)
+			try:
+				fd = os.open(base_dir, os.O_DIRECTORY)
+				try:
+					os.fsync(fd)
+				finally:
+					os.close(fd)
+			except Exception:
+				pass
 			# Вычисляем средние значения для логирования
 			mean_ch0_even = np.mean(self.dc_offset_ch0_even[:200]) if len(self.dc_offset_ch0_even) >= 200 else 0
 			mean_ch0_odd = np.mean(self.dc_offset_ch0_odd[:200]) if len(self.dc_offset_ch0_odd) >= 200 else 0
 			mean_ch1_even = np.mean(self.dc_offset_ch1_even[:200]) if len(self.dc_offset_ch1_even) >= 200 else 0
 			mean_ch1_odd = np.mean(self.dc_offset_ch1_odd[:200]) if len(self.dc_offset_ch1_odd) >= 200 else 0
-			print(f"[DC_REMOVAL] DC offset массивы сохранены в {self.dc_save_file}")
+			print(f"[DC_REMOVAL] DC offset массивы сохранены в {self.dc_save_file} (bak={self.dc_save_file_bak})")
 			print(f"[DC_REMOVAL] Средние значения (первые 200 семплов): ch0_even={mean_ch0_even:.1f}, ch0_odd={mean_ch0_odd:.1f}, ch1_even={mean_ch1_even:.1f}, ch1_odd={mean_ch1_odd:.1f}")
 		except Exception as e:
 			print(f"[DC_REMOVAL] Ошибка сохранения DC offset: {e}")
@@ -748,40 +859,76 @@ class ScopeWindow:
 	def _load_dc_offset(self):
 		"""Загрузить сохраненные DC offset массивы из файла"""
 		try:
-			if os.path.exists(self.dc_save_file):
-				data = np.load(self.dc_save_file)
-				# Загружаем массивы, при необходимости расширяем или обрезаем до max_samples
-				self.dc_offset_ch0_even[:] = 0
-				self.dc_offset_ch0_odd[:] = 0
-				self.dc_offset_ch1_even[:] = 0
-				self.dc_offset_ch1_odd[:] = 0
-				
-				if 'dc_offset_ch0_even' in data:
-					n = min(len(data['dc_offset_ch0_even']), self.max_samples)
-					self.dc_offset_ch0_even[:n] = data['dc_offset_ch0_even'][:n]
-				if 'dc_offset_ch0_odd' in data:
-					n = min(len(data['dc_offset_ch0_odd']), self.max_samples)
-					self.dc_offset_ch0_odd[:n] = data['dc_offset_ch0_odd'][:n]
-				if 'dc_offset_ch1_even' in data:
-					n = min(len(data['dc_offset_ch1_even']), self.max_samples)
-					self.dc_offset_ch1_even[:n] = data['dc_offset_ch1_even'][:n]
-				if 'dc_offset_ch1_odd' in data:
-					n = min(len(data['dc_offset_ch1_odd']), self.max_samples)
-					self.dc_offset_ch1_odd[:n] = data['dc_offset_ch1_odd'][:n]
-				
-				saved_time = float(data['timestamp'][0]) if 'timestamp' in data else 0
-				age_minutes = (time.time() - saved_time) / 60
-				
-				# Вычисляем средние значения для логирования
-				mean_ch0_even = np.mean(self.dc_offset_ch0_even[:200]) if len(self.dc_offset_ch0_even) >= 200 else 0
-				mean_ch0_odd = np.mean(self.dc_offset_ch0_odd[:200]) if len(self.dc_offset_ch0_odd) >= 200 else 0
-				mean_ch1_even = np.mean(self.dc_offset_ch1_even[:200]) if len(self.dc_offset_ch1_even) >= 200 else 0
-				mean_ch1_odd = np.mean(self.dc_offset_ch1_odd[:200]) if len(self.dc_offset_ch1_odd) >= 200 else 0
-				
-				print(f"[DC_REMOVAL] DC offset массивы загружены из файла (возраст: {age_minutes:.1f} мин)")
-				print(f"[DC_REMOVAL] Средние значения (первые 200 семплов): ch0_even={mean_ch0_even:.1f}, ch0_odd={mean_ch0_odd:.1f}, ch1_even={mean_ch1_even:.1f}, ch1_odd={mean_ch1_odd:.1f}")
-			else:
-				print(f"[DC_REMOVAL] Файл DC offset не найден: {self.dc_save_file}, используются нулевые массивы")
+			# кандидаты: основной, backup, и запасной (cwd) на случай запуска из другой папки
+			candidates = []
+			try:
+				candidates.append(self.dc_save_file)
+			except Exception:
+				pass
+			try:
+				candidates.append(self.dc_save_file_bak)
+			except Exception:
+				pass
+			try:
+				cwd_alt = os.path.join(os.getcwd(), os.path.basename(self.dc_save_file))
+				if cwd_alt not in candidates:
+					candidates.append(cwd_alt)
+			except Exception:
+				pass
+			loaded_from = None
+			payload = None
+			last_err = None
+			for path in candidates:
+				try:
+					if not path or not os.path.exists(path):
+						continue
+					with np.load(path, allow_pickle=False) as data:
+						need = ('dc_offset_ch0_even', 'dc_offset_ch0_odd', 'dc_offset_ch1_even', 'dc_offset_ch1_odd')
+						if not all(k in data for k in need):
+							raise ValueError(f"missing keys in {path}")
+						payload = {k: np.array(data[k], dtype=np.float32, copy=True) for k in need}
+						ts = float(np.array(data['timestamp'])[0]) if 'timestamp' in data else 0.0
+						payload['timestamp'] = ts
+					loaded_from = path
+					break
+				except Exception as e:
+					last_err = e
+					continue
+			if payload is None:
+				if last_err is not None:
+					print(f"[DC_REMOVAL] Ошибка загрузки DC offset (candidates={candidates}): {last_err}")
+				else:
+					print(f"[DC_REMOVAL] Файл DC offset не найден (candidates={candidates}), используются нулевые массивы")
+				return
+			# Валидируем размеры и применяем только если всё ок
+			for k in ('dc_offset_ch0_even', 'dc_offset_ch0_odd', 'dc_offset_ch1_even', 'dc_offset_ch1_odd'):
+				arr = payload.get(k)
+				if arr is None or arr.ndim != 1:
+					raise ValueError(f"invalid array {k}")
+			# Применяем (обрезаем/расширяем до max_samples)
+			self.dc_offset_ch0_even[:] = 0
+			self.dc_offset_ch0_odd[:] = 0
+			self.dc_offset_ch1_even[:] = 0
+			self.dc_offset_ch1_odd[:] = 0
+			n = min(len(payload['dc_offset_ch0_even']), self.max_samples)
+			self.dc_offset_ch0_even[:n] = payload['dc_offset_ch0_even'][:n]
+			n = min(len(payload['dc_offset_ch0_odd']), self.max_samples)
+			self.dc_offset_ch0_odd[:n] = payload['dc_offset_ch0_odd'][:n]
+			n = min(len(payload['dc_offset_ch1_even']), self.max_samples)
+			self.dc_offset_ch1_even[:n] = payload['dc_offset_ch1_even'][:n]
+			n = min(len(payload['dc_offset_ch1_odd']), self.max_samples)
+			self.dc_offset_ch1_odd[:n] = payload['dc_offset_ch1_odd'][:n]
+			saved_time = float(payload.get('timestamp', 0.0) or 0.0)
+			age_minutes = (time.time() - saved_time) / 60
+			
+			# Вычисляем средние значения для логирования
+			mean_ch0_even = np.mean(self.dc_offset_ch0_even[:200]) if len(self.dc_offset_ch0_even) >= 200 else 0
+			mean_ch0_odd = np.mean(self.dc_offset_ch0_odd[:200]) if len(self.dc_offset_ch0_odd) >= 200 else 0
+			mean_ch1_even = np.mean(self.dc_offset_ch1_even[:200]) if len(self.dc_offset_ch1_even) >= 200 else 0
+			mean_ch1_odd = np.mean(self.dc_offset_ch1_odd[:200]) if len(self.dc_offset_ch1_odd) >= 200 else 0
+			
+			print(f"[DC_REMOVAL] DC offset массивы загружены из {loaded_from} (возраст: {age_minutes:.1f} мин)")
+			print(f"[DC_REMOVAL] Средние значения (первые 200 семплов): ch0_even={mean_ch0_even:.1f}, ch0_odd={mean_ch0_odd:.1f}, ch1_even={mean_ch1_even:.1f}, ch1_odd={mean_ch1_odd:.1f}")
 		except Exception as e:
 			print(f"[DC_REMOVAL] Ошибка загрузки DC offset: {e}")
 
@@ -801,16 +948,31 @@ class ScopeWindow:
 			# Переключить в режим LATEST (600 семплов, STREAM_MODE=0)
 			if self.stream is not None:
 				self._switch_to_latest_mode()
-			# Выключить режим DC removal
+			# Выключить режим DC removal / AVG
 			self.dc_removal_enabled = False
+			self.avg20_enabled = False
 			self._set_view_mode(mode_map[idx])
 		elif idx == 4:
 			# Кнопка 4: переключение в LOSSLESS_ROI режим (STREAM_MODE=1), показ 2 каналов × 2 осциллограммы × 200 семплов
 			self.dc_removal_enabled = False  # Выключить DC removal
+			self.avg20_enabled = False
 			self._switch_to_lossless_roi()
 		elif idx == 5:
 			# Кнопка 5: переключение в LOSSLESS_ROI режим с удалением постоянной составляющей (DC removal)
+			# Не перезапускаем LOSSLESS_ROI, если уже там — только переключаем отображение.
 			self._switch_to_dc_removal_mode()
+			self.avg20_enabled = False
+		elif idx == 6:
+			# Кнопка 6: как кнопка 5, но усреднение последних 20 кадров по каждому семплу
+			self._switch_to_dc_removal_mode()
+			was = bool(getattr(self, 'avg20_enabled', False))
+			with self.data_lock:
+				self.avg20_enabled = True
+				# Чтобы при первом включении не было "разгона" от нулей (это выглядит как повторная подстройка DC),
+				# засеем усреднение текущим кадром.
+				if not was:
+					self._seed_avg20_buffers_locked()
+			self._set_status("AVG20 DC Removal: среднее по 20 кадрам, 2 канала × 2 осциллограммы × 200 семплов", hold_sec=3.0)
 		elif self.stream is not None and idx not in (1, 2, 3, 4, 5):
 			try:
 				self.stream.close()
@@ -1193,6 +1355,31 @@ class ScopeWindow:
 								self._update_dc_offset_adaptive(ch0, self.dc_offset_ch0_odd, len(ch0))
 							else:
 								self._update_dc_offset_adaptive(ch0, self.dc_offset_ch0_even, len(ch0))
+							# AVG20: копим уже DC-скорректированные значения для отображения
+							if getattr(self, 'avg20_enabled', False):
+								try:
+									if par:
+										dc_view = self.dc_offset_ch0_odd[:len(ch0)]
+										out = ch0.astype(np.float32) - dc_view.astype(np.float32) + np.float32(32767.0)
+										if not getattr(self, 'debug_markers', False) and not getattr(self, 'no_invert', False):
+											out = np.float32(32767.5) - (out - np.float32(32767.5))
+										self._avg0_odd[self._avg0_odd_pos, :len(out)] = out
+										if len(out) < self.max_samples:
+											self._avg0_odd[self._avg0_odd_pos, len(out):] = 0
+										self._avg0_odd_pos = (self._avg0_odd_pos + 1) % self.avg20_nframes
+										self._avg0_odd_cnt = min(self.avg20_nframes, self._avg0_odd_cnt + 1)
+									else:
+										dc_view = self.dc_offset_ch0_even[:len(ch0)]
+										out = ch0.astype(np.float32) - dc_view.astype(np.float32) + np.float32(32767.0)
+										if not getattr(self, 'debug_markers', False) and not getattr(self, 'no_invert', False):
+											out = np.float32(32767.5) - (out - np.float32(32767.5))
+										self._avg0_even[self._avg0_even_pos, :len(out)] = out
+										if len(out) < self.max_samples:
+											self._avg0_even[self._avg0_even_pos, len(out):] = 0
+										self._avg0_even_pos = (self._avg0_even_pos + 1) % self.avg20_nframes
+										self._avg0_even_cnt = min(self.avg20_nframes, self._avg0_even_cnt + 1)
+								except Exception as e:
+									print(f"[AVG20] ch0 накопление ошибка: {e}")
 					
 					if ch1 is not None:
 						try:
@@ -1217,6 +1404,31 @@ class ScopeWindow:
 								self._update_dc_offset_adaptive(ch1, self.dc_offset_ch1_odd, len(ch1))
 							else:
 								self._update_dc_offset_adaptive(ch1, self.dc_offset_ch1_even, len(ch1))
+							# AVG20: копим уже DC-скорректированные значения для отображения
+							if getattr(self, 'avg20_enabled', False):
+								try:
+									if par:
+										dc_view = self.dc_offset_ch1_odd[:len(ch1)]
+										out = ch1.astype(np.float32) - dc_view.astype(np.float32) + np.float32(32767.0)
+										if not getattr(self, 'debug_markers', False) and not getattr(self, 'no_invert', False):
+											out = np.float32(32767.5) - (out - np.float32(32767.5))
+										self._avg1_odd[self._avg1_odd_pos, :len(out)] = out
+										if len(out) < self.max_samples:
+											self._avg1_odd[self._avg1_odd_pos, len(out):] = 0
+										self._avg1_odd_pos = (self._avg1_odd_pos + 1) % self.avg20_nframes
+										self._avg1_odd_cnt = min(self.avg20_nframes, self._avg1_odd_cnt + 1)
+									else:
+										dc_view = self.dc_offset_ch1_even[:len(ch1)]
+										out = ch1.astype(np.float32) - dc_view.astype(np.float32) + np.float32(32767.0)
+										if not getattr(self, 'debug_markers', False) and not getattr(self, 'no_invert', False):
+											out = np.float32(32767.5) - (out - np.float32(32767.5))
+										self._avg1_even[self._avg1_even_pos, :len(out)] = out
+										if len(out) < self.max_samples:
+											self._avg1_even[self._avg1_even_pos, len(out):] = 0
+										self._avg1_even_pos = (self._avg1_even_pos + 1) % self.avg20_nframes
+										self._avg1_even_cnt = min(self.avg20_nframes, self._avg1_even_cnt + 1)
+								except Exception as e:
+									print(f"[AVG20] ch1 накопление ошибка: {e}")
 					
 					# Сохранять DC offset в файл каждые 10 минут (при STREAM_MODE=1)
 					if getattr(self, 'stream_mode', 0) == 1 and (current_time - self.dc_last_save >= self.dc_save_interval):
@@ -1544,7 +1756,7 @@ class ScopeWindow:
 		seg1b = (self.data1_odd if hasattr(self, 'data1_odd') else np.zeros_like(seg1))[self.view_start:self.view_start+vlen]
 		
 		# DC removal: вычитание постоянной составляющей и сдвиг на 32767
-		if getattr(self, 'dc_removal_enabled', False):
+		if getattr(self, 'dc_removal_enabled', False) and not getattr(self, 'avg20_enabled', False):
 			try:
 				# Применяем DC removal поэлементно: data - DC_offset[view] + 32767
 				dc0_even_view = self.dc_offset_ch0_even[self.view_start:self.view_start+vlen]
@@ -1559,8 +1771,24 @@ class ScopeWindow:
 			except Exception as e:
 				print(f"[DC_REMOVAL] Ошибка применения DC removal: {e}")
 		
+		# AVG20: вместо текущего кадра показываем среднее по последним N кадрам (уже DC-скорректированные значения)
+		if getattr(self, 'avg20_enabled', False):
+			try:
+				# Берём только реально накопленные кадры, чтобы первые секунды не усреднялись с нулями
+				cnt0e = int(getattr(self, '_avg0_even_cnt', 0))
+				cnt0o = int(getattr(self, '_avg0_odd_cnt', 0))
+				cnt1e = int(getattr(self, '_avg1_even_cnt', 0))
+				cnt1o = int(getattr(self, '_avg1_odd_cnt', 0))
+				seg0 = (np.mean(self._avg0_even[:cnt0e, self.view_start:self.view_start+vlen], axis=0) if cnt0e > 0 else np.zeros(vlen, dtype=np.float32))
+				seg0b = (np.mean(self._avg0_odd[:cnt0o, self.view_start:self.view_start+vlen], axis=0) if cnt0o > 0 else np.zeros(vlen, dtype=np.float32))
+				seg1 = (np.mean(self._avg1_even[:cnt1e, self.view_start:self.view_start+vlen], axis=0) if cnt1e > 0 else np.zeros(vlen, dtype=np.float32))
+				seg1b = (np.mean(self._avg1_odd[:cnt1o, self.view_start:self.view_start+vlen], axis=0) if cnt1o > 0 else np.zeros(vlen, dtype=np.float32))
+			except Exception as e:
+				print(f"[AVG20] Ошибка вычисления среднего: {e}")
+				# fallback на текущие данные
+				pass
 		# Инверсию можно включить через BMI30_INVERT=1; для маркеров инверсия не нужна
-		if not getattr(self, 'debug_markers', False) and not getattr(self, 'no_invert', False):
+		if not getattr(self, 'avg20_enabled', False) and not getattr(self, 'debug_markers', False) and not getattr(self, 'no_invert', False):
 			# Для беззнаковых данных разворачиваем вокруг середины 32767.5
 			seg0 = 32767.5 - (seg0 - 32767.5)
 			seg1 = 32767.5 - (seg1 - 32767.5)
@@ -2286,6 +2514,11 @@ class ScopeWindow:
 
 	def _on_close(self, ev):
 		try:
+			# Перед выходом сохраним DC offset (best-effort)
+			try:
+				self._save_dc_offset(force=True)
+			except Exception:
+				pass
 			self.stream.close()
 		except Exception:
 			pass
