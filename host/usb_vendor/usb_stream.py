@@ -14,6 +14,9 @@ CMD_START_STREAM  = 0x20
 CMD_STOP_STREAM   = 0x21
 CMD_GET_STATUS    = 0x30
 CMD_SET_FRAME_SAMPLES = 0x17
+CMD_ASYNC         = 0x18  # 0=strict pairs A/B, 1=independent A/B
+CMD_SET_WINDOWS    = 0x10  # payload: <HHHH> start0,len0,start1,len1
+CMD_SET_STREAM_MODE = 0x1A  # payload: <B> 0=LATEST(600), 1=LOSSLESS_ROI(200)
 CMD_SET_ALT       = 0x31  # optional vendor EP0 control OUT to set alt
 CMD_SOFT_RESET   = 0x7E  # EP0 vendor control OUT, no data
 CMD_DEEP_RESET   = 0x7F  # EP0 vendor control OUT, no data
@@ -51,7 +54,18 @@ class StereoAssembler:
     def __init__(self, relaxed: bool | None = None, relaxed_order: bool | None = None, ts_pairing: bool | None = None, ts_tol: float | None = None, independent: bool | None = None):
         self.bufA = {}
         self.bufB = {}
-        self.q = queue.Queue(maxsize=256)
+        # Очереди по умолчанию были маленькие (256) и при переполнении silently-drop'али пары.
+        # Это может выглядеть как GAP на хосте даже при идеальном USB. Делаем размер настраиваемым и считаем потери.
+        def _int_env(name: str, dflt: int) -> int:
+            try:
+                v = int(os.getenv(name, str(dflt)))
+                return max(1, v)
+            except Exception:
+                return dflt
+        self.q = queue.Queue(maxsize=_int_env('BMI30_ASM_Q_MAX', 2048))
+        self.drop_pairs = 0
+        self.drop_a = 0
+        self.drop_b = 0
         # Relaxed mode: allow pairing with seq+1/seq-1 if exact seq not present
         # If param is None, respect environment variables (backwards compatibility)
         try:
@@ -100,23 +114,39 @@ class StereoAssembler:
             self.independent = False
         if self.independent:
             # queues for each channel (A=0,B=1)
-            self.qA = queue.Queue(maxsize=256)
-            self.qB = queue.Queue(maxsize=256)
+            self.qA = queue.Queue(maxsize=_int_env('BMI30_ASM_QA_MAX', 2048))
+            self.qB = queue.Queue(maxsize=_int_env('BMI30_ASM_QB_MAX', 2048))
     def _emit_pair(self, a: 'Frame', b: 'Frame'):
         try:
-            self.q.put((a, b))
+            self.q.put_nowait((a, b))
         except Exception:
-            pass
+            # queue.Full или другое: попробуем вытеснить один старый элемент и вставить новый
+            try:
+                self.drop_pairs += 1
+                _ = self.q.get_nowait()
+                self.q.put_nowait((a, b))
+            except Exception:
+                pass
     def _emit_frame_a(self, a: 'Frame'):
         try:
-            self.qA.put(a)
+            self.qA.put_nowait(a)
         except Exception:
-            pass
+            try:
+                self.drop_a += 1
+                _ = self.qA.get_nowait()
+                self.qA.put_nowait(a)
+            except Exception:
+                pass
     def _emit_frame_b(self, b: 'Frame'):
         try:
-            self.qB.put(b)
+            self.qB.put_nowait(b)
         except Exception:
-            pass
+            try:
+                self.drop_b += 1
+                _ = self.qB.get_nowait()
+                self.qB.put_nowait(b)
+            except Exception:
+                pass
     def push(self,f:Frame):
         # independent mode: just enqueue frames per-channel
         if self.independent:
@@ -631,6 +661,69 @@ class USBStream:
         self.frames = 0; self.bytes = 0; self.crc_bad = 0; self.magic_bad = 0
         self.test_seen = 0
         self.last_stat = None
+        # Track per-channel RX sequence continuity (adc_id=0/1).
+        # This matches the user's definition of "no losses": each channel independently.
+        self.seq_last_ch0: int | None = None
+        self.seq_last_ch1: int | None = None
+        self.seq_gap_ch0: int = 0
+        self.seq_gap_ch1: int = 0
+        self.seq_dup_ch0: int = 0
+        self.seq_dup_ch1: int = 0
+        self.seq_reset_ch0: int = 0
+        self.seq_reset_ch1: int = 0
+        # Per-channel timestamp continuity (u32 from header)
+        self.ts_last_ch0: int | None = None
+        self.ts_last_ch1: int | None = None
+        self.ts_dup_ch0: int = 0
+        self.ts_dup_ch1: int = 0
+        self.ts_reset_ch0: int = 0
+        self.ts_reset_ch1: int = 0
+        # Timestamp delta histograms collected within each 1s stats interval
+        self._ts_dhist_ch0: dict[int, int] = {}
+        self._ts_dhist_ch1: dict[int, int] = {}
+        self._ts_hist_lock = threading.Lock()
+
+        # Seq delta histograms collected within each 1s stats interval.
+        # Important: seq often increments by STEP=2 per-channel when A/B are interleaved.
+        # We infer STEP from these histograms and estimate gaps based on it.
+        self._seq_dhist_ch0: dict[int, int] = {}
+        self._seq_dhist_ch1: dict[int, int] = {}
+
+        # Warm-up: ignore early unstable intervals when switching modes.
+        try:
+            self.warmup_sec = float(os.getenv('BMI30_WARMUP_SEC', '5'))
+        except Exception:
+            self.warmup_sec = 5.0
+
+        # Timestamp gap detection strictness.
+        # We treat dt=2*step as jitter/batching by default and count gaps only for dt >= 3*step.
+        # Override via env BMI30_TS_GAP_FACTOR (float).
+        try:
+            self.ts_gap_factor = float(os.getenv('BMI30_TS_GAP_FACTOR', '3'))
+        except Exception:
+            self.ts_gap_factor = 3.0
+        self._stats_epoch = time.time()
+        # Cumulative (post-warmup) totals for timestamp-based gaps/loss
+        self._ts_gap_tot_ch0 = 0
+        self._ts_gap_tot_ch1 = 0
+        self._rx_tot_ch0 = 0
+        self._rx_tot_ch1 = 0
+        # Per-channel received frame counters (RX loop)
+        self.rx_cnt_ch0: int = 0
+        self.rx_cnt_ch1: int = 0
+        # snapshots for per-second delta printing
+        self._seq_gap_ch0_0: int = 0
+        self._seq_gap_ch1_0: int = 0
+        self._seq_dup_ch0_0: int = 0
+        self._seq_dup_ch1_0: int = 0
+        self._seq_reset_ch0_0: int = 0
+        self._seq_reset_ch1_0: int = 0
+        self._rx_cnt_ch0_0: int = 0
+        self._rx_cnt_ch1_0: int = 0
+        self._ts_dup_ch0_0: int = 0
+        self._ts_dup_ch1_0: int = 0
+        self._ts_reset_ch0_0: int = 0
+        self._ts_reset_ch1_0: int = 0
         # allow overriding pairing policy via constructor params
         try:
             asm_relaxed = getattr(self, '_asm_relaxed_override', None)
@@ -1276,6 +1369,99 @@ class USBStream:
                 self.asm.push(f)
                 self.frames += 1
                 self.bytes += payload_len
+                # Update per-channel seq continuity counters.
+                try:
+                    s = int(seq) & 0xFFFFFFFF
+                    tsu = int(timestamp) & 0xFFFFFFFF
+                    if int(adc_id) == 0:
+                        self.rx_cnt_ch0 += 1
+                        last = self.seq_last_ch0
+                        if last is None:
+                            self.seq_last_ch0 = s
+                        else:
+                            d = (s - int(last)) & 0xFFFFFFFF
+                            if d == 0:
+                                self.seq_dup_ch0 += 1
+                            elif 0 < d < 0x80000000:
+                                # Collect small deltas to infer nominal seq STEP (often 2).
+                                if 0 < d <= 16:
+                                    try:
+                                        with self._ts_hist_lock:
+                                            dhs = self._seq_dhist_ch0
+                                            dhs[int(d)] = dhs.get(int(d), 0) + 1
+                                    except Exception:
+                                        pass
+                                self.seq_last_ch0 = s
+                            else:
+                                self.seq_reset_ch0 += 1
+                                self.seq_last_ch0 = s
+
+                        # timestamp continuity for ch0
+                        tlast = self.ts_last_ch0
+                        if tlast is None:
+                            self.ts_last_ch0 = tsu
+                        else:
+                            dt = (tsu - int(tlast)) & 0xFFFFFFFF
+                            if dt == 0:
+                                self.ts_dup_ch0 += 1
+                            elif 0 < dt < 0x80000000:
+                                # Record only reasonable deltas to infer nominal step (avoid huge outliers)
+                                if 0 < dt <= 10_000_000:
+                                    try:
+                                        with self._ts_hist_lock:
+                                            dh = self._ts_dhist_ch0
+                                            dh[dt] = dh.get(dt, 0) + 1
+                                    except Exception:
+                                        pass
+                                self.ts_last_ch0 = tsu
+                            else:
+                                self.ts_reset_ch0 += 1
+                                self.ts_last_ch0 = tsu
+                    else:
+                        self.rx_cnt_ch1 += 1
+                        last = self.seq_last_ch1
+                        if last is None:
+                            self.seq_last_ch1 = s
+                        else:
+                            d = (s - int(last)) & 0xFFFFFFFF
+                            if d == 0:
+                                self.seq_dup_ch1 += 1
+                            elif 0 < d < 0x80000000:
+                                # Collect small deltas to infer nominal seq STEP (often 2).
+                                if 0 < d <= 16:
+                                    try:
+                                        with self._ts_hist_lock:
+                                            dhs = self._seq_dhist_ch1
+                                            dhs[int(d)] = dhs.get(int(d), 0) + 1
+                                    except Exception:
+                                        pass
+                                self.seq_last_ch1 = s
+                            else:
+                                self.seq_reset_ch1 += 1
+                                self.seq_last_ch1 = s
+
+                        # timestamp continuity for ch1
+                        tlast = self.ts_last_ch1
+                        if tlast is None:
+                            self.ts_last_ch1 = tsu
+                        else:
+                            dt = (tsu - int(tlast)) & 0xFFFFFFFF
+                            if dt == 0:
+                                self.ts_dup_ch1 += 1
+                            elif 0 < dt < 0x80000000:
+                                if 0 < dt <= 10_000_000:
+                                    try:
+                                        with self._ts_hist_lock:
+                                            dh = self._ts_dhist_ch1
+                                            dh[dt] = dh.get(dt, 0) + 1
+                                    except Exception:
+                                        pass
+                                self.ts_last_ch1 = tsu
+                            else:
+                                self.ts_reset_ch1 += 1
+                                self.ts_last_ch1 = tsu
+                except Exception:
+                    pass
                 del buf[:frame_total]
                 self._working_seen = True
             now=time.time()
@@ -1284,30 +1470,264 @@ class USBStream:
                 self._do_fallback_start()
             if now - self.stat_t >= 1.0:
                 with self.lock:
-                    fps = self.frames; bps = self.bytes
+                    frames_n = self.frames
+                    bytes_n = self.bytes
                     try:
+                        dt_stat = float(now - float(self.stat_t))
+                        if dt_stat <= 0:
+                            dt_stat = 1.0
+                    except Exception:
+                        dt_stat = 1.0
+                    try:
+                        fps_hz = float(frames_n) / float(dt_stat)
+                        bps_hz = float(bytes_n) / float(dt_stat)
+                    except Exception:
+                        fps_hz = float(frames_n)
+                        bps_hz = float(bytes_n)
+                    try:
+                        # compute deltas since last stat tick
+                        try:
+                            dd0 = int(self.seq_dup_ch0) - int(getattr(self, '_seq_dup_ch0_0', 0))
+                            dd1 = int(self.seq_dup_ch1) - int(getattr(self, '_seq_dup_ch1_0', 0))
+                            dr0 = int(self.seq_reset_ch0) - int(getattr(self, '_seq_reset_ch0_0', 0))
+                            dr1 = int(self.seq_reset_ch1) - int(getattr(self, '_seq_reset_ch1_0', 0))
+                            rc0 = int(self.rx_cnt_ch0) - int(getattr(self, '_rx_cnt_ch0_0', 0))
+                            rc1 = int(self.rx_cnt_ch1) - int(getattr(self, '_rx_cnt_ch1_0', 0))
+                            td0 = int(self.ts_dup_ch0) - int(getattr(self, '_ts_dup_ch0_0', 0))
+                            td1 = int(self.ts_dup_ch1) - int(getattr(self, '_ts_dup_ch1_0', 0))
+                            tr0 = int(self.ts_reset_ch0) - int(getattr(self, '_ts_reset_ch0_0', 0))
+                            tr1 = int(self.ts_reset_ch1) - int(getattr(self, '_ts_reset_ch1_0', 0))
+                        except Exception:
+                            dd0 = dd1 = dr0 = dr1 = rc0 = rc1 = 0
+                            td0 = td1 = tr0 = tr1 = 0
+
+                        # infer timestamp step and estimate timestamp-based gaps within this interval
+                        def _mode_step(dh: dict[int, int]) -> int | None:
+                            try:
+                                if not dh:
+                                    return None
+                                return max(dh.items(), key=lambda kv: kv[1])[0]
+                            except Exception:
+                                return None
+
+                        def _est_seq_gaps_from_step(dh: dict[int, int], step: int | None) -> int:
+                            """Estimate missing frames based on observed seq deltas.
+
+                            Handles STEP>1 (e.g. per-channel STEP=2 when A/B are interleaved).
+                            """
+                            try:
+                                if not dh or not step or step <= 0:
+                                    return 0
+                                gaps = 0
+                                for d, c in dh.items():
+                                    if c <= 0 or d <= 0:
+                                        continue
+                                    if d <= step:
+                                        continue
+                                    missing = max(0, (int(d) // int(step)) - 1)
+                                    # If delta is not an exact multiple of step, count at least one anomaly.
+                                    if (int(d) % int(step)) != 0:
+                                        missing = max(missing, 1)
+                                    gaps += int(c) * int(missing)
+                                return int(gaps)
+                            except Exception:
+                                return 0
+
+                        def _est_gaps_from_step(dh: dict[int, int], step: int | None) -> int:
+                            try:
+                                if not dh or not step or step <= 0:
+                                    return 0
+                                gaps = 0
+                                st = float(step)
+                                try:
+                                    factor = float(getattr(self, 'ts_gap_factor', 3.0))
+                                except Exception:
+                                    factor = 3.0
+                                if not (factor > 1.0):
+                                    factor = 2.0
+                                for d, c in dh.items():
+                                    if c <= 0 or d <= 0:
+                                        continue
+                                    dt = float(d)
+                                    # Stricter rule: ignore small multiples (e.g., 2*step) as jitter/batching.
+                                    if dt < (factor * st):
+                                        continue
+                                    # Estimate missing ticks conservatively using floor (avoid overcounting jitter).
+                                    k_floor = int(dt // st)
+                                    if k_floor <= 1:
+                                        continue
+                                    gaps += int(c) * int(max(0, k_floor - 1))
+                                return int(gaps)
+                            except Exception:
+                                return 0
+
+                        try:
+                            with self._ts_hist_lock:
+                                dh_ts0 = dict(getattr(self, '_ts_dhist_ch0', {}) or {})
+                                dh_ts1 = dict(getattr(self, '_ts_dhist_ch1', {}) or {})
+                                dh_seq0 = dict(getattr(self, '_seq_dhist_ch0', {}) or {})
+                                dh_seq1 = dict(getattr(self, '_seq_dhist_ch1', {}) or {})
+                                try:
+                                    getattr(self, '_ts_dhist_ch0', {}).clear()
+                                    getattr(self, '_ts_dhist_ch1', {}).clear()
+                                    getattr(self, '_seq_dhist_ch0', {}).clear()
+                                    getattr(self, '_seq_dhist_ch1', {}).clear()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            dh_ts0 = {}
+                            dh_ts1 = {}
+                            dh_seq0 = {}
+                            dh_seq1 = {}
+
+                        ts_step0 = _mode_step(dh_ts0)
+                        ts_step1 = _mode_step(dh_ts1)
+                        ts_gap0 = _est_gaps_from_step(dh_ts0, ts_step0)
+                        ts_gap1 = _est_gaps_from_step(dh_ts1, ts_step1)
+
+                        # infer seq step and estimate seq-based gaps within this interval
+                        seq_step0 = _mode_step(dh_seq0)
+                        seq_step1 = _mode_step(dh_seq1)
+                        dg0 = _est_seq_gaps_from_step(dh_seq0, seq_step0)
+                        dg1 = _est_seq_gaps_from_step(dh_seq1, seq_step1)
+
+                        # Maintain cumulative seq gap counters for compatibility with older consumers.
+                        try:
+                            self.seq_gap_ch0 += int(dg0)
+                            self.seq_gap_ch1 += int(dg1)
+                        except Exception:
+                            pass
+
+                        # compute per-channel loss percentage for this interval
+                        try:
+                            loss0 = (100.0 * float(dg0) / float(dg0 + rc0)) if (dg0 + rc0) > 0 else 0.0
+                            loss1 = (100.0 * float(dg1) / float(dg1 + rc1)) if (dg1 + rc1) > 0 else 0.0
+                        except Exception:
+                            loss0 = loss1 = 0.0
+
+                        try:
+                            tsloss0 = (100.0 * float(ts_gap0) / float(ts_gap0 + rc0)) if (ts_gap0 + rc0) > 0 else 0.0
+                            tsloss1 = (100.0 * float(ts_gap1) / float(ts_gap1 + rc1)) if (ts_gap1 + rc1) > 0 else 0.0
+                        except Exception:
+                            tsloss0 = tsloss1 = 0.0
+
+                        # cumulative post-warmup
+                        try:
+                            warm = (now - float(getattr(self, '_stats_epoch', now))) < float(getattr(self, 'warmup_sec', 5.0))
+                        except Exception:
+                            warm = False
+                        if not warm:
+                            try:
+                                self._ts_gap_tot_ch0 += int(ts_gap0)
+                                self._ts_gap_tot_ch1 += int(ts_gap1)
+                                self._rx_tot_ch0 += int(rc0)
+                                self._rx_tot_ch1 += int(rc1)
+                            except Exception:
+                                pass
+                        try:
+                            tot0 = int(getattr(self, '_rx_tot_ch0', 0)) + int(getattr(self, '_ts_gap_tot_ch0', 0))
+                            tot1 = int(getattr(self, '_rx_tot_ch1', 0)) + int(getattr(self, '_ts_gap_tot_ch1', 0))
+                            tsloss0_tot = (100.0 * float(getattr(self, '_ts_gap_tot_ch0', 0)) / float(tot0)) if tot0 > 0 else 0.0
+                            tsloss1_tot = (100.0 * float(getattr(self, '_ts_gap_tot_ch1', 0)) / float(tot1)) if tot1 > 0 else 0.0
+                        except Exception:
+                            tsloss0_tot = tsloss1_tot = 0.0
+
+                        try:
+                            rx0_hz = float(rc0) / float(dt_stat) if dt_stat > 0 else float(rc0)
+                            rx1_hz = float(rc1) / float(dt_stat) if dt_stat > 0 else float(rc1)
+                        except Exception:
+                            rx0_hz = float(rc0)
+                            rx1_hz = float(rc1)
+
                         if getattr(self.asm, 'independent', False):
                             qszA = self.asm.qA.qsize() if hasattr(self.asm, 'qA') else 0
                             qszB = self.asm.qB.qsize() if hasattr(self.asm, 'qB') else 0
-                            print(f"fps={fps} bytes={bps} crc_bad={self.crc_bad} magic_bad={self.magic_bad} qA={qszA} qB={qszB}")
+                            print(
+                                f"dt={dt_stat:.3f}s frames={frames_n} fps={fps_hz:.1f}/s bytes={int(bps_hz)}B/s "
+                                f"rxA={rx0_hz:.1f}/s rxB={rx1_hz:.1f}/s lossA={loss0:.1f}% lossB={loss1:.1f}% "
+                                f"tsStepA={ts_step0} tsStepB={ts_step1} tsLossA={tsloss0:.1f}% tsLossB={tsloss1:.1f}% "
+                                f"tsLossTotA={tsloss0_tot:.1f}% tsLossTotB={tsloss1_tot:.1f}% "
+                                f"rxGapA+={dg0} rxGapB+={dg1} "
+                                f"rxDupA+={dd0} rxDupB+={dd1} "
+                                f"rxRstA+={dr0} rxRstB+={dr1} "
+                                f"tsDupA+={td0} tsDupB+={td1} tsRstA+={tr0} tsRstB+={tr1} "
+                                f"crc_bad={self.crc_bad} magic_bad={self.magic_bad} "
+                                f"qA={qszA} qB={qszB} dropA={getattr(self.asm,'drop_a',0)} dropB={getattr(self.asm,'drop_b',0)}",
+                                flush=True,
+                            )
                         else:
-                            print(f"fps={fps} bytes={bps} crc_bad={self.crc_bad} magic_bad={self.magic_bad} stereo_ready={self.asm.q.qsize()}")
+                            print(
+                                f"dt={dt_stat:.3f}s frames={frames_n} fps={fps_hz:.1f}/s bytes={int(bps_hz)}B/s "
+                                f"rxA={rx0_hz:.1f}/s rxB={rx1_hz:.1f}/s lossA={loss0:.1f}% lossB={loss1:.1f}% "
+                                f"tsStepA={ts_step0} tsStepB={ts_step1} tsLossA={tsloss0:.1f}% tsLossB={tsloss1:.1f}% "
+                                f"tsLossTotA={tsloss0_tot:.1f}% tsLossTotB={tsloss1_tot:.1f}% "
+                                f"rxGapA+={dg0} rxGapB+={dg1} "
+                                f"rxDupA+={dd0} rxDupB+={dd1} "
+                                f"rxRstA+={dr0} rxRstB+={dr1} "
+                                f"tsDupA+={td0} tsDupB+={td1} tsRstA+={tr0} tsRstB+={tr1} "
+                                f"crc_bad={self.crc_bad} magic_bad={self.magic_bad} "
+                                f"stereo_ready={self.asm.q.qsize()} dropPairs={getattr(self.asm,'drop_pairs',0)}",
+                                flush=True,
+                            )
                     except Exception:
-                        print(f"fps={fps} bytes={bps} crc_bad={self.crc_bad} magic_bad={self.magic_bad}")
+                        print(f"dt={dt_stat:.3f}s frames={frames_n} fps={fps_hz:.1f}/s bytes={int(bps_hz)}B/s crc_bad={self.crc_bad} magic_bad={self.magic_bad}")
+
+                    # store snapshots for next tick
+                    try:
+                        self._seq_gap_ch0_0 = int(self.seq_gap_ch0)
+                        self._seq_gap_ch1_0 = int(self.seq_gap_ch1)
+                        self._seq_dup_ch0_0 = int(self.seq_dup_ch0)
+                        self._seq_dup_ch1_0 = int(self.seq_dup_ch1)
+                        self._seq_reset_ch0_0 = int(self.seq_reset_ch0)
+                        self._seq_reset_ch1_0 = int(self.seq_reset_ch1)
+                        self._rx_cnt_ch0_0 = int(self.rx_cnt_ch0)
+                        self._rx_cnt_ch1_0 = int(self.rx_cnt_ch1)
+                        self._ts_dup_ch0_0 = int(self.ts_dup_ch0)
+                        self._ts_dup_ch1_0 = int(self.ts_dup_ch1)
+                        self._ts_reset_ch0_0 = int(self.ts_reset_ch0)
+                        self._ts_reset_ch1_0 = int(self.ts_reset_ch1)
+                    except Exception:
+                        pass
                     self.frames = 0; self.bytes = 0; self.stat_t = now
     def get_stereo(self, timeout=0.0):
         try:
             if getattr(self.asm, 'independent', False):
-                # In independent mode, return a single frame dict {'adc_id':0/1, 'frame':Frame}
+                # Independent mode: return a single frame ('A', frame) or ('B', frame).
+                # IMPORTANT: do not starve channel B by always reading qA first.
+                start = time.monotonic()
                 try:
-                    a = self.asm.qA.get(timeout=timeout)
-                    return ('A', a)
-                except queue.Empty:
+                    rr = int(getattr(self, '_indep_rr', 0))
+                except Exception:
+                    rr = 0
+                # Toggle preference for next call.
+                try:
+                    self._indep_rr = 1 - rr
+                except Exception:
+                    pass
+
+                def _remaining() -> float:
+                    if timeout is None:
+                        return 0.0
                     try:
-                        b = self.asm.qB.get(timeout=timeout)
-                        return ('B', b)
+                        t = float(timeout)
+                    except Exception:
+                        t = 0.0
+                    if t <= 0:
+                        return 0.0
+                    rem = t - (time.monotonic() - start)
+                    return rem if rem > 0 else 0.0
+
+                first = ('A', getattr(self.asm, 'qA', None)) if rr == 0 else ('B', getattr(self.asm, 'qB', None))
+                second = ('B', getattr(self.asm, 'qB', None)) if rr == 0 else ('A', getattr(self.asm, 'qA', None))
+                for tag, q in (first, second):
+                    if q is None:
+                        continue
+                    try:
+                        item = q.get(timeout=_remaining())
+                        return (tag, item)
                     except queue.Empty:
-                        return None
+                        continue
+                return None
             else:
                 return self.asm.q.get(timeout=timeout)
         except queue.Empty:
@@ -1465,13 +1885,305 @@ if __name__=='__main__':
     if '--watch' in sys.argv:
         watch_loop()
     else:
-        us = USBStream(profile=1, full=True)
+        # Demo: by default print compact stats once per second.
+        # Use --print to also print individual frames (can be very noisy).
+        print_frames = '--print' in sys.argv
+
+        # Optional: switch streaming mode to match GUI behaviors.
+        # --lossless-roi  : STOP → SET_WINDOWS(roi_start,roi_len,0,0) → SET_STREAM_MODE(1) → SET_ASYNC(0) → START
+        # --latest        : STOP → SET_WINDOWS(0,0,0,0)     → SET_STREAM_MODE(0) → SET_ASYNC(1) → START
+        want_lossless = ('--lossless-roi' in sys.argv) or ('--roi200' in sys.argv)
+        want_latest = ('--latest' in sys.argv)
+        force_async1 = ('--async1' in sys.argv)
+        force_async0 = ('--async0' in sys.argv)
+
+        # LOSSLESS_ROI window parameters
+        roi_start = 280
+        roi_len = 200
+        # Demo connection parameters
+        demo_profile = 1
+        demo_frame_samples: int | None = None
+        for a in list(sys.argv):
+            if a.startswith('--profile='):
+                try:
+                    demo_profile = int(a.split('=', 1)[1])
+                except Exception:
+                    pass
+            elif a.startswith('--frame-samples='):
+                try:
+                    demo_frame_samples = int(a.split('=', 1)[1])
+                except Exception:
+                    demo_frame_samples = None
+            if a.startswith('--roi-len='):
+                try:
+                    roi_len = int(a.split('=', 1)[1])
+                except Exception:
+                    pass
+            elif a.startswith('--roi-start='):
+                try:
+                    roi_start = int(a.split('=', 1)[1])
+                except Exception:
+                    pass
+        try:
+            roi_start = max(0, min(65535, int(roi_start)))
+        except Exception:
+            roi_start = 280
+        try:
+            roi_len = max(1, min(65535, int(roi_len)))
+        except Exception:
+            roi_len = 200
+
+        # Optional: warm-up seconds for stats (ignore early unstable period after switching modes)
+        warmup_sec = None
+        for i, a in enumerate(list(sys.argv)):
+            if a.startswith('--warmup='):
+                try:
+                    warmup_sec = float(a.split('=', 1)[1])
+                except Exception:
+                    warmup_sec = None
+        if warmup_sec is not None:
+            try:
+                os.environ['BMI30_WARMUP_SEC'] = str(warmup_sec)
+            except Exception:
+                pass
+
+        us = USBStream(profile=demo_profile, full=True, frame_samples=demo_frame_samples)
+        try:
+            if want_lossless or want_latest:
+                import struct as _st
+                try:
+                    us.send_cmd(CMD_STOP_STREAM, b"")
+                    time.sleep(0.05)
+                except Exception:
+                    pass
+
+                if want_lossless:
+                    us.send_cmd(CMD_SET_WINDOWS, _st.pack('<HHHH', int(roi_start) & 0xFFFF, int(roi_len) & 0xFFFF, 0, 0))
+                    time.sleep(0.02)
+                    us.send_cmd(CMD_SET_STREAM_MODE, b"\x01")
+                    time.sleep(0.02)
+                    # LOSSLESS_ROI default is strict pairs (0), but user may want independent channels (1)
+                    async_mode = 0
+                    if force_async1:
+                        async_mode = 1
+                    if force_async0:
+                        async_mode = 0
+                    us.send_cmd(CMD_ASYNC, bytes([async_mode]))
+                    time.sleep(0.02)
+                    us.send_cmd(CMD_START_STREAM, b"")
+                    time.sleep(0.05)
+                    print(f'[demo] LOSSLESS_ROI enabled: windows({roi_start},{roi_len},0,0) stream_mode=1 async={async_mode}', flush=True)
+                else:
+                    us.send_cmd(CMD_SET_WINDOWS, _st.pack('<HHHH', 0, 0, 0, 0))
+                    time.sleep(0.02)
+                    us.send_cmd(CMD_SET_STREAM_MODE, b"\x00")
+                    time.sleep(0.02)
+                    # LATEST default is independent (1), but allow forcing strict (0)
+                    async_mode = 1
+                    if force_async0:
+                        async_mode = 0
+                    if force_async1:
+                        async_mode = 1
+                    us.send_cmd(CMD_ASYNC, bytes([async_mode]))
+                    time.sleep(0.02)
+                    us.send_cmd(CMD_START_STREAM, b"")
+                    time.sleep(0.05)
+                    print(f'[demo] LATEST enabled: windows(0,0,0,0) stream_mode=0 async={async_mode}', flush=True)
+        except Exception as e:
+            try:
+                print('[demo] mode switch failed:', e, flush=True)
+            except Exception:
+                pass
+
+        last_t = time.time()
+        cnt_a = 0
+        cnt_b = 0
+        last_seq_a = None
+        last_seq_b = None
+        last_seq_p = None
+        step_a = None
+        step_b = None
+        step_p = None
+        # Track delta distribution to infer step robustly (often STEP=2 when A/B are interleaved)
+        delta_hist_a: dict[int, int] = {}
+        delta_hist_b: dict[int, int] = {}
+        delta_hist_p: dict[int, int] = {}
+        crc0 = 0
+        magic0 = 0
+        dropa0 = 0
+        dropb0 = 0
+        dropp0 = 0
+        samp_hist_a: dict[int, int] = {}
+        samp_hist_b: dict[int, int] = {}
+        pm_cnt = 0
+
+        def _infer_step(delta_hist: dict[int, int]) -> int | None:
+            try:
+                if not delta_hist:
+                    return None
+                return max(delta_hist.items(), key=lambda kv: kv[1])[0]
+            except Exception:
+                return None
+
+        def _estimate_gaps(delta_hist: dict[int, int], step: int | None) -> int:
+            """Estimate missing frames in the interval based on observed seq deltas.
+
+            This is computed at print-time to avoid artifacts when step inference changes.
+            """
+            try:
+                if not delta_hist or not step or step <= 0:
+                    return 0
+                gaps = 0
+                for d, c in delta_hist.items():
+                    if d <= 0 or c <= 0:
+                        continue
+                    if d <= step:
+                        continue
+                    missing = max(0, (d // step) - 1)
+                    # If delta is not an exact multiple of step, count at least one anomaly.
+                    if (d % step) != 0:
+                        missing = max(missing, 1)
+                    gaps += int(c) * int(missing)
+                return int(gaps)
+            except Exception:
+                return 0
         try:
             while True:
-                pair = us.get_stereo(timeout=0.1)
-                if pair:
-                    (a,b) = pair
-                    print(f"stereo seq={a.seq} samplesA={a.samples} samplesB={b.samples}")
+                got_any = False
+                if getattr(us.asm, 'independent', False):
+                    # Drain both channels so we don't artificially overflow qB.
+                    a = us.get_frame(0, timeout=0.001)
+                    if a is not None:
+                        got_any = True
+                        cnt_a += 1
+                        try:
+                            sa = int(getattr(a, 'samples', 0) or 0)
+                            if sa > 0:
+                                samp_hist_a[sa] = samp_hist_a.get(sa, 0) + 1
+                        except Exception:
+                            pass
+                        if print_frames:
+                            print(f"A seq={a.seq} samples={a.samples}")
+                        if last_seq_a is not None:
+                            d = int(a.seq) - int(last_seq_a)
+                            if 0 < d <= 16:
+                                delta_hist_a[d] = delta_hist_a.get(d, 0) + 1
+                        last_seq_a = a.seq
+
+                    b = us.get_frame(1, timeout=0.001)
+                    if b is not None:
+                        got_any = True
+                        cnt_b += 1
+                        try:
+                            sb = int(getattr(b, 'samples', 0) or 0)
+                            if sb > 0:
+                                samp_hist_b[sb] = samp_hist_b.get(sb, 0) + 1
+                        except Exception:
+                            pass
+                        if print_frames:
+                            print(f"B seq={b.seq} samples={b.samples}")
+                        if last_seq_b is not None:
+                            d = int(b.seq) - int(last_seq_b)
+                            if 0 < d <= 16:
+                                delta_hist_b[d] = delta_hist_b.get(d, 0) + 1
+                        last_seq_b = b.seq
+                else:
+                    pair = us.get_stereo(timeout=0.01)
+                    if pair:
+                        got_any = True
+                        (a, b) = pair
+                        cnt_a += 1
+                        cnt_b += 1
+                        try:
+                            if int(getattr(a, 'seq', 0) or 0) != int(getattr(b, 'seq', 0) or 0):
+                                pm_cnt += 1
+                        except Exception:
+                            pass
+                        try:
+                            sa = int(getattr(a, 'samples', 0) or 0)
+                            sb = int(getattr(b, 'samples', 0) or 0)
+                            if sa > 0:
+                                samp_hist_a[sa] = samp_hist_a.get(sa, 0) + 1
+                            if sb > 0:
+                                samp_hist_b[sb] = samp_hist_b.get(sb, 0) + 1
+                        except Exception:
+                            pass
+                        try:
+                            # Use A's seq as pair seq reference
+                            if last_seq_p is not None:
+                                d = int(a.seq) - int(last_seq_p)
+                                if 0 < d <= 16:
+                                    delta_hist_p[d] = delta_hist_p.get(d, 0) + 1
+                            last_seq_p = a.seq
+                        except Exception:
+                            pass
+                        if print_frames:
+                            print(f"stereo seq={a.seq} samplesA={a.samples} samplesB={b.samples}")
+
+                if not got_any:
+                    time.sleep(0.001)
+
+                now = time.time()
+                if now - last_t >= 1.0:
+                    # Update inferred step as the most common observed delta (within last interval)
+                    step_a = _infer_step(delta_hist_a)
+                    step_b = _infer_step(delta_hist_b)
+                    step_p = _infer_step(delta_hist_p)
+                    gap_a = _estimate_gaps(delta_hist_a, step_a)
+                    gap_b = _estimate_gaps(delta_hist_b, step_b)
+                    gap_p = _estimate_gaps(delta_hist_p, step_p)
+                    crc1 = getattr(us, 'crc_bad', 0)
+                    magic1 = getattr(us, 'magic_bad', 0)
+                    dropa1 = getattr(us.asm, 'drop_a', 0)
+                    dropb1 = getattr(us.asm, 'drop_b', 0)
+                    dropp1 = getattr(us.asm, 'drop_pairs', 0)
+                    qszA = us.asm.qA.qsize() if getattr(us.asm, 'independent', False) and hasattr(us.asm, 'qA') else 0
+                    qszB = us.asm.qB.qsize() if getattr(us.asm, 'independent', False) and hasattr(us.asm, 'qB') else 0
+                    qszP = us.asm.q.qsize() if (not getattr(us.asm, 'independent', False)) and hasattr(us.asm, 'q') else 0
+
+                    if getattr(us.asm, 'independent', False):
+                        # Most-common sample count seen in the last second
+                        try:
+                            sa_mode = max(samp_hist_a.items(), key=lambda kv: kv[1])[0] if samp_hist_a else None
+                            sb_mode = max(samp_hist_b.items(), key=lambda kv: kv[1])[0] if samp_hist_b else None
+                        except Exception:
+                            sa_mode = sb_mode = None
+                        print(
+                            f"A={cnt_a}/s B={cnt_b}/s stepA={step_a} stepB={step_b} "
+                            f"gapA={gap_a} gapB={gap_b} "
+                            f"samplesA~={sa_mode} samplesB~={sb_mode} "
+                            f"crc+={crc1-crc0} magic+={magic1-magic0} "
+                            f"qA={qszA} qB={qszB} dropA+={dropa1-dropa0} dropB+={dropb1-dropb0}",
+                            flush=True,
+                        )
+                    else:
+                        try:
+                            sa_mode = max(samp_hist_a.items(), key=lambda kv: kv[1])[0] if samp_hist_a else None
+                            sb_mode = max(samp_hist_b.items(), key=lambda kv: kv[1])[0] if samp_hist_b else None
+                        except Exception:
+                            sa_mode = sb_mode = None
+                        print(
+                            f"stereo={cnt_a}/s stepP={step_p} gapP={gap_p} pm={pm_cnt} "
+                            f"crc+={crc1-crc0} magic+={magic1-magic0} "
+                            f"samplesA~={sa_mode} samplesB~={sb_mode} "
+                            f"qPairs={qszP} dropPairs+={dropp1-dropp0}",
+                            flush=True,
+                        )
+
+                    cnt_a = 0
+                    cnt_b = 0
+                    delta_hist_a.clear()
+                    delta_hist_b.clear()
+                    delta_hist_p.clear()
+                    samp_hist_a.clear()
+                    samp_hist_b.clear()
+                    pm_cnt = 0
+                    crc0 = crc1
+                    magic0 = magic1
+                    dropa0 = dropa1
+                    dropb0 = dropb1
+                    dropp0 = dropp1
+                    last_t = now
         except KeyboardInterrupt:
             pass
         finally:

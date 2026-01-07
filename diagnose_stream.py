@@ -32,25 +32,44 @@ try:
     
     print(f"\n[STREAM] Ждём данных 5 секунд...")
     start_t = time.time()
-    frames_got = 0
-    tests_got = 0
+    frames_a = 0
+    frames_b = 0
+    pairs_got = 0
     errors = 0
     
     while time.time() - start_t < 5:
         try:
-            pair = stream.get_stereo(timeout=0.5)
-            if pair and pair[0]:
-                frames_got += 1
-                a, b = pair
-                print(f"  [{int(time.time()-start_t)}s] Кадр {frames_got}: {len(a.payload)} + {len(b.payload)} байт")
-        except Exception as e:
+            if getattr(stream.asm, 'independent', False):
+                # Drain both channels to avoid filling qB artificially
+                a = stream.get_frame(0, timeout=0.2)
+                if a is not None:
+                    frames_a += 1
+                b = stream.get_frame(1, timeout=0.2)
+                if b is not None:
+                    frames_b += 1
+            else:
+                pair = stream.get_stereo(timeout=0.5)
+                if pair:
+                    pairs_got += 1
+                    a, b = pair
+                    frames_a += 1
+                    frames_b += 1
+                    print(f"  [{int(time.time()-start_t)}s] Пара {pairs_got}: {len(a.payload)} + {len(b.payload)} байт")
+        except Exception:
             errors += 1
     
     elapsed = time.time() - start_t
     
     print(f"\n[STREAM] Результаты:")
-    print(f"  Получено кадров: {frames_got}")
-    print(f"  Получено тестов: {tests_got}")
+    if getattr(stream.asm, 'independent', False):
+        print(f"  Режим: independent")
+        print(f"  Получено A: {frames_a}")
+        print(f"  Получено B: {frames_b}")
+    else:
+        print(f"  Режим: paired")
+        print(f"  Получено пар: {pairs_got}")
+        print(f"  Получено A: {frames_a}")
+        print(f"  Получено B: {frames_b}")
     print(f"  Ошибок: {errors}")
     print(f"  Время: {elapsed:.1f}с")
     
@@ -64,8 +83,14 @@ try:
     print(f"  restart_attempts: {stream.restart_attempts}")
     
     # Смотрим в очереди ASM
-    qsize = stream.asm.q.qsize() if hasattr(stream.asm, 'q') else 'unknown'
-    print(f"  ASM queue size: {qsize}")
+    if getattr(stream.asm, 'independent', False):
+        qsize_a = stream.asm.qA.qsize() if hasattr(stream.asm, 'qA') else 'unknown'
+        qsize_b = stream.asm.qB.qsize() if hasattr(stream.asm, 'qB') else 'unknown'
+        print(f"  ASM qA: {qsize_a} (dropA={getattr(stream.asm, 'drop_a', 0)})")
+        print(f"  ASM qB: {qsize_b} (dropB={getattr(stream.asm, 'drop_b', 0)})")
+    else:
+        qsize = stream.asm.q.qsize() if hasattr(stream.asm, 'q') else 'unknown'
+        print(f"  ASM queue size: {qsize} (dropPairs={getattr(stream.asm, 'drop_pairs', 0)})")
     
     print(f"\n[STREAM] Закрываем поток...")
     stream.send_cmd(0x21, b'')

@@ -24,7 +24,7 @@ import numpy as np  # type: ignore
 import serial, glob
 
 try:
-	from usb_vendor.usb_stream import USBStream, CMD_SET_PROFILE, CMD_STOP_STREAM, CMD_START_STREAM, CMD_SOFT_RESET, CMD_DEEP_RESET, CMD_SET_WINDOWS, CMD_SET_STREAM_MODE  # type: ignore
+	from usb_vendor.usb_stream import USBStream, CMD_SET_PROFILE, CMD_STOP_STREAM, CMD_START_STREAM, CMD_SOFT_RESET, CMD_DEEP_RESET, CMD_SET_WINDOWS, CMD_SET_STREAM_MODE, CMD_ASYNC  # type: ignore
 except Exception:
 	from usb_vendor.usb_stream import USBStream  # type: ignore
 	CMD_SET_PROFILE = 0x14
@@ -252,19 +252,71 @@ class ScopeWindow:
 		# Основной файл (по умолчанию рядом со скриптом), можно переопределить через BMI30_DC_FILE
 		self.dc_save_file = os.getenv('BMI30_DC_FILE', os.path.join(os.path.dirname(__file__), 'dc_offset_samples.npz'))
 		self.dc_save_file_bak = self.dc_save_file + '.bak'
-		self.dc_update_step = 1.0  # Шаг адаптивной коррекции: ±1 единица на кадр
+		try:
+			self.dc_update_step = float(os.getenv('BMI30_DC_UPDATE_STEP', '1.0'))
+		except Exception:
+			self.dc_update_step = 1.0
+		# В каких STREAM_MODE учим DC (1=LOSSLESS_ROI, 2=AVG_ROI). По умолчанию: 1,2.
+		try:
+			modes_s = str(os.getenv('BMI30_DC_ADAPT_MODES', '1,2'))
+			modes = set()
+			for part in modes_s.replace(';', ',').replace(' ', '').split(','):
+				if not part:
+					continue
+				try:
+					modes.add(int(part))
+				except Exception:
+					pass
+			self.dc_adapt_modes = modes if modes else {1, 2}
+		except Exception:
+			self.dc_adapt_modes = {1, 2}
 		# Загрузить сохраненные DC offset массивы при старте
 		self._load_dc_offset()
 		
 		# How to split packets into two phases (even/odd).
 		# Firmware may encode phase in seq LSB, timestamp LSB, or reserved fields.
 		try:
-			self.phase_key = str(os.getenv('BMI30_PHASE_KEY', 'auto')).strip().lower()
+			# IMPORTANT: On RPi we must split even/odd strictly by reserved2&1.
+			# (Do NOT use seq&1 or timestamp&1; those can drift or be reused by firmware.)
+			requested = str(os.getenv('BMI30_PHASE_KEY', 'reserved2')).strip().lower()
+			allow_legacy = str(os.getenv('BMI30_PHASE_ALLOW_LEGACY', '0')).lower() not in ('0','false','no')
+			# Normalize common aliases
+			if requested in ('r2', 'reserved2_lsb', 'reserved2&1'):
+				requested = 'reserved2'
+			if (requested not in ('reserved2',)) and not allow_legacy:
+				print(f"[PHASE_KEY] forcing reserved2&1 (ignoring BMI30_PHASE_KEY={requested}); set BMI30_PHASE_ALLOW_LEGACY=1 to override", flush=True)
+				requested = 'reserved2'
+			self.phase_key = requested
+			print(f"[PHASE_KEY] using {self.phase_key}&1", flush=True)
 		except Exception:
-			self.phase_key = 'auto'
+			self.phase_key = 'reserved2'
+			try:
+				print(f"[PHASE_KEY] using {self.phase_key}&1", flush=True)
+			except Exception:
+				pass
 		self._phase_key_chosen = None
 		self._phase_key_stats = {}
 		self._phase_key_seen = 0
+		# Stable per-channel phase togglers (used when phase_key=='toggle')
+		self._phase_last_seq_a = None
+		self._phase_last_seq_b = None
+		self._phase_last_ts_a = None
+		self._phase_last_ts_b = None
+		self._phase_toggle_a = 0
+		self._phase_toggle_b = 0
+		self._phase_last_par_a = None
+		self._phase_last_par_b = None
+		self._phase_repeat_a = 0
+		self._phase_repeat_b = 0
+		self._phase_trace_n = 0
+		try:
+			self.phase_trace = str(os.getenv('BMI30_PHASE_TRACE', '0')).lower() not in ('0','false','no')
+		except Exception:
+			self.phase_trace = False
+		try:
+			self.phase_trace_limit = int(os.getenv('BMI30_PHASE_TRACE_LIMIT', '400'))
+		except Exception:
+			self.phase_trace_limit = 400
 		try:
 			self.phase_diag = str(os.getenv('BMI30_PHASE_DIAG', '0')).lower() not in ('0','false','no')
 		except Exception:
@@ -300,9 +352,9 @@ class ScopeWindow:
 			self.debug_markers = str(os.getenv("BMI30_DEBUG_MARKERS", "0")).lower() not in ("0","false","no")
 		except Exception:
 			self.debug_markers = False
-		# Режим независимых каналов: по умолчанию ВЫКЛЮЧЕН — берём пары A/B без накопления хвоста
+		# Режим независимых каналов: по умолчанию ВКЛЮЧЕН — прошивка может вести независимые seq для A/B.
 		try:
-			self.independent_channels = str(os.getenv('BMI30_INDEPENDENT_CHANNELS', '0')).lower() not in ('0','false','no')
+			self.independent_channels = str(os.getenv('BMI30_INDEPENDENT_CHANNELS', '1')).lower() not in ('0','false','no')
 		except Exception:
 			self.independent_channels = False
 		# Диагностика размеров кадров: включить лог seq/lenA/lenB через BMI30_LOG_FRAME_LEN=1
@@ -372,6 +424,28 @@ class ScopeWindow:
 		self._capture_diag_fp = None
 		self._capture_diag_started = 0.0
 		self._capture_diag_lines = 0
+		# GAP capture: отдельный лог по событиям delta!=step (в т.ч. реальные пропуски) — включается только по env
+		try:
+			gcap_env = os.getenv('BMI30_GAP_CAPTURE', None)
+			if gcap_env is None:
+				self.gap_capture_path = None
+			elif isinstance(gcap_env, str) and gcap_env.strip() == '1':
+				self.gap_capture_path = os.path.join('/tmp', f'bmi30_gap_{int(time.time())}.csv')
+			else:
+				self.gap_capture_path = gcap_env
+		except Exception:
+			self.gap_capture_path = None
+		try:
+			self.gap_capture_seconds = float(os.getenv('BMI30_GAP_CAPTURE_SECONDS', '10'))
+		except Exception:
+			self.gap_capture_seconds = 10.0
+		try:
+			self.gap_capture_limit = int(os.getenv('BMI30_GAP_CAPTURE_LIMIT', '2000'))
+		except Exception:
+			self.gap_capture_limit = 2000
+		self._gap_capture_fp = None
+		self._gap_capture_started = 0.0
+		self._gap_capture_lines = 0
 		# Скрывать полностью нулевые кадры (если это артефакт отображения/потока): по умолчанию ВКЛ (BMI30_HIDE_ALL_ZERO=1)
 		try:
 			self.hide_all_zero = str(os.getenv("BMI30_HIDE_ALL_ZERO", "1")).lower() not in ("0","false","no")
@@ -385,9 +459,63 @@ class ScopeWindow:
 		# max_samples, data0, data1, timestamps уже инициализированы выше для shared buffers
 		self.last_seq = None
 		self.gap_count = 0
+		# Оценка шага seq (некоторые прошивки инкрементируют seq не на 1 на стерео-пару).
+		self.seq_step = 1
+		self._seq_step_hist = {}
+		self._seq_step_hist_n = 0
+		self.seq_reorder_count = 0
+		# Пер-канальные seq/gap (важно, если A/B имеют независимые seq или relaxed-паринг склеивает разные seq).
+		self.last_seq_a = None
+		self.last_seq_b = None
+		self.gap_a = 0
+		self.gap_b = 0
+		self.step_a = 1
+		self.step_b = 1
+		self.reord_a = 0
+		self.reord_b = 0
+		self._step_hist_a = {}
+		self._step_hist_b = {}
+		self._step_hist_a_n = 0
+		self._step_hist_b_n = 0
+		try:
+			self.auto_independent = str(os.getenv('BMI30_AUTO_INDEPENDENT', '0')).lower() not in ('0','false','no')
+		except Exception:
+			self.auto_independent = False
+		# GAP-логирование может само провоцировать пропуски на FS (console I/O). По умолчанию включено, но с throttling.
+		try:
+			self.gap_log_enabled = str(os.getenv('BMI30_GAP_LOG', '1')).lower() not in ('0', 'false', 'no')
+		except Exception:
+			self.gap_log_enabled = True
+		try:
+			# печатать не чаще, чем раз в N секунд; 0 = без ограничения
+			self.gap_log_every = float(os.getenv('BMI30_GAP_LOG_EVERY', '1.0'))
+		except Exception:
+			self.gap_log_every = 1.0
+		self._gap_log_last_t = 0.0
+		self._gap_log_pending = 0
+		self._gap_log_last_exp = None
+		self._gap_log_last_got = None
 		self.frames_sec = 0
 		self.frames_a = 0  # счетчик кадров канала A (ADC0)
 		self.frames_b = 0  # счетчик кадров канала B (ADC1)
+		# Per-phase (even/odd) counters to validate rhythm (especially in AVG_ROI)
+		self.frames_a_even = 0
+		self.frames_a_odd = 0
+		self.frames_b_even = 0
+		self.frames_b_odd = 0
+		self.afps_even = 0.0
+		self.afps_odd = 0.0
+		self.bfps_even = 0.0
+		self.bfps_odd = 0.0
+		# Timestamp delta diagnostics per phase (in seconds, last observed)
+		self._dt_a_even = None
+		self._dt_a_odd = None
+		self._dt_b_even = None
+		self._dt_b_odd = None
+		self._ts_a_even = None
+		self._ts_a_odd = None
+		self._ts_b_even = None
+		self._ts_b_odd = None
 		self.zero_blocks = 0  # счётчик полностью нулевых кадров, скрытых из отображения
 		self.last_fps_t = time.time()
 		self.fps = 0.0  # общая частота кадров (для совместимости)
@@ -534,11 +662,15 @@ class ScopeWindow:
 		except Exception:
 			_autostart = True
 		if _autostart and not _test_mode:
-			# Установить режим оба канала и запустить поток
+			# Автозапуск: запускаем тот режим, который выбран/восстановлен из bmi30_sel.json.
+			# Это важно, чтобы (например) sel=5 действительно включал AVG_ROI(20) без ручного клика.
 			self.view_mode = 0
-			if self.num_group.checkedId() != 3:
-				self.num_buttons[3].setChecked(True)
-			self._activate_stream()
+			try:
+				idx = int(self.num_group.checkedId())
+			except Exception:
+				idx = 3
+			if idx != 0:
+				self._num_clicked(idx)
 		# режим отображения: 0=оба, 1=только канал 1, 2=только канал 2
 		self.view_mode = 0
 		
@@ -577,6 +709,48 @@ class ScopeWindow:
 				print("[RESET] SOFT_RESET sent via CDC")
 		except Exception as e:
 			print(f"[RESET] SOFT_RESET via CDC failed: {e}")
+
+	def _reset_phase_splitter(self, reason: str = ""):
+		"""Reset host-side even/odd splitter state.
+		
+		Why:
+		- Stream restarts (STOP/START, reconnects) can re-anchor the device phase.
+		- If we keep toggling across restarts, the displayed even/odd can appear to swap.
+		
+		We bias the *first* new frame after reset to be EVEN (par=0).
+		"""
+		try:
+			# Make first non-duplicate return par=0:
+			# toggle starts at 1, then toggles to 0 on first frame.
+			self._phase_toggle_a = 1
+			self._phase_toggle_b = 1
+			self._phase_last_seq_a = None
+			self._phase_last_seq_b = None
+			self._phase_last_ts_a = None
+			self._phase_last_ts_b = None
+			self._phase_last_par_a = None
+			self._phase_last_par_b = None
+			self._phase_repeat_a = 0
+			self._phase_repeat_b = 0
+			self._phase_trace_n = 0
+			# Also reset validity markers so GUI won't show stale phase buffers.
+			self.seq0_even = None
+			self.seq0_odd = None
+			self.seq1_even = None
+			self.seq1_odd = None
+			# Clear buffers (optional but helps avoid confusing stale plots)
+			try:
+				self.data0_even[:] = 0
+				self.data0_odd[:] = 0
+				self.data1_even[:] = 0
+				self.data1_odd[:] = 0
+			except Exception:
+				pass
+			if getattr(self, 'phase_trace', False):
+				msg = f"[PHASE_RESET] {reason}".strip()
+				print(msg, flush=True)
+		except Exception:
+			pass
 
 	def _switch_to_latest_mode(self):
 		"""Возврат в режим LATEST (STREAM_MODE=0): 600 семплов, допускаются пропуски"""
@@ -627,6 +801,7 @@ class ScopeWindow:
 			
 			# Сбросить параметры буфера для переинициализации с новым размером (600 семплов)
 			with self.data_lock:
+				self._reset_phase_splitter("switch_to_latest")
 				self.base_buf_len = None
 				self.base_buf_len_bytes = None
 				self.freq_hz = None
@@ -703,6 +878,7 @@ class ScopeWindow:
 			
 			# Сбросить параметры буфера для переинициализации с новым размером (200 семплов)
 			with self.data_lock:
+				self._reset_phase_splitter("switch_to_lossless_roi")
 				self.base_buf_len = None
 				self.base_buf_len_bytes = None
 				self.freq_hz = None
@@ -741,6 +917,84 @@ class ScopeWindow:
 		
 		self._set_status("DC Removal: вычитание постоянной составляющей, уровень = 32767", hold_sec=3.0)
 		print("[DC_REMOVAL] Режим активирован: отображение скорректированных данных без DC")
+
+	def _switch_to_avg_roi(self, avg_n: int = 20):
+		"""Переключение в режим усреднения на устройстве (STREAM_MODE=2, AVG_ROI).
+		Устройство усредняет ROI по N входным буферам и выдаёт усреднённые ROI-кадры.
+		См. HOST_RPI.md: STOP -> SET_WINDOWS -> SET_STREAM_MODE(mode, avg_n) -> SET_ASYNC(0) -> START.
+		"""
+		# Если поток не запущен - запустить его сначала
+		if self.stream is None:
+			print("[AVG_ROI] Поток не запущен, запускаем...")
+			self._set_status("Запуск потока для AVG_ROI...", hold_sec=1.0)
+			self._activate_stream()
+			time.sleep(0.5)
+			if self.stream is None:
+				print("[AVG_ROI] Не удалось запустить поток")
+				self._set_status("Ошибка запуска потока", hold_sec=2.0)
+				return
+		try:
+			avg_n = int(avg_n)
+			if avg_n < 2:
+				avg_n = 2
+			if avg_n > 32:
+				avg_n = 32
+		except Exception:
+			avg_n = 20
+
+		try:
+			print(f"[AVG_ROI] Переключение в AVG_ROI (STREAM_MODE=2, avg_n={avg_n})...")
+			self._set_status(f"Переключение в AVG_ROI (avg_n={avg_n})...", hold_sec=1.0)
+
+			# Остановка потока
+			self.stream.send_cmd(CMD_STOP_STREAM, b"")
+			time.sleep(0.05)
+			print("[AVG_ROI] STOP отправлен")
+
+			# SET_WINDOWS: ROI 280..479 (200) для обоих каналов (A и B)
+			windows_data = struct.pack('<HHHH', 280, 200, 280, 200)
+			self.stream.send_cmd(CMD_SET_WINDOWS, windows_data)
+			time.sleep(0.02)
+			print("[AVG_ROI] SET_WINDOWS(280,200, 280,200) отправлен")
+
+			# SET_STREAM_MODE: 2 (AVG_ROI) + avg_n
+			# В новой прошивке payload: <B mode> <B avg_n>
+			self.stream.send_cmd(CMD_SET_STREAM_MODE, bytes([0x02, avg_n & 0xFF]))
+			time.sleep(0.02)
+			print("[AVG_ROI] SET_STREAM_MODE=2 (AVG_ROI) отправлен")
+
+			# SET_ASYNC_MODE: 1 (независимые каналы A/B)
+			self.stream.send_cmd(CMD_ASYNC, b"\x01")
+			time.sleep(0.02)
+			print("[AVG_ROI] SET_ASYNC_MODE=1 отправлен")
+
+			# Запуск потока
+			self.stream.send_cmd(CMD_START_STREAM, b"")
+			time.sleep(0.05)
+			print("[AVG_ROI] START отправлен")
+
+			# Сброс параметров буфера для переинициализации
+			with self.data_lock:
+				self._reset_phase_splitter(f"switch_to_avg_roi avg_n={avg_n}")
+				self.base_buf_len = None
+				self.base_buf_len_bytes = None
+				self.freq_hz = None
+				self._sliders_initialized = False
+			print("[AVG_ROI] Параметры буфера сброшены для переинициализации")
+
+			# Показать оба канала
+			self._set_view_mode(0)
+
+			# stream_mode=2 (AVG_ROI)
+			self.stream_mode = 2
+
+			# Можно снизить FPS GUI: в AVG_ROI кадры редкие (для avg_n=20 ~10Гц на канал)
+			self.qtimer.setInterval(200)  # 5 FPS
+			self._set_status(f"AVG_ROI: усреднение на устройстве avg_n={avg_n}, ROI=200", hold_sec=3.0)
+			print("[AVG_ROI] Режим активирован")
+		except Exception as e:
+			print(f"[AVG_ROI] Ошибка переключения: {e}")
+			self._set_status(f"Ошибка AVG_ROI: {e}", hold_sec=3.0)
 
 	def _seed_avg20_buffers_locked(self):
 		"""Заполнить буферы AVG20 текущим кадром, чтобы при включении 6 не было 'разгона с нуля'.
@@ -958,21 +1212,16 @@ class ScopeWindow:
 			self.avg20_enabled = False
 			self._switch_to_lossless_roi()
 		elif idx == 5:
-			# Кнопка 5: переключение в LOSSLESS_ROI режим с удалением постоянной составляющей (DC removal)
-			# Не перезапускаем LOSSLESS_ROI, если уже там — только переключаем отображение.
-			self._switch_to_dc_removal_mode()
+			# Кнопка 5: усреднение на УСТРОЙСТВЕ (AVG_ROI, stream_mode=2, avg_n=20) + вычитание DC на хосте
 			self.avg20_enabled = False
+			self._switch_to_avg_roi(avg_n=20)
+			self.dc_removal_enabled = True
+			self._set_status("AVG_ROI(20) + DC Removal: усреднение на устройстве, вычитание DC на хосте", hold_sec=3.0)
 		elif idx == 6:
-			# Кнопка 6: как кнопка 5, но усреднение последних 20 кадров по каждому семплу
+			# Кнопка 6: временно оставляем прежний режим DC-removal в LOSSLESS_ROI (без усреднения на хосте).
+			# Корреляцию добавим сюда позже.
+			self.avg20_enabled = False
 			self._switch_to_dc_removal_mode()
-			was = bool(getattr(self, 'avg20_enabled', False))
-			with self.data_lock:
-				self.avg20_enabled = True
-				# Чтобы при первом включении не было "разгона" от нулей (это выглядит как повторная подстройка DC),
-				# засеем усреднение текущим кадром.
-				if not was:
-					self._seed_avg20_buffers_locked()
-			self._set_status("AVG20 DC Removal: среднее по 20 кадрам, 2 канала × 2 осциллограммы × 200 семплов", hold_sec=3.0)
 		elif self.stream is not None and idx not in (1, 2, 3, 4, 5):
 			try:
 				self.stream.close()
@@ -1019,25 +1268,112 @@ class ScopeWindow:
 
 	def _reader_thread_func(self):
 		"""Поток чтения USB: получает пакеты и заполняет data0/data1"""
+		def _update_chan_seq(kind: str, seq_val: int):
+			"""Обновить шаг/пропуски для одного канала (A/B) по seq."""
+			try:
+				seq_val = int(seq_val) & 0xFFFFFFFF
+			except Exception:
+				return
+			if kind == 'A':
+				last = self.last_seq_a
+				hist = self._step_hist_a
+				hist_n = '_step_hist_a_n'
+				step_attr = 'step_a'
+				gap_attr = 'gap_a'
+				reord_attr = 'reord_a'
+				last_attr = 'last_seq_a'
+			else:
+				last = self.last_seq_b
+				hist = self._step_hist_b
+				hist_n = '_step_hist_b_n'
+				step_attr = 'step_b'
+				gap_attr = 'gap_b'
+				reord_attr = 'reord_b'
+				last_attr = 'last_seq_b'
+			if last is None:
+				setattr(self, last_attr, seq_val)
+				return
+			delta = (seq_val - int(last)) & 0xFFFFFFFF
+			# Учим шаг на небольших delta.
+			if 0 < delta <= 16:
+				try:
+					hist[int(delta)] = int(hist.get(int(delta), 0)) + 1
+					setattr(self, hist_n, int(getattr(self, hist_n, 0)) + 1)
+				except Exception:
+					pass
+			if int(getattr(self, hist_n, 0)) >= 50:
+				try:
+					best_step = max(hist.items(), key=lambda kv: kv[1])[0]
+					if 1 <= int(best_step) <= 16:
+						setattr(self, step_attr, int(best_step))
+				except Exception:
+					pass
+			step = int(getattr(self, step_attr, 1) or 1)
+			# Пропуски считаем только для монотонного вперёд (delta small/normal). Остальное -> reord.
+			if delta != step:
+				if delta > step and delta < 0x80000000:
+					if step > 0 and (delta % step) == 0:
+						missed = max(1, int(delta // step) - 1)
+					else:
+						missed = 1
+					setattr(self, gap_attr, int(getattr(self, gap_attr, 0)) + int(missed))
+				else:
+					setattr(self, reord_attr, int(getattr(self, reord_attr, 0)) + 1)
+			setattr(self, last_attr, seq_val)
 		def _phase_candidates(frame):
 			"""Return candidate phase bits from frame fields."""
 			out = {}
 			try:
 				seqv = int(getattr(frame, 'seq', 0))
+				# seq may increment by 1, 2, or other step depending on firmware/mode.
+				# Keep a few low bits as candidates.
+				try:
+					adc_id = int(getattr(frame, 'adc_id', 0))
+					step = int(self.step_a if adc_id == 0 else self.step_b)
+					if step < 1:
+						step = 1
+					# If step>1 (often step=2 with interleaved windows), seq LSB becomes constant;
+					# using (seq//step)&1 restores a 50/50 alternating phase.
+					out['seq_div_step_lsb'] = (seqv // step) & 1
+				except Exception:
+					pass
 				out['seq'] = seqv & 1
 				out['seq1'] = (seqv >> 1) & 1
+				out['seq2'] = (seqv >> 2) & 1
+				out['seq3'] = (seqv >> 3) & 1
+			except Exception:
+				pass
+			try:
+				tsv = int(getattr(frame, 'timestamp', 0))
+				# Timestamp can be a stable cadence marker in AVG_ROI; try a few LSBs.
+				out['ts'] = tsv & 1
+				out['ts1'] = (tsv >> 1) & 1
+				out['ts2'] = (tsv >> 2) & 1
+				out['ts3'] = (tsv >> 3) & 1
 			except Exception:
 				pass
 			try:
 				rv = int(getattr(frame, 'reserved', 0))
 				out['reserved'] = rv & 1
 				out['reserved1'] = (rv >> 1) & 1
+				out['reserved2'] = (rv >> 2) & 1
+				out['reserved3'] = (rv >> 3) & 1
+				out['reserved4'] = (rv >> 4) & 1
+				out['reserved5'] = (rv >> 5) & 1
+				out['reserved6'] = (rv >> 6) & 1
+				out['reserved7'] = (rv >> 7) & 1
 			except Exception:
 				pass
 			try:
 				r2 = int(getattr(frame, 'reserved2', 0))
-				out['reserved2'] = r2 & 1
+				out['reserved2_lsb'] = r2 & 1
 				out['reserved2_1'] = (r2 >> 1) & 1
+				out['reserved2_2'] = (r2 >> 2) & 1
+				out['reserved2_3'] = (r2 >> 3) & 1
+				out['reserved2_4'] = (r2 >> 4) & 1
+				out['reserved2_5'] = (r2 >> 5) & 1
+				out['reserved2_6'] = (r2 >> 6) & 1
+				out['reserved2_7'] = (r2 >> 7) & 1
 			except Exception:
 				pass
 			return out
@@ -1082,9 +1418,14 @@ class ScopeWindow:
 			# wait for enough samples
 			min_n = 60
 			bias = {
+				# Best default when seq increments by step>1 (e.g. step=2): keeps even/odd balanced.
+				'seq_div_step_lsb': 6.0,
 				'seq': 5.0,
 				'seq1': 3.0,
-				'reserved2': 1.0,
+				'ts1': 1.5,
+				'ts2': 1.0,
+				'ts3': 0.5,
+				'reserved2_lsb': 1.0,
 				'reserved2_1': 1.0,
 				'reserved': 0.0,
 				'reserved1': 0.0,
@@ -1117,8 +1458,97 @@ class ScopeWindow:
 				except Exception:
 					print(f"[PHASE_KEY] auto={best}", flush=True)
 
-		def _phase_bit(frame):
-			"""Compute phase bit (0/1) using chosen or forced key."""
+		def _phase_toggle_bit(kind: str, frame):
+			"""Stable even/odd splitter per channel.
+			Default strategy: alternate by arrival order (per channel).
+			Why: firmware may reuse the same seq for both phases; relying on seq/timestamp LSB can flip.
+			We only suppress toggling on *true duplicates* (same seq AND same timestamp).
+			On backward jumps/resets: re-sync.
+			"""
+			try:
+				seqv = int(getattr(frame, 'seq', 0)) & 0xFFFFFFFF
+			except Exception:
+				seqv = 0
+			try:
+				tsv = int(getattr(frame, 'timestamp', 0)) & 0xFFFFFFFFFFFFFFFF
+			except Exception:
+				tsv = 0
+			if kind == 'A':
+				last_seq_attr = '_phase_last_seq_a'
+				last_ts_attr = '_phase_last_ts_a'
+				tog_attr = '_phase_toggle_a'
+				last_par_attr = '_phase_last_par_a'
+				rep_attr = '_phase_repeat_a'
+			else:
+				last_seq_attr = '_phase_last_seq_b'
+				last_ts_attr = '_phase_last_ts_b'
+				tog_attr = '_phase_toggle_b'
+				last_par_attr = '_phase_last_par_b'
+				rep_attr = '_phase_repeat_b'
+			last_seq = getattr(self, last_seq_attr, None)
+			last_ts = getattr(self, last_ts_attr, None)
+			tog = int(getattr(self, tog_attr, 0) or 0)
+			# Detect backward jump/resets using seq monotonicity when available
+			if last_seq is not None:
+				delta = (seqv - int(last_seq)) & 0xFFFFFFFF
+				if delta >= 0x80000000:
+					# backward jump: reorder/reset
+					tog = 0
+					setattr(self, tog_attr, tog)
+					setattr(self, last_seq_attr, seqv)
+					setattr(self, last_ts_attr, tsv)
+					setattr(self, last_par_attr, None)
+					setattr(self, rep_attr, 0)
+					return tog
+			# Suppress toggling only on true duplicates
+			if last_seq is not None and last_ts is not None and int(last_seq) == int(seqv) and int(last_ts) == int(tsv):
+				par = int(tog)
+			else:
+				tog ^= 1
+				par = int(tog)
+				setattr(self, tog_attr, tog)
+			setattr(self, last_seq_attr, seqv)
+			setattr(self, last_ts_attr, tsv)
+			# Track repeats (should normally alternate)
+			lp = getattr(self, last_par_attr, None)
+			if lp is not None and int(lp) == int(par):
+				setattr(self, rep_attr, int(getattr(self, rep_attr, 0)) + 1)
+			else:
+				setattr(self, rep_attr, 0)
+			setattr(self, last_par_attr, int(par))
+			# Optional tracing
+			try:
+				if getattr(self, 'phase_trace', False) and int(getattr(self, '_phase_trace_n', 0)) < int(getattr(self, 'phase_trace_limit', 0)):
+					self._phase_trace_n = int(getattr(self, '_phase_trace_n', 0)) + 1
+					rep = int(getattr(self, rep_attr, 0))
+					if rep >= 1:
+						print(f"[PHASE_ANOM] {kind} rep={rep} par={par} seq={seqv} ts={tsv} last_seq={last_seq} last_ts={last_ts}", flush=True)
+					elif (self._phase_trace_n % 50) == 0:
+						print(f"[PHASE] {kind} par={par} seq={seqv} ts={tsv}", flush=True)
+			except Exception:
+				pass
+			return par
+
+		def _phase_bit(kind: str, frame):
+			"""Compute phase bit (0/1) using the configured splitter."""
+			key = (self._phase_key_chosen or getattr(self, 'phase_key', 'reserved2') or 'reserved2').strip().lower()
+			# Preferred/required path: phase = reserved2 & 1
+			if key in ('reserved2', 'reserved2_lsb', 'r2', 'reserved2&1'):
+				try:
+					return int(getattr(frame, 'reserved2', 0)) & 1
+				except Exception:
+					# If the field is missing for some reason, fall back to 0 (EVEN)
+					return 0
+			# Legacy/debug paths are only allowed if explicitly enabled
+			allow_legacy = str(os.getenv('BMI30_PHASE_ALLOW_LEGACY', '0')).lower() not in ('0','false','no')
+			if not allow_legacy:
+				try:
+					return int(getattr(frame, 'reserved2', 0)) & 1
+				except Exception:
+					return 0
+			if key == 'toggle':
+				return int(_phase_toggle_bit(kind, frame))
+			# legacy/diagnostic path: auto-select a toggling bit from frame fields
 			try:
 				_update_phase_key_stats(frame)
 			except Exception:
@@ -1127,12 +1557,50 @@ class ScopeWindow:
 				_maybe_choose_phase_key()
 			except Exception:
 				pass
-			key = self._phase_key_chosen or getattr(self, 'phase_key', 'auto')
+			key = (self._phase_key_chosen or getattr(self, 'phase_key', 'auto') or 'auto').strip().lower()
 			cands = _phase_candidates(frame)
 			if key in cands:
 				return int(cands[key])
-			# fallback
+			if 'seq_div_step_lsb' in cands:
+				return int(cands.get('seq_div_step_lsb', 0))
 			return int(cands.get('seq', 0))
+
+		def _is_true_duplicate(kind: str, frame) -> bool:
+			"""Return True if frame repeats exactly (same seq AND same timestamp).
+			
+			Used to drop duplicate frames before updating even/odd buffers.
+			In AVG_ROI mode the device/transport can emit repeats; treating those as new
+			frames makes one phase look stale (and previously could trigger PHASE_ANOM).
+			"""
+			try:
+				seqv = int(getattr(frame, 'seq', 0)) & 0xFFFFFFFF
+			except Exception:
+				seqv = 0
+			try:
+				tsv = int(getattr(frame, 'timestamp', 0)) & 0xFFFFFFFFFFFFFFFF
+			except Exception:
+				tsv = 0
+			if kind == 'A':
+				last_seq_attr = '_dup_last_seq_a'
+				last_ts_attr = '_dup_last_ts_a'
+				cnt_attr = '_dup_drop_a'
+			else:
+				last_seq_attr = '_dup_last_seq_b'
+				last_ts_attr = '_dup_last_ts_b'
+				cnt_attr = '_dup_drop_b'
+			last_seq = getattr(self, last_seq_attr, None)
+			last_ts = getattr(self, last_ts_attr, None)
+			is_dup = (
+				last_seq is not None
+				and last_ts is not None
+				and int(last_seq) == int(seqv)
+				and int(last_ts) == int(tsv)
+			)
+			setattr(self, last_seq_attr, seqv)
+			setattr(self, last_ts_attr, tsv)
+			if is_dup:
+				setattr(self, cnt_attr, int(getattr(self, cnt_attr, 0)) + 1)
+			return bool(is_dup)
 
 		print("[READER] Thread started", flush=True)
 		while self.reader_running:
@@ -1156,18 +1624,33 @@ class ScopeWindow:
 					a, b = pair
 
 				# Help auto-detect phase key: in paired mode, enforce A/B consistency for candidates.
-				if a is not None and b is not None:
+				# (Only relevant when phase_key=='auto'; default is stable 'toggle'.)
+				if (getattr(self, 'phase_key', 'toggle') == 'auto') and a is not None and b is not None:
 					_update_phase_key_pair_consistency(a, b)
+
+				# Пер-канальные seq/gap: обновляем всегда (даже если пары склеены relaxed-режимом).
+				try:
+					if a is not None and getattr(a, 'seq', None) is not None:
+						_update_chan_seq('A', int(a.seq))
+					if b is not None and getattr(b, 'seq', None) is not None:
+						_update_chan_seq('B', int(b.seq))
+				except Exception:
+					pass
 
 				# При необходимости можно явно сбросить накопленную очередь ассемблера (независимый режим),
 				# чтобы не было задержки из старых кадров. Выключено по умолчанию, включается env BMI30_FLUSH_ASM_QUEUE=1.
 				if getattr(self, 'flush_asm_queue', False) and getattr(self, 'independent_channels', False):
 					try:
 						asm = getattr(self.stream, 'asm', None)
-						q = getattr(asm, 'q', None)
-						if q is not None and hasattr(q, 'qsize'):
-							qs = q.qsize()
-							if qs > 0:
+						# independent: trim qA/qB; paired: trim q
+						if asm is not None and getattr(asm, 'independent', False):
+							for tag in ('qA', 'qB'):
+								q = getattr(asm, tag, None)
+								if q is None or not hasattr(q, 'qsize'):
+									continue
+								qs = q.qsize()
+								if qs <= 1:
+									continue
 								last_item = None
 								while True:
 									try:
@@ -1180,7 +1663,25 @@ class ScopeWindow:
 										q.put_nowait(last_item)
 									except Exception:
 										pass
-								print(f"[ASM_FLUSH] queue trimmed (was {qs}), kept latest. new_q={q.qsize() if hasattr(q,'qsize') else '?'}", flush=True)
+								print(f"[ASM_FLUSH] {tag} trimmed (was {qs}), kept latest. new={q.qsize() if hasattr(q,'qsize') else '?'}", flush=True)
+						else:
+							q = getattr(asm, 'q', None)
+							if q is not None and hasattr(q, 'qsize'):
+								qs = q.qsize()
+								if qs > 0:
+									last_item = None
+									while True:
+										try:
+											item = q.get_nowait()
+											last_item = item
+										except Exception:
+											break
+									if last_item is not None:
+										try:
+											q.put_nowait(last_item)
+										except Exception:
+											pass
+									print(f"[ASM_FLUSH] queue trimmed (was {qs}), kept latest. new_q={q.qsize() if hasattr(q,'qsize') else '?'}", flush=True)
 					except Exception:
 						pass
 
@@ -1332,9 +1833,16 @@ class ScopeWindow:
 				with self.data_lock:
 					current_time = time.time()
 					if ch0 is not None:
+						# Drop exact duplicate frames (same seq+ts) to avoid stale even/odd artifacts
+						try:
+							if a is not None and _is_true_duplicate('A', a):
+								ch0 = None
+						except Exception:
+							pass
+					if ch0 is not None:
 						# even/odd selection by detected phase bit
 						try:
-							par = _phase_bit(a) if a is not None else 0
+							par = _phase_bit('A', a) if a is not None else 0
 							seqv = int(getattr(a, 'seq', 0)) if a is not None else 0
 						except Exception:
 							par = 0
@@ -1347,10 +1855,27 @@ class ScopeWindow:
 							self.seq0_odd = seqv
 						else:
 							self.seq0_even = seqv
+						# Per-parity rhythm counters + timestamp cadence
+						try:
+							ts = int(getattr(a, 'timestamp', 0)) if a is not None else None
+						except Exception:
+							ts = None
+						if par:
+							self.frames_a_odd += 1
+							if ts is not None and self._ts_a_odd is not None:
+								self._dt_a_odd = float((ts - int(self._ts_a_odd)) / 1_000_000.0)
+							if ts is not None:
+								self._ts_a_odd = ts
+						else:
+							self.frames_a_even += 1
+							if ts is not None and self._ts_a_even is not None:
+								self._dt_a_even = float((ts - int(self._ts_a_even)) / 1_000_000.0)
+							if ts is not None:
+								self._ts_a_even = ts
 						
-						# Адаптивное обновление DC offset (±1 на каждый семпл каждый кадр)
-						# Накопление работает ТОЛЬКО при STREAM_MODE=1 (LOSSLESS_ROI)
-						if getattr(self, 'stream_mode', 0) == 1 and len(ch0) > 0:
+						# Адаптивное обновление DC offset (пошагово, по семплам)
+						# По умолчанию включено для STREAM_MODE=1 (LOSSLESS_ROI) и 2 (AVG_ROI)
+						if int(getattr(self, 'stream_mode', 0) or 0) in set(getattr(self, 'dc_adapt_modes', {1, 2})) and len(ch0) > 0:
 							if par:
 								self._update_dc_offset_adaptive(ch0, self.dc_offset_ch0_odd, len(ch0))
 							else:
@@ -1383,7 +1908,13 @@ class ScopeWindow:
 					
 					if ch1 is not None:
 						try:
-							par = _phase_bit(b) if b is not None else 0
+							if b is not None and _is_true_duplicate('B', b):
+								ch1 = None
+						except Exception:
+							pass
+					if ch1 is not None:
+						try:
+							par = _phase_bit('B', b) if b is not None else 0
 							seqv = int(getattr(b, 'seq', 0)) if b is not None else 0
 						except Exception:
 							par = 0
@@ -1396,10 +1927,26 @@ class ScopeWindow:
 							self.seq1_odd = seqv
 						else:
 							self.seq1_even = seqv
+						# Per-parity rhythm counters + timestamp cadence
+						try:
+							ts = int(getattr(b, 'timestamp', 0)) if b is not None else None
+						except Exception:
+							ts = None
+						if par:
+							self.frames_b_odd += 1
+							if ts is not None and self._ts_b_odd is not None:
+								self._dt_b_odd = float((ts - int(self._ts_b_odd)) / 1_000_000.0)
+							if ts is not None:
+								self._ts_b_odd = ts
+						else:
+							self.frames_b_even += 1
+							if ts is not None and self._ts_b_even is not None:
+								self._dt_b_even = float((ts - int(self._ts_b_even)) / 1_000_000.0)
+							if ts is not None:
+								self._ts_b_even = ts
 						
 						# Адаптивное обновление DC offset
-						# Накопление работает ТОЛЬКО при STREAM_MODE=1 (LOSSLESS_ROI)
-						if getattr(self, 'stream_mode', 0) == 1 and len(ch1) > 0:
+						if int(getattr(self, 'stream_mode', 0) or 0) in set(getattr(self, 'dc_adapt_modes', {1, 2})) and len(ch1) > 0:
 							if par:
 								self._update_dc_offset_adaptive(ch1, self.dc_offset_ch1_odd, len(ch1))
 							else:
@@ -1531,12 +2078,87 @@ class ScopeWindow:
 					# Обновим счетчики и проверим разрывы в режиме пар (если оба канала пришли одновременно)
 					if a is not None and b is not None:
 						if not getattr(self.stream, 'asm', None) or not getattr(self.stream.asm, 'independent', False):
-							if self.last_seq is not None:
-								exp = (self.last_seq + 1) & 0xFFFFFFFF  # seq увеличивается на 1 на каждую стерео-пару (A/B имеют одинаковый seq)
-								if a.seq != exp:
-									print(f"[GAP] Expected seq {exp}, got {a.seq} (diff: {a.seq - exp})", flush=True)
-									self.gap_count += 1
-							self.last_seq = a.seq
+							# ВАЖНО: если seqA!=seqB, это не «пропуск пар», а рассинхрон/независимый счётчик.
+							try:
+								pair_match = int(a.seq) == int(b.seq)
+							except Exception:
+								pair_match = False
+							if pair_match:
+								# Считаем gap только для "настоящих" стерео-пар (seqA==seqB).
+								if self.last_seq is None:
+									self.last_seq = a.seq
+								else:
+									delta = (int(a.seq) - int(self.last_seq)) & 0xFFFFFFFF
+									if 0 < delta <= 16:
+										try:
+											self._seq_step_hist[int(delta)] = int(self._seq_step_hist.get(int(delta), 0)) + 1
+											self._seq_step_hist_n = int(self._seq_step_hist_n) + 1
+										except Exception:
+											pass
+									if int(getattr(self, '_seq_step_hist_n', 0)) >= 50:
+										try:
+											best_step = max(self._seq_step_hist.items(), key=lambda kv: kv[1])[0]
+											if 1 <= int(best_step) <= 16:
+												self.seq_step = int(best_step)
+										except Exception:
+											pass
+									step = int(getattr(self, 'seq_step', 1) or 1)
+									if delta != step:
+										missed = 0
+										if delta > step and delta < 0x80000000:
+											if step > 0 and (delta % step) == 0:
+												missed = max(1, int(delta // step) - 1)
+											else:
+												missed = 1
+											self.gap_count += int(missed)
+											self._gap_log_pending += int(missed)
+										else:
+											self.seq_reorder_count = int(getattr(self, 'seq_reorder_count', 0)) + 1
+										# GAP-capture (опционально) только при реальном missed>0
+										if missed > 0 and getattr(self, 'gap_capture_path', None):
+											try:
+												if self._gap_capture_fp is None:
+													self._gap_capture_fp = open(self.gap_capture_path, 'a', encoding='utf-8', errors='replace')
+													self._gap_capture_started = time.time()
+													self._gap_capture_lines = 0
+													self._gap_capture_fp.write('#ts_unix,last_seq,seq,delta,step,missed,pm,stereo_q,bufA,bufB,usb_magic_bad,usb_crc_bad,usb_bytes_per_s\n')
+													self._gap_capture_fp.flush()
+												# write line if within capture window
+												if (time.time() - float(self._gap_capture_started)) <= float(self.gap_capture_seconds) and int(self._gap_capture_lines) < int(self.gap_capture_limit):
+													asm = getattr(self.stream, 'asm', None)
+													stereo_q = asm.q.qsize() if asm is not None and hasattr(asm, 'q') else 0
+													bufA = len(getattr(asm, 'bufA', {}) or {}) if asm is not None else 0
+													bufB = len(getattr(asm, 'bufB', {}) or {}) if asm is not None else 0
+													pm = int(getattr(self, '_pair_mismatch_count', 0))
+													usb_magic_bad = int(getattr(self.stream, 'magic_bad', 0))
+													usb_crc_bad = int(getattr(self.stream, 'crc_bad', 0))
+													usb_bps = int(getattr(self.stream, 'bytes', 0))
+													line = f"{time.time():.6f},{int(self.last_seq)},{int(a.seq)},{int(delta)},{int(step)},{int(missed)},{pm},{stereo_q},{bufA},{bufB},{usb_magic_bad},{usb_crc_bad},{usb_bps}\n"
+													self._gap_capture_fp.write(line)
+													self._gap_capture_lines = int(self._gap_capture_lines) + 1
+													if (int(self._gap_capture_lines) % 10) == 0:
+														self._gap_capture_fp.flush()
+												# close if time or limit exceeded
+												if (time.time() - float(self._gap_capture_started)) > float(self.gap_capture_seconds) or int(self._gap_capture_lines) >= int(self.gap_capture_limit):
+													try:
+														self._gap_capture_fp.close()
+													except Exception:
+														pass
+													self._gap_capture_fp = None
+											except Exception:
+												pass
+										# throttled GAP log
+										exp = (int(self.last_seq) + step) & 0xFFFFFFFF
+										self._gap_log_last_exp = exp
+										self._gap_log_last_got = int(a.seq)
+										if self.gap_log_enabled:
+											now_gap = time.time()
+											if self.gap_log_every <= 0 or (now_gap - self._gap_log_last_t) >= self.gap_log_every:
+												pending = int(self._gap_log_pending)
+												self._gap_log_pending = 0
+												self._gap_log_last_t = now_gap
+												print(f"[GAP] +{pending} step={step} ожидаю {exp}, получил {int(a.seq)} (delta={delta}) total={self.gap_count} reord={int(getattr(self,'seq_reorder_count',0))}", flush=True)
+									self.last_seq = a.seq
 						self.frames_sec += 2
 						self.frames_a += 1
 						self.frames_b += 1
@@ -1622,21 +2244,23 @@ class ScopeWindow:
 				vlen = buf_len  # Fallback
 			self.view_start = vstart
 			self.view_len = vlen
-			
-			# Копируем сегменты данных из shared buffers
-			seg0 = self.data0[vstart:vstart+vlen].copy()
-			seg1 = self.data1[vstart:vstart+vlen].copy()
-		
-		# Отображаем данные через _update_view
-		self._update_view()
+			# NB: реальные сегменты берутся внутри _update_view(); здесь важно лишь вычислить окно.
 		now = time.time()
 		if now - self.last_fps_t >= 1.0:
 			self.fps = self.frames_sec / (now - self.last_fps_t)  # общая FPS (для совместимости)
 			self.afps = self.frames_a / (now - self.last_fps_t)   # FPS канала A
 			self.bfps = self.frames_b / (now - self.last_fps_t)   # FPS канала B
+			self.afps_even = self.frames_a_even / (now - self.last_fps_t)
+			self.afps_odd = self.frames_a_odd / (now - self.last_fps_t)
+			self.bfps_even = self.frames_b_even / (now - self.last_fps_t)
+			self.bfps_odd = self.frames_b_odd / (now - self.last_fps_t)
 			self.frames_sec = 0
 			self.frames_a = 0
 			self.frames_b = 0
+			self.frames_a_even = 0
+			self.frames_a_odd = 0
+			self.frames_b_even = 0
+			self.frames_b_odd = 0
 			self.last_fps_t = now
 		# auto symmetric y-range update (0.5s throttle) — ТОЛЬКО если включено BMI30_Y_AUTO=1
 		if self.y_auto and (now - self.last_range_t > 0.5) and (len(self.data0) or len(self.data1)):
@@ -1671,10 +2295,34 @@ class ScopeWindow:
 		try:
 			asm = getattr(self.stream, 'asm', None)
 			if asm is not None:
-				asm_stat = f" ASM(ts_pairs={getattr(asm, '_ts_pair_count', 0)} neigh={getattr(asm, '_seq_neighbor_pairs', 0)} q={asm.q.qsize()})"
+				bufA = len(getattr(asm, 'bufA', {}) or {})
+				bufB = len(getattr(asm, 'bufB', {}) or {})
+				qsz = asm.q.qsize() if hasattr(asm, 'q') else 0
+				pm = int(getattr(self, '_pair_mismatch_count', 0))
+				dp = int(getattr(asm, 'drop_pairs', 0))
+				da = int(getattr(asm, 'drop_a', 0))
+				db = int(getattr(asm, 'drop_b', 0))
+				asm_stat = f" ASM(ts_pairs={getattr(asm, '_ts_pair_count', 0)} neigh={getattr(asm, '_seq_neighbor_pairs', 0)} q={qsz} bufA={bufA} bufB={bufB} PM={pm} dropP={dp} dropA={da} dropB={db})"
 		except Exception:
 			asm_stat = ''
-		_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}{asm_stat}"
+		_dt_a = ''
+		_dt_b = ''
+		try:
+			if self._dt_a_even is not None or self._dt_a_odd is not None:
+				_dt_a = f" dte/dto:{(self._dt_a_even if self._dt_a_even is not None else -1):.3f}/{(self._dt_a_odd if self._dt_a_odd is not None else -1):.3f}s"
+		except Exception:
+			_dt_a = ''
+		try:
+			if self._dt_b_even is not None or self._dt_b_odd is not None:
+				_dt_b = f" dte/dto:{(self._dt_b_even if self._dt_b_even is not None else -1):.3f}/{(self._dt_b_odd if self._dt_b_odd is not None else -1):.3f}s"
+		except Exception:
+			_dt_b = ''
+		_phase = ''
+		try:
+			_phase = f" PH:{(getattr(self,'_phase_key_chosen',None) or getattr(self,'phase_key','auto'))}"
+		except Exception:
+			_phase = ''
+		_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} Aeo:{self.afps_even:.1f}/{self.afps_odd:.1f}{_dt_a} Beo:{self.bfps_even:.1f}/{self.bfps_odd:.1f}{_dt_b}{_phase} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} STEP:{getattr(self,'seq_step',1)} R:{getattr(self,'seq_reorder_count',0)} GA:{getattr(self,'gap_a',0)} GB:{getattr(self,'gap_b',0)} SA:{getattr(self,'step_a',1)} SB:{getattr(self,'step_b',1)} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}{asm_stat}"
 		# Печатаем дефолтный статус не чаще 1 раза в секунду и только если нет активного hold
 		_now_for_default = time.time()
 		if (self._status_hold_text is None or _now_for_default >= self._status_hold_until) and (_now_for_default - self._last_default_update_t >= 1.0):
@@ -1733,7 +2381,7 @@ class ScopeWindow:
 				freq_part = f" FREQ:{self.freq_hz}Hz" if self.freq_hz else ""
 				buf_info = f" BUF:{self.base_buf_len}({self.base_buf_len_bytes}B){freq_part}"
 			_zero_part = f" ZERO:{self.zero_blocks}" if getattr(self, 'zero_blocks', 0) else ""
-			_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}"
+			_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} STEP:{getattr(self,'seq_step',1)} R:{getattr(self,'seq_reorder_count',0)} GA:{getattr(self,'gap_a',0)} GB:{getattr(self,'gap_b',0)} SA:{getattr(self,'step_a',1)} SB:{getattr(self,'step_b',1)} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}"
 			self._set_status(_default_status)
 		
 		# Обновить view после всех изменений данных
@@ -1749,11 +2397,17 @@ class ScopeWindow:
 		self.view_start = min(self.view_start, max_start)
 		vlen = min(vlen, len(self.data0) - self.view_start)  # не больше доступных данных
 		self.view_len = vlen
-		# even/odd buffers (fallback to legacy names if needed)
-		seg0 = (self.data0_even if hasattr(self, 'data0_even') else self.data0)[self.view_start:self.view_start+vlen]
-		seg1 = (self.data1_even if hasattr(self, 'data1_even') else self.data1)[self.view_start:self.view_start+vlen]
-		seg0b = (self.data0_odd if hasattr(self, 'data0_odd') else np.zeros_like(seg0))[self.view_start:self.view_start+vlen]
-		seg1b = (self.data1_odd if hasattr(self, 'data1_odd') else np.zeros_like(seg1))[self.view_start:self.view_start+vlen]
+		# Snapshot buffers under lock to avoid tearing/races (can look like swaps/in-phase).
+		with self.data_lock:
+			seg0 = (self.data0_even if hasattr(self, 'data0_even') else self.data0)[self.view_start:self.view_start+vlen].copy()
+			seg1 = (self.data1_even if hasattr(self, 'data1_even') else self.data1)[self.view_start:self.view_start+vlen].copy()
+			seg0b = (self.data0_odd if hasattr(self, 'data0_odd') else np.zeros_like(seg0))[self.view_start:self.view_start+vlen].copy()
+			seg1b = (self.data1_odd if hasattr(self, 'data1_odd') else np.zeros_like(seg1))[self.view_start:self.view_start+vlen].copy()
+			# Validity markers: if we haven't received a phase yet, don't draw stale buffers.
+			v0e = (getattr(self, 'seq0_even', None) is not None)
+			v0o = (getattr(self, 'seq0_odd', None) is not None)
+			v1e = (getattr(self, 'seq1_even', None) is not None)
+			v1o = (getattr(self, 'seq1_odd', None) is not None)
 		
 		# DC removal: вычитание постоянной составляющей и сдвиг на 32767
 		if getattr(self, 'dc_removal_enabled', False) and not getattr(self, 'avg20_enabled', False):
@@ -1801,19 +2455,19 @@ class ScopeWindow:
 		# --- режимы отображения ---
 		if self.view_mode == 0:
 			# оба канала
-			if len(seg0) > 0 and (self.show_zero or not np.all(seg0 == 0)):
+			if v0e and len(seg0) > 0 and (self.show_zero or not np.all(seg0 == 0)):
 				self.curve0_a.setData(x, seg0)
 			else:
 				self.curve0_a.setData([], [])
-			if len(seg0b) > 0 and (self.show_zero or not np.all(seg0b == 0)):
+			if v0o and len(seg0b) > 0 and (self.show_zero or not np.all(seg0b == 0)):
 				self.curve0_b.setData(x, seg0b)
 			else:
 				self.curve0_b.setData([], [])
-			if len(seg1) > 0 and (self.show_zero or not np.all(seg1 == 0)):
+			if v1e and len(seg1) > 0 and (self.show_zero or not np.all(seg1 == 0)):
 				self.curve1_a.setData(x, seg1)
 			else:
 				self.curve1_a.setData([], [])
-			if len(seg1b) > 0 and (self.show_zero or not np.all(seg1b == 0)):
+			if v1o and len(seg1b) > 0 and (self.show_zero or not np.all(seg1b == 0)):
 				self.curve1_b.setData(x, seg1b)
 			else:
 				self.curve1_b.setData([], [])
@@ -1821,11 +2475,11 @@ class ScopeWindow:
 			self.p1.show()
 		elif self.view_mode == 1:
 			# только канал 1
-			if len(seg0) > 0 and (self.show_zero or not np.all(seg0 == 0)):
+			if v0e and len(seg0) > 0 and (self.show_zero or not np.all(seg0 == 0)):
 				self.curve0_a.setData(x, seg0)
 			else:
 				self.curve0_a.setData([], [])
-			if len(seg0b) > 0 and (self.show_zero or not np.all(seg0b == 0)):
+			if v0o and len(seg0b) > 0 and (self.show_zero or not np.all(seg0b == 0)):
 				self.curve0_b.setData(x, seg0b)
 			else:
 				self.curve0_b.setData([], [])
@@ -1837,11 +2491,11 @@ class ScopeWindow:
 			# только канал 2
 			self.curve0_a.setData([], [])
 			self.curve0_b.setData([], [])
-			if len(seg1) > 0 and (self.show_zero or not np.all(seg1 == 0)):
+			if v1e and len(seg1) > 0 and (self.show_zero or not np.all(seg1 == 0)):
 				self.curve1_a.setData(x, seg1)
 			else:
 				self.curve1_a.setData([], [])
-			if len(seg1b) > 0 and (self.show_zero or not np.all(seg1b == 0)):
+			if v1o and len(seg1b) > 0 and (self.show_zero or not np.all(seg1b == 0)):
 				self.curve1_b.setData(x, seg1b)
 			else:
 				self.curve1_b.setData([], [])
