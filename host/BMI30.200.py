@@ -76,6 +76,38 @@ def save_config(desired_profile):
 		pass
 
 
+def load_avg_n():
+	"""Load avg_n from config file (fallback 20)."""
+	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+	try:
+		with open(config_file, "r") as f:
+			data = json.load(f)
+		val = int(data.get("avg_n", 20))
+		if val < 2:
+			return 20
+		return val
+	except Exception:
+		return 20
+
+
+def save_avg_n(avg_n: int):
+	"""Save avg_n to config file alongside other settings (best-effort merge)."""
+	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+	try:
+		data = {}
+		if os.path.exists(config_file):
+			try:
+				with open(config_file, "r") as f:
+					data = json.load(f) or {}
+			except Exception:
+				data = {}
+		data["avg_n"] = int(avg_n)
+		with open(config_file, "w") as f:
+			json.dump(data, f)
+	except Exception:
+		pass
+
+
 class ScopeWindow:
 	def __init__(self):
 		print("[INIT] BMI30 GUI starting...", flush=True)
@@ -98,34 +130,78 @@ class ScopeWindow:
 		self.legend_lbl.setFont(font)
 		legend_bar = QtWidgets.QHBoxLayout()
 		legend_bar.addWidget(self.legend_lbl, 1)
-		# выбор частоты
-		self.freq_box = QtWidgets.QComboBox()
-		self.freq_box.addItems(["200 Hz","300 Hz"])
-		# Не триггерить _on_freq_change при установке значения по умолчанию
+		# выбор количества усреднённых буферов (avg_n)
+		self.avg_n = load_avg_n()
+		self.avg_box = QtWidgets.QComboBox()
+		avg_items = ["4","8","12","16","20","24","28","32"]
+		self.avg_box.addItems(avg_items)
+		# Не триггерить обработчик при установке значения по умолчанию
 		try:
-			self.freq_box.blockSignals(True)
+			self.avg_box.blockSignals(True)
 		except Exception:
 			pass
-		self.freq_box.setCurrentIndex(0 if self.desired_profile == 1 else 1)  # загружаем из config
+		# установим индекс на текущее значение avg_n
 		try:
-			self.freq_box.blockSignals(False)
+			if str(self.avg_n) in avg_items:
+				self.avg_box.setCurrentIndex(avg_items.index(str(self.avg_n)))
+			else:
+				# если значение не в списке, добавим его и выберем
+				self.avg_box.addItem(str(self.avg_n))
+				self.avg_box.setCurrentIndex(self.avg_box.count()-1)
 		except Exception:
 			pass
-		self.freq_box.currentIndexChanged.connect(self._on_freq_change)
-		legend_bar.addWidget(self.freq_box, 0)
+		try:
+			self.avg_box.blockSignals(False)
+		except Exception:
+			pass
+		self.avg_box.currentIndexChanged.connect(self._on_avg_change)
+		legend_bar.addWidget(self.avg_box, 0)
 		self.btn_reconnect = QtWidgets.QPushButton("↻")
 		self.btn_reconnect.setToolTip("Ручное переподключение к устройству")
 		self.btn_reconnect.clicked.connect(self._manual_reconnect)
+		# уменьшить ширину трёх правых кнопок вдвое
+		for _btn in (self.btn_reconnect,):
+			try:
+				_btn.setFixedSize(21, 21)
+			except Exception:
+				pass
 		legend_bar.addWidget(self.btn_reconnect, 0)
 		# Кнопка перезапитки USB-порта (через uhubctl)
 		self.btn_power = QtWidgets.QPushButton("⚡")
 		self.btn_power.setToolTip("Переподать питание на USB-порту устройства (uhubctl)")
 		self.btn_power.clicked.connect(self._power_cycle_usb_port)
+		try:
+			self.btn_power.setFixedSize(21, 21)
+		except Exception:
+			pass
+		# правый клик по кнопке питания копирует заголовок в буфер обмена
+		try:
+			self.btn_power.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+			self.btn_power.customContextMenuRequested.connect(self._copy_legend_from_btn)
+		except Exception:
+			pass
 		legend_bar.addWidget(self.btn_power, 0)
 		# Кнопка диагностики и мягкого рестарта
+		# Диагностика: делаем кнопку переключаемой и используем её для
+		# включения/выключения DC-вычитания (фиксация состояния).
 		self.btn_diag = QtWidgets.QPushButton("🩺")
-		self.btn_diag.setToolTip("Диагностика EP0/STAT, SOFT_RESET/DEEP_RESET, alt 0/1")
-		self.btn_diag.clicked.connect(self._diagnose_and_kick)
+		self.btn_diag.setToolTip("Переключатель DC removal (клик: вкл/выкл)")
+		self.btn_diag.setCheckable(True)
+		# отобразим текущее состояние DC
+		try:
+			self.btn_diag.setChecked(bool(self.dc_removal_enabled))
+		except Exception:
+			pass
+		self.btn_diag.toggled.connect(self._on_toggle_dc_removal)
+		try:
+			self.btn_diag.setFixedSize(21, 21)
+		except Exception:
+			pass
+		# синхронизируем визуальный вид кнопки с текущим состоянием DC
+		try:
+			self._on_toggle_dc_removal(bool(self.dc_removal_enabled))
+		except Exception:
+			pass
 		legend_bar.addWidget(self.btn_diag, 0)
 		layout.addLayout(legend_bar)
 		# plots
@@ -135,10 +211,12 @@ class ScopeWindow:
 		self.p1 = self.plotw.addPlot(row=1, col=0, title="ADC1")
 		# Use fast line plots instead of many symbols to reduce CPU and increase FPS
 		# Two packets per channel => draw even/odd oscillograms per plot (different colors)
-		self.curve0_a = self.p0.plot(pen=pg.mkPen('#2ecc71', width=1), symbol=None)  # even
-		self.curve0_b = self.p0.plot(pen=pg.mkPen('#1abc9c', width=1), symbol=None)  # odd
-		self.curve1_a = self.p1.plot(pen=pg.mkPen('#3498db', width=1), symbol=None)  # even
-		self.curve1_b = self.p1.plot(pen=pg.mkPen('#9b59b6', width=1), symbol=None)  # odd
+		# ADC0: более контрастные цвета для тёмной темы
+		self.curve0_a = self.p0.plot(pen=pg.mkPen('#ffb86b', width=1.5), symbol=None)  # even (яркий оранжевый)
+		self.curve0_b = self.p0.plot(pen=pg.mkPen('#00e5ff', width=1.5), symbol=None)  # odd (яркий циановый)
+		# ADC1: повышенная яркость для лучшей видимости на тёмной теме
+		self.curve1_a = self.p1.plot(pen=pg.mkPen('#ff6b6b', width=1.5), symbol=None)  # even (яркий красный)
+		self.curve1_b = self.p1.plot(pen=pg.mkPen('#00ffd5', width=1.5), symbol=None)  # odd (яркий мятный)
 		self.p0.showGrid(x=True, y=True, alpha=0.3)
 		self.p1.showGrid(x=True, y=True, alpha=0.3)
 		# Синхронизируем X-оси между графиками
@@ -2227,7 +2305,12 @@ class ScopeWindow:
 					self.slider_len.blockSignals(True)
 				except Exception:
 					pass
-				self._init_sliders(self.base_buf_len)
+				# Инициализируем слайдеры только при первой инициализации
+				# или если длина буфера изменилась (чтобы не сбрасывать позицию
+				# при каждом тике GUI, когда мы только перемещаем ползунки).
+				if (not getattr(self, '_sliders_initialized', False)) or getattr(self, '_last_buf_len', None) != self.base_buf_len:
+					self._init_sliders(self.base_buf_len)
+					self._last_buf_len = self.base_buf_len
 			
 			# Используем base_buf_len если установлен, иначе max_samples
 			buf_len = self.base_buf_len if self.base_buf_len is not None else self.max_samples
@@ -2657,6 +2740,41 @@ class ScopeWindow:
 			self.slider_start.setMaximum(max(0, self.base_buf_len - self.view_len))
 		self._update_view()
 
+	def _on_toggle_dc_removal(self, enabled: bool):
+		"""Handler for top-right diagnostic toggle button — enables/disables DC subtraction."""
+		try:
+			self.dc_removal_enabled = bool(enabled)
+		except Exception:
+			self.dc_removal_enabled = False
+		# Обновим визуальную подсказку (цвет/tooltip) и статус-индикатор
+		try:
+			if self.dc_removal_enabled:
+				style = "QPushButton { background:#b6f0b6; color:#000; border:1px solid #6fb36f; }"
+				tt = "DC removal: ВКЛЮЧЕНО"
+				self.btn_diag.setToolTip("DC removal включено — вычитание постоянной составляющей")
+			else:
+				style = "QPushButton { background:#f0b6b6; color:#000; border:1px solid #b36f6f; }"
+				tt = "DC removal: ВЫКЛЮЧЕНО"
+				self.btn_diag.setToolTip("DC removal выключено — вычитание постоянной составляющей отключено")
+			try:
+				self.btn_diag.setStyleSheet(style)
+			except Exception:
+				pass
+			# краткий статус
+			self._set_status(tt, hold_sec=2.0)
+		except Exception:
+			pass
+
+	def _copy_legend_from_btn(self, pos):
+		"""Handle right-click on `btn_power`: copy `legend_lbl` text to clipboard."""
+		try:
+			text = self.legend_lbl.text() if hasattr(self, 'legend_lbl') else ''
+			cb = QtWidgets.QApplication.clipboard()
+			cb.setText(text)
+			self._set_status("Заголовок скопирован в буфер обмена", hold_sec=2.0)
+		except Exception:
+			pass
+
 	def _manual_reconnect(self):
 		# Принудительно закрыть и заново начать поиск
 		try:
@@ -2697,6 +2815,8 @@ class ScopeWindow:
 		self.lbl_start_value.setText("0")
 		self.lbl_len_value.setText("0")
 		self._sliders_initialized = False
+		# forget last buffer length so init will run on next valid buf_len
+		self._last_buf_len = None
 		try:
 			self.slider_start.blockSignals(False)
 			self.slider_len.blockSignals(False)
@@ -2724,6 +2844,11 @@ class ScopeWindow:
 		self.lbl_start_value.setText(str(self.view_start))
 		self.lbl_len_value.setText(str(self.view_len))
 		self._sliders_initialized = True
+		try:
+			self.slider_start.blockSignals(False)
+			self.slider_len.blockSignals(False)
+		except Exception:
+			pass
 		try:
 			self.slider_start.blockSignals(False)
 			self.slider_len.blockSignals(False)
@@ -3165,6 +3290,31 @@ class ScopeWindow:
 			self.no_data_warned = False
 		except Exception as e:
 			self._set_status(f"Ошибка смены частоты: {e}", hold_sec=2.0)
+
+	def _on_avg_change(self, idx: int):
+		"""Handler for avg_n combo box: send AVG_ROI change to device and save setting."""
+		try:
+			text = self.avg_box.currentText()
+			new_n = int(text)
+		except Exception:
+			new_n = 20
+		# save selection
+		save_avg_n(new_n)
+		self.avg_n = new_n
+		# If stream is not running, just inform user
+		if self.stream is None:
+			self._set_status(f"Выбрано avg_n={new_n} (устройство не подключено)", hold_sec=2.0)
+			return
+		# If already in AVG_ROI, send only SET_STREAM_MODE with new avg_n; otherwise do full switch
+		try:
+			if getattr(self, 'stream_mode', 0) == 2:
+				self.stream.send_cmd(CMD_SET_STREAM_MODE, bytes([0x02, new_n & 0xFF]))
+				self._set_status(f"Отправлен AVG_ROI avg_n={new_n}", hold_sec=2.0)
+				print(f"[AVG_ROI] SET_STREAM_MODE=2 (avg_n={new_n}) отправлен по изменению меню")
+			else:
+				self._switch_to_avg_roi(new_n)
+		except Exception as e:
+			print(f"[AVG_ROI] Ошибка при применении avg_n={new_n}: {e}")
 
 	def _on_close(self, ev):
 		try:
