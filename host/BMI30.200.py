@@ -123,6 +123,8 @@ class ScopeWindow:
 		layout = QtWidgets.QVBoxLayout(central)
 		# Загружаем desired_profile из config
 		self.desired_profile = load_config()  # 1=>200 Гц, 2=>300 Гц
+		# По умолчанию — GUI не должен применять DC-вычитание при старте
+		self.dc_removal_enabled = False
 		# legend (вместо верхних кнопок)
 		self.legend_lbl = QtWidgets.QLabel("--")
 		font = self.legend_lbl.font()
