@@ -447,14 +447,17 @@ class ScopeWindow:
 			if requested in ('r2', 'reserved2_lsb', 'reserved2&1'):
 				requested = 'reserved2'
 			if (requested not in ('reserved2',)) and not allow_legacy:
-				print(f"[PHASE_KEY] forcing reserved2&1 (ignoring BMI30_PHASE_KEY={requested}); set BMI30_PHASE_ALLOW_LEGACY=1 to override", flush=True)
+				if bool(getattr(self, 'debug', False)):
+					print(f"[PHASE_KEY] forcing reserved2&1 (ignoring BMI30_PHASE_KEY={requested}); set BMI30_PHASE_ALLOW_LEGACY=1 to override", flush=True)
 				requested = 'reserved2'
 			self.phase_key = requested
-			print(f"[PHASE_KEY] using {self.phase_key}&1", flush=True)
+			if bool(getattr(self, 'debug', False)):
+				print(f"[PHASE_KEY] using {self.phase_key}&1", flush=True)
 		except Exception:
 			self.phase_key = 'reserved2'
 			try:
-				print(f"[PHASE_KEY] using {self.phase_key}&1", flush=True)
+				if bool(getattr(self, 'debug', False)):
+					print(f"[PHASE_KEY] using {self.phase_key}&1", flush=True)
 			except Exception:
 				pass
 		self._phase_key_chosen = None
@@ -1254,30 +1257,36 @@ class ScopeWindow:
 					gui_fps = 16
 				interval = max(10, int(1000 / gui_fps))
 				self.qtimer.setInterval(interval)
-				print(f"[LATEST] GUI восстановлен до {gui_fps} FPS")
+				if bool(getattr(self, 'debug', False)):
+					print(f"[LATEST] GUI восстановлен до {gui_fps} FPS")
 			
-			print("[LATEST] Переключение в режим LATEST (600 семплов, STREAM_MODE=0)...")
+			if bool(getattr(self, 'debug', False)):
+				print("[LATEST] Переключение в режим LATEST (600 семплов, STREAM_MODE=0)...")
 			
 			# Остановка потока
 			self.stream.send_cmd(CMD_STOP_STREAM, b"")
 			time.sleep(0.05)
-			print("[LATEST] STOP отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[LATEST] STOP отправлен")
 			
 			# SET_WINDOWS: (0,0,0,0) - полный буфер
 			windows_data = struct.pack('<HHHH', 0, 0, 0, 0)
 			self.stream.send_cmd(CMD_SET_WINDOWS, windows_data)
 			time.sleep(0.02)
-			print("[LATEST] SET_WINDOWS(0, 0, 0, 0) отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[LATEST] SET_WINDOWS(0, 0, 0, 0) отправлен")
 			
 			# SET_STREAM_MODE: 0 (LATEST)
 			self.stream.send_cmd(CMD_SET_STREAM_MODE, b"\x00")
 			time.sleep(0.02)
-			print("[LATEST] SET_STREAM_MODE=0 отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[LATEST] SET_STREAM_MODE=0 отправлен")
 			
 			# SET_ASYNC_MODE: 1 (независимые A/B для быстрого режима)
 			self.stream.send_cmd(CMD_ASYNC, b"\x01")
 			time.sleep(0.02)
-			print("[LATEST] SET_ASYNC_MODE=1 отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[LATEST] SET_ASYNC_MODE=1 отправлен")
 			
 			# Сбросить параметры буфера для переинициализации с новым размером (600 семплов)
 			with self.data_lock:
@@ -1286,16 +1295,19 @@ class ScopeWindow:
 				self.base_buf_len_bytes = None
 				self.freq_hz = None
 				self._sliders_initialized = False
-			print("[LATEST] Параметры буфера сброшены для переинициализации с 600 семплами")
+			if bool(getattr(self, 'debug', False)):
+				print("[LATEST] Параметры буфера сброшены для переинициализации с 600 семплами")
 			
 			# Запуск потока
 			self.stream.send_cmd(CMD_START_STREAM, b"")
 			time.sleep(0.05)
-			print("[LATEST] START отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[LATEST] START отправлен")
 			
 			# Устанавливаем stream_mode=0
 			self.stream_mode = 0
-			print("[LATEST] Режим активирован: 600 семплов, STREAM_MODE=0")
+			if bool(getattr(self, 'debug', False)):
+				print("[LATEST] Режим активирован: 600 семплов, STREAM_MODE=0")
 			
 		except Exception as e:
 			print(f"[LATEST] Ошибка переключения: {e}")
@@ -1311,7 +1323,8 @@ class ScopeWindow:
 			self._set_view_mode(0)
 			self.qtimer.setInterval(200)
 			self._set_status("LOSSLESS_ROI (active)", hold_sec=1.0)
-			print("[LOSSLESS_ROI] Already active — no restart performed")
+			if bool(getattr(self, 'debug', False)):
+				print("[LOSSLESS_ROI] Already active — no restart performed")
 			return
 
 		# If background worker available, enqueue non-blocking job
@@ -1338,37 +1351,44 @@ class ScopeWindow:
 					gui_fps = 16
 				interval = max(10, int(1000 / gui_fps))
 				self.qtimer.setInterval(interval)
-				print(f"[LOSSLESS_ROI] GUI восстановлен до {gui_fps} FPS")
+				if bool(getattr(self, 'debug', False)):
+					print(f"[LOSSLESS_ROI] GUI восстановлен до {gui_fps} FPS")
 			
-			print("[LOSSLESS_ROI] Переключение в режим LOSSLESS_ROI (200 семплов из окна 280..480)...")
+			if bool(getattr(self, 'debug', False)):
+				print("[LOSSLESS_ROI] Переключение в режим LOSSLESS_ROI (200 семплов из окна 280..480)...")
 			self._set_status("Переключение в LOSSLESS_ROI...", hold_sec=1.0)
 			
 			# Остановка потока
 			self.stream.send_cmd(CMD_STOP_STREAM, b"")
 			time.sleep(0.05)
-			print("[LOSSLESS_ROI] STOP отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[LOSSLESS_ROI] STOP отправлен")
 			
 			# SET_WINDOWS: start0=280, len0=200, start1=0, len1=0 (только канал A)
 			# Формат: u16 start0 + u16 len0 + u16 start1 + u16 len1 (little-endian)
 			windows_data = struct.pack('<HHHH', 280, 200, 0, 0)
 			self.stream.send_cmd(CMD_SET_WINDOWS, windows_data)
 			time.sleep(0.02)
-			print("[LOSSLESS_ROI] SET_WINDOWS(280, 200, 0, 0) отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[LOSSLESS_ROI] SET_WINDOWS(280, 200, 0, 0) отправлен")
 			
 			# SET_STREAM_MODE: 1 (LOSSLESS_ROI)
 			self.stream.send_cmd(CMD_SET_STREAM_MODE, b"\x01")
 			time.sleep(0.02)
-			print("[LOSSLESS_ROI] SET_STREAM_MODE=1 отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[LOSSLESS_ROI] SET_STREAM_MODE=1 отправлен")
 			
 			# SET_ASYNC_MODE: 0 (строгие пары A/B)
 			self.stream.send_cmd(CMD_ASYNC, b"\x00")
 			time.sleep(0.02)
-			print("[LOSSLESS_ROI] SET_ASYNC_MODE=0 отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[LOSSLESS_ROI] SET_ASYNC_MODE=0 отправлен")
 			
 			# Запуск потока
 			self.stream.send_cmd(CMD_START_STREAM, b"")
 			time.sleep(0.05)
-			print("[LOSSLESS_ROI] START отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[LOSSLESS_ROI] START отправлен")
 			
 			# Сбросить параметры буфера для переинициализации с новым размером (200 семплов)
 			with self.data_lock:
@@ -1377,7 +1397,8 @@ class ScopeWindow:
 				self.base_buf_len_bytes = None
 				self.freq_hz = None
 				self._sliders_initialized = False
-			print("[LOSSLESS_ROI] Параметры буфера сброшены для переинициализации с 200 семплами")
+			if bool(getattr(self, 'debug', False)):
+				print("[LOSSLESS_ROI] Параметры буфера сброшены для переинициализации с 200 семплами")
 			
 			# Переключить на отображение обоих каналов
 			self._set_view_mode(0)  # 0 = оба канала
@@ -1388,10 +1409,12 @@ class ScopeWindow:
 			# Снижаем частоту отрисовки GUI для уменьшения блокировок data_lock
 			# В LOSSLESS_ROI не нужна быстрая отрисовка (5 FPS достаточно для накопления DC)
 			self.qtimer.setInterval(200)  # 200 мс = 5 FPS
-			print("[LOSSLESS_ROI] GUI снижен до 5 FPS для минимизации блокировок")
+			if bool(getattr(self, 'debug', False)):
+				print("[LOSSLESS_ROI] GUI снижен до 5 FPS для минимизации блокировок")
 			
 			self._set_status("LOSSLESS_ROI: 2 канала × 2 осциллограммы × 200 семплов", hold_sec=3.0)
-			print("[LOSSLESS_ROI] Режим активирован: ROI 280..480, 200 семплов, 2 канала по 2 кривых, без пропусков")
+			if bool(getattr(self, 'debug', False)):
+				print("[LOSSLESS_ROI] Режим активирован: ROI 280..480, 200 семплов, 2 канала по 2 кривых, без пропусков")
 			
 		except Exception as e:
 			print(f"[LOSSLESS_ROI] Ошибка переключения: {e}")
@@ -1414,7 +1437,8 @@ class ScopeWindow:
 				self._set_view_mode(0)
 				self.qtimer.setInterval(200)
 				self._set_status("LOSSLESS_ROI (active)", hold_sec=1.0)
-				print("[DC_REMOVAL] Already in LOSSLESS_ROI — no restart performed")
+				if bool(getattr(self, 'debug', False)):
+					print("[DC_REMOVAL] Already in LOSSLESS_ROI — no restart performed")
 				return
 
 			# Иначе — переключаемся полноценно
@@ -1457,12 +1481,14 @@ class ScopeWindow:
 		try:
 			# Ensure stream is running
 			if self.stream is None:
-				print("[AVG_ROI] Поток не запущен, запускаем...")
+				if bool(getattr(self, 'debug', False)):
+					print("[AVG_ROI] Поток не запущен, запускаем...")
 				self._set_status("Запуск потока для AVG_ROI...", hold_sec=1.0)
 				self._activate_stream()
 				time.sleep(0.5)
 				if self.stream is None:
-					print("[AVG_ROI] Не удалось запустить поток")
+					if bool(getattr(self, 'debug', False)):
+						print("[AVG_ROI] Не удалось запустить поток")
 					self._set_status("Ошибка запуска потока", hold_sec=2.0)
 					return
 
@@ -1474,7 +1500,8 @@ class ScopeWindow:
 					avg_n = 20
 				avg_n = max(2, min(32, avg_n))
 				self.stream.send_cmd(CMD_SET_STREAM_MODE, bytes([0x02, avg_n & 0xFF]))
-				print(f"[AVG_ROI] Updated avg_n in-place to {avg_n} (no restart)")
+				if bool(getattr(self, 'debug', False)):
+					print(f"[AVG_ROI] Updated avg_n in-place to {avg_n} (no restart)")
 				self.stream_mode = 2
 				self.qtimer.setInterval(200)
 				self._set_status(f"AVG_ROI updated (avg_n={avg_n})", hold_sec=1.5)
@@ -1486,34 +1513,40 @@ class ScopeWindow:
 			except Exception:
 				avg_n = 20
 			avg_n = max(2, min(32, avg_n))
-			print(f"[AVG_ROI] Переключение в AVG_ROI (STREAM_MODE=2, avg_n={avg_n})...")
+			if bool(getattr(self, 'debug', False)):
+				print(f"[AVG_ROI] Переключение в AVG_ROI (STREAM_MODE=2, avg_n={avg_n})...")
 			self._set_status(f"Переключение в AVG_ROI (avg_n={avg_n})...", hold_sec=1.0)
 
 			# STOP
 			self.stream.send_cmd(CMD_STOP_STREAM, b"")
 			time.sleep(0.05)
-			print("[AVG_ROI] STOP отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[AVG_ROI] STOP отправлен")
 
 			# SET_WINDOWS: both channels ROI 280..479 (200)
 			windows_data = struct.pack('<HHHH', 280, 200, 280, 200)
 			self.stream.send_cmd(CMD_SET_WINDOWS, windows_data)
 			time.sleep(0.02)
-			print("[AVG_ROI] SET_WINDOWS(280,200, 280,200) отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[AVG_ROI] SET_WINDOWS(280,200, 280,200) отправлен")
 
 			# SET_STREAM_MODE: 2 (AVG_ROI) + avg_n
 			self.stream.send_cmd(CMD_SET_STREAM_MODE, bytes([0x02, avg_n & 0xFF]))
 			time.sleep(0.02)
-			print("[AVG_ROI] SET_STREAM_MODE=2 (AVG_ROI) отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[AVG_ROI] SET_STREAM_MODE=2 (AVG_ROI) отправлен")
 
 			# SET_ASYNC_MODE: 1 (independent A/B)
 			self.stream.send_cmd(CMD_ASYNC, b"\x01")
 			time.sleep(0.02)
-			print("[AVG_ROI] SET_ASYNC_MODE=1 отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[AVG_ROI] SET_ASYNC_MODE=1 отправлен")
 
 			# START
 			self.stream.send_cmd(CMD_START_STREAM, b"")
 			time.sleep(0.05)
-			print("[AVG_ROI] START отправлен")
+			if bool(getattr(self, 'debug', False)):
+				print("[AVG_ROI] START отправлен")
 
 			# Reset buffers for reinitialization
 			with self.data_lock:
@@ -1522,13 +1555,15 @@ class ScopeWindow:
 				self.base_buf_len_bytes = None
 				self.freq_hz = None
 				self._sliders_initialized = False
-			print("[AVG_ROI] Параметры буфера сброшены для переинициализации")
+			if bool(getattr(self, 'debug', False)):
+				print("[AVG_ROI] Параметры буфера сброшены для переинициализации")
 
 			self._set_view_mode(0)
 			self.stream_mode = 2
 			self.qtimer.setInterval(200)
 			self._set_status(f"AVG_ROI: усреднение на устройстве avg_n={avg_n}, ROI=200", hold_sec=3.0)
-			print("[AVG_ROI] Режим активирован")
+			if bool(getattr(self, 'debug', False)):
+				print("[AVG_ROI] Режим активирован")
 		except Exception as e:
 			print(f"[AVG_ROI] Ошибка переключения: {e}")
 			self._set_status(f"Ошибка AVG_ROI: {e}", hold_sec=3.0)
@@ -1585,7 +1620,7 @@ class ScopeWindow:
 		If called, emit a diagnostic message to help track unexpected invocations.
 		"""
 		try:
-			if getattr(self, 'diag_to_console', False):
+			if bool(getattr(self, 'debug', False)) and getattr(self, 'diag_to_console', False):
 				print("[DC_REMOVAL] _update_dc_offset_adaptive was called (host adaptation disabled)")
 		except Exception:
 			pass
@@ -1595,7 +1630,7 @@ class ScopeWindow:
 			"""Host-side DC save disabled: device handles DC; this is a no-op."""
 			try:
 				# no-op, but keep a debug print for visibility
-				if getattr(self, 'diag_to_console', False):
+				if bool(getattr(self, 'debug', False)) and getattr(self, 'diag_to_console', False):
 					print("[DC_REMOVAL] _save_dc_offset called but host DC save is disabled")
 			except Exception:
 				pass
@@ -1908,7 +1943,8 @@ class ScopeWindow:
 			forced = getattr(self, 'phase_key', 'auto')
 			if forced and forced != 'auto':
 				self._phase_key_chosen = forced
-				print(f"[PHASE_KEY] forced={self._phase_key_chosen}", flush=True)
+				if bool(getattr(self, 'debug', False)) or bool(getattr(self, 'phase_trace', False)):
+					print(f"[PHASE_KEY] forced={self._phase_key_chosen}", flush=True)
 				return
 			# wait for enough samples
 			min_n = 60
@@ -1949,9 +1985,11 @@ class ScopeWindow:
 				self._phase_key_chosen = best
 				try:
 					st = self._phase_key_stats.get(best, {})
-					print(f"[PHASE_KEY] auto={best} n={st.get('n')} ones={st.get('ones')} toggles={st.get('toggles')}", flush=True)
+					if bool(getattr(self, 'debug', False)) or bool(getattr(self, 'phase_trace', False)):
+						print(f"[PHASE_KEY] auto={best} n={st.get('n')} ones={st.get('ones')} toggles={st.get('toggles')}", flush=True)
 				except Exception:
-					print(f"[PHASE_KEY] auto={best}", flush=True)
+					if bool(getattr(self, 'debug', False)) or bool(getattr(self, 'phase_trace', False)):
+						print(f"[PHASE_KEY] auto={best}", flush=True)
 
 		def _phase_toggle_bit(kind: str, frame):
 			"""Stable even/odd splitter per channel.
@@ -3043,13 +3081,15 @@ class ScopeWindow:
 		try:
 			windows_data = struct.pack('<HHHH', 0, 0, 0, 0)
 			self.stream.send_cmd(CMD_SET_WINDOWS, windows_data)
-			print("[initseq] SET_WINDOWS(0,0,0,0) - полный буфер")
+			if bool(getattr(self, 'debug', False)):
+				print("[initseq] SET_WINDOWS(0,0,0,0) - полный буфер")
 		except Exception as e:
 			print("[initseq] SET_WINDOWS err", e)
 		# SET_STREAM_MODE: 0 (LATEST) - по умолчанию запускаем в режиме LATEST
 		try:
 			self.stream.send_cmd(CMD_SET_STREAM_MODE, b"\x00")
-			print("[initseq] SET_STREAM_MODE=0 (LATEST)")
+			if bool(getattr(self, 'debug', False)):
+				print("[initseq] SET_STREAM_MODE=0 (LATEST)")
 		except Exception as e:
 			print("[initseq] SET_STREAM_MODE err", e)
 		# FULL mode
@@ -3589,7 +3629,8 @@ class ScopeWindow:
 							res_b = subprocess.run(["sudo", "tee", bb], input=f"{port_path}\n", text=True, capture_output=True, timeout=6)
 						if res_u.returncode != 0 or res_b.returncode != 0:
 							raise RuntimeError(f"unbind/bind rcU={res_u.returncode} rcB={res_b.returncode} outU={res_u.stderr or res_u.stdout} outB={res_b.stderr or res_b.stdout}")
-						print("[power] unbind/bind OK")
+						if bool(getattr(self, 'debug', False)):
+							print("[power] unbind/bind OK")
 					except Exception as e_ub:
 						self._set_status(f"Не удалось перезапустить порт: {e_ub}", hold_sec=3.0)
 						return
@@ -3624,7 +3665,8 @@ class ScopeWindow:
 				os.environ['BMI30_SEND_BLOCK_RATE'] = '1'
 			except Exception:
 				pass
-			print(f"[CONNECT] Creating USBStream, profile={self.desired_profile}, fs={fs}", flush=True)
+			if bool(getattr(self, 'debug', False)):
+				print(f"[CONNECT] Creating USBStream, profile={self.desired_profile}, fs={fs}", flush=True)
 			self.stream = USBStream(profile=self.desired_profile, full=True, test_as_data=self.test_as_data, frame_samples=fs, fast_mode=True, assembler_independent=self.independent_channels)
 			# Сохраним порт info для power cycle без stream
 			self.last_port_info = self.stream.port_info
@@ -3639,14 +3681,17 @@ class ScopeWindow:
 			self.last_frame_t = 0
 			self.no_data_warned = False
 			# Запускаем reader thread
-			print(f"[CONNECT] reader_running={self.reader_running}, starting thread...", flush=True)
+			if bool(getattr(self, 'debug', False)):
+				print(f"[CONNECT] reader_running={self.reader_running}, starting thread...", flush=True)
 			if not self.reader_running:
 				self.reader_running = True
 				self.reader_thread = threading.Thread(target=self._reader_thread_func, daemon=True)
 				self.reader_thread.start()
-				print("[GUI] Reader thread started", flush=True)
+				if bool(getattr(self, 'debug', False)):
+					print("[GUI] Reader thread started", flush=True)
 			else:
-				print("[GUI] Reader thread already running", flush=True)
+				if bool(getattr(self, 'debug', False)):
+					print("[GUI] Reader thread already running", flush=True)
 		except SystemExit as se:
 			self.stream = None
 			print(f"[ERROR] SystemExit: {se}", flush=True)
@@ -3777,7 +3822,8 @@ class ScopeWindow:
 			try:
 				self._switch_to_avg_roi(new_n)
 			except Exception as e:
-				print(f"[AVG_ROI] Не удалось автоматически переключить AVG_ROI: {e}")
+				if bool(getattr(self, 'debug', False)):
+					print(f"[AVG_ROI] Не удалось автоматически переключить AVG_ROI: {e}")
 				self._set_status(f"Выбрано avg_n={new_n} (устройство не подключено)", hold_sec=2.0)
 				return
 		# If already in AVG_ROI, send only SET_STREAM_MODE with new avg_n; otherwise do full switch
@@ -3785,7 +3831,8 @@ class ScopeWindow:
 			if getattr(self, 'stream_mode', 0) == 2:
 				self.stream.send_cmd(CMD_SET_STREAM_MODE, bytes([0x02, new_n & 0xFF]))
 				self._set_status(f"Отправлен AVG_ROI avg_n={new_n}", hold_sec=2.0)
-				print(f"[AVG_ROI] SET_STREAM_MODE=2 (avg_n={new_n}) отправлен по изменению меню")
+				if bool(getattr(self, 'debug', False)):
+					print(f"[AVG_ROI] SET_STREAM_MODE=2 (avg_n={new_n}) отправлен по изменению меню")
 			else:
 				self._switch_to_avg_roi(new_n)
 		except Exception as e:
