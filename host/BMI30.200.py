@@ -22,6 +22,7 @@ os.environ.setdefault("QT_STYLE_OVERRIDE", "Fusion")
 os.environ.pop("QT_QPA_PLATFORMTHEME", None)
 import numpy as np  # type: ignore
 import serial, glob
+import threading, queue
 
 try:
 	from usb_vendor.usb_stream import USBStream, CMD_SET_PROFILE, CMD_STOP_STREAM, CMD_START_STREAM, CMD_SOFT_RESET, CMD_DEEP_RESET, CMD_SET_WINDOWS, CMD_SET_STREAM_MODE, CMD_ASYNC  # type: ignore
@@ -44,96 +45,123 @@ except Exception:
 # Qt/pyqtgraph bootstrap: enforce PyQt5 first to keep binding consistent
 PG_IMPORT_ERR = None
 try:
-	# Tell pyqtgraph which Qt lib to use
-	os.environ.setdefault("PYQTGRAPH_QT_LIB", "PyQt5")
-	from PyQt5 import QtWidgets, QtCore  # type: ignore
-	import pyqtgraph as pg  # type: ignore
+    # Tell pyqtgraph which Qt lib to use
+    os.environ.setdefault("PYQTGRAPH_QT_LIB", "PyQt5")
+    from PyQt5 import QtWidgets, QtCore  # type: ignore
+    import pyqtgraph as pg  # type: ignore
 except Exception as e1:  # pragma: no cover
-	try:
-		os.environ["PYQTGRAPH_QT_LIB"] = "PySide6"
-		from PySide6 import QtWidgets, QtCore  # type: ignore
-		import pyqtgraph as pg  # type: ignore
-	except Exception as e2:
-		PG_IMPORT_ERR = e1
-
-
-def load_config():
-	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
-	try:
-		with open(config_file, "r") as f:
-			data = json.load(f)
-		return data.get("desired_profile", 1)
-	except Exception:
-		return 1
+    try:
+        os.environ["PYQTGRAPH_QT_LIB"] = "PySide6"
+        from PySide6 import QtWidgets, QtCore  # type: ignore
+        import pyqtgraph as pg  # type: ignore
+    except Exception:
+        PG_IMPORT_ERR = e1
 
 
 def save_config(desired_profile):
-	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
-	try:
-		with open(config_file, "w") as f:
-			json.dump({"desired_profile": desired_profile}, f)
-	except Exception:
-		pass
+    config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+    try:
+        with open(config_file, "w") as f:
+            json.dump({"desired_profile": desired_profile}, f)
+    except Exception:
+        pass
 
-
-def load_avg_n():
-	"""Load avg_n from config file (fallback 20)."""
+def load_config():
+	"""Load desired_profile from config file (1=200Hz, 2=300Hz). Default=1."""
 	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
 	try:
 		with open(config_file, "r") as f:
-			data = json.load(f)
-		val = int(data.get("avg_n", 20))
-		if val < 2:
-			return 20
+			data = json.load(f) or {}
+		val = int(data.get("desired_profile", 1))
+		if val not in (1, 2):
+			return 1
 		return val
 	except Exception:
-		return 20
+		return 1
+
+def load_avg_n():
+    """Load avg_n from config file (fallback 20)."""
+    config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+    try:
+        with open(config_file, "r") as f:
+            data = json.load(f) or {}
+        val = int(data.get("avg_n", 20))
+        if val < 2:
+            return 20
+        return val
+    except Exception:
+        return 20
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+	"""Parse common boolean env var values."""
+	try:
+		val = os.getenv(name)
+		if val is None:
+			return bool(default)
+		return str(val).strip().lower() in ("1", "true", "yes", "y", "on", "t")
+	except Exception:
+		return bool(default)
 
 
 def save_avg_n(avg_n: int):
-	"""Save avg_n to config file alongside other settings (best-effort merge)."""
-	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
-	try:
-		data = {}
-		if os.path.exists(config_file):
-			try:
-				with open(config_file, "r") as f:
-					data = json.load(f) or {}
-			except Exception:
-				data = {}
-		data["avg_n"] = int(avg_n)
-		with open(config_file, "w") as f:
-			json.dump(data, f)
-	except Exception:
-		pass
+    """Save avg_n to config file alongside other settings (best-effort merge)."""
+    config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+    try:
+        data = {}
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, "r") as f:
+                    data = json.load(f) or {}
+            except Exception:
+                data = {}
+        data["avg_n"] = int(avg_n)
+        with open(config_file, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
 
 
 class ScopeWindow:
 	def __init__(self):
-		print("[INIT] BMI30 GUI starting...", flush=True)
+		# Logging flags (quiet by default)
+		self.debug = _env_bool("BMI30_DEBUG", False)
+		self.xcorr_debug = _env_bool("BMI30_XCORR_DEBUG", self.debug)
+		self.reader_debug = _env_bool("BMI30_READER_DEBUG", self.debug)
+		if self.debug:
+			print("[INIT] BMI30 GUI starting...", flush=True)
 		if PG_IMPORT_ERR:
 			print(f"[ERR] pyqtgraph/Qt import failed: {PG_IMPORT_ERR}")
 			sys.exit(2)
 		self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 		self.win = QtWidgets.QMainWindow()
 		self.win.setWindowTitle("BMI30 Vendor Bulk Oscilloscope - Thread Mode")
-		print("[INIT] Window created", flush=True)
+		if self.debug:
+			print("[INIT] Window created", flush=True)
 		central = QtWidgets.QWidget()
 		self.win.setCentralWidget(central)
 		layout = QtWidgets.QVBoxLayout(central)
 		# Загружаем desired_profile из config
 		self.desired_profile = load_config()  # 1=>200 Гц, 2=>300 Гц
-		# По умолчанию — GUI не должен применять DC-вычитание при старте
+		# По умолчанию — DC-вычитание не применяется в GUI (встроено в устройство)
 		self.dc_removal_enabled = False
+		# Переключатель нормализации XCorr (привязан к кнопке "звук")
+		# True  -> авто-масштаб/центрированный продукт (текущая логика)
+		# False -> фиксированная шкала 0..65535 для просмотра слабых сигналов
+		self.xcorr_norm_enabled = True
 		# legend (вместо верхних кнопок)
 		self.legend_lbl = QtWidgets.QLabel("--")
 		font = self.legend_lbl.font()
 		font.setPointSize(font.pointSize()+1)
 		self.legend_lbl.setFont(font)
+		# legend_lbl остаётся основным статусным лейблом; цветные метки 1/0
+		# отображаются в заголовках каждого графика (локально), поэтому
+		# не создаём глобальный mapping-widget в легенде.
 		legend_bar = QtWidgets.QHBoxLayout()
 		legend_bar.addWidget(self.legend_lbl, 1)
+		# no global mapping widget - per-plot colored titles are used
 		# выбор количества усреднённых буферов (avg_n)
-		self.avg_n = load_avg_n()
+		self.avg_n = load_avg_n()  # Load avg_n from config file
 		self.avg_box = QtWidgets.QComboBox()
 		avg_items = ["4","8","12","16","20","24","28","32"]
 		self.avg_box.addItems(avg_items)
@@ -187,21 +215,21 @@ class ScopeWindow:
 		# Диагностика: делаем кнопку переключаемой и используем её для
 		# включения/выключения DC-вычитания (фиксация состояния).
 		self.btn_diag = QtWidgets.QPushButton("🩺")
-		self.btn_diag.setToolTip("Переключатель DC removal (клик: вкл/выкл)")
+		self.btn_diag.setToolTip("XCorr: нормализация/автомасштаб (кнопка звука)")
 		self.btn_diag.setCheckable(True)
-		# отобразим текущее состояние DC
+		# отобразим текущее состояние нормализации XCorr
 		try:
-			self.btn_diag.setChecked(bool(self.dc_removal_enabled))
+			self.btn_diag.setChecked(bool(self.xcorr_norm_enabled))
 		except Exception:
 			pass
-		self.btn_diag.toggled.connect(self._on_toggle_dc_removal)
+		self.btn_diag.toggled.connect(self._on_toggle_xcorr_norm)
 		try:
 			self.btn_diag.setFixedSize(21, 21)
 		except Exception:
 			pass
-		# синхронизируем визуальный вид кнопки с текущим состоянием DC
+		# синхронизируем визуальный вид кнопки с текущим состоянием
 		try:
-			self._on_toggle_dc_removal(bool(self.dc_removal_enabled))
+			self._on_toggle_xcorr_norm(bool(self.xcorr_norm_enabled))
 		except Exception:
 			pass
 		legend_bar.addWidget(self.btn_diag, 0)
@@ -209,8 +237,24 @@ class ScopeWindow:
 		# plots
 		self.plotw = pg.GraphicsLayoutWidget()
 		layout.addWidget(self.plotw, 1)
-		self.p0 = self.plotw.addPlot(row=0, col=0, title="ADC0")
-		self.p1 = self.plotw.addPlot(row=1, col=0, title="ADC1")
+		self.p0 = self.plotw.addPlot(row=0, col=0)
+		# set colored title mapping for ADC0: 1 / 0
+		try:
+			self.p0.setTitle("<span style='font-weight:bold; font-size:12pt; color:#ffb86b'>ADC0 1</span> / <span style='font-weight:bold; font-size:12pt; color:#00e5ff'>0</span>")
+		except Exception:
+			try:
+				self.p0.setTitle("ADC0 (1/0)")
+			except Exception:
+				pass
+		self.p1 = self.plotw.addPlot(row=1, col=0)
+		# set colored title mapping for ADC1: 1 / 0
+		try:
+			self.p1.setTitle("<span style='font-weight:bold; font-size:12pt; color:#ff6b6b'>ADC1 1</span> / <span style='font-weight:bold; font-size:12pt; color:#00ffd5'>0</span>")
+		except Exception:
+			try:
+				self.p1.setTitle("ADC1 (1/0)")
+			except Exception:
+				pass
 		# Use fast line plots instead of many symbols to reduce CPU and increase FPS
 		# Two packets per channel => draw even/odd oscillograms per plot (different colors)
 		# ADC0: более контрастные цвета для тёмной темы
@@ -219,6 +263,47 @@ class ScopeWindow:
 		# ADC1: повышенная яркость для лучшей видимости на тёмной теме
 		self.curve1_a = self.p1.plot(pen=pg.mkPen('#ff6b6b', width=1.5), symbol=None)  # even (яркий красный)
 		self.curve1_b = self.p1.plot(pen=pg.mkPen('#00ffd5', width=1.5), symbol=None)  # odd (яркий мятный)
+		# Корреляционные кривые — отображать в отдельном ViewBox справа (масштаб вокруг нуля)
+		try:
+			# create right-side viewbox for corr on p0
+			self.p0.showAxis('right')
+			self.vb_corr0 = pg.ViewBox()
+			self.p0.scene().addItem(self.vb_corr0)
+			self.p0.getAxis('right').linkToView(self.vb_corr0)
+			self.vb_corr0.setXLink(self.p0)
+			# create plot item inside that viewbox
+			self.corr0 = pg.PlotDataItem(pen=pg.mkPen('#ffff00', width=1.2), symbol=None)
+			self.vb_corr0.addItem(self.corr0)
+			# keep right viewbox geometry in sync
+			def _update_vb_corr0():
+				self.vb_corr0.setGeometry(self.p0.getViewBox().sceneBoundingRect())
+			self.p0.getViewBox().sigResized.connect(_update_vb_corr0)
+
+			# create right-side viewbox for corr on p1
+			self.p1.showAxis('right')
+			self.vb_corr1 = pg.ViewBox()
+			self.p1.scene().addItem(self.vb_corr1)
+			self.p1.getAxis('right').linkToView(self.vb_corr1)
+			self.vb_corr1.setXLink(self.p1)
+			self.corr1 = pg.PlotDataItem(pen=pg.mkPen('#00ff00', width=1.2), symbol=None)
+			self.vb_corr1.addItem(self.corr1)
+			def _update_vb_corr1():
+				self.vb_corr1.setGeometry(self.p1.getViewBox().sceneBoundingRect())
+			self.p1.getViewBox().sigResized.connect(_update_vb_corr1)
+
+			# hide correlation curves by default
+			self.corr0.setVisible(False)
+			self.corr1.setVisible(False)
+		except Exception:
+			# fallback to simple plots if ViewBox API unavailable
+			self.corr0 = self.p0.plot(pen=pg.mkPen('#ffff00', width=1.2), symbol=None)
+			self.corr1 = self.p1.plot(pen=pg.mkPen('#00ff00', width=1.2), symbol=None)
+			try:
+				self.corr0.setVisible(False)
+				self.corr1.setVisible(False)
+			except Exception:
+				pass
+
 		self.p0.showGrid(x=True, y=True, alpha=0.3)
 		self.p1.showGrid(x=True, y=True, alpha=0.3)
 		# Синхронизируем X-оси между графиками
@@ -285,6 +370,11 @@ class ScopeWindow:
 		# Shared buffers для двух каналов - инициализируем сразу с максимальным размером
 		# Резерв под максимальный буфер (не жёстко завязан на профиль)
 		self.max_samples = 2048
+		# saved best per-sample product arrays and peaks (persist until larger peak found)
+		self._xcorr_saved_prod0 = np.zeros(self.max_samples, dtype=np.float64)
+		self._xcorr_saved_prod1 = np.zeros(self.max_samples, dtype=np.float64)
+		self._xcorr_saved_peak0 = 0.0
+		self._xcorr_saved_peak1 = 0.0
 		# Two buffers per channel: even/odd packets keyed by seq&1
 		self.data0 = np.zeros(self.max_samples, dtype=np.int32)  # совместимость (используем как even)
 		self.data1 = np.zeros(self.max_samples, dtype=np.int32)  # совместимость (используем как even)
@@ -337,21 +427,14 @@ class ScopeWindow:
 		except Exception:
 			self.dc_update_step = 1.0
 		# В каких STREAM_MODE учим DC (1=LOSSLESS_ROI, 2=AVG_ROI). По умолчанию: 1,2.
+		# Disable host-side DC adaptation: device performs DC compensation.
+		# Keep empty set to avoid any adaptive updates or host DC logic.
 		try:
-			modes_s = str(os.getenv('BMI30_DC_ADAPT_MODES', '1,2'))
-			modes = set()
-			for part in modes_s.replace(';', ',').replace(' ', '').split(','):
-				if not part:
-					continue
-				try:
-					modes.add(int(part))
-				except Exception:
-					pass
-			self.dc_adapt_modes = modes if modes else {1, 2}
+			self.dc_adapt_modes = set()
 		except Exception:
-			self.dc_adapt_modes = {1, 2}
-		# Загрузить сохраненные DC offset массивы при старте
-		self._load_dc_offset()
+			self.dc_adapt_modes = set()
+		# DC компенсация встроена в устройство — не загружаем локальные офсеты
+		# (раньше вызывали self._load_dc_offset())
 		
 		# How to split packets into two phases (even/odd).
 		# Firmware may encode phase in seq LSB, timestamp LSB, or reserved fields.
@@ -414,6 +497,8 @@ class ScopeWindow:
 		self.data_lock = threading.Lock()  # защита shared buffers
 		self.reader_thread = None
 		self.reader_running = False
+		# Flag set by reader when new data copied; polled in GUI tick to trigger xcorr compute
+		self._need_xcorr = False
 		# Инициализируем view параметры сразу чтобы показывать данные
 		self.view_start = 0
 		self.view_len = self.max_samples
@@ -658,6 +743,13 @@ class ScopeWindow:
 		self.qtimer.setInterval(interval)
 		self.qtimer.timeout.connect(self._tick)
 		self.qtimer.start()
+
+		# Start background mode-switch worker to avoid blocking GUI on USB commands
+		try:
+			self._mode_worker = _ModeWorker(self)
+			self._mode_worker.start()
+		except Exception:
+			self._mode_worker = None
 		# авто-кик при зависании
 		self.auto_soft_kick = str(os.getenv("BMI30_AUTO_SOFT_KICK", "1")).lower() not in ("0","false","no")
 		self.last_soft_kick_t = 0.0
@@ -711,6 +803,14 @@ class ScopeWindow:
 			self.num_group.addButton(b, i)
 			btns_layout.addWidget(b)
 			self.num_buttons.append(b)
+			# Ensure special handlers run even when clicking an already-checked button
+			try:
+				# connect per-button clicked to extra handler (passes index)
+				from functools import partial
+				b.clicked.connect(partial(self._on_num_clicked_extra, i))
+			except Exception:
+				# if partial import fails for any reason, ignore
+				pass
 		# без stretch — слайдеры тянутся до кнопок
 		bottom.addLayout(btns_layout)
 		# apply saved selection
@@ -719,6 +819,8 @@ class ScopeWindow:
 		else:
 			self.num_buttons[0].setChecked(True)
 		self.num_group.idClicked.connect(self._num_clicked)
+		# Дополнительный обработчик для специальных режимов (например кнопка 6 — корреляция)
+		self.num_group.idClicked.connect(self._on_num_clicked_extra)
 		self.win.closeEvent = self._on_close  # type: ignore
 		# slider signals
 		self.slider_start.valueChanged.connect(self._on_slider_start)
@@ -751,6 +853,11 @@ class ScopeWindow:
 				idx = 3
 			if idx != 0:
 				self._num_clicked(idx)
+				# also trigger extra handler (e.g., button 6 correlation) on autostart
+				try:
+					self._on_num_clicked_extra(idx)
+				except Exception:
+					pass
 		# режим отображения: 0=оба, 1=только канал 1, 2=только канал 2
 		self.view_mode = 0
 		
@@ -832,18 +939,311 @@ class ScopeWindow:
 		except Exception:
 			pass
 
-	def _switch_to_latest_mode(self):
-		"""Возврат в режим LATEST (STREAM_MODE=0): 600 семплов, допускаются пропуски"""
-		if self.stream is None:
-			return
-		# Если уходим из LOSSLESS_ROI, постараемся сохранить DC offset сразу (на выходе/перезапусках это критично)
+	def _xcorr_even_inverted(self, even: np.ndarray, odd: np.ndarray):
+		"""Compute cross-correlation between `even` and inverted `odd`.
+		Returns (best_shift, best_sum, norm_corr_full, best_prod_array).
+		- even, odd: 1D arrays of equal length N
+		- best_shift: integer in [-(N-1)..(N-1)] (odd index = i + shift)
+		- best_sum: raw (un-normalized) sum at best_shift
+		- norm_corr_full: float array length 2N-1 (normalized correlation)
+		- best_prod_array: length N array with per-sample products for best_shift,
+		  zeros outside overlap.
+		"""
 		try:
-			if getattr(self, 'stream_mode', 0) == 1:
-				self._save_dc_offset(force=True)
+			N = int(len(even))
+			if N != len(odd):
+				raise ValueError("even and odd must have same length")
+			# convert to signed centered values (0..65535 -> around 0)
+			even_s = even.astype(np.int64) - 32767
+			odd_s = odd.astype(np.int64) - 32767
+			# invert odd arithmetically
+			odd_inv = -odd_s
+
+			# raw cross-correlation (lags -(N-1)..(N-1))
+			corr = np.correlate(even_s, odd_inv, mode='full')  # int64
+
+			# energy for normalization: sliding sums of squared samples
+			even_sq = (even_s * even_s).astype(np.int64)
+			odd_sq = (odd_inv * odd_inv).astype(np.int64)
+			ones = np.ones(N, dtype=np.int64)
+			sum_even_sq = np.convolve(even_sq, ones, mode='full').astype(np.float64)
+			sum_odd_sq = np.convolve(odd_sq, ones, mode='full').astype(np.float64)
+			den = np.sqrt(sum_even_sq * sum_odd_sq)
+			# avoid div by zero
+			with np.errstate(invalid='ignore', divide='ignore'):
+				norm_corr = corr.astype(np.float64) / (den + 1e-12)
+
+			# choose best lag by absolute normalized correlation (scan full range)
+			# this avoids selecting edge zeros and finds strongest match magnitude
+			with np.errstate(invalid='ignore'):
+				abs_norm = np.abs(norm_corr)
+			# if all NaN/zero, fall back to raw corr
+			if np.all(np.isnan(abs_norm)) or np.nanmax(abs_norm) == 0:
+				best_idx = int(np.argmax(corr))
+				best_sum = float(corr[best_idx])
+			else:
+				best_idx = int(np.nanargmax(abs_norm))
+				best_sum = float(norm_corr[best_idx])
+			best_shift = best_idx - (N - 1)
+
+			# build per-sample product array for that shift (zeros outside overlap)
+			prod = np.zeros(N, dtype=np.float64)
+			L = best_shift
+			if L >= 0:
+				# odd index = i + L in [0..N-1] => i in [0..N-1-L]
+				end = N - L
+				if end > 0:
+					_i = np.arange(0, end)
+					prod[_i] = (even_s[_i].astype(np.float64) * odd_inv[_i + L].astype(np.float64))
+			else:
+				# L < 0: odd index = i + L => i starts at -L
+				start = -L
+				if start < N:
+					_i = np.arange(start, N)
+					prod[_i] = (even_s[_i].astype(np.float64) * odd_inv[_i + L].astype(np.float64))
+
+			return best_shift, best_sum, norm_corr, prod
+		except Exception:
+			# on error, return safe defaults
+			N = int(len(even)) if hasattr(even, '__len__') else 0
+			return 0, 0.0, np.zeros(2 * N - 1, dtype=np.float64), np.zeros(N, dtype=np.float64)
+
+	def _on_num_clicked_extra(self, idx: int):
+		"""Extra handler for numeric buttons — button 6 triggers cross-correlation display."""
+		try:
+			if int(idx) != 6:
+				return
+		except Exception:
+			return
+
+		# lazy-init timer for continuous recompute
+		if not hasattr(self, '_corr_timer') or self._corr_timer is None:
+			self._corr_timer = QtCore.QTimer()
+			# call compute every 200 ms (5 Hz) — responsive but light
+			self._corr_timer.setInterval(200)
+			self._corr_timer.timeout.connect(self._compute_and_plot_xcorr)
+
+		# if button is checked -> start continuous recompute, else stop
+		try:
+			if self.num_buttons[6].isChecked():
+				# immediate compute once, then start timer
+				# make correlation curves visible and compute
+				try:
+					self.corr0.setVisible(True)
+					self.corr1.setVisible(True)
+				except Exception:
+					pass
+				self._compute_and_plot_xcorr()
+				self._corr_timer.start()
+				self._set_status('XCorr: continuous', hold_sec=1.0)
+			else:
+				if hasattr(self, '_corr_timer'):
+					self._corr_timer.stop()
+				# hide and clear corr plots
+				try:
+					self.corr0.setData([], [])
+					self.corr1.setData([], [])
+					self.corr0.setVisible(False)
+					self.corr1.setVisible(False)
+				except Exception:
+					pass
+					# reset saved bests
+					try:
+						self._xcorr_saved_peak0 = 0.0
+						self._xcorr_saved_peak1 = 0.0
+						self._xcorr_saved_prod0.fill(0)
+						self._xcorr_saved_prod1.fill(0)
+					except Exception:
+						pass
+					self._set_status('XCorr: stopped', hold_sec=1.0)
 		except Exception:
 			pass
-		
+
+	def _compute_and_plot_xcorr(self):
+		"""Compute cross-correlation for both channels and update plots/legend."""
+		with self.data_lock:
+			N = int(self.base_buf_len) if getattr(self, 'base_buf_len', None) else int(getattr(self, 'view_len', self.max_samples))
+			N = max(1, min(N, self.max_samples))
+			# copy raw buffers (unsigned 0..65535 stored as ints) and keep as float for DC ops
+			e0_raw = np.array(self.data0_even[:N], copy=True).astype(np.float64)
+			o0_raw = np.array(self.data0_odd[:N], copy=True).astype(np.float64)
+			e1_raw = np.array(self.data1_even[:N], copy=True).astype(np.float64)
+			o1_raw = np.array(self.data1_odd[:N], copy=True).astype(np.float64)
+
+		if N <= 1:
+			return
+
+		# Use raw inputs as-is (0..65535). Device already provides DC-compensated signals.
+		# Keep *_raw arrays for computations and diagnostics; do not center/subtract DC here.
+		e0 = e0_raw
+		o0 = o0_raw
+		e1 = e1_raw
+		o1 = o1_raw
+
+		# Diagnostic (optional): show means/std
+		if bool(getattr(self, 'xcorr_debug', False)):
+			try:
+				print(f"[XCORR] N={N} stream_mode={getattr(self,'stream_mode',None)} avg_n={getattr(self,'avg_n',None)} avg20_enabled={getattr(self,'avg20_enabled',False)} dc_removal={getattr(self,'dc_removal_enabled',False)}")
+				print(f"[XCORR] ch0 mean_even={float(np.mean(e0)):.2f} std_even={float(np.std(e0)):.2f} mean_odd={float(np.mean(o0)):.2f} std_odd={float(np.std(o0)):.2f}")
+				print(f"[XCORR] ch1 mean_even={float(np.mean(e1)):.2f} std_even={float(np.std(e1)):.2f} mean_odd={float(np.mean(o1)):.2f} std_odd={float(np.std(o1)):.2f}")
+			except Exception:
+				pass
+
+		# ---- Simple per-sample product (no lag) as first step ----
+		# Compute centered signed product so sign/doubling behavior is correct.
+		# В режиме XCorr-norm=ON показываем центрированный продукт и авто-масштабируем.
+		# В режиме XCorr-norm=OFF фиксируем шкалу 0..65535 и сдвигаем данные в этот диапазон.
 		try:
+			# centered (signed) signals: 0..65535 -> roughly -32767..+32768
+			even0_c = e0_raw.astype(np.float64) - 32767.0
+			odd0_c = o0_raw.astype(np.float64) - 32767.0
+			even1_c = e1_raw.astype(np.float64) - 32767.0
+			odd1_c = o1_raw.astype(np.float64) - 32767.0
+
+			# inverted odd (signed)
+			odd0_inv_c = -odd0_c
+			odd1_inv_c = -odd1_c
+
+			# centered per-sample product (can be negative)
+			prod0_center = even0_c * odd0_inv_c
+			prod1_center = even1_c * odd1_inv_c
+
+			# normalize centered product to approx [-1..1] dividing by max possible (32768^2)
+			denom = (32768.0 * 32768.0)
+			prod0_norm = prod0_center / (denom + 1e-12)
+			prod1_norm = prod1_center / (denom + 1e-12)
+
+			xcorr_norm = bool(getattr(self, 'xcorr_norm_enabled', True))
+			if xcorr_norm:
+				# авто-масштаб вокруг 0
+				prod0_raw = prod0_center
+				prod1_raw = prod1_center
+			else:
+				# фиксированная шкала 0..65535 (сдвиг центра в 32767)
+				prod0_raw = prod0_center + 32767.0
+				prod1_raw = prod1_center + 32767.0
+
+			# keep centered product for diagnostics/legend
+			prod0 = prod0_center
+			prod1 = prod1_center
+		except Exception:
+			prod0_raw = np.zeros_like(e0_raw)
+			prod1_raw = np.zeros_like(e1_raw)
+			prod0 = np.zeros_like(e0_raw)
+			prod1 = np.zeros_like(e1_raw)
+
+		# Only display correlation when button 6 is active; otherwise clear/hide
+		try:
+			if not (hasattr(self, 'num_buttons') and len(self.num_buttons) > 6 and self.num_buttons[6].isChecked()):
+				# ensure cleared
+				try:
+					self.corr0.setData([], [])
+					self.corr1.setData([], [])
+				except Exception:
+					pass
+				return
+		except Exception:
+			# if anything goes wrong, bail safely
+			return
+
+		# prod0_raw/prod1_raw are currently centered per-sample products (can be negative); sanitize NaNs
+		try:
+			prod0_raw = np.nan_to_num(prod0_raw)
+			prod1_raw = np.nan_to_num(prod1_raw)
+		except Exception:
+			prod0_raw = np.zeros(N, dtype=np.float64)
+			prod1_raw = np.zeros(N, dtype=np.float64)
+		# display length (pad to at least 200 for consistency)
+		try:
+			min_display = max(200, N)
+			pad0 = np.zeros(min_display, dtype=np.float64)
+			pad1 = np.zeros(min_display, dtype=np.float64)
+			# fill with centered products (can be negative)
+			pad0[:N] = prod0_raw[:N]
+			pad1[:N] = prod1_raw[:N]
+			self._xcorr_saved_prod0[:min_display] = pad0
+			self._xcorr_saved_prod1[:min_display] = pad1
+		except Exception:
+			min_display = N
+
+		# diagnostic: show current prod stats (optional)
+		if bool(getattr(self, 'xcorr_debug', False)):
+			try:
+				print(f"[XCORR-PROD] centered ch0 min={float(np.min(prod0)):.3f} max={float(np.max(prod0)):.3f} mean={float(np.mean(prod0)):.3f}")
+				print(f"[XCORR-PROD] centered ch1 min={float(np.min(prod1)):.3f} max={float(np.max(prod1)):.3f} mean={float(np.mean(prod1)):.3f}")
+				print(f"[XCORR-DISP] ch0 disp prod min={float(np.min(prod0_raw)):.3f} max={float(np.max(prod0_raw)):.3f} mean={float(np.mean(prod0_raw)):.3f}")
+				print(f"[XCORR-DISP] ch1 disp prod min={float(np.min(prod1_raw)):.3f} max={float(np.max(prod1_raw)):.3f} mean={float(np.mean(prod1_raw)):.3f}")
+			except Exception:
+				pass
+
+		# plot raw-domain simple-product arrays (0..65535) on same scale as inputs
+		try:
+			x = np.arange(0, min_display, dtype=np.int32)
+			self.corr0.setData(x, self._xcorr_saved_prod0[:min_display])
+			self.corr1.setData(x, self._xcorr_saved_prod1[:min_display])
+			try:
+				xcorr_norm = bool(getattr(self, 'xcorr_norm_enabled', True))
+				# В режиме OFF фиксируем шкалу для обоих каналов.
+				if hasattr(self, 'vb_corr0'):
+					if xcorr_norm:
+						# symmetric around 0 based on current data magnitude
+						vals = self._xcorr_saved_prod0[:min_display]
+						mag = float(np.max(np.abs(vals))) if vals.size else 1.0
+						mag = max(1.0, mag)
+						try:
+							self.vb_corr0.setYRange(-mag * 1.05, mag * 1.05, padding=0.0)
+						except Exception:
+							self.vb_corr0.autoRange()
+					else:
+						self.vb_corr0.setYRange(0.0, 65535.0, padding=0.0)
+			except Exception:
+				pass
+			try:
+				if hasattr(self, 'vb_corr1'):
+					if xcorr_norm:
+						vals = self._xcorr_saved_prod1[:min_display]
+						mag = float(np.max(np.abs(vals))) if vals.size else 1.0
+						mag = max(1.0, mag)
+						try:
+							self.vb_corr1.setYRange(-mag * 1.05, mag * 1.05, padding=0.0)
+						except Exception:
+							self.vb_corr1.autoRange()
+					else:
+						self.vb_corr1.setYRange(0.0, 65535.0, padding=0.0)
+			except Exception:
+				pass
+		except Exception:
+			try:
+				self.corr0.setData([], [])
+				self.corr1.setData([], [])
+			except Exception:
+				pass
+
+		# show simple-product summary in legend
+		try:
+			xcorr_norm = bool(getattr(self, 'xcorr_norm_enabled', True))
+			mode = "norm" if xcorr_norm else "0..65535"
+			self.legend_lbl.setText(f"Prod(no-shift) [{mode}]: ch0 mean={float(np.mean(prod0)):.1f} ch1 mean={float(np.mean(prod1)):.1f}")
+		except Exception:
+			pass
+
+	def _switch_to_latest_mode(self):
+		"""Возврат в режим LATEST (STREAM_MODE=0): 600 семплов, допускаются пропуски"""
+		# prevent concurrent mode switches which block GUI (USB send_cmd is synchronous)
+		if getattr(self, '_mode_switch_in_progress', False):
+			self._set_status('Реж.переключения в процессе, подождите...', hold_sec=1.0)
+			return
+		self._mode_switch_in_progress = True
+		try:
+			if self.stream is None:
+				return
+			# Если уходим из LOSSLESS_ROI, постараемся сохранить DC offset сразу (на выходе/перезапусках это критично)
+			try:
+				if getattr(self, 'stream_mode', 0) == 1:
+					self._save_dc_offset(force=True)
+			except Exception:
+				pass
+			
 			# Отключаем DC removal если был включен
 			if getattr(self, 'dc_removal_enabled', False):
 				self.dc_removal_enabled = False
@@ -899,19 +1299,33 @@ class ScopeWindow:
 			
 		except Exception as e:
 			print(f"[LATEST] Ошибка переключения: {e}")
+		finally:
+			self._mode_switch_in_progress = False
 
-	def _switch_to_lossless_roi(self):
-		"""Переключение в режим LOSSLESS_ROI (STREAM_MODE=1): строгий FIFO, ROI 280..480 (200 семплов)"""
-		# Если поток не запущен - запустить его сначала
-		if self.stream is None:
-			print("[LOSSLESS_ROI] Поток не запущен, запускаем...")
-			self._set_status("Запуск потока для LOSSLESS_ROI...", hold_sec=1.0)
-			self._activate_stream()
-			time.sleep(0.5)  # Даём время на инициализацию
+	def _switch_to_lossless_roi(self, restart: bool = True):
+		"""Переключение в режим LOSSLESS_ROI (STREAM_MODE=1): строгий FIFO, ROI 280..480 (200 семплов)
+		Если `restart`=False и уже в STREAM_MODE=1, не перезапускаем поток/окна — только переключаем отображение/статус.
+		"""
+		# If caller requested no restart and already in desired mode, do light update only
+		if not restart and getattr(self, 'stream_mode', 0) == 1 and self.stream is not None:
+			self._set_view_mode(0)
+			self.qtimer.setInterval(200)
+			self._set_status("LOSSLESS_ROI (active)", hold_sec=1.0)
+			print("[LOSSLESS_ROI] Already active — no restart performed")
+			return
+
+		# If background worker available, enqueue non-blocking job
+		if getattr(self, '_mode_worker', None) is not None:
 			if self.stream is None:
-				print("[LOSSLESS_ROI] Не удалось запустить поток")
-				self._set_status("Ошибка запуска потока", hold_sec=2.0)
-				return
+				self._set_status("Запуск потока для LOSSLESS_ROI...", hold_sec=1.0)
+				self._activate_stream()
+				time.sleep(0.5)
+				if self.stream is None:
+					self._set_status("Ошибка запуска потока", hold_sec=2.0)
+					return
+			self._set_status("Переключение в LOSSLESS_ROI (в очереди)...", hold_sec=1.0)
+			self._enqueue_mode_action('lossless')
+			return
 		
 		try:
 			# Отключаем DC removal если был включен (режим LOSSLESS_ROI без DC)
@@ -982,78 +1396,126 @@ class ScopeWindow:
 		except Exception as e:
 			print(f"[LOSSLESS_ROI] Ошибка переключения: {e}")
 			self._set_status(f"Ошибка LOSSLESS_ROI: {e}", hold_sec=3.0)
+		finally:
+			self._mode_switch_in_progress = False
 
-	def _switch_to_dc_removal_mode(self):
-		"""Переключение в режим LOSSLESS_ROI с удалением постоянной составляющей (DC removal)"""
-		# Если уже в LOSSLESS_ROI (STREAM_MODE=1), не перезапускаем поток/окна — просто включаем отображение.
-		# Это важно, чтобы не создавать ощущения "сброса" DC при переключениях 5↔6.
-		if getattr(self, 'stream_mode', 0) != 1 or self.stream is None:
-			# Сначала переключаемся в LOSSLESS_ROI режим (stream_mode=1 устанавливается там)
-			self._switch_to_lossless_roi()
-		
-		# Включаем режим удаления DC (отображение скорректированных данных)
-		self.dc_removal_enabled = True
-		# AVG режимы управляются отдельно; здесь не трогаем
-		
-		self._set_status("DC Removal: вычитание постоянной составляющей, уровень = 32767", hold_sec=3.0)
-		print("[DC_REMOVAL] Режим активирован: отображение скорректированных данных без DC")
+	def _switch_to_dc_removal_mode(self, restart: bool = True):
+		"""Переключение в режим LOSSLESS_ROI с удалением постоянной составляющей (DC removal).
+		Если `restart`=False и уже в STREAM_MODE=1, не перезапускаем поток/окна — только обновляем отображение/статус.
+		"""
+		# Guard against concurrent switches
+		if getattr(self, '_mode_switch_in_progress', False):
+			self._set_status('Реж.переключения в процессе, подождите...', hold_sec=1.0)
+			return
+		self._mode_switch_in_progress = True
+		try:
+			# Если уже в LOSSLESS_ROI и restart=False — сделаем лёгкое обновление без STOP/START
+			if not restart and getattr(self, 'stream_mode', 0) == 1 and self.stream is not None:
+				self._set_view_mode(0)
+				self.qtimer.setInterval(200)
+				self._set_status("LOSSLESS_ROI (active)", hold_sec=1.0)
+				print("[DC_REMOVAL] Already in LOSSLESS_ROI — no restart performed")
+				return
 
-	def _switch_to_avg_roi(self, avg_n: int = 20):
+			# Иначе — переключаемся полноценно
+			if getattr(self, 'stream_mode', 0) != 1 or self.stream is None:
+				self._switch_to_lossless_roi(restart=restart)
+
+			# Host-side DC removal is disabled; device performs DC compensation.
+			self._set_status("LOSSLESS_ROI (device DC compensation)", hold_sec=2.0)
+		finally:
+			self._mode_switch_in_progress = False
+
+	def _switch_to_avg_roi(self, avg_n: int = 20, restart: bool = True):
 		"""Переключение в режим усреднения на устройстве (STREAM_MODE=2, AVG_ROI).
 		Устройство усредняет ROI по N входным буферам и выдаёт усреднённые ROI-кадры.
 		См. HOST_RPI.md: STOP -> SET_WINDOWS -> SET_STREAM_MODE(mode, avg_n) -> SET_ASYNC(0) -> START.
 		"""
-		# Если поток не запущен - запустить его сначала
-		if self.stream is None:
-			print("[AVG_ROI] Поток не запущен, запускаем...")
-			self._set_status("Запуск потока для AVG_ROI...", hold_sec=1.0)
-			self._activate_stream()
-			time.sleep(0.5)
+		# If background worker available, enqueue non-blocking avg switch
+		if getattr(self, '_mode_worker', None) is not None:
+			try:
+				avg_n = int(avg_n)
+			except Exception:
+				avg_n = 20
+			avg_n = max(2, min(32, avg_n))
 			if self.stream is None:
-				print("[AVG_ROI] Не удалось запустить поток")
-				self._set_status("Ошибка запуска потока", hold_sec=2.0)
-				return
-		try:
-			avg_n = int(avg_n)
-			if avg_n < 2:
-				avg_n = 2
-			if avg_n > 32:
-				avg_n = 32
-		except Exception:
-			avg_n = 20
+				self._set_status("Запуск потока для AVG_ROI...", hold_sec=1.0)
+				self._activate_stream()
+				time.sleep(0.5)
+				if self.stream is None:
+					self._set_status("Ошибка запуска потока", hold_sec=2.0)
+					return
+			self._set_status(f"Переключение в AVG_ROI (в очереди) avg_n={avg_n}", hold_sec=1.0)
+			self._enqueue_mode_action('avg', avg_n)
+			return
 
+		# Fallback synchronous path (guarded)
+		if getattr(self, '_mode_switch_in_progress', False):
+			self._set_status('Реж.переключения в процессе, подождите...', hold_sec=1.0)
+			return
+		self._mode_switch_in_progress = True
 		try:
+			# Ensure stream is running
+			if self.stream is None:
+				print("[AVG_ROI] Поток не запущен, запускаем...")
+				self._set_status("Запуск потока для AVG_ROI...", hold_sec=1.0)
+				self._activate_stream()
+				time.sleep(0.5)
+				if self.stream is None:
+					print("[AVG_ROI] Не удалось запустить поток")
+					self._set_status("Ошибка запуска потока", hold_sec=2.0)
+					return
+
+			# If caller requested no restart and device already in AVG_ROI, update avg_n in-place
+			if not restart and getattr(self, 'stream_mode', 0) == 2 and self.stream is not None:
+				try:
+					avg_n = int(avg_n)
+				except Exception:
+					avg_n = 20
+				avg_n = max(2, min(32, avg_n))
+				self.stream.send_cmd(CMD_SET_STREAM_MODE, bytes([0x02, avg_n & 0xFF]))
+				print(f"[AVG_ROI] Updated avg_n in-place to {avg_n} (no restart)")
+				self.stream_mode = 2
+				self.qtimer.setInterval(200)
+				self._set_status(f"AVG_ROI updated (avg_n={avg_n})", hold_sec=1.5)
+				return
+
+			# Full switch path
+			try:
+				avg_n = int(avg_n)
+			except Exception:
+				avg_n = 20
+			avg_n = max(2, min(32, avg_n))
 			print(f"[AVG_ROI] Переключение в AVG_ROI (STREAM_MODE=2, avg_n={avg_n})...")
 			self._set_status(f"Переключение в AVG_ROI (avg_n={avg_n})...", hold_sec=1.0)
 
-			# Остановка потока
+			# STOP
 			self.stream.send_cmd(CMD_STOP_STREAM, b"")
 			time.sleep(0.05)
 			print("[AVG_ROI] STOP отправлен")
 
-			# SET_WINDOWS: ROI 280..479 (200) для обоих каналов (A и B)
+			# SET_WINDOWS: both channels ROI 280..479 (200)
 			windows_data = struct.pack('<HHHH', 280, 200, 280, 200)
 			self.stream.send_cmd(CMD_SET_WINDOWS, windows_data)
 			time.sleep(0.02)
 			print("[AVG_ROI] SET_WINDOWS(280,200, 280,200) отправлен")
 
 			# SET_STREAM_MODE: 2 (AVG_ROI) + avg_n
-			# В новой прошивке payload: <B mode> <B avg_n>
 			self.stream.send_cmd(CMD_SET_STREAM_MODE, bytes([0x02, avg_n & 0xFF]))
 			time.sleep(0.02)
 			print("[AVG_ROI] SET_STREAM_MODE=2 (AVG_ROI) отправлен")
 
-			# SET_ASYNC_MODE: 1 (независимые каналы A/B)
+			# SET_ASYNC_MODE: 1 (independent A/B)
 			self.stream.send_cmd(CMD_ASYNC, b"\x01")
 			time.sleep(0.02)
 			print("[AVG_ROI] SET_ASYNC_MODE=1 отправлен")
 
-			# Запуск потока
+			# START
 			self.stream.send_cmd(CMD_START_STREAM, b"")
 			time.sleep(0.05)
 			print("[AVG_ROI] START отправлен")
 
-			# Сброс параметров буфера для переинициализации
+			# Reset buffers for reinitialization
 			with self.data_lock:
 				self._reset_phase_splitter(f"switch_to_avg_roi avg_n={avg_n}")
 				self.base_buf_len = None
@@ -1062,19 +1524,16 @@ class ScopeWindow:
 				self._sliders_initialized = False
 			print("[AVG_ROI] Параметры буфера сброшены для переинициализации")
 
-			# Показать оба канала
 			self._set_view_mode(0)
-
-			# stream_mode=2 (AVG_ROI)
 			self.stream_mode = 2
-
-			# Можно снизить FPS GUI: в AVG_ROI кадры редкие (для avg_n=20 ~10Гц на канал)
-			self.qtimer.setInterval(200)  # 5 FPS
+			self.qtimer.setInterval(200)
 			self._set_status(f"AVG_ROI: усреднение на устройстве avg_n={avg_n}, ROI=200", hold_sec=3.0)
 			print("[AVG_ROI] Режим активирован")
 		except Exception as e:
 			print(f"[AVG_ROI] Ошибка переключения: {e}")
 			self._set_status(f"Ошибка AVG_ROI: {e}", hold_sec=3.0)
+		finally:
+			self._mode_switch_in_progress = False
 
 	def _seed_avg20_buffers_locked(self):
 		"""Заполнить буферы AVG20 текущим кадром, чтобы при включении 6 не было 'разгона с нуля'.
@@ -1091,7 +1550,9 @@ class ScopeWindow:
 				self._avg1_even_cnt = self._avg1_odd_cnt = 0
 				return
 			def _dc_out(raw_i32, dc_f32):
-				out = raw_i32.astype(np.float32) - dc_f32.astype(np.float32) + np.float32(32767.0)
+				# Device provides DC compensation — do not apply host-side DC offsets.
+				out = raw_i32.astype(np.float32)
+				# Preserve optional inversion logic (legacy visual inversion), but do not alter DC level
 				if not getattr(self, 'debug_markers', False) and not getattr(self, 'no_invert', False):
 					out = np.float32(32767.5) - (out - np.float32(32767.5))
 				return out
@@ -1119,76 +1580,26 @@ class ScopeWindow:
 			print(f"[AVG20] seed ошибка: {e}")
 	
 	def _update_dc_offset_adaptive(self, data_arr, dc_arr, length):
-		"""Адаптивное обновление DC offset: для каждого семпла корректировка на ±1"""
-		try:
-			for i in range(min(length, len(data_arr), len(dc_arr))):
-				if data_arr[i] > dc_arr[i]:
-					dc_arr[i] += self.dc_update_step  # Увеличиваем DC если данные больше
-				elif data_arr[i] < dc_arr[i]:
-					dc_arr[i] -= self.dc_update_step  # Уменьшаем DC если данные меньше
-				# Если равны - не меняем
-		except Exception as e:
-			print(f"[DC_REMOVAL] Ошибка адаптивного обновления DC: {e}")
-	
-	def _save_dc_offset(self, force: bool = False):
-		"""Сохранить текущие DC offset массивы в файл.
-		Надёжно: атомарная запись + backup, чтобы при обрыве питания не получался битый .npz.
+		"""Host-side DC adaptation disabled: device handles DC compensation.
+		This is intentionally a no-op to avoid any host-side DC changes.
+		If called, emit a diagnostic message to help track unexpected invocations.
 		"""
 		try:
-			# Подготовим данные под запись (копии — чтобы не держать data_lock/не читать мутирующие массивы)
-			snap = {
-				'dc_offset_ch0_even': np.array(self.dc_offset_ch0_even, dtype=np.float32, copy=True),
-				'dc_offset_ch0_odd': np.array(self.dc_offset_ch0_odd, dtype=np.float32, copy=True),
-				'dc_offset_ch1_even': np.array(self.dc_offset_ch1_even, dtype=np.float32, copy=True),
-				'dc_offset_ch1_odd': np.array(self.dc_offset_ch1_odd, dtype=np.float32, copy=True),
-				'timestamp': np.array([time.time()], dtype=np.float64),
-				'max_samples': np.array([int(getattr(self, 'max_samples', 0) or 0)], dtype=np.int32),
-				'stream_mode': np.array([int(getattr(self, 'stream_mode', 0) or 0)], dtype=np.int32),
-			}
-			# Пишем во временный файл и атомарно подменяем основной
-			base_dir = os.path.dirname(self.dc_save_file) or '.'
+			if getattr(self, 'diag_to_console', False):
+				print("[DC_REMOVAL] _update_dc_offset_adaptive was called (host adaptation disabled)")
+		except Exception:
+			pass
+		return
+	
+	def _save_dc_offset(self, force: bool = False):
+			"""Host-side DC save disabled: device handles DC; this is a no-op."""
 			try:
-				os.makedirs(base_dir, exist_ok=True)
+				# no-op, but keep a debug print for visibility
+				if getattr(self, 'diag_to_console', False):
+					print("[DC_REMOVAL] _save_dc_offset called but host DC save is disabled")
 			except Exception:
 				pass
-			# Важно: numpy добавляет расширение .npz автоматически, если его нет.
-			# Поэтому временный файл ДОЛЖЕН заканчиваться на .npz, иначе получится "...tmp.npz",
-			# а os.replace() будет пытаться заменить несуществующий путь.
-			if str(self.dc_save_file).lower().endswith('.npz'):
-				tmp_path = self.dc_save_file[:-4] + '.tmp.npz'
-			else:
-				tmp_path = self.dc_save_file + '.tmp.npz'
-			try:
-				if os.path.exists(tmp_path):
-					os.remove(tmp_path)
-			except Exception:
-				pass
-			np.savez_compressed(tmp_path, **snap)
-			# Сохраним предыдущую версию как .bak (если есть)
-			try:
-				if os.path.exists(self.dc_save_file):
-					os.replace(self.dc_save_file, self.dc_save_file_bak)
-			except Exception:
-				pass
-			os.replace(tmp_path, self.dc_save_file)
-			# best-effort fsync каталога (не везде поддерживается)
-			try:
-				fd = os.open(base_dir, os.O_DIRECTORY)
-				try:
-					os.fsync(fd)
-				finally:
-					os.close(fd)
-			except Exception:
-				pass
-			# Вычисляем средние значения для логирования
-			mean_ch0_even = np.mean(self.dc_offset_ch0_even[:200]) if len(self.dc_offset_ch0_even) >= 200 else 0
-			mean_ch0_odd = np.mean(self.dc_offset_ch0_odd[:200]) if len(self.dc_offset_ch0_odd) >= 200 else 0
-			mean_ch1_even = np.mean(self.dc_offset_ch1_even[:200]) if len(self.dc_offset_ch1_even) >= 200 else 0
-			mean_ch1_odd = np.mean(self.dc_offset_ch1_odd[:200]) if len(self.dc_offset_ch1_odd) >= 200 else 0
-			print(f"[DC_REMOVAL] DC offset массивы сохранены в {self.dc_save_file} (bak={self.dc_save_file_bak})")
-			print(f"[DC_REMOVAL] Средние значения (первые 200 семплов): ch0_even={mean_ch0_even:.1f}, ch0_odd={mean_ch0_odd:.1f}, ch1_even={mean_ch1_even:.1f}, ch1_odd={mean_ch1_odd:.1f}")
-		except Exception as e:
-			print(f"[DC_REMOVAL] Ошибка сохранения DC offset: {e}")
+			return
 	
 	def _load_dc_offset(self):
 		"""Загрузить сохраненные DC offset массивы из файла"""
@@ -1290,18 +1701,22 @@ class ScopeWindow:
 			# Кнопка 4: переключение в LOSSLESS_ROI режим (STREAM_MODE=1), показ 2 каналов × 2 осциллограммы × 200 семплов
 			self.dc_removal_enabled = False  # Выключить DC removal
 			self.avg20_enabled = False
-			self._switch_to_lossless_roi()
+			# If already in STREAM_MODE=1, avoid full restart
+			restart = not (getattr(self, 'stream_mode', 0) == 1 and self.stream is not None)
+			self._switch_to_lossless_roi(restart=restart)
 		elif idx == 5:
 			# Кнопка 5: усреднение на УСТРОЙСТВЕ (AVG_ROI, stream_mode=2, avg_n=20) + вычитание DC на хосте
+			# Switch to device-side averaging (AVG_ROI); do NOT enable host DC removal
 			self.avg20_enabled = False
-			self._switch_to_avg_roi(avg_n=20)
-			self.dc_removal_enabled = True
-			self._set_status("AVG_ROI(20) + DC Removal: усреднение на устройстве, вычитание DC на хосте", hold_sec=3.0)
+			# If already in STREAM_MODE=2, avoid full restart and update avg_n in-place
+			restart = not (getattr(self, 'stream_mode', 0) == 2 and self.stream is not None)
+			self._switch_to_avg_roi(avg_n=20, restart=restart)
+			self._set_status("AVG_ROI(20): усреднение на устройстве (DC handled by device)", hold_sec=3.0)
 		elif idx == 6:
-			# Кнопка 6: временно оставляем прежний режим DC-removal в LOSSLESS_ROI (без усреднения на хосте).
-			# Корреляцию добавим сюда позже.
+			# Кнопка 6: не переключаем STREAM_MODE — включаем/выключаем корреляцию (overlay).
+			# Реальная корреляция управляется в `_on_num_clicked_extra` (подключена к клику кнопки).
 			self.avg20_enabled = False
-			self._switch_to_dc_removal_mode()
+			self._set_status("XCorr: toggle (no stream mode change)", hold_sec=1.5)
 		elif self.stream is not None and idx not in (1, 2, 3, 4, 5):
 			try:
 				self.stream.close()
@@ -1682,7 +2097,8 @@ class ScopeWindow:
 				setattr(self, cnt_attr, int(getattr(self, cnt_attr, 0)) + 1)
 			return bool(is_dup)
 
-		print("[READER] Thread started", flush=True)
+		if bool(getattr(self, 'reader_debug', False)):
+			print("[READER] Thread started", flush=True)
 		while self.reader_running:
 			if self.stream is None:
 				time.sleep(0.1)
@@ -1795,7 +2211,8 @@ class ScopeWindow:
 									asm_info = f" ts_pairs={getattr(asm, '_ts_pair_count', 0)} seq_neigh_pairs={getattr(asm, '_seq_neighbor_pairs', 0)} q={asm.q.qsize()}"
 							except Exception:
 								asm_info = ''
-							print(
+							if bool(getattr(self, 'reader_debug', False)):
+								print(
 								f"[PAIR_MISMATCH] count={self._pair_mismatch_count} last seqA={seq_a} seqB={seq_b} "
 								f"lenA={len(ch0)} lenB={len(ch1)} flagsA={getattr(a,'flags',None)} flagsB={getattr(b,'flags',None)}{asm_info}",
 								flush=True,
@@ -1907,7 +2324,8 @@ class ScopeWindow:
 								self.freq_hz = 300
 							else:
 								self.freq_hz = None
-							print(f"[READER] Buffer size changed: {old_len} -> {self.base_buf_len} семплов, freq={self.freq_hz}Hz", flush=True)
+							if bool(getattr(self, 'reader_debug', False)):
+								print(f"[READER] Buffer size changed: {old_len} -> {self.base_buf_len} семплов, freq={self.freq_hz}Hz", flush=True)
 				
 				# Копируем данные в shared buffers (поддержка независимых каналов)
 				with self.data_lock:
@@ -1929,6 +2347,8 @@ class ScopeWindow:
 							seqv = 0
 						tgt = self.data0_odd if par else self.data0_even
 						tgt[:len(ch0)] = ch0
+						# mark that new data arrived and we should recompute xcorr (schedule outside lock)
+						self._need_xcorr = True
 						if len(ch0) < self.max_samples:
 							tgt[len(ch0):] = 0
 						if par:
@@ -1953,38 +2373,8 @@ class ScopeWindow:
 							if ts is not None:
 								self._ts_a_even = ts
 						
-						# Адаптивное обновление DC offset (пошагово, по семплам)
-						# По умолчанию включено для STREAM_MODE=1 (LOSSLESS_ROI) и 2 (AVG_ROI)
-						if int(getattr(self, 'stream_mode', 0) or 0) in set(getattr(self, 'dc_adapt_modes', {1, 2})) and len(ch0) > 0:
-							if par:
-								self._update_dc_offset_adaptive(ch0, self.dc_offset_ch0_odd, len(ch0))
-							else:
-								self._update_dc_offset_adaptive(ch0, self.dc_offset_ch0_even, len(ch0))
-							# AVG20: копим уже DC-скорректированные значения для отображения
-							if getattr(self, 'avg20_enabled', False):
-								try:
-									if par:
-										dc_view = self.dc_offset_ch0_odd[:len(ch0)]
-										out = ch0.astype(np.float32) - dc_view.astype(np.float32) + np.float32(32767.0)
-										if not getattr(self, 'debug_markers', False) and not getattr(self, 'no_invert', False):
-											out = np.float32(32767.5) - (out - np.float32(32767.5))
-										self._avg0_odd[self._avg0_odd_pos, :len(out)] = out
-										if len(out) < self.max_samples:
-											self._avg0_odd[self._avg0_odd_pos, len(out):] = 0
-										self._avg0_odd_pos = (self._avg0_odd_pos + 1) % self.avg20_nframes
-										self._avg0_odd_cnt = min(self.avg20_nframes, self._avg0_odd_cnt + 1)
-									else:
-										dc_view = self.dc_offset_ch0_even[:len(ch0)]
-										out = ch0.astype(np.float32) - dc_view.astype(np.float32) + np.float32(32767.0)
-										if not getattr(self, 'debug_markers', False) and not getattr(self, 'no_invert', False):
-											out = np.float32(32767.5) - (out - np.float32(32767.5))
-										self._avg0_even[self._avg0_even_pos, :len(out)] = out
-										if len(out) < self.max_samples:
-											self._avg0_even[self._avg0_even_pos, len(out):] = 0
-										self._avg0_even_pos = (self._avg0_even_pos + 1) % self.avg20_nframes
-										self._avg0_even_cnt = min(self.avg20_nframes, self._avg0_even_cnt + 1)
-								except Exception as e:
-									print(f"[AVG20] ch0 накопление ошибка: {e}")
+						# Host DC adaptation disabled — do not update host DC offset arrays.
+						# Device performs DC compensation; skip any host-side DC adaptation or DC-based averaging.
 					
 					if ch1 is not None:
 						try:
@@ -2001,6 +2391,8 @@ class ScopeWindow:
 							seqv = 0
 						tgt = self.data1_odd if par else self.data1_even
 						tgt[:len(ch1)] = ch1
+						# mark that new data arrived and we should recompute xcorr (schedule outside lock)
+						self._need_xcorr = True
 						if len(ch1) < self.max_samples:
 							tgt[len(ch1):] = 0
 						if par:
@@ -2025,37 +2417,8 @@ class ScopeWindow:
 							if ts is not None:
 								self._ts_b_even = ts
 						
-						# Адаптивное обновление DC offset
-						if int(getattr(self, 'stream_mode', 0) or 0) in set(getattr(self, 'dc_adapt_modes', {1, 2})) and len(ch1) > 0:
-							if par:
-								self._update_dc_offset_adaptive(ch1, self.dc_offset_ch1_odd, len(ch1))
-							else:
-								self._update_dc_offset_adaptive(ch1, self.dc_offset_ch1_even, len(ch1))
-							# AVG20: копим уже DC-скорректированные значения для отображения
-							if getattr(self, 'avg20_enabled', False):
-								try:
-									if par:
-										dc_view = self.dc_offset_ch1_odd[:len(ch1)]
-										out = ch1.astype(np.float32) - dc_view.astype(np.float32) + np.float32(32767.0)
-										if not getattr(self, 'debug_markers', False) and not getattr(self, 'no_invert', False):
-											out = np.float32(32767.5) - (out - np.float32(32767.5))
-										self._avg1_odd[self._avg1_odd_pos, :len(out)] = out
-										if len(out) < self.max_samples:
-											self._avg1_odd[self._avg1_odd_pos, len(out):] = 0
-										self._avg1_odd_pos = (self._avg1_odd_pos + 1) % self.avg20_nframes
-										self._avg1_odd_cnt = min(self.avg20_nframes, self._avg1_odd_cnt + 1)
-									else:
-										dc_view = self.dc_offset_ch1_even[:len(ch1)]
-										out = ch1.astype(np.float32) - dc_view.astype(np.float32) + np.float32(32767.0)
-										if not getattr(self, 'debug_markers', False) and not getattr(self, 'no_invert', False):
-											out = np.float32(32767.5) - (out - np.float32(32767.5))
-										self._avg1_even[self._avg1_even_pos, :len(out)] = out
-										if len(out) < self.max_samples:
-											self._avg1_even[self._avg1_even_pos, len(out):] = 0
-										self._avg1_even_pos = (self._avg1_even_pos + 1) % self.avg20_nframes
-										self._avg1_even_cnt = min(self.avg20_nframes, self._avg1_even_cnt + 1)
-								except Exception as e:
-									print(f"[AVG20] ch1 накопление ошибка: {e}")
+						# Host DC adaptation disabled — device provides DC compensation.
+						# Skipping any host-side DC update or DC-based averaging for channel 1.
 					
 					# Сохранять DC offset в файл каждые 10 минут (при STREAM_MODE=1)
 					if getattr(self, 'stream_mode', 0) == 1 and (current_time - self.dc_last_save >= self.dc_save_interval):
@@ -2111,7 +2474,8 @@ class ScopeWindow:
 									ch1o = self.data1_odd[:n]
 									c0, lag0, bc0 = _best_lag(ch0e, ch0o)
 									c1, lag1, bc1 = _best_lag(ch1e, ch1o)
-									print(
+									if bool(getattr(self, 'reader_debug', False)):
+										print(
 										"[PHASE] "
 										f"CH0 se={self.seq0_even} so={self.seq0_odd} corr0={c0:.3f} best_lag={lag0} best_corr={bc0:.3f} | "
 										f"CH1 se={self.seq1_even} so={self.seq1_odd} corr0={c1:.3f} best_lag={lag1} best_corr={bc1:.3f}",
@@ -2130,6 +2494,8 @@ class ScopeWindow:
 								self.data0_odd[:buf_len] = vals
 								self.data1_even[:buf_len] = vals
 								self.data1_odd[:buf_len] = vals
+								# mark new data for xcorr
+								self._need_xcorr = True
 								if buf_len < self.max_samples:
 									self.data0_even[buf_len:] = 0
 									self.data0_odd[buf_len:] = 0
@@ -2237,7 +2603,8 @@ class ScopeWindow:
 												pending = int(self._gap_log_pending)
 												self._gap_log_pending = 0
 												self._gap_log_last_t = now_gap
-												print(f"[GAP] +{pending} step={step} ожидаю {exp}, получил {int(a.seq)} (delta={delta}) total={self.gap_count} reord={int(getattr(self,'seq_reorder_count',0))}", flush=True)
+												if bool(getattr(self, 'reader_debug', False)):
+													print(f"[GAP] +{pending} step={step} ожидаю {exp}, получил {int(a.seq)} (delta={delta}) total={self.gap_count} reord={int(getattr(self,'seq_reorder_count',0))}", flush=True)
 									self.last_seq = a.seq
 						self.frames_sec += 2
 						self.frames_a += 1
@@ -2265,7 +2632,8 @@ class ScopeWindow:
 							s1 = ch1[:5] if ch1 is not None else 'None'
 						except Exception:
 							s1 = 'ERR'
-						print(f"[READER] Received {self._reader_count} frames, ch0[0:5]={s0}, ch1[0:5]={s1}", flush=True)
+						if bool(getattr(self, 'reader_debug', False)):
+							print(f"[READER] Received {self._reader_count} frames, ch0[0:5]={s0}, ch1[0:5]={s1}", flush=True)
 				
 			except Exception as e:
 				if "Resource busy" in str(e) or "[Errno" in str(e):
@@ -2274,7 +2642,8 @@ class ScopeWindow:
 					continue
 				print(f"[READER] Exception: {e}", flush=True)
 				time.sleep(0.1)
-		print("[READER] Thread stopped", flush=True)
+		if bool(getattr(self, 'reader_debug', False)):
+			print("[READER] Thread stopped", flush=True)
 	
 	def _tick(self):
 		"""GUI thread: читает из shared buffers и отображает данные ВСЕГДА"""
@@ -2413,6 +2782,20 @@ class ScopeWindow:
 		if (self._status_hold_text is None or _now_for_default >= self._status_hold_until) and (_now_for_default - self._last_default_update_t >= 1.0):
 			self._set_status(_default_status)
 			self._last_default_update_t = _now_for_default
+
+		# Пер-пакетный триггер корреляции: если reader пометил новые данные и кнопка 6 активна,
+		# выполним вычисление в GUI-потоке (здесь мы в GUI-потоке, т.к. _tick вызывается qtimer).
+		try:
+			if getattr(self, '_need_xcorr', False):
+				if hasattr(self, 'num_buttons') and len(self.num_buttons) > 6 and self.num_buttons[6].isChecked():
+					# сбрасываем флаг и вызываем немедленно
+					self._need_xcorr = False
+					self._compute_and_plot_xcorr()
+				else:
+					# очистим флаг если кнопка не активна
+					self._need_xcorr = False
+		except Exception:
+			pass
 		# предупреждение если нет данных
 		now2 = time.time()
 		if self.stream and self.base_buf_len is None and self.connect_t and (now2-self.connect_t)>2.0 and not self.no_data_warned:
@@ -2484,31 +2867,31 @@ class ScopeWindow:
 		self.view_len = vlen
 		# Snapshot buffers under lock to avoid tearing/races (can look like swaps/in-phase).
 		with self.data_lock:
-			seg0 = (self.data0_even if hasattr(self, 'data0_even') else self.data0)[self.view_start:self.view_start+vlen].copy()
-			seg1 = (self.data1_even if hasattr(self, 'data1_even') else self.data1)[self.view_start:self.view_start+vlen].copy()
-			seg0b = (self.data0_odd if hasattr(self, 'data0_odd') else np.zeros_like(seg0))[self.view_start:self.view_start+vlen].copy()
-			seg1b = (self.data1_odd if hasattr(self, 'data1_odd') else np.zeros_like(seg1))[self.view_start:self.view_start+vlen].copy()
-			# Validity markers: if we haven't received a phase yet, don't draw stale buffers.
+			# copy and cast to float64 immediately to avoid unsigned-int wrap/overflow
+			seg0 = (self.data0_even if hasattr(self, 'data0_even') else self.data0)[self.view_start:self.view_start+vlen].copy().astype(np.float64)
+			seg1 = (self.data1_even if hasattr(self, 'data1_even') else self.data1)[self.view_start:self.view_start+vlen].copy().astype(np.float64)
+			seg0b = (self.data0_odd if hasattr(self, 'data0_odd') else np.zeros_like(seg0))[self.view_start:self.view_start+vlen].copy().astype(np.float64)
+			seg1b = (self.data1_odd if hasattr(self, 'data1_odd') else np.zeros_like(seg1))[self.view_start:self.view_start+vlen].copy().astype(np.float64)
+			# Validity markers: if we haven't received a phase yet, avoid hiding freshly-filled buffers.
 			v0e = (getattr(self, 'seq0_even', None) is not None)
 			v0o = (getattr(self, 'seq0_odd', None) is not None)
 			v1e = (getattr(self, 'seq1_even', None) is not None)
 			v1o = (getattr(self, 'seq1_odd', None) is not None)
-		
-		# DC removal: вычитание постоянной составляющей и сдвиг на 32767
-		if getattr(self, 'dc_removal_enabled', False) and not getattr(self, 'avg20_enabled', False):
+			# If seq flags are not yet set but data contain non-zero samples, treat them as valid to display
 			try:
-				# Применяем DC removal поэлементно: data - DC_offset[view] + 32767
-				dc0_even_view = self.dc_offset_ch0_even[self.view_start:self.view_start+vlen]
-				dc0_odd_view = self.dc_offset_ch0_odd[self.view_start:self.view_start+vlen]
-				dc1_even_view = self.dc_offset_ch1_even[self.view_start:self.view_start+vlen]
-				dc1_odd_view = self.dc_offset_ch1_odd[self.view_start:self.view_start+vlen]
-				
-				seg0 = seg0 - dc0_even_view[:len(seg0)] + 32767
-				seg0b = seg0b - dc0_odd_view[:len(seg0b)] + 32767
-				seg1 = seg1 - dc1_even_view[:len(seg1)] + 32767
-				seg1b = seg1b - dc1_odd_view[:len(seg1b)] + 32767
-			except Exception as e:
-				print(f"[DC_REMOVAL] Ошибка применения DC removal: {e}")
+				if not v0e and np.any(seg0 != 0):
+					v0e = True
+				if not v0o and np.any(seg0b != 0):
+					v0o = True
+				if not v1e and np.any(seg1 != 0):
+					v1e = True
+				if not v1o and np.any(seg1b != 0):
+					v1o = True
+			except Exception:
+				pass
+		
+		# Host-side DC removal disabled: device provides DC compensation.
+		# (No host-side per-sample DC subtraction.)
 		
 		# AVG20: вместо текущего кадра показываем среднее по последним N кадрам (уже DC-скорректированные значения)
 		if getattr(self, 'avg20_enabled', False):
@@ -2537,6 +2920,12 @@ class ScopeWindow:
 			except Exception:
 				pass
 		x = np.arange(vlen)
+
+		# display arrays (use raw seg* values so per-button behavior is preserved)
+		disp0 = seg0
+		disp0b = seg0b
+		disp1 = seg1
+		disp1b = seg1b
 		# --- режимы отображения ---
 		if self.view_mode == 0:
 			# оба канала
@@ -2742,28 +3131,34 @@ class ScopeWindow:
 			self.slider_start.setMaximum(max(0, self.base_buf_len - self.view_len))
 		self._update_view()
 
-	def _on_toggle_dc_removal(self, enabled: bool):
-		"""Handler for top-right diagnostic toggle button — enables/disables DC subtraction."""
+	def _on_toggle_xcorr_norm(self, enabled: bool):
+		"""Переключатель нормализации/масштабирования отображения XCorr."""
 		try:
-			self.dc_removal_enabled = bool(enabled)
+			self.xcorr_norm_enabled = bool(enabled)
 		except Exception:
-			self.dc_removal_enabled = False
-		# Обновим визуальную подсказку (цвет/tooltip) и статус-индикатор
+			self.xcorr_norm_enabled = True
+		# Update visual hint (color/tooltip) and status indicator
 		try:
-			if self.dc_removal_enabled:
+			if self.xcorr_norm_enabled:
 				style = "QPushButton { background:#b6f0b6; color:#000; border:1px solid #6fb36f; }"
-				tt = "DC removal: ВКЛЮЧЕНО"
-				self.btn_diag.setToolTip("DC removal включено — вычитание постоянной составляющей")
+				tt = "XCorr norm: ON (auto)"
+				self.btn_diag.setToolTip("XCorr: нормализация/автомасштаб ВКЛ")
 			else:
 				style = "QPushButton { background:#f0b6b6; color:#000; border:1px solid #b36f6f; }"
-				tt = "DC removal: ВЫКЛЮЧЕНО"
-				self.btn_diag.setToolTip("DC removal выключено — вычитание постоянной составляющей отключено")
+				tt = "XCorr norm: OFF (0..65535)"
+				self.btn_diag.setToolTip("XCorr: нормализация/автомасштаб ВЫКЛ (шкала 0..65535)")
 			try:
 				self.btn_diag.setStyleSheet(style)
 			except Exception:
 				pass
 			# краткий статус
 			self._set_status(tt, hold_sec=2.0)
+			# если XCorr включён (кнопка 6), обновим график сразу
+			try:
+				if hasattr(self, 'num_buttons') and len(self.num_buttons) > 6 and self.num_buttons[6].isChecked():
+					self._compute_and_plot_xcorr()
+			except Exception:
+				pass
 		except Exception:
 			pass
 
@@ -2800,6 +3195,73 @@ class ScopeWindow:
 			self._activate_stream()
 		else:
 			self.legend_lbl.setText("Нажмите 1 для запуска")
+
+	def _enqueue_mode_action(self, action: str, *args, **kwargs):
+		"""Place a mode-switch action to background worker (non-blocking)."""
+		if getattr(self, '_mode_worker', None) is None:
+			# no worker: run synchronously as fallback
+			try:
+				if action == 'latest':
+					self._switch_to_latest_mode()
+				elif action == 'lossless':
+					self._switch_to_lossless_roi(*args, **kwargs)
+				elif action == 'avg':
+					self._switch_to_avg_roi(*args, **kwargs)
+			except Exception:
+				pass
+			return
+		# enqueue for background execution
+		try:
+			self._mode_worker.enqueue(action, *args, **kwargs)
+		except Exception:
+			pass
+
+	def _on_mode_action_done(self, action: str, *args, **kwargs):
+		"""Called in GUI thread when worker finished an action; update buffers/UI."""
+		try:
+			if action == 'latest':
+				with self.data_lock:
+					self._reset_phase_splitter('switch_to_latest')
+					self.base_buf_len = None
+					self.base_buf_len_bytes = None
+					self.freq_hz = None
+					self._sliders_initialized = False
+				self.stream_mode = 0
+				# restore GUI FPS
+				try:
+					gui_fps = int(os.getenv("BMI30_GUI_FPS", "16"))
+				except Exception:
+					gui_fps = 16
+				self.qtimer.setInterval(max(10, int(1000 / gui_fps)))
+				self._set_status("LATEST activated", hold_sec=2.0)
+			elif action == 'lossless':
+				with self.data_lock:
+					self._reset_phase_splitter('switch_to_lossless')
+					self.base_buf_len = None
+					self.base_buf_len_bytes = None
+					self.freq_hz = None
+					self._sliders_initialized = False
+				self.stream_mode = 1
+				self.qtimer.setInterval(200)
+				self._set_status("LOSSLESS_ROI activated", hold_sec=2.0)
+			elif action == 'avg':
+				avg_n = int(args[0]) if args else int(kwargs.get('avg_n', getattr(self,'avg_n',20)))
+				with self.data_lock:
+					self._reset_phase_splitter(f'switch_to_avg_roi avg_n={avg_n}')
+					self.base_buf_len = None
+					self.base_buf_len_bytes = None
+					self.freq_hz = None
+					self._sliders_initialized = False
+				self.stream_mode = 2
+				self.qtimer.setInterval(200)
+				self._set_status(f"AVG_ROI activated (avg_n={avg_n})", hold_sec=2.0)
+			# refresh view immediately
+			try:
+				self._update_view()
+			except Exception:
+				pass
+		except Exception as e:
+			print(f"[ModeCallback] error on done({action}): {e}")
 
 	def _reset_sliders(self):
 		"""Вернуть слайдеры в исходное состояние и разрешить повторную инициализацию."""
@@ -3222,6 +3684,12 @@ class ScopeWindow:
 				print(f"[start] Профиль={self.desired_profile} ожидаемый BUF={expected} семплов")
 			except Exception:
 				pass
+			# Ensure device streaming is started (best-effort). Some devices require explicit START.
+			try:
+				self.stream.send_cmd(CMD_START_STREAM, b"")
+				print("[activate] Sent CMD_START_STREAM (ensure streaming)")
+			except Exception:
+				pass
 
 	def _on_freq_change(self, idx:int):
 		# 0 -> 200Hz (profile 1), 1 -> 300Hz (profile 2)
@@ -3303,10 +3771,15 @@ class ScopeWindow:
 		# save selection
 		save_avg_n(new_n)
 		self.avg_n = new_n
-		# If stream is not running, just inform user
+		# If stream is not running, start and switch to AVG_ROI so setting takes effect
 		if self.stream is None:
-			self._set_status(f"Выбрано avg_n={new_n} (устройство не подключено)", hold_sec=2.0)
-			return
+			self._set_status(f"Выбрано avg_n={new_n} (запускаю поток и переключаю AVG_ROI)", hold_sec=1.0)
+			try:
+				self._switch_to_avg_roi(new_n)
+			except Exception as e:
+				print(f"[AVG_ROI] Не удалось автоматически переключить AVG_ROI: {e}")
+				self._set_status(f"Выбрано avg_n={new_n} (устройство не подключено)", hold_sec=2.0)
+				return
 		# If already in AVG_ROI, send only SET_STREAM_MODE with new avg_n; otherwise do full switch
 		try:
 			if getattr(self, 'stream_mode', 0) == 2:
@@ -3325,7 +3798,16 @@ class ScopeWindow:
 				self._save_dc_offset(force=True)
 			except Exception:
 				pass
-			self.stream.close()
+			# stop background worker
+			try:
+				if getattr(self, '_mode_worker', None) is not None:
+					self._mode_worker.stop()
+			except Exception:
+				pass
+			try:
+				self.stream.close()
+			except Exception:
+				pass
 		except Exception:
 			pass
 		ev.accept()
