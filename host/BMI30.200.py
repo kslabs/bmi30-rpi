@@ -1504,13 +1504,13 @@ class ScopeWindow:
 			_fps_part = f"XCorrFPS:{float(getattr(self,'_xcorr_fps',0.0)):.1f} tick:{_tick_hz:.1f}"
 			if use_optimal:
 				self.legend_lbl.setText(
-					f"{_fps_part} | Prod [{mode}] "
+					f"{_fps_part}\nProd [{mode}] "
 					f"ch0(shift={shift0}) mean={mean0:.1f} "
 					f"ch1(shift={shift1}) mean={mean1:.1f}"
 				)
 			else:
 				self.legend_lbl.setText(
-					f"{_fps_part} | Prod(no-shift) [{mode}] "
+					f"{_fps_part}\nProd(no-shift) [{mode}] "
 					f"ch0 mean={mean0:.1f} ch1 mean={mean1:.1f}"
 				)
 		except Exception:
