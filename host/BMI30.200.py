@@ -497,11 +497,46 @@ class ScopeWindow:
 			self.phase_diag_maxlag = 20
 		self._phase_diag_frames = 0
 		self.timestamps = np.zeros(self.max_samples, dtype=np.float64)
-		self.data_lock = threading.Lock()  # защита shared buffers
+		# Re-entrant: reader thread may call helpers that also need data_lock.
+		# (Avoids deadlock when phase-search is enabled and triggered from inside the reader's locked section.)
+		self.data_lock = threading.RLock()  # защита shared buffers
 		self.reader_thread = None
 		self.reader_running = False
 		# Flag set by reader when new data copied; polled in GUI tick to trigger xcorr compute
 		self._need_xcorr = False
+		# Optimal phase shift computation results (global variables for next task)
+		# ADC0 results
+		self._phase_shift_adc0 = 0  # optimal phase shift in samples for ADC0
+		self._phase_peak_idx_adc0 = 0  # sample index of maximum in optimal product array for ADC0
+		self._phase_max_sum_adc0 = 0.0  # maximum sum of products for ADC0
+		self._phase_prod_adc0 = None  # optimal product array for ADC0 (N samples)
+		# ADC1 results
+		self._phase_shift_adc1 = 0  # optimal phase shift in samples for ADC1
+		self._phase_peak_idx_adc1 = 0  # sample index of maximum in optimal product array for ADC1
+		self._phase_max_sum_adc1 = 0.0  # maximum sum of products for ADC1
+		self._phase_prod_adc1 = None  # optimal product array for ADC1 (N samples)
+		# Phase shift search thread state
+		self._phase_search_thread = None
+		self._phase_search_running = False
+		self._phase_search_event = threading.Event()
+		self._phase_search_req_lock = threading.Lock()
+		self._phase_search_latest = None  # (N, e0, o0, e1, o1)
+		self._phase_search_stop = False
+		# Run phase-shift search only in GUI modes 6+ (set in _num_clicked).
+		# This flag is read from the USB reader thread; do NOT access Qt widgets there.
+		self._phase_search_enabled = False
+		# By default compute phase shift after every new packet (user requirement).
+		# Can be disabled via env to save CPU.
+		try:
+			self.phase_search_each_packet = str(os.getenv('BMI30_PHASE_SEARCH_EACH_PACKET', '1')).lower() not in ('0', 'false', 'no')
+		except Exception:
+			self.phase_search_each_packet = True
+		# Optional performance knob: limit maximum absolute shift scanned.
+		# 0 => full range (-(N-1)..(N-1)).
+		try:
+			self.phase_search_max_shift = int(os.getenv('BMI30_PHASE_MAX_SHIFT', '0'))
+		except Exception:
+			self.phase_search_max_shift = 0
 		# Инициализируем view параметры сразу чтобы показывать данные
 		self.view_start = 0
 		self.view_len = self.max_samples
@@ -689,6 +724,10 @@ class ScopeWindow:
 		self.fps = 0.0  # общая частота кадров (для совместимости)
 		self.afps = 0.0  # частота кадров канала A
 		self.bfps = 0.0  # частота кадров канала B
+		# Measured GUI overlay FPS (for button 6 XCorr/product rendering)
+		self._xcorr_fps = 0.0
+		self._xcorr_frames = 0
+		self._xcorr_fps_t0 = time.time()
 		self.last_range_t = 0.0
 		self.max_int16_span = 33000  # предельное окно по амплитуде
 		self._y_span_smooth = None  # сглаженный спан по Y
@@ -1011,6 +1050,176 @@ class ScopeWindow:
 			N = int(len(even)) if hasattr(even, '__len__') else 0
 			return 0, 0.0, np.zeros(2 * N - 1, dtype=np.float64), np.zeros(N, dtype=np.float64)
 
+	def _find_optimal_phase_shift(self, even: np.ndarray, odd: np.ndarray, channel_name: str = ""):
+		"""Find optimal phase shift between even and inverted odd by iterating all shifts.
+		
+		For each shift, compute element-wise product of even and shifted inverted odd,
+		then find the shift that gives maximum positive sum of all products.
+		
+		Args:
+			even: 1D array of even samples (0..65535)
+			odd: 1D array of odd samples (0..65535)
+			channel_name: "ADC0" or "ADC1" for debug output
+		
+		Returns:
+			tuple: (best_shift, peak_idx, max_sum, best_prod_array)
+			- best_shift: integer shift in samples (negative = shift odd left, positive = shift odd right)
+			- peak_idx: sample index of maximum in best_prod_array
+			- max_sum: sum of all products at best_shift
+			- best_prod_array: length N array with per-sample products at best_shift
+		"""
+		try:
+			N = int(len(even))
+			if N != len(odd) or N == 0:
+				return 0, 0, 0.0, np.zeros(N, dtype=np.float64)
+
+			# Convert to signed centered values (0..65535 -> around 0)
+			even_s = even.astype(np.int64) - 32767
+			odd_s = odd.astype(np.int64) - 32767
+			# Invert odd arithmetically
+			odd_inv = -odd_s
+
+			# Scan range: either full or limited by env
+			max_shift = int(getattr(self, 'phase_search_max_shift', 0) or 0)
+			if max_shift <= 0:
+				shift_start = -(N - 1)
+				shift_end = N - 1
+			else:
+				max_shift = min(max_shift, N - 1)
+				shift_start = -max_shift
+				shift_end = max_shift
+
+			best_shift = 0
+			max_sum = -np.inf
+
+			# Compute sum for each shift WITHOUT allocating full prod array per shift
+			for shift in range(shift_start, shift_end + 1):
+				if shift >= 0:
+					end = N - shift
+					if end <= 0:
+						continue
+					current_sum = float(np.dot(even_s[:end], odd_inv[shift:shift + end]))
+				else:
+					start = -shift
+					if start >= N:
+						continue
+					# overlap length = N-start
+					current_sum = float(np.dot(even_s[start:], odd_inv[:N - start]))
+
+				if current_sum > max_sum:
+					max_sum = current_sum
+					best_shift = shift
+
+			# Build product array only once for best_shift
+			best_prod = np.zeros(N, dtype=np.float64)
+			if best_shift >= 0:
+				end = N - best_shift
+				if end > 0:
+					best_prod[:end] = (even_s[:end].astype(np.float64) * odd_inv[best_shift:best_shift + end].astype(np.float64))
+			else:
+				start = -best_shift
+				if start < N:
+					best_prod[start:] = (even_s[start:].astype(np.float64) * odd_inv[:N - start].astype(np.float64))
+
+			# Peak index: maximum POSITIVE value (as per requirement)
+			best_peak_idx = int(np.argmax(best_prod)) if best_prod.size else 0
+
+			if bool(getattr(self, 'xcorr_debug', False)):
+				print(f"[PHASE_SHIFT_{channel_name}] best_shift={best_shift} peak_idx={best_peak_idx} max_sum={max_sum:.2e}", flush=True)
+
+			return best_shift, best_peak_idx, max_sum, best_prod
+		except Exception as e:
+			if bool(getattr(self, 'xcorr_debug', False)):
+				print(f"[PHASE_SHIFT_{channel_name}] ERROR: {e}", flush=True)
+			N = int(len(even)) if hasattr(even, '__len__') else 0
+			return 0, 0, 0.0, np.zeros(N, dtype=np.float64)
+
+	def _phase_search_thread_main(self):
+		"""Single long-lived worker: always processes the latest requested buffers.
+
+		Important: this avoids spawning a new thread per packet. If packets arrive faster
+		than computation, intermediate requests are dropped and only the latest snapshot
+		is processed (which is what we want for live oscilloscope).
+		"""
+		try:
+			if bool(getattr(self, 'xcorr_debug', False)):
+				print("[PHASE_WORKER] thread started", flush=True)
+			while True:
+				self._phase_search_event.wait()
+				self._phase_search_event.clear()
+				if getattr(self, '_phase_search_stop', False):
+					return
+				with self._phase_search_req_lock:
+					payload = self._phase_search_latest
+					self._phase_search_latest = None
+				if payload is None:
+					continue
+				N, e0, o0, e1, o1 = payload
+				self._phase_search_running = True
+
+				# Compute optimal phase shift for ADC0/ADC1
+				shift0, peak_idx0, max_sum0, prod0 = self._find_optimal_phase_shift(e0, o0, "ADC0")
+				shift1, peak_idx1, max_sum1, prod1 = self._find_optimal_phase_shift(e1, o1, "ADC1")
+
+				with self.data_lock:
+					self._phase_shift_adc0 = shift0
+					self._phase_peak_idx_adc0 = peak_idx0
+					self._phase_max_sum_adc0 = max_sum0
+					if self._phase_prod_adc0 is None or len(self._phase_prod_adc0) != N:
+						self._phase_prod_adc0 = np.zeros(N, dtype=np.float64)
+					self._phase_prod_adc0[:N] = prod0[:N]
+
+					self._phase_shift_adc1 = shift1
+					self._phase_peak_idx_adc1 = peak_idx1
+					self._phase_max_sum_adc1 = max_sum1
+					if self._phase_prod_adc1 is None or len(self._phase_prod_adc1) != N:
+						self._phase_prod_adc1 = np.zeros(N, dtype=np.float64)
+					self._phase_prod_adc1[:N] = prod1[:N]
+
+				if bool(getattr(self, 'xcorr_debug', False)):
+					print(
+						f"[PHASE_WORKER] done: ADC0 shift={shift0} sum={max_sum0:.2e} peak={peak_idx0}; "
+						f"ADC1 shift={shift1} sum={max_sum1:.2e} peak={peak_idx1}",
+						flush=True,
+					)
+				self._phase_search_running = False
+		except Exception as e:
+			self._phase_search_running = False
+			if bool(getattr(self, 'xcorr_debug', False)):
+				print(f"[PHASE_WORKER] ERROR: {e}", flush=True)
+
+	def _ensure_phase_search_thread(self):
+		if self._phase_search_thread is not None and self._phase_search_thread.is_alive():
+			return
+		self._phase_search_stop = False
+		self._phase_search_thread = threading.Thread(target=self._phase_search_thread_main, daemon=True)
+		self._phase_search_thread.start()
+
+	def _request_phase_shift_search(self):
+		"""Request (enqueue) phase shift search for the latest buffers.
+
+		Called after each packet reception. This does not block and does not start
+		new threads; it only updates the 'latest' snapshot for the worker.
+		"""
+		if not bool(getattr(self, 'phase_search_each_packet', True)):
+			return
+		if not bool(getattr(self, '_phase_search_enabled', False)):
+			return
+		# Copy current data under lock
+		with self.data_lock:
+			N = int(self.base_buf_len) if getattr(self, 'base_buf_len', None) else int(getattr(self, 'view_len', self.max_samples))
+			N = max(1, min(N, self.max_samples))
+			e0 = np.array(self.data0_even[:N], copy=True)
+			o0 = np.array(self.data0_odd[:N], copy=True)
+			e1 = np.array(self.data1_even[:N], copy=True)
+			o1 = np.array(self.data1_odd[:N], copy=True)
+		if N <= 1:
+			return
+		self._ensure_phase_search_thread()
+		with self._phase_search_req_lock:
+			self._phase_search_latest = (N, e0, o0, e1, o1)
+		self._phase_search_event.set()
+
 	def _on_num_clicked_extra(self, idx: int):
 		"""Extra handler for numeric buttons — button 6 triggers cross-correlation display."""
 		try:
@@ -1064,6 +1273,18 @@ class ScopeWindow:
 
 	def _compute_and_plot_xcorr(self):
 		"""Compute cross-correlation for both channels and update plots/legend."""
+		# Measure real update rate of this overlay (how often we actually redraw in mode 6)
+		try:
+			_now = time.time()
+			self._xcorr_frames = int(getattr(self, '_xcorr_frames', 0)) + 1
+			t0 = float(getattr(self, '_xcorr_fps_t0', _now))
+			if (_now - t0) >= 1.0:
+				self._xcorr_fps = float(self._xcorr_frames) / max(1e-6, (_now - t0))
+				self._xcorr_frames = 0
+				self._xcorr_fps_t0 = _now
+		except Exception:
+			pass
+
 		with self.data_lock:
 			N = int(self.base_buf_len) if getattr(self, 'base_buf_len', None) else int(getattr(self, 'view_len', self.max_samples))
 			N = max(1, min(N, self.max_samples))
@@ -1092,24 +1313,39 @@ class ScopeWindow:
 			except Exception:
 				pass
 
-		# ---- Simple per-sample product (no lag) as first step ----
+		# ---- Use optimal phase shift if available, otherwise simple per-sample product (no lag) ----
 		# Compute centered signed product so sign/doubling behavior is correct.
 		# В режиме XCorr-norm=ON показываем центрированный продукт и авто-масштабируем.
 		# В режиме XCorr-norm=OFF фиксируем шкалу 0..65535 и сдвигаем данные в этот диапазон.
 		try:
-			# centered (signed) signals: 0..65535 -> roughly -32767..+32768
-			even0_c = e0_raw.astype(np.float64) - 32767.0
-			odd0_c = o0_raw.astype(np.float64) - 32767.0
-			even1_c = e1_raw.astype(np.float64) - 32767.0
-			odd1_c = o1_raw.astype(np.float64) - 32767.0
+			# Check if optimal phase shift results are available
+			with self.data_lock:
+				use_optimal = (self._phase_prod_adc0 is not None and self._phase_prod_adc1 is not None)
+				if use_optimal:
+					# Use pre-computed optimal phase-shifted products
+					prod0_center = np.array(self._phase_prod_adc0[:N], copy=True)
+					prod1_center = np.array(self._phase_prod_adc1[:N], copy=True)
+					shift0 = self._phase_shift_adc0
+					shift1 = self._phase_shift_adc1
+				else:
+					shift0 = 0
+					shift1 = 0
+			
+			if not use_optimal:
+				# Fallback: compute simple per-sample product with no shift
+				# centered (signed) signals: 0..65535 -> roughly -32767..+32768
+				even0_c = e0_raw.astype(np.float64) - 32767.0
+				odd0_c = o0_raw.astype(np.float64) - 32767.0
+				even1_c = e1_raw.astype(np.float64) - 32767.0
+				odd1_c = o1_raw.astype(np.float64) - 32767.0
 
-			# inverted odd (signed)
-			odd0_inv_c = -odd0_c
-			odd1_inv_c = -odd1_c
+				# inverted odd (signed)
+				odd0_inv_c = -odd0_c
+				odd1_inv_c = -odd1_c
 
-			# centered per-sample product (can be negative)
-			prod0_center = even0_c * odd0_inv_c
-			prod1_center = even1_c * odd1_inv_c
+				# centered per-sample product (can be negative)
+				prod0_center = even0_c * odd0_inv_c
+				prod1_center = even1_c * odd1_inv_c
 
 			# normalize centered product to approx [-1..1] dividing by max possible (32768^2)
 			denom = (32768.0 * 32768.0)
@@ -1119,12 +1355,26 @@ class ScopeWindow:
 			xcorr_norm = bool(getattr(self, 'xcorr_norm_enabled', True))
 			if xcorr_norm:
 				# авто-масштаб вокруг 0
+				self._xcorr_prod_scale = 1.0
 				prod0_raw = prod0_center
 				prod1_raw = prod1_center
 			else:
-				# фиксированная шкала 0..65535 (сдвиг центра в 32767)
-				prod0_raw = prod0_center + 32767.0
-				prod1_raw = prod1_center + 32767.0
+				# фиксированная шкала 0..65535: продукт слишком большой, поэтому масштабируем.
+				# По умолчанию делим на 100 (можно переопределить BMI30_PROD_SCALE).
+				try:
+					scale = float(os.getenv('BMI30_PROD_SCALE', '100'))
+					if not np.isfinite(scale) or scale == 0.0:
+						scale = 100.0
+				except Exception:
+					scale = 100.0
+				self._xcorr_prod_scale = float(scale)
+				prod0_raw = (prod0_center / scale) + 32767.0
+				prod1_raw = (prod1_center / scale) + 32767.0
+				try:
+					prod0_raw = np.clip(prod0_raw, 0.0, 65535.0)
+					prod1_raw = np.clip(prod1_raw, 0.0, 65535.0)
+				except Exception:
+					pass
 
 			# keep centered product for diagnostics/legend
 			prod0 = prod0_center
@@ -1134,6 +1384,9 @@ class ScopeWindow:
 			prod1_raw = np.zeros_like(e1_raw)
 			prod0 = np.zeros_like(e0_raw)
 			prod1 = np.zeros_like(e1_raw)
+			use_optimal = False
+			shift0 = 0
+			shift1 = 0
 
 		# Only display correlation when button 6 is active; otherwise clear/hide
 		try:
@@ -1189,10 +1442,13 @@ class ScopeWindow:
 				# В режиме OFF фиксируем шкалу для обоих каналов.
 				if hasattr(self, 'vb_corr0'):
 					if xcorr_norm:
-						# symmetric around 0 based on current data magnitude
+						# symmetric around 0 based on a *stable* magnitude (leaky peak) to avoid flicker
 						vals = self._xcorr_saved_prod0[:min_display]
-						mag = float(np.max(np.abs(vals))) if vals.size else 1.0
-						mag = max(1.0, mag)
+						mag_cur = float(np.max(np.abs(vals))) if vals.size else 1.0
+						mag_cur = max(1.0, mag_cur)
+						mag_prev = float(getattr(self, '_xcorr_mag0', mag_cur))
+						mag = max(mag_cur, mag_prev * 0.90)
+						self._xcorr_mag0 = mag
 						try:
 							self.vb_corr0.setYRange(-mag * 1.05, mag * 1.05, padding=0.0)
 						except Exception:
@@ -1205,8 +1461,11 @@ class ScopeWindow:
 				if hasattr(self, 'vb_corr1'):
 					if xcorr_norm:
 						vals = self._xcorr_saved_prod1[:min_display]
-						mag = float(np.max(np.abs(vals))) if vals.size else 1.0
-						mag = max(1.0, mag)
+						mag_cur = float(np.max(np.abs(vals))) if vals.size else 1.0
+						mag_cur = max(1.0, mag_cur)
+						mag_prev = float(getattr(self, '_xcorr_mag1', mag_cur))
+						mag = max(mag_cur, mag_prev * 0.90)
+						self._xcorr_mag1 = mag
 						try:
 							self.vb_corr1.setYRange(-mag * 1.05, mag * 1.05, padding=0.0)
 						except Exception:
@@ -1222,11 +1481,38 @@ class ScopeWindow:
 			except Exception:
 				pass
 
-		# show simple-product summary in legend
+		# show simple-product summary in legend with optimal phase shift info
 		try:
 			xcorr_norm = bool(getattr(self, 'xcorr_norm_enabled', True))
 			mode = "norm" if xcorr_norm else "0..65535"
-			self.legend_lbl.setText(f"Prod(no-shift) [{mode}]: ch0 mean={float(np.mean(prod0)):.1f} ch1 mean={float(np.mean(prod1)):.1f}")
+			try:
+				_sc = float(getattr(self, '_xcorr_prod_scale', 1.0))
+				if not np.isfinite(_sc) or _sc == 0.0:
+					_sc = 1.0
+			except Exception:
+				_sc = 1.0
+			mean0 = float(np.mean(prod0))
+			mean1 = float(np.mean(prod1))
+			if not xcorr_norm:
+				mean0 = mean0 / _sc
+				mean1 = mean1 / _sc
+			# Target tick rate from Qt timer interval (informational)
+			try:
+				_tick_hz = 1000.0 / max(1.0, float(self.qtimer.interval()))
+			except Exception:
+				_tick_hz = 0.0
+			_fps_part = f"XCorrFPS:{float(getattr(self,'_xcorr_fps',0.0)):.1f} tick:{_tick_hz:.1f}"
+			if use_optimal:
+				self.legend_lbl.setText(
+					f"{_fps_part} | Prod [{mode}] "
+					f"ch0(shift={shift0}) mean={mean0:.1f} "
+					f"ch1(shift={shift1}) mean={mean1:.1f}"
+				)
+			else:
+				self.legend_lbl.setText(
+					f"{_fps_part} | Prod(no-shift) [{mode}] "
+					f"ch0 mean={mean0:.1f} ch1 mean={mean1:.1f}"
+				)
 		except Exception:
 			pass
 
@@ -1714,6 +2000,12 @@ class ScopeWindow:
 
 	# --- numeric buttons persistence ---
 	def _num_clicked(self, idx: int):
+		# Enable heavy phase-shift search only in modes 6+ ("6 и более").
+		# This flag is consumed by the USB reader thread.
+		try:
+			self._phase_search_enabled = bool(int(idx) >= 6)
+		except Exception:
+			self._phase_search_enabled = False
 		if idx in (1, 2, 3):
 			mode_map = {1: 1, 2: 2, 3: 0}  # 1: канал 1, 2: канал 2, 3: оба
 			# Если поток не запущен - запустить его
@@ -2387,6 +2679,11 @@ class ScopeWindow:
 						tgt[:len(ch0)] = ch0
 						# mark that new data arrived and we should recompute xcorr (schedule outside lock)
 						self._need_xcorr = True
+						# Also trigger phase shift search in background worker (latest-only)
+						try:
+							self._request_phase_shift_search()
+						except Exception:
+							pass
 						if len(ch0) < self.max_samples:
 							tgt[len(ch0):] = 0
 						if par:
@@ -2431,6 +2728,11 @@ class ScopeWindow:
 						tgt[:len(ch1)] = ch1
 						# mark that new data arrived and we should recompute xcorr (schedule outside lock)
 						self._need_xcorr = True
+						# Also trigger phase shift search in background worker (latest-only)
+						try:
+							self._request_phase_shift_search()
+						except Exception:
+							pass
 						if len(ch1) < self.max_samples:
 							tgt[len(ch1):] = 0
 						if par:
@@ -2534,6 +2836,11 @@ class ScopeWindow:
 								self.data1_odd[:buf_len] = vals
 								# mark new data for xcorr
 								self._need_xcorr = True
+								# Also trigger phase shift search in background worker (latest-only)
+								try:
+									self._request_phase_shift_search()
+								except Exception:
+									pass
 								if buf_len < self.max_samples:
 									self.data0_even[buf_len:] = 0
 									self.data0_odd[buf_len:] = 0
@@ -2826,9 +3133,17 @@ class ScopeWindow:
 		try:
 			if getattr(self, '_need_xcorr', False):
 				if hasattr(self, 'num_buttons') and len(self.num_buttons) > 6 and self.num_buttons[6].isChecked():
-					# сбрасываем флаг и вызываем немедленно
-					self._need_xcorr = False
-					self._compute_and_plot_xcorr()
+					# Если включён отдельный таймер XCorr (режим 6), не дёргаем пер-пакетно,
+					# иначе получается «двойная перерисовка» и визуальное моргание.
+					try:
+						if hasattr(self, '_corr_timer') and self._corr_timer is not None and self._corr_timer.isActive():
+							self._need_xcorr = False
+						else:
+							# сбрасываем флаг и вызываем немедленно
+							self._need_xcorr = False
+							self._compute_and_plot_xcorr()
+					except Exception:
+						self._need_xcorr = False
 				else:
 					# очистим флаг если кнопка не активна
 					self._need_xcorr = False
