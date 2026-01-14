@@ -42,6 +42,209 @@ except Exception:
 	CMD_DEEP_RESET = 0x7F
 	CMD_SET_ALT = 0x31
 
+# Optional: device-side DC adaptation toggle (not present in older usb_stream.py)
+try:
+	from usb_vendor.usb_stream import CMD_SET_DC_ADAPT  # type: ignore
+except Exception:
+	try:
+		CMD_SET_DC_ADAPT = int(os.getenv("BMI30_CMD_SET_DC_ADAPT", "0x1B"), 0)
+	except Exception:
+		CMD_SET_DC_ADAPT = 0x1B
+
+
+class PwmBeeper:
+	"""Best-effort beeper for RPi PWM0 (GPIO12).
+
+	Backends:
+	- pigpio.hardware_PWM (preferred)
+	- lgpio.tx_pwm (direct, works on Pi5 without pigpiod)
+	- RPi.GPIO.PWM (software PWM fallback)
+	
+	If no backend available, all methods become no-ops.
+	"""
+	def __init__(self, gpio_pin: int = 12):
+		self.gpio_pin = int(gpio_pin)
+		self._backend = None
+		self._pi = None
+		self._lg = None
+		self._lg_h = None
+		self._gpio = None
+		self._pwm = None
+		self._lock = threading.Lock()
+		self._enabled = str(os.getenv("BMI30_BEEP_ENABLE", "1")).lower() not in ("0", "false", "no")
+		self._continuous_on = False
+		self._last_freq = 0
+		self._init_backend()
+
+	def status(self) -> str:
+		"""Return backend status for UI/logging."""
+		try:
+			if not bool(self._enabled):
+				return 'OFF'
+			b = str(self._backend or 'none')
+			if b == 'none':
+				return 'none'
+			# include minimal runtime state to debug "no variable signal"
+			try:
+				if bool(getattr(self, '_continuous_on', False)) and int(getattr(self, '_last_freq', 0) or 0) > 0:
+					return f"{b}@GPIO{int(self.gpio_pin)} f={int(self._last_freq)}"
+			except Exception:
+				pass
+			return f"{b}@GPIO{int(self.gpio_pin)}"
+		except Exception:
+			return 'unknown'
+
+	def _init_backend(self):
+		if not self._enabled:
+			return
+		# Try pigpio first
+		try:
+			import pigpio  # type: ignore
+			pi = pigpio.pi()
+			if getattr(pi, 'connected', False):
+				self._backend = 'pigpio'
+				self._pi = pi
+				return
+		except Exception:
+			pass
+		# Try lgpio (recommended on Pi5 / modern distros)
+		try:
+			import lgpio  # type: ignore
+			chip = 0
+			try:
+				chip = int(os.getenv('BMI30_GPIOCHIP', '0') or 0)
+			except Exception:
+				chip = 0
+			h = lgpio.gpiochip_open(chip)
+			# Claim as output (initial low). PWM will override level.
+			try:
+				lgpio.gpio_claim_output(h, self.gpio_pin, 0)
+			except Exception:
+				# Some kernels/drivers don't require claim for tx_pwm; proceed anyway.
+				pass
+			self._backend = 'lgpio'
+			self._lg = lgpio
+			self._lg_h = h
+			return
+		except Exception:
+			self._lg = None
+			self._lg_h = None
+		# Fallback: RPi.GPIO software PWM
+		try:
+			import RPi.GPIO as GPIO  # type: ignore
+			GPIO.setwarnings(False)
+			GPIO.setmode(GPIO.BCM)
+			GPIO.setup(self.gpio_pin, GPIO.OUT)
+			self._backend = 'rpi_gpio'
+			self._gpio = GPIO
+			return
+		except Exception:
+			self._backend = None
+			self._gpio = None
+			self._pi = None
+			self._lg = None
+			self._lg_h = None
+
+	def _start(self, freq_hz: float):
+		if not self._enabled or self._backend is None:
+			return
+		freq = int(max(1, float(freq_hz)))
+		if self._backend == 'pigpio' and self._pi is not None:
+			# dutycycle: 0..1_000_000
+			try:
+				self._pi.hardware_PWM(self.gpio_pin, freq, 500_000)
+			except Exception:
+				pass
+			return
+		if self._backend == 'lgpio' and self._lg is not None and self._lg_h is not None:
+			# dutycycle: 0..100 (percentage)
+			try:
+				self._lg.tx_pwm(self._lg_h, self.gpio_pin, freq, 50)
+			except Exception:
+				pass
+			return
+		if self._backend == 'rpi_gpio' and self._gpio is not None:
+			try:
+				if self._pwm is None:
+					self._pwm = self._gpio.PWM(self.gpio_pin, freq)
+					self._pwm.start(50.0)
+				else:
+					self._pwm.ChangeFrequency(freq)
+					self._pwm.ChangeDutyCycle(50.0)
+			except Exception:
+				pass
+
+	def _stop(self):
+		if not self._enabled or self._backend is None:
+			return
+		if self._backend == 'pigpio' and self._pi is not None:
+			try:
+				self._pi.hardware_PWM(self.gpio_pin, 0, 0)
+			except Exception:
+				pass
+			return
+		if self._backend == 'lgpio' and self._lg is not None and self._lg_h is not None:
+			try:
+				self._lg.tx_pwm(self._lg_h, self.gpio_pin, 0, 0)
+			except Exception:
+				pass
+			return
+		if self._backend == 'rpi_gpio' and self._pwm is not None:
+			try:
+				self._pwm.ChangeDutyCycle(0.0)
+			except Exception:
+				pass
+
+	def set_continuous(self, freq_hz: float | None):
+		"""Enable/disable continuous tone (for scope/measurement).
+
+		- freq_hz=None or <=0: stop output
+		- else: set PWM frequency and keep running
+		"""
+		if not self._enabled or self._backend is None:
+			return
+		try:
+			freq = int(max(0, float(freq_hz or 0.0)))
+		except Exception:
+			freq = 0
+		with self._lock:
+			if freq <= 0:
+				self._continuous_on = False
+				self._last_freq = 0
+				self._stop()
+				return
+			# avoid needless reprogramming
+			if self._continuous_on and self._last_freq == int(freq):
+				return
+			self._continuous_on = True
+			self._last_freq = int(freq)
+			self._start(float(freq))
+
+	def play_pattern(self, f1: float, f2: float, t_on1: float = 0.150, t_gap: float = 0.050, t_on2: float = 0.150):
+		"""Play: ON(f1) -> OFF -> ON(f2). Non-blocking for callers (spawns a daemon thread)."""
+		if not self._enabled or self._backend is None:
+			return
+		# If continuous mode is active, do not interrupt it with patterns.
+		try:
+			if bool(getattr(self, '_continuous_on', False)):
+				return
+		except Exception:
+			pass
+
+		def _run():
+			with self._lock:
+				try:
+					self._start(f1)
+					time.sleep(max(0.0, float(t_on1)))
+					self._stop()
+					time.sleep(max(0.0, float(t_gap)))
+					self._start(f2)
+					time.sleep(max(0.0, float(t_on2)))
+				finally:
+					self._stop()
+
+		threading.Thread(target=_run, daemon=True).start()
+
 # Qt/pyqtgraph bootstrap: enforce PyQt5 first to keep binding consistent
 PG_IMPORT_ERR = None
 try:
@@ -122,12 +325,20 @@ def save_avg_n(avg_n: int):
         pass
 
 
+# Optional background worker for non-blocking USB mode switches.
+# In some builds this class may be absent; keep a placeholder to avoid
+# static-analysis errors and safely fall back to synchronous mode switching.
+_ModeWorker = None
+
+
 class ScopeWindow:
 	def __init__(self):
 		# Logging flags (quiet by default)
 		self.debug = _env_bool("BMI30_DEBUG", False)
 		self.xcorr_debug = _env_bool("BMI30_XCORR_DEBUG", self.debug)
 		self.reader_debug = _env_bool("BMI30_READER_DEBUG", self.debug)
+		# Легенда: по умолчанию компактная (без "мусора"); подробная — только по флагу.
+		self.legend_verbose = _env_bool("BMI30_LEGEND_VERBOSE", self.debug)
 		if self.debug:
 			print("[INIT] BMI30 GUI starting...", flush=True)
 		if PG_IMPORT_ERR:
@@ -148,12 +359,26 @@ class ScopeWindow:
 		# Переключатель нормализации XCorr (привязан к кнопке "звук")
 		# True  -> авто-масштаб/центрированный продукт (текущая логика)
 		# False -> фиксированная шкала 0..65535 для просмотра слабых сигналов
-		self.xcorr_norm_enabled = True
+		self.xcorr_norm_enabled = False  # По умолчанию выключена (фиксированная шкала)
 		# legend (вместо верхних кнопок)
 		self.legend_lbl = QtWidgets.QLabel("--")
 		font = self.legend_lbl.font()
 		font.setPointSize(font.pointSize()+1)
 		self.legend_lbl.setFont(font)
+		# ВАЖНО: wordWrap=True, иначе QLabel может задрать minimum width и раздувать окно.
+		try:
+			self.legend_lbl.setWordWrap(True)
+		except Exception:
+			pass
+		# Минимизируем влияние длинного текста на минимальную ширину окна
+		try:
+			sp = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+			sp.setHorizontalStretch(1)
+			self.legend_lbl.setSizePolicy(sp)
+			self.legend_lbl.setMinimumWidth(0)
+		except Exception:
+			pass
+		self._last_full_status: str = ""
 		# legend_lbl остаётся основным статусным лейблом; цветные метки 1/0
 		# отображаются в заголовках каждого графика (локально), поэтому
 		# не создаём глобальный mapping-widget в легенде.
@@ -233,6 +458,21 @@ class ScopeWindow:
 		except Exception:
 			pass
 		legend_bar.addWidget(self.btn_diag, 0)
+		# Кнопка принудительного включения PWM (GPIO12) для проверки выхода ("динамик").
+		# Не зависит от детекции. По умолчанию выключена.
+		self.btn_pwm = QtWidgets.QPushButton("🔊")
+		self.btn_pwm.setToolTip("Принудительно включить PWM (GPIO12) для диагностики")
+		self.btn_pwm.setCheckable(True)
+		try:
+			self.btn_pwm.setChecked(False)
+		except Exception:
+			pass
+		try:
+			self.btn_pwm.setFixedSize(21, 21)
+		except Exception:
+			pass
+		self.btn_pwm.toggled.connect(self._on_toggle_force_pwm)
+		legend_bar.addWidget(self.btn_pwm, 0)
 		layout.addLayout(legend_bar)
 		# plots
 		self.plotw = pg.GraphicsLayoutWidget()
@@ -764,6 +1004,169 @@ class ScopeWindow:
 		self._status_hold_until: float = 0.0
 		self._last_status_text: str | None = None
 		self._last_default_update_t: float = 0.0
+		self._legend_last_runtime_t: float = 0.0
+		# --- Signal detection (per-channel) over correlation/product array ---
+		self._det_enabled = str(os.getenv("BMI30_DETECT_ENABLE", "1")).lower() not in ("0", "false", "no")
+		# Detector input source:
+		# - "norm": use normalized product max (0..1) mapped to u16 (0..65535) -> slow/stable adaptation
+		# - "prod": use raw centered product max scaled down by BMI30_DETECT_LEVEL_SCALE/BMI30_PROD_SCALE -> legacy/raw mode
+		try:
+			# Default is 'prod' because user-visible correlation/product graph operates in this domain.
+			self._det_source = str(os.getenv("BMI30_DETECT_SOURCE", "prod")).strip().lower()
+			if self._det_source in ("raw", "product"):
+				self._det_source = "prod"
+			if self._det_source not in ("norm", "prod"):
+				self._det_source = "prod"
+		except Exception:
+			self._det_source = "prod"
+		try:
+			self._det_thr_init = int(os.getenv("BMI30_DETECT_THR_INIT", "0"))
+		except Exception:
+			self._det_thr_init = 0
+		self._det_thr0 = int(self._det_thr_init)
+		self._det_thr1 = int(self._det_thr_init)
+		self._det_exceed0 = 0
+		self._det_exceed1 = 0
+		self._det_hold0 = False
+		self._det_hold1 = False
+		self._det_last_fire_t = 0.0
+		self._det_last_seen_t0 = 0.0
+		self._det_last_seen_t1 = 0.0
+		self._det_last_present_t0 = 0.0
+		self._det_last_present_t1 = 0.0
+		self._det_last_lvl0 = 0
+		self._det_last_lvl1 = 0
+		# Raw amplitude estimates (abs(u16-32768)) for display/debug
+		self._det_last_amp0 = 0
+		self._det_last_amp1 = 0
+		# Raw product maxima (abs(prod)) and scale used for detector level
+		self._det_last_prodmax0 = 0.0
+		self._det_last_prodmax1 = 0.0
+		self._det_last_level_scale = 0.0
+		self._det_last_source = str(getattr(self, '_det_source', 'norm'))
+		self._det_last_shift0 = 0
+		self._det_last_shift1 = 0
+		# Device DC adapt control (freeze on detect, resume on loss)
+		self._det_dc_frozen = False
+		# Threshold snapshots at freeze time (used to decide loss reliably even if adaptive thr drifts)
+		self._det_freeze_thr0 = 0
+		self._det_freeze_thr1 = 0
+		# Сохраненные пороговые уровни (при переходе с кнопок 6+ на другие)
+		self._det_saved_thr0 = 0  # сохраненный порог канала 0
+		self._det_saved_thr1 = 0  # сохраненный порог канала 1
+		self._det_last_mode_idx = None  # последний номер кнопки режима
+		# Счетчики срабатываний для статистики
+		self._beep_fire_count = 0  # счетчик включений динамика
+		self._freeze_fire_count = 0  # счетчик включений заморозки
+		# Предыдущие состояния для отслеживания переходов 0->1
+		self._prev_beep_state = False  # предыдущее состояние динамика
+		self._prev_freeze_state = False  # предыдущее состояние заморозки
+		# Счетчики последовательных срабатываний для динамика (нужно 2 подряд)
+		self._beep_consecutive0 = 0  # последовательные срабатывания канала 0
+		self._beep_consecutive1 = 0  # последовательные срабатывания канала 1
+		# Detector warmup: during the first seconds after startup, thresholds adapt but
+		# we ignore any early "fire" (no freeze, no hold, no beep) to avoid false startup freezes.
+		try:
+			self._det_warmup_sec = float(os.getenv('BMI30_DETECT_WARMUP_SEC', '2.0'))
+			if (not np.isfinite(self._det_warmup_sec)) or self._det_warmup_sec < 0.0:
+				self._det_warmup_sec = 2.0
+		except Exception:
+			self._det_warmup_sec = 2.0
+		# IMPORTANT: warmup is armed on stream start/connect, not on GUI launch.
+		# Otherwise, if user waits before pressing "1", the warmup window expires and
+		# the first frames may immediately freeze.
+		self._det_warmup_until = 0.0
+		self._det_warmup_dc_fix_last_t = 0.0
+		# Beeper: PWM0/GPIO12 best-effort (no-op if not available)
+		try:
+			gpio_pin = int(os.getenv("BMI30_BEEP_GPIO", "12"))
+		except Exception:
+			gpio_pin = 12
+		self._beeper = PwmBeeper(gpio_pin=gpio_pin)
+		# Optional continuous PWM output (useful for measuring "variable signal" on the pin)
+		# Modes: pattern (default), continuous, sweep
+		try:
+			self._beep_mode = str(os.getenv('BMI30_BEEP_MODE', 'pattern')).strip().lower()
+			if self._beep_mode not in ('pattern', 'continuous', 'sweep'):
+				self._beep_mode = 'pattern'
+		except Exception:
+			self._beep_mode = 'pattern'
+		# Explicit sweep mode (guaranteed variable PWM frequency on GPIO12 for scope/debug)
+		try:
+			self._beep_sweep_enabled = _env_bool('BMI30_BEEP_SWEEP', False) or (self._beep_mode == 'sweep')
+		except Exception:
+			self._beep_sweep_enabled = (self._beep_mode == 'sweep')
+		try:
+			self._beep_sweep_min = float(os.getenv('BMI30_BEEP_SWEEP_MIN', '1000'))
+			self._beep_sweep_max = float(os.getenv('BMI30_BEEP_SWEEP_MAX', '4000'))
+			self._beep_sweep_period_s = float(os.getenv('BMI30_BEEP_SWEEP_PERIOD', '2.0'))
+			if not np.isfinite(self._beep_sweep_min) or not np.isfinite(self._beep_sweep_max):
+				raise ValueError('bad sweep range')
+			if self._beep_sweep_max <= self._beep_sweep_min:
+				self._beep_sweep_max = self._beep_sweep_min + 1.0
+			if (not np.isfinite(self._beep_sweep_period_s)) or self._beep_sweep_period_s <= 0.1:
+				self._beep_sweep_period_s = 2.0
+		except Exception:
+			self._beep_sweep_min = 1000.0
+			self._beep_sweep_max = 4000.0
+			self._beep_sweep_period_s = 2.0
+		self._beep_sweep_t0 = time.time()
+		# Detection parameters (u16 domain 0..65535)
+		try:
+			# Default is x2 threshold (can be overridden via env).
+			self._det_ratio = float(os.getenv("BMI30_DETECT_RATIO", "2.0"))
+		except Exception:
+			self._det_ratio = 2.0
+		try:
+			# Slightly longer default to avoid rapid re-trigger; does not block unfreeze while frozen.
+			self._det_cooldown_s = float(os.getenv("BMI30_DETECT_COOLDOWN", "1.0"))
+		except Exception:
+			self._det_cooldown_s = 1.0
+		try:
+			# Faster default unfreeze once signal is lost.
+			self._det_loss_s = float(os.getenv("BMI30_DETECT_LOSS_SEC", "1.0"))
+		except Exception:
+			self._det_loss_s = 1.0
+		try:
+			# Slightly stricter loss criterion => быстрее считаться "потерянным".
+			self._det_loss_ratio = float(os.getenv("BMI30_DETECT_LOSS_RATIO", "1.4"))
+		except Exception:
+			self._det_loss_ratio = 1.4
+		# Beep frequencies
+		try:
+			self._beep_adc0_base = float(os.getenv("BMI30_BEEP_ADC0_BASE", "3000"))
+			self._beep_adc1_base = float(os.getenv("BMI30_BEEP_ADC1_BASE", "2000"))
+		except Exception:
+			self._beep_adc0_base = 3000.0
+			self._beep_adc1_base = 2000.0
+		try:
+			self._beep_adc0_min = float(os.getenv("BMI30_BEEP_ADC0_MIN", "2000"))
+			self._beep_adc0_max = float(os.getenv("BMI30_BEEP_ADC0_MAX", "4000"))
+			self._beep_adc1_min = float(os.getenv("BMI30_BEEP_ADC1_MIN", "1000"))
+			self._beep_adc1_max = float(os.getenv("BMI30_BEEP_ADC1_MAX", "3000"))
+		except Exception:
+			self._beep_adc0_min, self._beep_adc0_max = 2000.0, 4000.0
+			self._beep_adc1_min, self._beep_adc1_max = 1000.0, 3000.0
+		# Optional: keep PWM running while detection HOLD is active.
+		# This is OFF by default to avoid changing behavior unexpectedly.
+		self._beep_hold_enabled = _env_bool('BMI30_BEEP_HOLD_ENABLE', False)
+		try:
+			self._beep_hold_delay_s = float(os.getenv('BMI30_BEEP_HOLD_DELAY', '0.40'))
+			if (not np.isfinite(self._beep_hold_delay_s)) or self._beep_hold_delay_s < 0.0:
+				self._beep_hold_delay_s = 0.40
+		except Exception:
+			self._beep_hold_delay_s = 0.40
+		self._beep_hold_active = False
+		self._beep_hold_freq = 0.0
+		self._beep_hold_after_t = 0.0
+		# Forced PWM from GUI button (independent from detection)
+		self._beep_force_enabled = False
+		try:
+			self._beep_force_freq = float(os.getenv('BMI30_BEEP_FORCE_FREQ', '2000'))
+			if (not np.isfinite(self._beep_force_freq)) or self._beep_force_freq <= 0.0:
+				self._beep_force_freq = 2000.0
+		except Exception:
+			self._beep_force_freq = 2000.0
 		# stream (ленивый запуск по кнопке 1)
 		self.stream = None
 		self._connecting = False
@@ -788,8 +1191,12 @@ class ScopeWindow:
 
 		# Start background mode-switch worker to avoid blocking GUI on USB commands
 		try:
-			self._mode_worker = _ModeWorker(self)
-			self._mode_worker.start()
+			mw = globals().get('_ModeWorker', None)
+			if mw is not None:
+				self._mode_worker = mw(self)
+				self._mode_worker.start()
+			else:
+				self._mode_worker = None
 		except Exception:
 			self._mode_worker = None
 		# авто-кик при зависании
@@ -1481,7 +1888,7 @@ class ScopeWindow:
 			except Exception:
 				pass
 
-		# show simple-product summary in legend with optimal phase shift info
+		# legend text is updated centrally in _tick (stable 3 lines)
 		try:
 			xcorr_norm = bool(getattr(self, 'xcorr_norm_enabled', True))
 			mode = "norm" if xcorr_norm else "0..65535"
@@ -1496,25 +1903,487 @@ class ScopeWindow:
 			if not xcorr_norm:
 				mean0 = mean0 / _sc
 				mean1 = mean1 / _sc
-			# Target tick rate from Qt timer interval (informational)
-			try:
-				_tick_hz = 1000.0 / max(1.0, float(self.qtimer.interval()))
-			except Exception:
-				_tick_hz = 0.0
-			_fps_part = f"XCorrFPS:{float(getattr(self,'_xcorr_fps',0.0)):.1f} tick:{_tick_hz:.1f}"
 			if use_optimal:
-				self.legend_lbl.setText(
-					f"{_fps_part}\nProd [{mode}] "
-					f"ch0(shift={shift0}) mean={mean0:.1f} "
-					f"ch1(shift={shift1}) mean={mean1:.1f}"
-				)
+				self._xcorr_last_summary = f"XCORR[{mode}] sh0={int(shift0)} sh1={int(shift1)} mean0={mean0:.1f} mean1={mean1:.1f}"
 			else:
-				self.legend_lbl.setText(
-					f"{_fps_part}\nProd(no-shift) [{mode}] "
-					f"ch0 mean={mean0:.1f} ch1 mean={mean1:.1f}"
-				)
+				self._xcorr_last_summary = f"XCORR[{mode}] no-shift mean0={mean0:.1f} mean1={mean1:.1f}"
+		except Exception:
+			self._xcorr_last_summary = "XCORR: error"
+
+		# --- Signal detection hook: use product-array maximum (same data as corr graph) ---
+		try:
+			# Robust fallback: if centered product arrays are not available (due to earlier error),
+			# fall back to whatever `prod0/prod1` contain (zeros-safe).
+			try:
+				prod0c = prod0_center
+				prod1c = prod1_center
+			except NameError:
+				prod0c = prod0
+				prod1c = prod1
+			# Also track raw amplitude (what you visually see on the oscilloscope): abs(u16-32768)
+			try:
+				amp0 = float(max(np.nanmax(np.abs(e0_raw - 32767.0)), np.nanmax(np.abs(o0_raw - 32767.0))))
+				amp1 = float(max(np.nanmax(np.abs(e1_raw - 32767.0)), np.nanmax(np.abs(o1_raw - 32767.0))))
+				self._det_last_amp0 = int(max(0, min(32768, int(amp0))))
+				self._det_last_amp1 = int(max(0, min(32768, int(amp1))))
+			except Exception:
+				pass
+			# Always record raw product maxima for diagnostics (centered product units).
+			try:
+				with np.errstate(invalid='ignore'):
+					self._det_last_prodmax0 = float(np.nanmax(np.abs(prod0c))) if prod0c is not None and getattr(prod0c, 'size', 0) else 0.0
+					self._det_last_prodmax1 = float(np.nanmax(np.abs(prod1c))) if prod1c is not None and getattr(prod1c, 'size', 0) else 0.0
+			except Exception:
+				pass
+			# Feed detector with selected source (default: raw product max).
+			src = str(getattr(self, '_det_source', 'norm') or 'norm').strip().lower()
+			if src in ('raw', 'product'):
+				src = 'prod'
+			if src == 'prod':
+				self._update_signal_detection(prod0c, prod1c, int(shift0), int(shift1), source='prod')
+			else:
+				self._update_signal_detection(prod0_norm, prod1_norm, int(shift0), int(shift1), source='norm')
+			# Optional: continuous PWM output proportional to current phase shift while correlation view is active.
+			try:
+				if str(getattr(self, '_beep_mode', 'pattern')) == 'continuous':
+					# Choose a representative shift (largest magnitude) and map into a frequency band.
+					s0 = int(shift0)
+					s1 = int(shift1)
+					use_s = s0 if abs(s0) >= abs(s1) else s1
+					# If shift is near zero, silence output to avoid constant tone.
+					if abs(int(use_s)) <= 0:
+						self._beeper.set_continuous(None)
+					else:
+						# Use a broad band so it's visible on scope.
+						f = self._shift_to_beep_freq(use_s, 1000.0, 4000.0)
+						self._beeper.set_continuous(float(f))
+			except Exception:
+				pass
 		except Exception:
 			pass
+
+	def _device_set_dc_adapt(self, enabled: bool):
+		"""Toggle device-side DC adaptation if supported by firmware."""
+		try:
+			if self.stream is None:
+				return
+			payload = b"\x01" if bool(enabled) else b"\x00"
+			self.stream.send_cmd(CMD_SET_DC_ADAPT, payload)
+		except Exception:
+			pass
+
+	def _det_reset_and_arm_warmup(self, reason: str = ""):
+		"""Force detector into RUN state and arm warmup window.
+
+		Goal: right after startup/connect, we should never remain FROZEN.
+		Warmup starts from the first connection/stream start (not from GUI launch).
+		"""
+		_now = time.time()
+		try:
+			warm = float(getattr(self, '_det_warmup_sec', 2.0) or 0.0)
+			if (not np.isfinite(warm)) or warm < 0.0:
+				warm = 2.0
+		except Exception:
+			warm = 2.0
+		try:
+			self._det_warmup_until = float(_now + warm)
+		except Exception:
+			self._det_warmup_until = float(_now)
+		try:
+			self._det_warmup_dc_fix_last_t = 0.0
+			self._det_dc_frozen = False
+			self._det_hold0 = False
+			self._det_hold1 = False
+			self._det_exceed0 = 0
+			self._det_exceed1 = 0
+			self._det_freeze_thr0 = 0
+			self._det_freeze_thr1 = 0
+			# Reset threshold adaptation to avoid inheriting stale values across reconnects.
+			# НО: если пороги уже были восстановлены (>0), сохраняем их для быстрой подстройки
+			if not (hasattr(self, '_det_thr0') and self._det_thr0 > 0):
+				self._det_thr0 = int(getattr(self, '_det_thr_init', 0) or 0)
+			if not (hasattr(self, '_det_thr1') and self._det_thr1 > 0):
+				self._det_thr1 = int(getattr(self, '_det_thr_init', 0) or 0)
+			self._det_last_fire_t = 0.0
+			self._det_last_present_t0 = float(_now)
+			self._det_last_present_t1 = float(_now)
+		except Exception:
+			pass
+		# Best effort: ensure device DC adaptation is ON immediately.
+		try:
+			self._device_set_dc_adapt(True)
+		except Exception:
+			pass
+		try:
+			self._beep_hold_stop()
+		except Exception:
+			pass
+
+	def _shift_to_beep_freq(self, shift: int, f_min: float, f_max: float) -> float:
+		"""Map absolute phase shift into a frequency within [f_min..f_max]."""
+		try:
+			max_shift = int(getattr(self, 'phase_search_max_shift', 0) or 0)
+		except Exception:
+			max_shift = 0
+		den = float(max_shift) if max_shift > 0 else 32.0
+		frac = min(1.0, max(0.0, float(abs(int(shift))) / den))
+		return float(f_min + frac * (float(f_max) - float(f_min)))
+
+	def _beep_hold_start(self, fired0: bool, fired1: bool, shift0: int, shift1: int, lvl0: int, lvl1: int):
+		"""Optionally enable continuous PWM while in detection HOLD."""
+		try:
+			if not bool(getattr(self, '_beep_hold_enabled', False)):
+				return
+			# Do not interfere with explicit debug modes
+			bm = str(getattr(self, '_beep_mode', 'pattern') or 'pattern')
+			if bm in ('continuous', 'sweep'):
+				return
+			if bool(getattr(self, '_beep_sweep_enabled', False)):
+				return
+			# Choose the channel to represent when both fire
+			use_ch = None
+			if fired0 and fired1:
+				use_ch = 0 if int(lvl0) >= int(lvl1) else 1
+			elif fired0:
+				use_ch = 0
+			elif fired1:
+				use_ch = 1
+			if use_ch is None:
+				return
+			# Use the same mapping as the second tone (phase-dependent)
+			if use_ch == 0:
+				freq = float(self._shift_to_beep_freq(int(shift0), float(self._beep_adc0_min), float(self._beep_adc0_max)))
+			else:
+				freq = float(self._shift_to_beep_freq(int(shift1), float(self._beep_adc1_min), float(self._beep_adc1_max)))
+			self._beep_hold_active = True
+			self._beep_hold_freq = float(freq)
+			now = time.time()
+			delay = float(getattr(self, '_beep_hold_delay_s', 0.40) or 0.40)
+			self._beep_hold_after_t = now + max(0.0, delay)
+		except Exception:
+			pass
+
+	def _beep_hold_stop(self):
+		"""Stop continuous PWM used for HOLD."""
+		try:
+			self._beep_hold_active = False
+			self._beep_hold_freq = 0.0
+			self._beep_hold_after_t = 0.0
+			# Do not stop PWM if user forced it ON from the GUI.
+			if not bool(getattr(self, '_beep_force_enabled', False)):
+				try:
+					self._beeper.set_continuous(None)
+				except Exception:
+					pass
+		except Exception:
+			pass
+
+	def _fire_beep(self, fired0: bool, fired1: bool, shift0: int, shift1: int):
+		"""Generate PWM beeps. Single PWM output -> play patterns sequentially if both channels fire."""
+		try:
+			# Compute second-tone frequencies
+			f2_0 = self._shift_to_beep_freq(shift0, self._beep_adc0_min, self._beep_adc0_max)
+			f2_1 = self._shift_to_beep_freq(shift1, self._beep_adc1_min, self._beep_adc1_max)
+			# If both fired and phase shifts equal, enforce equal second-tone frequency (within intersection)
+			if fired0 and fired1 and int(shift0) == int(shift1):
+				f2_common = self._shift_to_beep_freq(shift0, 2000.0, 3000.0)
+				f2_0 = float(np.clip(f2_common, self._beep_adc0_min, self._beep_adc0_max))
+				f2_1 = float(np.clip(f2_common, self._beep_adc1_min, self._beep_adc1_max))
+			# Play patterns (sequential)
+			if fired0:
+				self._beeper.play_pattern(self._beep_adc0_base, f2_0)
+				if fired1:
+					time.sleep(0.25)
+			if fired1:
+				self._beeper.play_pattern(self._beep_adc1_base, f2_1)
+		except Exception:
+			pass
+
+	def _update_signal_detection(self, prod0_arr: np.ndarray, prod1_arr: np.ndarray, shift0: int, shift1: int, source: str = 'norm'):
+		"""Per-channel signal detection.
+
+		By default (source='norm'), we use normalized product max (0..1) mapped to a u16-like level (0..65535).
+		This keeps threshold adaptation stable/slow even when raw product magnitudes swing a lot.
+
+		Alternative (source='prod'): use raw centered product max scaled by BMI30_DETECT_LEVEL_SCALE (or BMI30_PROD_SCALE).
+
+		Threshold adaptation is ALWAYS active, but uses two sets of step sizes:
+		- no-detect: +20 / -5
+		- detect/hold: +2 / -1
+		"""
+		if not bool(getattr(self, '_det_enabled', False)):
+			return
+		try:
+			source = str(source or 'norm').strip().lower()
+			if source in ('raw', 'product'):
+				source = 'prod'
+			if source not in ('norm', 'prod'):
+				source = 'norm'
+		except Exception:
+			source = 'norm'
+		try:
+			self._det_last_source = str(source)
+		except Exception:
+			pass
+		_now = time.time()
+		# Warmup period after startup: adapt thresholds, but suppress any early fire/freeze/beep.
+		try:
+			warmup_until = float(getattr(self, '_det_warmup_until', 0.0) or 0.0)
+		except Exception:
+			warmup_until = 0.0
+		in_warmup = (warmup_until > 0.0) and (_now < warmup_until)
+		# If anything ended up frozen during warmup (should not), force resume.
+		if in_warmup and bool(getattr(self, '_det_dc_frozen', False)):
+			try:
+				# throttle USB commands
+				last_fix = float(getattr(self, '_det_warmup_dc_fix_last_t', 0.0) or 0.0)
+			except Exception:
+				last_fix = 0.0
+			if (_now - last_fix) >= 0.50:
+				try:
+					self._det_warmup_dc_fix_last_t = _now
+				except Exception:
+					pass
+				try:
+					self._det_dc_frozen = False
+					self._det_hold0 = False
+					self._det_hold1 = False
+					self._det_exceed0 = 0
+					self._det_exceed1 = 0
+				except Exception:
+					pass
+				try:
+					self._device_set_dc_adapt(True)
+				except Exception:
+					pass
+				try:
+					self._beep_hold_stop()
+				except Exception:
+					pass
+		# cooldown to avoid rapid retrigger
+		# IMPORTANT: do not block unfreeze logic while DC is frozen.
+		try:
+			in_freeze = bool(getattr(self, '_det_dc_frozen', False))
+		except Exception:
+			in_freeze = False
+		if (not in_freeze) and ((_now - float(getattr(self, '_det_last_fire_t', 0.0))) < float(getattr(self, '_det_cooldown_s', 1.0))):
+			return
+
+		def _level_u16(arr: np.ndarray) -> int:
+			"""Return detector level (0..65535) from product array magnitude."""
+			try:
+				if arr is None or (not hasattr(arr, 'size')) or (arr.size == 0):
+					return 0
+				with np.errstate(invalid='ignore'):
+					mx = float(np.nanmax(np.abs(arr)))
+			except Exception:
+				mx = 0.0
+			if not np.isfinite(mx) or mx <= 0.0:
+				return 0
+			if source == 'norm':
+				# Normalized product magnitude is ~[0..1]. Map to u16 for stable adaptation.
+				try:
+					self._det_last_level_scale = 0.0
+				except Exception:
+					pass
+				v = int(mx * 65535.0)
+				return int(max(0, min(65535, v)))
+			# Raw product mode: scale down to u16-like range.
+			try:
+				level_scale = float(getattr(self, '_det_level_scale', 0.0) or 0.0)
+			except Exception:
+				level_scale = 0.0
+			if level_scale <= 0.0:
+				try:
+					level_scale = float(os.getenv('BMI30_DETECT_LEVEL_SCALE', '') or 0.0)
+				except Exception:
+					level_scale = 0.0
+			if level_scale <= 0.0:
+				try:
+					level_scale = float(os.getenv('BMI30_PROD_SCALE', '100') or 100.0)
+				except Exception:
+					level_scale = 100.0
+			if not np.isfinite(level_scale) or level_scale <= 0.0:
+				level_scale = 100.0
+			try:
+				self._det_last_level_scale = float(level_scale)
+			except Exception:
+				pass
+			v = int(mx / level_scale)
+			return int(max(0, min(65535, v)))
+		lvl0 = _level_u16(prod0_arr)
+		lvl1 = _level_u16(prod1_arr)
+		try:
+			self._det_last_lvl0 = int(lvl0)
+			self._det_last_lvl1 = int(lvl1)
+			self._det_last_shift0 = int(shift0)
+			self._det_last_shift1 = int(shift1)
+		except Exception:
+			pass
+
+		# init thresholds quickly on first valid data
+		if int(getattr(self, '_det_thr0', 0)) <= 0 and lvl0 > 0:
+			self._det_thr0 = int(lvl0)
+		if int(getattr(self, '_det_thr1', 0)) <= 0 and lvl1 > 0:
+			self._det_thr1 = int(lvl1)
+
+		ratio = float(getattr(self, '_det_ratio', 2.0))
+
+		def _step_one(ch: int, lvl: int):
+			thr_key = '_det_thr0' if ch == 0 else '_det_thr1'
+			ex_key = '_det_exceed0' if ch == 0 else '_det_exceed1'
+			hold_key = '_det_hold0' if ch == 0 else '_det_hold1'
+			seen_key = '_det_last_seen_t0' if ch == 0 else '_det_last_seen_t1'
+			present_key = '_det_last_present_t0' if ch == 0 else '_det_last_present_t1'
+			thr = int(getattr(self, thr_key, 1))
+			thr_prev = max(1, thr)
+			setattr(self, seen_key, _now)
+			# Update presence timestamp when level is meaningfully above threshold.
+			# IMPORTANT: while DC is frozen, use the snapshot threshold from the moment of freeze,
+			# otherwise the adaptive threshold may drift down into the noise floor and keep extending "present".
+			try:
+				loss_ratio = float(getattr(self, '_det_loss_ratio', 1.2))
+			except Exception:
+				loss_ratio = 1.2
+			base_thr = thr_prev
+			try:
+				if bool(getattr(self, '_det_dc_frozen', False)):
+					ref = int(getattr(self, '_det_freeze_thr0' if ch == 0 else '_det_freeze_thr1', 0) or 0)
+					if ref > 0:
+						base_thr = max(base_thr, ref)
+			except Exception:
+				pass
+			if float(lvl) >= loss_ratio * float(base_thr):
+				setattr(self, present_key, _now)
+			# Decide whether we currently have "detection":
+			# - HOLD means we previously fired and are still in detected/present state.
+			# - exceed_now means current level is above ratio*threshold.
+			exceed_now = (float(lvl) > ratio * float(thr_prev))
+			in_detect = bool(getattr(self, hold_key, False)) or bool(exceed_now)
+			# Step sizes per user requirement:
+			# - detect: +4 / -1
+			# - no detect: +40 / -10
+			up = 4 if in_detect else 40
+			down = 1 if in_detect else 10
+			if int(lvl) > thr_prev:
+				thr_new = thr_prev + int(up)
+			else:
+				thr_new = thr_prev - int(down)
+			thr_new = int(max(1, min(65535, thr_new)))
+			setattr(self, thr_key, thr_new)
+			# Detect exceed vs previous threshold
+			exceed = bool(exceed_now)
+			cnt = int(getattr(self, ex_key, 0))
+			cnt = cnt + 1 if exceed else 0
+			setattr(self, ex_key, cnt)
+			return bool(exceed)
+
+		ex0 = _step_one(0, lvl0)
+		ex1 = _step_one(1, lvl1)
+
+		fire0 = int(getattr(self, '_det_exceed0', 0)) >= 2
+		fire1 = int(getattr(self, '_det_exceed1', 0)) >= 2
+		
+		if fire0 or fire1:
+			# During startup warmup we intentionally ignore the first (and any) early fires.
+			if in_warmup:
+				try:
+					self._det_exceed0 = 0
+					self._det_exceed1 = 0
+					self._det_hold0 = False
+					self._det_hold1 = False
+					# Ensure we don't show/keep a frozen state during warmup.
+					self._det_dc_frozen = False
+					# Сбрасываем счетчики динамика
+					self._beep_consecutive0 = 0
+					self._beep_consecutive1 = 0
+				except Exception:
+					pass
+				try:
+					# Best effort: keep device adapt enabled during warmup.
+					self._device_set_dc_adapt(True)
+				except Exception:
+					pass
+				try:
+					self._beep_hold_stop()
+				except Exception:
+					pass
+				return
+			# freeze further adaptations
+			if fire0:
+				self._det_hold0 = True
+				self._det_exceed0 = 0
+			if fire1:
+				self._det_hold1 = True
+				self._det_exceed1 = 0
+			# freeze device DC adapt
+			if not bool(getattr(self, '_det_dc_frozen', False)):
+				# snapshot thresholds at the moment of freeze to make later loss detection stable
+				try:
+					self._det_freeze_thr0 = int(getattr(self, '_det_thr0', 0) or 0)
+					self._det_freeze_thr1 = int(getattr(self, '_det_thr1', 0) or 0)
+				except Exception:
+					pass
+				# Отслеживаем переход 0->1 для счетчика заморозки
+				if not self._prev_freeze_state:
+					self._freeze_fire_count += 1
+				self._det_dc_frozen = True
+				self._prev_freeze_state = True
+				self._device_set_dc_adapt(False)
+		# also ensure host DC removal is off
+		try:
+			self.dc_removal_enabled = False
+		except Exception:
+			pass
+		# beep при срабатывании fire (уже требует 2 последовательных превышения)
+		if fire0 or fire1:
+			# Отслеживаем переход 0->1 для счетчика динамика
+			if not self._prev_beep_state:
+				self._beep_fire_count += 1
+				self._prev_beep_state = True
+			self._det_last_fire_t = _now
+			self._fire_beep(fire0, fire1, shift0, shift1)
+			# optional: keep PWM running while in HOLD
+			self._beep_hold_start(fire0, fire1, shift0, shift1, int(lvl0), int(lvl1))
+			return
+
+		# If previously frozen and signal "lost" for long enough -> resume device DC adapt
+		if bool(getattr(self, '_det_dc_frozen', False)):
+			loss_s = float(getattr(self, '_det_loss_s', 2.0))
+			loss_ratio = float(getattr(self, '_det_loss_ratio', 1.2))
+			# consider each channel lost if below loss_ratio*thr
+			thr0 = max(1, int(getattr(self, '_det_thr0', 1)))
+			thr1 = max(1, int(getattr(self, '_det_thr1', 1)))
+			# While frozen, use the snapshot threshold (moment of freeze) as a stable reference.
+			# This prevents adaptive thresholds drifting down in noise and delaying unfreeze.
+			try:
+				ref0 = int(getattr(self, '_det_freeze_thr0', 0) or 0)
+				ref1 = int(getattr(self, '_det_freeze_thr1', 0) or 0)
+				if ref0 > 0:
+					thr0 = max(thr0, ref0)
+				if ref1 > 0:
+					thr1 = max(thr1, ref1)
+			except Exception:
+				pass
+			lost0 = float(lvl0) < loss_ratio * float(thr0)
+			lost1 = float(lvl1) < loss_ratio * float(thr1)
+			# if both are lost for > loss_s, resume
+			lastp0 = float(getattr(self, '_det_last_present_t0', 0.0))
+			lastp1 = float(getattr(self, '_det_last_present_t1', 0.0))
+			if (lost0 and lost1) and ((_now - max(lastp0, lastp1)) >= loss_s):
+				self._det_dc_frozen = False
+				self._prev_freeze_state = False
+				self._prev_beep_state = False
+				self._det_hold0 = False
+				self._det_hold1 = False
+				try:
+					self._det_freeze_thr0 = 0
+					self._det_freeze_thr1 = 0
+				except Exception:
+					pass
+				self._device_set_dc_adapt(True)
+				# stop HOLD PWM
+				self._beep_hold_stop()
 
 	def _switch_to_latest_mode(self):
 		"""Возврат в режим LATEST (STREAM_MODE=0): 600 семплов, допускаются пропуски"""
@@ -2000,6 +2869,48 @@ class ScopeWindow:
 
 	# --- numeric buttons persistence ---
 	def _num_clicked(self, idx: int):
+		# Сброс счетчиков статистики и разморозка при любом переключении режима
+		# ВАЖНО: адаптивные пороги НЕ сбрасываем - они продолжают работать
+		try:
+			self._beep_fire_count = 0
+			self._freeze_fire_count = 0
+			self._prev_beep_state = False
+			self._prev_freeze_state = False
+			self._beep_consecutive0 = 0
+			self._beep_consecutive1 = 0
+			# Проверяем переход между режимами
+			last_idx = getattr(self, '_det_last_mode_idx', None)
+			going_to_detect = (idx >= 6)  # Переходим на кнопки 6+
+			coming_from_detect = (last_idx is not None and last_idx >= 6)  # Были на кнопках 6+
+			# Сохраняем текущий режим
+			self._det_last_mode_idx = idx
+			# Если уходим с кнопок 6+ - сохраняем пороги
+			if coming_from_detect and not going_to_detect:
+				self._det_saved_thr0 = self._det_thr0
+				self._det_saved_thr1 = self._det_thr1
+			# Если приходим на кнопки 6+ - восстанавливаем пороги и запускаем warmup
+			if going_to_detect:
+				# Восстанавливаем сохраненные пороги (если есть)
+				if hasattr(self, '_det_saved_thr0') and self._det_saved_thr0 > 0:
+					self._det_thr0 = self._det_saved_thr0
+					self._det_thr1 = self._det_saved_thr1
+				# Запускаем warmup для блокировки до подстройки уровней
+				self._det_reset_and_arm_warmup(f'mode_{idx}')
+				# Примечание: _det_reset_and_arm_warmup разморозит и сбросит счетчики
+			else:
+				# На кнопках <6: просто разморозка без warmup
+				self._det_dc_frozen = False
+				self._det_hold0 = False
+				self._det_hold1 = False
+				self._det_exceed0 = 0
+				self._det_exceed1 = 0
+				# Включаем адаптацию DC на устройстве
+				try:
+					self._device_set_dc_adapt(True)
+				except Exception:
+					pass
+		except Exception:
+			pass
 		# Enable heavy phase-shift search only in modes 6+ ("6 и более").
 		# This flag is consumed by the USB reader thread.
 		try:
@@ -2043,6 +2954,8 @@ class ScopeWindow:
 			# Кнопка 6: не переключаем STREAM_MODE — включаем/выключаем корреляцию (overlay).
 			# Реальная корреляция управляется в `_on_num_clicked_extra` (подключена к клику кнопки).
 			self.avg20_enabled = False
+			# Разморозка уже выполнена выше в начале _num_clicked
+			# Адаптивные пороги продолжают работать, не сбрасываются
 			self._set_status("XCorr: toggle (no stream mode change)", hold_sec=1.5)
 		elif self.stream is not None and idx not in (1, 2, 3, 4, 5):
 			try:
@@ -3088,7 +4001,7 @@ class ScopeWindow:
 		if self.base_buf_len is not None:
 			freq_part = f" FREQ:{self.freq_hz}Hz" if self.freq_hz else ""
 			buf_info = f" BUF:{self.base_buf_len}({self.base_buf_len_bytes}B){freq_part}"
-		self.legend_lbl.setWordWrap(True)
+		# legend_lbl: wordWrap включен (иначе окно может раздуваться по ширине)
 		_zero_part = f" ZERO:{self.zero_blocks}" if getattr(self, 'zero_blocks', 0) else ""
 		asm_stat = ''
 		try:
@@ -3121,12 +4034,67 @@ class ScopeWindow:
 			_phase = f" PH:{(getattr(self,'_phase_key_chosen',None) or getattr(self,'phase_key','auto'))}"
 		except Exception:
 			_phase = ''
-		_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} Aeo:{self.afps_even:.1f}/{self.afps_odd:.1f}{_dt_a} Beo:{self.bfps_even:.1f}/{self.bfps_odd:.1f}{_dt_b}{_phase} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} STEP:{getattr(self,'seq_step',1)} R:{getattr(self,'seq_reorder_count',0)} GA:{getattr(self,'gap_a',0)} GB:{getattr(self,'gap_b',0)} SA:{getattr(self,'step_a',1)} SB:{getattr(self,'step_b',1)} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}{asm_stat}"
-		# Печатаем дефолтный статус не чаще 1 раза в секунду и только если нет активного hold
-		_now_for_default = time.time()
-		if (self._status_hold_text is None or _now_for_default >= self._status_hold_until) and (_now_for_default - self._last_default_update_t >= 1.0):
-			self._set_status(_default_status)
-			self._last_default_update_t = _now_for_default
+		# Счетчики срабатываний для отображения
+		_counters = ''
+		try:
+			_counters = f" | 🔊:{self._beep_fire_count} ❄️:{self._freeze_fire_count}"
+		except Exception:
+			_counters = ''
+		# Полный статус сохраняем для копирования (правый клик по ⚡)
+		_default_status_full = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} Aeo:{self.afps_even:.1f}/{self.afps_odd:.1f}{_dt_a} Beo:{self.bfps_even:.1f}/{self.bfps_odd:.1f}{_dt_b}{_phase} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} STEP:{getattr(self,'seq_step',1)} R:{getattr(self,'seq_reorder_count',0)} GA:{getattr(self,'gap_a',0)} GB:{getattr(self,'gap_b',0)} SA:{getattr(self,'step_a',1)} SB:{getattr(self,'step_b',1)} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}{asm_stat}"
+		self._last_full_status = _default_status_full
+		# Компактный статус для отображения (убираем PH/SEG/VIEW/BUF/FREQ, добавляем счетчики)
+		_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} GAP:{self.gap_count}{_counters}"
+		# Forced PWM from GUI: highest priority, independent from detection.
+		try:
+			force_on = bool(getattr(self, '_beep_force_enabled', False))
+			sweep_on = bool(getattr(self, '_beep_sweep_enabled', False))
+		except Exception:
+			force_on = False
+			sweep_on = False
+		if force_on:
+			try:
+				freq = float(getattr(self, '_beep_force_freq', 2000.0) or 2000.0)
+				if (not np.isfinite(freq)) or freq <= 0.0:
+					freq = 2000.0
+				self._beeper.set_continuous(freq)
+			except Exception:
+				pass
+		else:
+			# PWM sweep mode: force variable signal on GPIO12 for scope/debug.
+			# Enabled by BMI30_BEEP_MODE=sweep or BMI30_BEEP_SWEEP=1.
+			try:
+				if sweep_on:
+					fmin = float(getattr(self, '_beep_sweep_min', 1000.0))
+					fmax = float(getattr(self, '_beep_sweep_max', 4000.0))
+					period = float(getattr(self, '_beep_sweep_period_s', 2.0))
+					t0 = float(getattr(self, '_beep_sweep_t0', now))
+					if period <= 0.1:
+						period = 2.0
+					# triangle wave 0..1..0 over one period
+					t = (now - t0) % period
+					frac = float(t) / float(period)
+					tri = 1.0 - abs(2.0 * frac - 1.0)
+					freq = float(fmin + tri * (fmax - fmin))
+					self._beeper.set_continuous(freq)
+			except Exception:
+				pass
+			# PWM while HOLD: after detection keep PWM running until signal is lost.
+			try:
+				if bool(getattr(self, '_beep_hold_active', False)) and (not sweep_on):
+					bm = str(getattr(self, '_beep_mode', 'pattern') or 'pattern')
+					if bm == 'pattern':
+						after_t = float(getattr(self, '_beep_hold_after_t', 0.0) or 0.0)
+						freq = float(getattr(self, '_beep_hold_freq', 0.0) or 0.0)
+						if (after_t > 0.0) and (now >= after_t) and (freq > 0.0):
+							self._beeper.set_continuous(freq)
+			except Exception:
+				pass
+		# Runtime-легенда (стабильная): обновляем чаще, но с троттлингом и без прыжков высоты
+		try:
+			self._set_runtime_legend(_default_status)
+		except Exception:
+			pass
 
 		# Пер-пакетный триггер корреляции: если reader пометил новые данные и кнопка 6 активна,
 		# выполним вычисление в GUI-потоке (здесь мы в GUI-потоке, т.к. _tick вызывается qtimer).
@@ -3196,14 +4164,21 @@ class ScopeWindow:
 		# обновить статус: если hold истёк, очистить его, чтобы отобразить дефолтный FPS-статус
 		if self._status_hold_text is not None and time.time() >= self._status_hold_until:
 			self._status_hold_text = None
-			# немедленно обновим подпись дефолтным
+			# немедленно обновим runtime-легенду дефолтным
 			buf_info = ""
 			if self.base_buf_len is not None:
 				freq_part = f" FREQ:{self.freq_hz}Hz" if self.freq_hz else ""
 				buf_info = f" BUF:{self.base_buf_len}({self.base_buf_len_bytes}B){freq_part}"
 			_zero_part = f" ZERO:{self.zero_blocks}" if getattr(self, 'zero_blocks', 0) else ""
-			_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} STEP:{getattr(self,'seq_step',1)} R:{getattr(self,'seq_reorder_count',0)} GA:{getattr(self,'gap_a',0)} GB:{getattr(self,'gap_b',0)} SA:{getattr(self,'step_a',1)} SB:{getattr(self,'step_b',1)} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}"
-			self._set_status(_default_status)
+			_counters = ''
+			try:
+				_counters = f" | 🔊:{self._beep_fire_count} ❄️:{self._freeze_fire_count}"
+			except Exception:
+				_counters = ''
+			_default_status_full = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} STEP:{getattr(self,'seq_step',1)} R:{getattr(self,'seq_reorder_count',0)} GA:{getattr(self,'gap_a',0)} GB:{getattr(self,'gap_b',0)} SA:{getattr(self,'step_a',1)} SB:{getattr(self,'step_b',1)} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}"
+			self._last_full_status = _default_status_full
+			_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} GAP:{self.gap_count}{_counters}"
+			self._set_runtime_legend(_default_status, force=True)
 		
 		# Обновить view после всех изменений данных
 		self._update_view()
@@ -3451,6 +4426,17 @@ class ScopeWindow:
 		чтобы не вызывать лишних перерисовок.
 		"""
 		try:
+			def _fmt3(s: str) -> str:
+				# Always keep exactly 3 lines to avoid QLabel height/layout flicker.
+				try:
+					parts = str(s).splitlines()
+				except Exception:
+					parts = [str(s)]
+				parts = parts[:3]
+				while len(parts) < 3:
+					parts.append("")
+				return "\n".join(parts)
+
 			# если сейчас активен hold и он ещё не истёк, не перетирать другим текстом без hold
 			now = time.time()
 			if self._status_hold_text is not None and now < self._status_hold_until:
@@ -3458,17 +4444,99 @@ class ScopeWindow:
 				if hold_sec and text != self._status_hold_text:
 					self._status_hold_text = text
 					self._status_hold_until = now + max(0.5, hold_sec)
-					if text != self._last_status_text:
-						self.legend_lbl.setText(text)
-						self._last_status_text = text
+					_fmt = _fmt3(text)
+					if _fmt != self._last_status_text:
+						self.legend_lbl.setText(_fmt)
+						self._last_status_text = _fmt
 				return
 			# сюда попадаем если hold нет или истёк — применим новый текст
 			if hold_sec:
 				self._status_hold_text = text
 				self._status_hold_until = now + max(0.5, hold_sec)
-			if text != self._last_status_text:
-				self.legend_lbl.setText(text)
-				self._last_status_text = text
+			_fmt = _fmt3(text)
+			if _fmt != self._last_status_text:
+				self.legend_lbl.setText(_fmt)
+				self._last_status_text = _fmt
+		except Exception:
+			pass
+
+	def _set_runtime_legend(self, line1: str, force: bool = False):
+		"""Update main legend without flicker.
+
+		- Respects active hold text.
+		- Throttles updates.
+		"""
+		try:
+			now = time.time()
+			if (self._status_hold_text is not None) and (now < self._status_hold_until):
+				return
+			# throttle
+			if (not force) and (now - float(getattr(self, '_legend_last_runtime_t', 0.0)) < 0.20):
+				return
+			self._legend_last_runtime_t = now
+			# Default: show compact detector status (user needs it), but keep other diagnostics hidden.
+			try:
+				verbose = bool(getattr(self, 'legend_verbose', False))
+			except Exception:
+				verbose = False
+			# Always compute minimal detector fields
+			thr0 = int(getattr(self, '_det_thr0', 0) or 0)
+			thr1 = int(getattr(self, '_det_thr1', 0) or 0)
+			lvl0 = int(getattr(self, '_det_last_lvl0', 0) or 0)
+			lvl1 = int(getattr(self, '_det_last_lvl1', 0) or 0)
+			src = str(getattr(self, '_det_last_source', getattr(self, '_det_source', 'norm')) or 'norm').strip().lower()
+			if src in ('raw', 'product'):
+				src = 'prod'
+			h0 = 'H' if bool(getattr(self, '_det_hold0', False)) else '-'
+			h1 = 'H' if bool(getattr(self, '_det_hold1', False)) else '-'
+			dcf = 'FROZEN' if bool(getattr(self, '_det_dc_frozen', False)) else 'RUN'
+			det_on = 'ON' if bool(getattr(self, '_det_enabled', False)) else 'OFF'
+			sh0 = int(getattr(self, '_det_last_shift0', 0) or 0)
+			sh1 = int(getattr(self, '_det_last_shift1', 0) or 0)
+			# Compact (default) line: detection only
+			line2_compact = (
+				f"DET[{det_on}] src={src} DC:{dcf} | "
+				f"A0 xpk/thr={lvl0}/{thr0} {h0} sh={sh0} | "
+				f"A1 xpk/thr={lvl1}/{thr1} {h1} sh={sh1}"
+			)
+			if not verbose:
+				self._set_status(f"{line1}\n{line2_compact}")
+				return
+			# Verbose mode: add PWM backend + extra metrics + XCorr summary
+			amp0 = int(getattr(self, '_det_last_amp0', 0) or 0)
+			amp1 = int(getattr(self, '_det_last_amp1', 0) or 0)
+			pm0 = float(getattr(self, '_det_last_prodmax0', 0.0) or 0.0)
+			pm1 = float(getattr(self, '_det_last_prodmax1', 0.0) or 0.0)
+			sc = float(getattr(self, '_det_last_level_scale', 0.0) or 0.0)
+			try:
+				beep_st = str(self._beeper.status())
+			except Exception:
+				beep_st = 'unknown'
+			bm = str(getattr(self, '_beep_mode', 'pattern') or 'pattern')
+			try:
+				if bool(getattr(self, '_beep_force_enabled', False)):
+					bm = f"{bm}+FORCE"
+			except Exception:
+				pass
+			_sc_txt = (f"sc={sc:.0f}" if sc > 0 else "sc=?") if src == 'prod' else "sc=norm"
+			line2 = (
+				f"DET[{det_on}] src={src} DC:{dcf} {_sc_txt} | BEEP:{beep_st}/{bm} | "
+				f"A0 amp={amp0} pm={pm0:.0f} xpk/thr={lvl0}/{thr0} {h0} sh={sh0} | "
+				f"A1 amp={amp1} pm={pm1:.0f} xpk/thr={lvl1}/{thr1} {h1} sh={sh1}"
+			)
+			# XCorr line
+			try:
+				_tick_hz = 1000.0 / max(1.0, float(self.qtimer.interval()))
+			except Exception:
+				_tick_hz = 0.0
+			xc_on = False
+			try:
+				xc_on = bool(hasattr(self, 'num_buttons') and len(self.num_buttons) > 6 and self.num_buttons[6].isChecked())
+			except Exception:
+				xc_on = False
+			xc_sum = str(getattr(self, '_xcorr_last_summary', 'XCORR: off'))
+			line3 = f"XCorrFPS:{float(getattr(self,'_xcorr_fps',0.0)):.1f} tick:{_tick_hz:.1f} | {xc_sum if xc_on else 'XCORR: off'}"
+			self._set_status(f"{line1}\n{line2}\n{line3}")
 		except Exception:
 			pass
 
@@ -3517,10 +4585,85 @@ class ScopeWindow:
 		except Exception:
 			pass
 
+	def _on_toggle_force_pwm(self, enabled: bool):
+		"""Принудительно включить/выключить PWM на GPIO12 (независимо от детектора)."""
+		try:
+			self._beep_force_enabled = bool(enabled)
+			if self._beep_force_enabled:
+				# Cancel any pending HOLD schedule to avoid confusing transitions.
+				try:
+					self._beep_hold_active = False
+					self._beep_hold_after_t = 0.0
+				except Exception:
+					pass
+				try:
+					freq = float(getattr(self, '_beep_force_freq', 2000.0) or 2000.0)
+					if (not np.isfinite(freq)) or freq <= 0.0:
+						freq = 2000.0
+					self._beeper.set_continuous(freq)
+				except Exception:
+					pass
+				# Show backend status and fail-fast if backend is unavailable
+				try:
+					st = str(self._beeper.status())
+				except Exception:
+					st = 'unknown'
+				try:
+					freq0 = float(getattr(self, '_beep_force_freq', 2000.0) or 2000.0)
+				except Exception:
+					freq0 = 2000.0
+				try:
+					self._set_status(f"PWM FORCE: ON @ {freq0:.0f} Hz | BEEP:{st}", hold_sec=3.0)
+				except Exception:
+					pass
+				# If beeper is effectively disabled/unavailable, revert the button so user sees it immediately.
+				if st in ('none', 'OFF', 'unknown'):
+					try:
+						self._beep_force_enabled = False
+					except Exception:
+						pass
+					try:
+						if hasattr(self, 'btn_pwm'):
+							self.btn_pwm.blockSignals(True)
+							self.btn_pwm.setChecked(False)
+							self.btn_pwm.blockSignals(False)
+					except Exception:
+						pass
+					try:
+						msg = "PWM недоступен: "
+						if st == 'OFF':
+							msg += "BMI30_BEEP_ENABLE=0 (выключено)"
+						elif st == 'none':
+							msg += "нет pigpio/RPi.GPIO (или pigpiod не запущен)"
+						else:
+							msg += "неизвестный статус"
+						self._set_status(msg, hold_sec=4.0)
+					except Exception:
+						pass
+			else:
+				# Turn off forced PWM; keep sweep/HOLD if they are enabled.
+				try:
+					if (not bool(getattr(self, '_beep_sweep_enabled', False))) and (not bool(getattr(self, '_beep_hold_active', False))):
+						self._beeper.set_continuous(None)
+				except Exception:
+					pass
+				try:
+					st = str(self._beeper.status())
+				except Exception:
+					st = 'unknown'
+				try:
+					self._set_status(f"PWM FORCE: OFF | BEEP:{st}", hold_sec=2.0)
+				except Exception:
+					pass
+		except Exception:
+			pass
+
 	def _copy_legend_from_btn(self, pos):
 		"""Handle right-click on `btn_power`: copy `legend_lbl` text to clipboard."""
 		try:
-			text = self.legend_lbl.text() if hasattr(self, 'legend_lbl') else ''
+			text = str(getattr(self, '_last_full_status', '') or '')
+			if not text:
+				text = self.legend_lbl.text() if hasattr(self, 'legend_lbl') else ''
 			cb = QtWidgets.QApplication.clipboard()
 			cb.setText(text)
 			self._set_status("Заголовок скопирован в буфер обмена", hold_sec=2.0)
@@ -3549,7 +4692,7 @@ class ScopeWindow:
 			self._set_status("Переподключение…", hold_sec=1.5)
 			self._activate_stream()
 		else:
-			self.legend_lbl.setText("Нажмите 1 для запуска")
+			self._set_status("Нажмите 1 для запуска")
 
 	def _enqueue_mode_action(self, action: str, *args, **kwargs):
 		"""Place a mode-switch action to background worker (non-blocking)."""
@@ -3983,6 +5126,12 @@ class ScopeWindow:
 			if bool(getattr(self, 'debug', False)):
 				print(f"[CONNECT] Creating USBStream, profile={self.desired_profile}, fs={fs}", flush=True)
 			self.stream = USBStream(profile=self.desired_profile, full=True, test_as_data=self.test_as_data, frame_samples=fs, fast_mode=True, assembler_independent=self.independent_channels)
+			# On every fresh connect: immediately force RUN state and start warmup from *now*.
+			# This prevents "FROZEN right after startup" and ignores early unstable thresholds.
+			try:
+				self._det_reset_and_arm_warmup('connect')
+			except Exception:
+				pass
 			# Сохраним порт info для power cycle без stream
 			self.last_port_info = self.stream.port_info
 			# Явная конфигурация устройства по согласованной последовательности
@@ -4033,6 +5182,12 @@ class ScopeWindow:
 		# Транспорт при подключении посылает минимальный START сам.
 		# Не дублируем SET_PROFILE/START здесь, чтобы не подавить первые A/B кадры.
 		if self.stream is not None:
+			# Arm warmup from actual stream start and force RUN state.
+			# (User may wait before pressing "1", so GUI-start warmup is not reliable.)
+			try:
+				self._det_reset_and_arm_warmup('activate')
+			except Exception:
+				pass
 			# Показать ожидаемое число семплов одного буфера по профилю
 			expected = self.expected_len_map.get(self.desired_profile, self.initial_expected)
 			freq = 200 if self.desired_profile == 1 else 300 if self.desired_profile == 2 else None
@@ -4099,6 +5254,11 @@ class ScopeWindow:
 			except Exception:
 				pass
 			self.stream.send_cmd(CMD_START_STREAM, b"")
+			# Re-arm warmup after a profile switch and force RUN.
+			try:
+				self._det_reset_and_arm_warmup('freq_change')
+			except Exception:
+				pass
 			self._set_status(f"Переключена частота {200 if idx==0 else 300} Гц, ожидание данных…", hold_sec=1.5)
 			self.base_buf_len = None
 			self.base_buf_len_bytes = None

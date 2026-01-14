@@ -17,6 +17,11 @@ CMD_SET_FRAME_SAMPLES = 0x17
 CMD_ASYNC         = 0x18  # 0=strict pairs A/B, 1=independent A/B
 CMD_SET_WINDOWS    = 0x10  # payload: <HHHH> start0,len0,start1,len1
 CMD_SET_STREAM_MODE = 0x1A  # payload: <B> 0=LATEST(600), 1=LOSSLESS_ROI(200)
+# Device-side DC adaptation toggle (firmware-dependent). Override via env if needed.
+try:
+    CMD_SET_DC_ADAPT = int(os.getenv("BMI30_CMD_SET_DC_ADAPT", "0x1B"), 0)
+except Exception:
+    CMD_SET_DC_ADAPT = 0x1B
 CMD_SET_ALT       = 0x31  # optional vendor EP0 control OUT to set alt
 CMD_SOFT_RESET   = 0x7E  # EP0 vendor control OUT, no data
 CMD_DEEP_RESET   = 0x7F  # EP0 vendor control OUT, no data
