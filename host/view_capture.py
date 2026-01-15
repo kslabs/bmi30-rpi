@@ -221,10 +221,32 @@ class CaptureViewer:
     
     def _show_error(self):
         """Show error message."""
+        error_msg = f"Не удалось загрузить файл:\n{self.filepath}\n\n"
+        
+        # Try to provide more specific error info
+        try:
+            data = np.load(self.filepath)
+            keys = list(data.keys())
+            
+            if 'ch0' in keys and 'ch1' in keys:
+                ch0_len = len(data['ch0'])
+                ch1_len = len(data['ch1'])
+                if ch0_len == 0 and ch1_len == 0:
+                    error_msg += "Файл содержит пустые массивы данных.\n"
+                    error_msg += "Возможно, это поврежденный или незавершенный capture.\n\n"
+                    error_msg += "Используйте новую систему автозахвата:\n"
+                    error_msg += "BMI30_AUTO_CAPTURE=1 python host/BMI30.200.py"
+                else:
+                    error_msg += f"Старый формат с данными: ch0={ch0_len}, ch1={ch1_len}"
+            else:
+                error_msg += f"Неизвестный формат. Ключи: {keys}"
+        except Exception as e:
+            error_msg += f"Дополнительная ошибка при чтении: {e}"
+        
         QtWidgets.QMessageBox.critical(
             self.win,
             "Ошибка загрузки",
-            f"Не удалось загрузить файл:\n{self.filepath}\n\nПроверьте формат файла."
+            error_msg
         )
         self._show_no_data()
     
@@ -246,8 +268,14 @@ class CaptureViewer:
                 print(f"[VIEWER] Loading intermediate format file (no metadata)")
             elif 'ch0' in self.data and 'ch1' in self.data:
                 # Very old format - single arrays ch0/ch1
+                ch0_len = len(self.data['ch0'])
+                ch1_len = len(self.data['ch1'])
+                
+                if ch0_len == 0 and ch1_len == 0:
+                    raise ValueError("File contains empty arrays (ch0 and ch1 have zero length). This appears to be a corrupt or incomplete capture.")
+                
                 self.n_frames = 1  # Single snapshot
-                print(f"[VIEWER] Loading VERY OLD format file (single snapshot, ch0/ch1)")
+                print(f"[VIEWER] Loading VERY OLD format file (single snapshot, ch0={ch0_len}, ch1={ch1_len})")
             else:
                 raise ValueError(f"Unknown file format. Keys: {list(self.data.keys())}")
             
