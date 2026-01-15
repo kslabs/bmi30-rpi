@@ -111,6 +111,14 @@ class CaptureViewer:
         self.btn_last.clicked.connect(self._go_last)
         ctrl_bar.addWidget(self.btn_last)
         
+        ctrl_bar.addSpacing(20)  # Spacer
+        
+        self.btn_normalize = QtWidgets.QPushButton("📊 Нормализация")
+        self.btn_normalize.setCheckable(True)
+        self.btn_normalize.setChecked(False)  # По умолчанию выключена
+        self.btn_normalize.clicked.connect(self._toggle_normalize)
+        ctrl_bar.addWidget(self.btn_normalize)
+        
         self.speed_lbl = QtWidgets.QLabel(f"Speed: {self.play_speed}x")
         ctrl_bar.addWidget(self.speed_lbl)
         
@@ -425,6 +433,21 @@ class CaptureViewer:
         else:
             self.btn_play.setText("▶ Play")
             self.timer.stop()
+    
+    def _toggle_normalize(self):
+        """Переключение автомасштабирования Y-оси."""
+        normalize = self.btn_normalize.isChecked()
+        try:
+            if normalize:
+                # Включить автомасштабирование
+                self.p0.enableAutoRange(axis='y')
+                self.p1.enableAutoRange(axis='y')
+            else:
+                # Фиксированный диапазон 0-65535
+                self.p0.setYRange(0, 65535, padding=0.02)
+                self.p1.setYRange(0, 65535, padding=0.02)
+        except Exception as e:
+            print(f"[VIEWER] Error toggling normalize: {e}")
     
     def _play_tick(self):
         """Auto-advance frame during playback."""

@@ -437,6 +437,18 @@ class ScopeWindow:
 		except Exception:
 			pass
 		legend_bar.addWidget(self.btn_power, 0)
+		# Кнопка автозахвата осциллограмм
+		self.btn_capture = QtWidgets.QPushButton("⏺")
+		self.btn_capture.setToolTip("Автозахват осциллограмм при срабатывании детектора")
+		self.btn_capture.setCheckable(True)
+		self.btn_capture.setChecked(self._auto_capture_enabled)
+		self.btn_capture.clicked.connect(self._toggle_capture)
+		try:
+			self.btn_capture.setFixedSize(21, 21)
+		except Exception:
+			pass
+		self._update_capture_btn_style()
+		legend_bar.addWidget(self.btn_capture, 0)
 		# Кнопка диагностики и мягкого рестарта
 		# Диагностика: делаем кнопку переключаемой и используем её для
 		# включения/выключения DC-вычитания (фиксация состояния).
@@ -5033,6 +5045,23 @@ class ScopeWindow:
 			self._activate_stream()
 		else:
 			self._set_status("Нажмите 1 для запуска")
+
+	def _toggle_capture(self):
+		"""Переключение автозахвата осциллограмм."""
+		self._auto_capture_enabled = self.btn_capture.isChecked()
+		self._update_capture_btn_style()
+		status = "включён" if self._auto_capture_enabled else "выключен"
+		self._set_status(f"Автозахват {status}", hold_sec=2.0)
+	
+	def _update_capture_btn_style(self):
+		"""Обновление цвета кнопки capture: зелёная=включено, красная=выключено."""
+		try:
+			if self._auto_capture_enabled:
+				self.btn_capture.setStyleSheet("background-color: #00cc00; color: white;")
+			else:
+				self.btn_capture.setStyleSheet("background-color: #cc0000; color: white;")
+		except Exception:
+			pass
 
 	def _enqueue_mode_action(self, action: str, *args, **kwargs):
 		"""Place a mode-switch action to background worker (non-blocking)."""
