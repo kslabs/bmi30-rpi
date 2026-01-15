@@ -3,10 +3,12 @@
 view_capture.py - Просмотр сохраненных осциллограмм из NPZ файлов
 
 Использование:
-    python view_capture.py <файл.npz>
-    python view_capture.py captures/capture_20260115_143052.npz
+    python view_capture.py [файл.npz]    # Необязательный аргумент
+    
+Если файл не указан, откроется диалог выбора файла.
 
 Управление:
+    Кнопки GUI или клавиатура:
     ← → или A/D - перемотка кадра назад/вперед
     Space - пауза/воспроизведение
     Home/End - первый/последний кадр
@@ -44,25 +46,41 @@ except Exception:
 
 
 class CaptureViewer:
-    def __init__(self, filepath: str):
+    def __init__(self, filepath: str | None = None):
         self.filepath = filepath
         self.data = None
         self.n_frames = 0
         self.current_frame = 0
         self.playing = False
         self.play_speed = 1  # frames per tick
+        self.last_dir = os.path.abspath("./captures")  # Default directory
         
-        # Load NPZ file
-        self._load_capture()
-        
-        # Create GUI
+        # Create GUI first
         self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
         self.win = QtWidgets.QMainWindow()
-        self.win.setWindowTitle(f"Capture Viewer: {os.path.basename(filepath)}")
+        self.win.setWindowTitle("Capture Viewer")
         
+        # Load NPZ file if provided
+        if filepath:
+            self._load_capture()
+        
+        self._setup_gui()
+    
+    def _setup_gui(self):
+        """Setup GUI components."""
         central = QtWidgets.QWidget()
         self.win.setCentralWidget(central)
         layout = QtWidgets.QVBoxLayout(central)
+        
+        # File bar
+        file_bar = QtWidgets.QHBoxLayout()
+        self.btn_open = QtWidgets.QPushButton("📁 Открыть файл")
+        self.btn_open.clicked.connect(self._open_file_dialog)
+        file_bar.addWidget(self.btn_open)
+        
+        self.file_lbl = QtWidgets.QLabel("Файл не загружен")
+        file_bar.addWidget(self.file_lbl, 1)
+        layout.addLayout(file_bar)
         
         # Info label
         self.info_lbl = QtWidgets.QLabel()
@@ -147,40 +165,130 @@ class CaptureViewer:
             pass
         
         # Update display
-        self._update_display()
-        self._update_info()
+        if self.data is not None:
+            self._update_display()
+            self._update_info()
+        else:
+            self._show_no_data()
         
         # Show window
         self.win.resize(1200, 800)
         self.win.show()
+        
+        # Open dialog if no file was provided
+        if not self.filepath:
+            QtCore.QTimer.singleShot(100, self._open_file_dialog)
     
-    def _load_capture(self):
-        """Load NPZ file and extract metadata."""
+    def _open_file_dialog(self):
+        """Open file dialog to select NPZ capture file."""
+        filepath, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self.win,
+            "Выберите файл захвата",
+            self.last_dir,
+            "NPZ файлы (*.npz);;Все файлы (*.*)"
+        )
+        
+        if filepath:
+            self.filepath = filepath
+            self.last_dir = os.path.dirname(filepath)
+            self._load_and_refresh()
+    
+    def _load_and_refresh(self):
+        """Load file and refresh display."""
+        if self._load_capture():
+            self.current_frame = 0
+            self.playing = False
+            if self.btn_play.isChecked():
+                self.btn_play.setChecked(False)
+            self.timer.stop()
+            
+            self.frame_slider.setMaximum(max(0, self.n_frames - 1))
+            self.frame_slider.setValue(0)
+            
+            self.win.setWindowTitle(f"Capture Viewer: {os.path.basename(self.filepath)}")
+            self.file_lbl.setText(os.path.basename(self.filepath))
+            
+            self._update_display()
+            self._update_info()
+        else:
+            self._show_error()
+    
+    def _show_no_data(self):
+        """Show message when no data is loaded."""
+        self.info_lbl.setText("Нет загруженных данных. Нажмите 'Открыть файл' для выбора capture файла.")
+        self.file_lbl.setText("Файл не загружен")
+        self.frame_lbl.setText("0 / 0")
+    
+    def _show_error(self):
+        """Show error message."""
+        QtWidgets.QMessageBox.critical(
+            self.win,
+            "Ошибка загрузки",
+            f"Не удалось загрузить файл:\n{self.filepath}\n\nПроверьте формат файла."
+        )
+        self._show_no_data()
+    
+    def _load_capture(self) -> bool:
+        """Load NPZ file and extract metadata. Returns True on success."""
+        if not self.filepath or not os.path.exists(self.filepath):
+            return False
+        
         try:
             self.data = np.load(self.filepath)
-            self.n_frames = int(self.data['n_frames'][0])
+            
+            # Check if this is the new auto-capture format or old manual format
+            if 'n_frames' in self.data:
+                # New format with full metadata
+                self.n_frames = int(self.data['n_frames'][0])
+            elif 'data0_even' in self.data:
+                # Intermediate format - just raw data arrays
+                self.n_frames = len(self.data['data0_even'])
+                print(f"[VIEWER] Loading intermediate format file (no metadata)")
+            elif 'ch0' in self.data and 'ch1' in self.data:
+                # Very old format - single arrays ch0/ch1
+                self.n_frames = 1  # Single snapshot
+                print(f"[VIEWER] Loading VERY OLD format file (single snapshot, ch0/ch1)")
+            else:
+                raise ValueError(f"Unknown file format. Keys: {list(self.data.keys())}")
+            
             if self.n_frames == 0:
                 raise ValueError("No frames in capture file")
             print(f"[VIEWER] Loaded {self.n_frames} frames from {self.filepath}")
+            return True
         except Exception as e:
             print(f"ERROR: Failed to load capture file: {e}")
-            sys.exit(1)
+            return False
     
     def _update_display(self):
         """Update plots with current frame data."""
+        if self.data is None or self.n_frames == 0:
+            return
+        
         try:
             idx = self.current_frame
             if idx < 0 or idx >= self.n_frames:
                 return
             
-            # Get frame data
-            data0_even = self.data['data0_even'][idx]
-            data0_odd = self.data['data0_odd'][idx]
-            data1_even = self.data['data1_even'][idx]
-            data1_odd = self.data['data1_odd'][idx]
-            
-            # Find actual data length (non-zero region)
-            buf_len = int(self.data['buf_len'][0])
+            # Check format and extract data accordingly
+            if 'ch0' in self.data and 'ch1' in self.data:
+                # Very old format - single snapshot
+                data0_even = self.data['ch0']
+                data0_odd = self.data['ch0']  # Same data for both
+                data1_even = self.data['ch1']
+                data1_odd = self.data['ch1']
+                buf_len = len(self.data['ch0'])
+            else:
+                # New or intermediate format
+                data0_even = self.data['data0_even'][idx]
+                data0_odd = self.data['data0_odd'][idx]
+                data1_even = self.data['data1_even'][idx]
+                data1_odd = self.data['data1_odd'][idx]
+                
+                # Find actual data length
+                if 'buf_len' in self.data:
+                    buf_len = int(self.data['buf_len'][0])
+                else:
+                    buf_len = len(data0_even)
             
             # Update curves
             x = np.arange(buf_len)
@@ -202,45 +310,59 @@ class CaptureViewer:
     
     def _update_info(self):
         """Update info label with metadata and detector state."""
+        if self.data is None or self.n_frames == 0:
+            return
+        
         try:
             idx = self.current_frame
             
-            # Metadata
-            profile = int(self.data['profile'][0])
-            freq_hz = int(self.data['freq_hz'][0])
-            avg_n = int(self.data['avg_n'][0])
-            stream_mode = int(self.data['stream_mode'][0])
-            det_source = str(self.data['det_source'][0])
-            det_ratio = float(self.data['det_ratio'][0])
+            # Check if we have full metadata (new format) or just data (old format)
+            has_metadata = 'n_frames' in self.data
             
-            # Trigger info
-            trigger_time = float(self.data['trigger_time'][0])
-            reason = str(self.data['reason'][0])
-            
-            # Frame-specific detector state
-            det_thr0 = int(self.data['det_thr0'][idx])
-            det_thr1 = int(self.data['det_thr1'][idx])
-            det_lvl0 = int(self.data['det_lvl0'][idx])
-            det_lvl1 = int(self.data['det_lvl1'][idx])
-            det_shift0 = int(self.data['det_shift0'][idx])
-            det_shift1 = int(self.data['det_shift1'][idx])
-            det_amp0 = int(self.data['det_amp0'][idx])
-            det_amp1 = int(self.data['det_amp1'][idx])
-            det_hold0 = bool(self.data['det_hold0'][idx])
-            det_hold1 = bool(self.data['det_hold1'][idx])
-            det_frozen = bool(self.data['det_frozen'][idx])
-            
-            timestamp = float(self.data['timestamps'][idx])
-            rel_time = timestamp - trigger_time
-            
-            info_text = (
-                f"<b>Capture Info:</b> Profile={profile} Freq={freq_hz}Hz avg_n={avg_n} mode={stream_mode}<br>"
-                f"<b>Trigger:</b> {reason}<br>"
-                f"<b>Frame {idx}:</b> t={rel_time:+.3f}s | "
-                f"DC={'FROZEN' if det_frozen else 'RUN'} | "
-                f"A0: {det_amp0} thr={det_thr0} lvl={det_lvl0} sh={det_shift0} {'H' if det_hold0 else '-'} | "
-                f"A1: {det_amp1} thr={det_thr1} lvl={det_lvl1} sh={det_shift1} {'H' if det_hold1 else '-'}"
-            )
+            if has_metadata:
+                # New format with full metadata
+                profile = int(self.data['profile'][0])
+                freq_hz = int(self.data['freq_hz'][0])
+                avg_n = int(self.data['avg_n'][0])
+                stream_mode = int(self.data['stream_mode'][0])
+                det_source = str(self.data['det_source'][0])
+                det_ratio = float(self.data['det_ratio'][0])
+                
+                # Trigger info
+                trigger_time = float(self.data['trigger_time'][0])
+                reason = str(self.data['reason'][0])
+                
+                # Frame-specific detector state
+                det_thr0 = int(self.data['det_thr0'][idx])
+                det_thr1 = int(self.data['det_thr1'][idx])
+                det_lvl0 = int(self.data['det_lvl0'][idx])
+                det_lvl1 = int(self.data['det_lvl1'][idx])
+                det_shift0 = int(self.data['det_shift0'][idx])
+                det_shift1 = int(self.data['det_shift1'][idx])
+                det_amp0 = int(self.data['det_amp0'][idx])
+                det_amp1 = int(self.data['det_amp1'][idx])
+                det_hold0 = bool(self.data['det_hold0'][idx])
+                det_hold1 = bool(self.data['det_hold1'][idx])
+                det_frozen = bool(self.data['det_frozen'][idx])
+                
+                timestamp = float(self.data['timestamps'][idx])
+                rel_time = timestamp - trigger_time
+                
+                info_text = (
+                    f"<b>Capture Info:</b> Profile={profile} Freq={freq_hz}Hz avg_n={avg_n} mode={stream_mode}<br>"
+                    f"<b>Trigger:</b> {reason}<br>"
+                    f"<b>Frame {idx}:</b> t={rel_time:+.3f}s | "
+                    f"DC={'FROZEN' if det_frozen else 'RUN'} | "
+                    f"A0: {det_amp0} thr={det_thr0} lvl={det_lvl0} sh={det_shift0} {'H' if det_hold0 else '-'} | "
+                    f"A1: {det_amp1} thr={det_thr1} lvl={det_lvl1} sh={det_shift1} {'H' if det_hold1 else '-'}"
+                )
+            else:
+                # Old format - minimal info
+                info_text = (
+                    f"<b>OLD FORMAT FILE (no metadata)</b><br>"
+                    f"<b>Frame {idx} / {self.n_frames}</b><br>"
+                    f"Raw data arrays only. Use new auto-capture system for full analysis."
+                )
             
             self.info_lbl.setText(info_text)
             
@@ -329,15 +451,14 @@ class CaptureViewer:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        print("\nUsage: python view_capture.py <capture_file.npz>")
-        sys.exit(1)
-    
-    filepath = sys.argv[1]
-    if not os.path.exists(filepath):
-        print(f"ERROR: File not found: {filepath}")
-        sys.exit(1)
+    # Optional command-line argument
+    filepath = None
+    if len(sys.argv) >= 2:
+        filepath = sys.argv[1]
+        if not os.path.exists(filepath):
+            print(f"WARNING: File not found: {filepath}")
+            print("Opening file dialog instead...")
+            filepath = None
     
     viewer = CaptureViewer(filepath)
     viewer.run()
