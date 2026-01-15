@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys, time, json, os as _os_alias, struct
 import threading
+import datetime
 # Qt env: avoid GTK theme/plugin conflicts on RPi (Bookworm)
 # Choose backend safely:
 # - if user set QT_QPA_PLATFORM explicitly, respect it
@@ -1167,6 +1168,43 @@ class ScopeWindow:
 				self._beep_force_freq = 2000.0
 		except Exception:
 			self._beep_force_freq = 2000.0
+		
+		# --- Automatic capture system for signal analysis ---
+		# Circular buffer holds recent frames; on detection trigger, saves PRE+HOLD+POST frames to NPZ
+		self._auto_capture_enabled = _env_bool('BMI30_AUTO_CAPTURE', False)
+		try:
+			self._capture_pre_frames = int(os.getenv('BMI30_CAPTURE_PRE', '30'))
+		except Exception:
+			self._capture_pre_frames = 30
+		try:
+			self._capture_post_frames = int(os.getenv('BMI30_CAPTURE_POST', '10'))
+		except Exception:
+			self._capture_post_frames = 10
+		try:
+			self._capture_dir = str(os.getenv('BMI30_CAPTURE_DIR', './captures'))
+		except Exception:
+			self._capture_dir = './captures'
+		# Ensure capture directory exists
+		if self._auto_capture_enabled:
+			try:
+				os.makedirs(self._capture_dir, exist_ok=True)
+			except Exception as e:
+				print(f"[CAPTURE] Failed to create capture directory {self._capture_dir}: {e}")
+				self._auto_capture_enabled = False
+		
+		# Circular buffer: stores last N frames (even/odd for both channels)
+		# Buffer size = PRE frames (to have enough history before trigger)
+		self._capture_buffer_size = max(self._capture_pre_frames + 5, 50)
+		self._capture_buffer = []  # list of frame dicts
+		self._capture_buffer_lock = threading.Lock()
+		
+		# Capture session state machine
+		# States: 'idle' -> 'triggered' -> 'recording' -> 'finalizing' -> 'idle'
+		self._capture_state = 'idle'
+		self._capture_session = None  # dict with session metadata
+		self._capture_frames_recorded = 0
+		self._capture_post_countdown = 0
+		
 		# stream (ленивый запуск по кнопке 1)
 		self.stream = None
 		self._connecting = False
@@ -2099,6 +2137,276 @@ class ScopeWindow:
 		except Exception:
 			pass
 
+	def _capture_push_frame(self):
+		"""Push current frame data to circular buffer (called from _tick after data update)."""
+		if not bool(getattr(self, '_auto_capture_enabled', False)):
+			return
+		try:
+			with self.data_lock:
+				# Copy current frame data (all 4 arrays: even/odd for both channels)
+				frame = {
+					'timestamp': time.time(),
+					'seq0_even': getattr(self, 'seq0_even', None),
+					'seq0_odd': getattr(self, 'seq0_odd', None),
+					'seq1_even': getattr(self, 'seq1_even', None),
+					'seq1_odd': getattr(self, 'seq1_odd', None),
+					'data0_even': np.copy(self.data0_even[:self.base_buf_len]) if self.base_buf_len else None,
+					'data0_odd': np.copy(self.data0_odd[:self.base_buf_len]) if self.base_buf_len else None,
+					'data1_even': np.copy(self.data1_even[:self.base_buf_len]) if self.base_buf_len else None,
+					'data1_odd': np.copy(self.data1_odd[:self.base_buf_len]) if self.base_buf_len else None,
+					'base_buf_len': self.base_buf_len,
+					'freq_hz': self.freq_hz,
+					'avg_n': getattr(self, 'avg_n', 20),
+					'stream_mode': getattr(self, 'stream_mode', 0),
+					# Detector state
+					'det_thr0': getattr(self, '_det_thr0', 0),
+					'det_thr1': getattr(self, '_det_thr1', 0),
+					'det_lvl0': getattr(self, '_det_last_lvl0', 0),
+					'det_lvl1': getattr(self, '_det_last_lvl1', 0),
+					'det_shift0': getattr(self, '_det_last_shift0', 0),
+					'det_shift1': getattr(self, '_det_last_shift1', 0),
+					'det_amp0': getattr(self, '_det_last_amp0', 0),
+					'det_amp1': getattr(self, '_det_last_amp1', 0),
+					'det_hold0': getattr(self, '_det_hold0', False),
+					'det_hold1': getattr(self, '_det_hold1', False),
+					'det_frozen': getattr(self, '_det_dc_frozen', False),
+				}
+			with self._capture_buffer_lock:
+				self._capture_buffer.append(frame)
+				# Keep only last N frames
+				max_size = int(getattr(self, '_capture_buffer_size', 50))
+				if len(self._capture_buffer) > max_size:
+					self._capture_buffer.pop(0)
+		except Exception as e:
+			if bool(getattr(self, 'debug', False)):
+				print(f"[CAPTURE] Error pushing frame: {e}", flush=True)
+
+	def _capture_trigger(self, reason: str = ''):
+		"""Trigger capture session on detection fire."""
+		if not bool(getattr(self, '_auto_capture_enabled', False)):
+			return
+		try:
+			state = str(getattr(self, '_capture_state', 'idle'))
+			if state != 'idle':
+				return  # Already capturing
+			self._capture_state = 'triggered'
+			# Initialize session
+			self._capture_session = {
+				'trigger_time': time.time(),
+				'reason': str(reason),
+				'frames': [],  # Will collect PRE + HOLD + POST frames
+				'metadata': {
+					'profile': getattr(self, 'desired_profile', 1),
+					'freq_hz': getattr(self, 'freq_hz', 200),
+					'avg_n': getattr(self, 'avg_n', 20),
+					'stream_mode': getattr(self, 'stream_mode', 0),
+					'det_source': getattr(self, '_det_source', 'norm'),
+					'det_ratio': getattr(self, '_det_ratio', 2.0),
+				}
+			}
+			# Copy PRE frames from circular buffer
+			with self._capture_buffer_lock:
+				pre_count = min(len(self._capture_buffer), int(getattr(self, '_capture_pre_frames', 30)))
+				if pre_count > 0:
+					self._capture_session['frames'].extend(self._capture_buffer[-pre_count:])
+			self._capture_frames_recorded = len(self._capture_session['frames'])
+			self._capture_post_countdown = 0
+			self._capture_state = 'recording'
+			if bool(getattr(self, 'debug', False)):
+				print(f"[CAPTURE] Session triggered: {reason}, PRE={self._capture_frames_recorded}", flush=True)
+		except Exception as e:
+			print(f"[CAPTURE] Error triggering session: {e}", flush=True)
+			self._capture_state = 'idle'
+
+	def _capture_record_frame(self):
+		"""Record current frame during active capture session (HOLD phase)."""
+		if not bool(getattr(self, '_auto_capture_enabled', False)):
+			return
+		try:
+			state = str(getattr(self, '_capture_state', 'idle'))
+			if state != 'recording':
+				return
+			# Copy current frame (same as _capture_push_frame but directly to session)
+			with self.data_lock:
+				frame = {
+					'timestamp': time.time(),
+					'seq0_even': getattr(self, 'seq0_even', None),
+					'seq0_odd': getattr(self, 'seq0_odd', None),
+					'seq1_even': getattr(self, 'seq1_even', None),
+					'seq1_odd': getattr(self, 'seq1_odd', None),
+					'data0_even': np.copy(self.data0_even[:self.base_buf_len]) if self.base_buf_len else None,
+					'data0_odd': np.copy(self.data0_odd[:self.base_buf_len]) if self.base_buf_len else None,
+					'data1_even': np.copy(self.data1_even[:self.base_buf_len]) if self.base_buf_len else None,
+					'data1_odd': np.copy(self.data1_odd[:self.base_buf_len]) if self.base_buf_len else None,
+					'base_buf_len': self.base_buf_len,
+					'freq_hz': self.freq_hz,
+					'avg_n': getattr(self, 'avg_n', 20),
+					'stream_mode': getattr(self, 'stream_mode', 0),
+					'det_thr0': getattr(self, '_det_thr0', 0),
+					'det_thr1': getattr(self, '_det_thr1', 0),
+					'det_lvl0': getattr(self, '_det_last_lvl0', 0),
+					'det_lvl1': getattr(self, '_det_last_lvl1', 0),
+					'det_shift0': getattr(self, '_det_last_shift0', 0),
+					'det_shift1': getattr(self, '_det_last_shift1', 0),
+					'det_amp0': getattr(self, '_det_last_amp0', 0),
+					'det_amp1': getattr(self, '_det_last_amp1', 0),
+					'det_hold0': getattr(self, '_det_hold0', False),
+					'det_hold1': getattr(self, '_det_hold1', False),
+					'det_frozen': getattr(self, '_det_dc_frozen', False),
+				}
+			if hasattr(self, '_capture_session') and self._capture_session:
+				self._capture_session['frames'].append(frame)
+				self._capture_frames_recorded += 1
+		except Exception as e:
+			if bool(getattr(self, 'debug', False)):
+				print(f"[CAPTURE] Error recording frame: {e}", flush=True)
+
+	def _capture_start_post(self):
+		"""Start POST frame countdown (signal lost, capture last N frames)."""
+		if not bool(getattr(self, '_auto_capture_enabled', False)):
+			return
+		try:
+			state = str(getattr(self, '_capture_state', 'idle'))
+			if state != 'recording':
+				return
+			self._capture_state = 'finalizing'
+			self._capture_post_countdown = int(getattr(self, '_capture_post_frames', 10))
+			if bool(getattr(self, 'debug', False)):
+				print(f"[CAPTURE] Starting POST phase, countdown={self._capture_post_countdown}", flush=True)
+		except Exception as e:
+			if bool(getattr(self, 'debug', False)):
+				print(f"[CAPTURE] Error starting POST: {e}", flush=True)
+
+	def _capture_finalize(self):
+		"""Finalize and save capture session to NPZ file."""
+		if not bool(getattr(self, '_auto_capture_enabled', False)):
+			return
+		try:
+			if not hasattr(self, '_capture_session') or not self._capture_session:
+				self._capture_state = 'idle'
+				return
+			# Generate filename with timestamp
+			ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+			filename = f"capture_{ts}.npz"
+			filepath = os.path.join(str(getattr(self, '_capture_dir', './captures')), filename)
+			
+			# Prepare arrays for NPZ
+			frames = self._capture_session.get('frames', [])
+			n_frames = len(frames)
+			if n_frames == 0:
+				self._capture_state = 'idle'
+				self._capture_session = None
+				return
+			
+			# Determine max buffer length
+			max_len = max((f.get('base_buf_len', 0) or 0) for f in frames)
+			if max_len == 0:
+				max_len = 2048  # fallback
+			
+			# Allocate arrays
+			data0_even_arr = np.zeros((n_frames, max_len), dtype=np.uint16)
+			data0_odd_arr = np.zeros((n_frames, max_len), dtype=np.uint16)
+			data1_even_arr = np.zeros((n_frames, max_len), dtype=np.uint16)
+			data1_odd_arr = np.zeros((n_frames, max_len), dtype=np.uint16)
+			timestamps_arr = np.zeros(n_frames, dtype=np.float64)
+			seq0_even_arr = np.zeros(n_frames, dtype=np.int32)
+			seq0_odd_arr = np.zeros(n_frames, dtype=np.int32)
+			seq1_even_arr = np.zeros(n_frames, dtype=np.int32)
+			seq1_odd_arr = np.zeros(n_frames, dtype=np.int32)
+			det_thr0_arr = np.zeros(n_frames, dtype=np.int32)
+			det_thr1_arr = np.zeros(n_frames, dtype=np.int32)
+			det_lvl0_arr = np.zeros(n_frames, dtype=np.int32)
+			det_lvl1_arr = np.zeros(n_frames, dtype=np.int32)
+			det_shift0_arr = np.zeros(n_frames, dtype=np.int32)
+			det_shift1_arr = np.zeros(n_frames, dtype=np.int32)
+			det_amp0_arr = np.zeros(n_frames, dtype=np.int32)
+			det_amp1_arr = np.zeros(n_frames, dtype=np.int32)
+			det_hold0_arr = np.zeros(n_frames, dtype=bool)
+			det_hold1_arr = np.zeros(n_frames, dtype=bool)
+			det_frozen_arr = np.zeros(n_frames, dtype=bool)
+			
+			# Fill arrays
+			for i, frame in enumerate(frames):
+				timestamps_arr[i] = frame.get('timestamp', 0.0)
+				seq0_even_arr[i] = frame.get('seq0_even', -1) or -1
+				seq0_odd_arr[i] = frame.get('seq0_odd', -1) or -1
+				seq1_even_arr[i] = frame.get('seq1_even', -1) or -1
+				seq1_odd_arr[i] = frame.get('seq1_odd', -1) or -1
+				buf_len = frame.get('base_buf_len', 0) or 0
+				if buf_len > 0:
+					d0e = frame.get('data0_even')
+					d0o = frame.get('data0_odd')
+					d1e = frame.get('data1_even')
+					d1o = frame.get('data1_odd')
+					if d0e is not None:
+						data0_even_arr[i, :buf_len] = d0e[:buf_len].astype(np.uint16)
+					if d0o is not None:
+						data0_odd_arr[i, :buf_len] = d0o[:buf_len].astype(np.uint16)
+					if d1e is not None:
+						data1_even_arr[i, :buf_len] = d1e[:buf_len].astype(np.uint16)
+					if d1o is not None:
+						data1_odd_arr[i, :buf_len] = d1o[:buf_len].astype(np.uint16)
+				det_thr0_arr[i] = frame.get('det_thr0', 0)
+				det_thr1_arr[i] = frame.get('det_thr1', 0)
+				det_lvl0_arr[i] = frame.get('det_lvl0', 0)
+				det_lvl1_arr[i] = frame.get('det_lvl1', 0)
+				det_shift0_arr[i] = frame.get('det_shift0', 0)
+				det_shift1_arr[i] = frame.get('det_shift1', 0)
+				det_amp0_arr[i] = frame.get('det_amp0', 0)
+				det_amp1_arr[i] = frame.get('det_amp1', 0)
+				det_hold0_arr[i] = frame.get('det_hold0', False)
+				det_hold1_arr[i] = frame.get('det_hold1', False)
+				det_frozen_arr[i] = frame.get('det_frozen', False)
+			
+			# Save to NPZ
+			metadata = self._capture_session.get('metadata', {})
+			np.savez_compressed(
+				filepath,
+				# Frame data
+				data0_even=data0_even_arr,
+				data0_odd=data0_odd_arr,
+				data1_even=data1_even_arr,
+				data1_odd=data1_odd_arr,
+				timestamps=timestamps_arr,
+				seq0_even=seq0_even_arr,
+				seq0_odd=seq0_odd_arr,
+				seq1_even=seq1_even_arr,
+				seq1_odd=seq1_odd_arr,
+				# Detector state
+				det_thr0=det_thr0_arr,
+				det_thr1=det_thr1_arr,
+				det_lvl0=det_lvl0_arr,
+				det_lvl1=det_lvl1_arr,
+				det_shift0=det_shift0_arr,
+				det_shift1=det_shift1_arr,
+				det_amp0=det_amp0_arr,
+				det_amp1=det_amp1_arr,
+				det_hold0=det_hold0_arr,
+				det_hold1=det_hold1_arr,
+				det_frozen=det_frozen_arr,
+				# Metadata
+				n_frames=np.array([n_frames]),
+				buf_len=np.array([max_len]),
+				trigger_time=np.array([self._capture_session.get('trigger_time', 0.0)]),
+				reason=np.array([self._capture_session.get('reason', '')], dtype='U256'),
+				profile=np.array([metadata.get('profile', 1)]),
+				freq_hz=np.array([metadata.get('freq_hz', 200)]),
+				avg_n=np.array([metadata.get('avg_n', 20)]),
+				stream_mode=np.array([metadata.get('stream_mode', 0)]),
+				det_source=np.array([metadata.get('det_source', 'norm')], dtype='U16'),
+				det_ratio=np.array([metadata.get('det_ratio', 2.0)]),
+			)
+			
+			print(f"[CAPTURE] Saved {n_frames} frames to {filepath}", flush=True)
+			self._set_status(f"Capture saved: {filename} ({n_frames} frames)", hold_sec=3.0)
+		except Exception as e:
+			print(f"[CAPTURE] Error finalizing session: {e}", flush=True)
+		finally:
+			self._capture_state = 'idle'
+			self._capture_session = None
+			self._capture_frames_recorded = 0
+			self._capture_post_countdown = 0
+
 	def _update_signal_detection(self, prod0_arr: np.ndarray, prod1_arr: np.ndarray, shift0: int, shift1: int, source: str = 'norm'):
 		"""Per-channel signal detection.
 
@@ -2341,10 +2649,21 @@ class ScopeWindow:
 			if not self._prev_beep_state:
 				self._beep_fire_count += 1
 				self._prev_beep_state = True
+				# Trigger capture session on first fire
+				try:
+					reason = f"ADC0={fire0} ADC1={fire1} thr0={thr_prev if fire0 else 0} thr1={thr_prev if fire1 else 0}"
+					self._capture_trigger(reason)
+				except Exception:
+					pass
 			self._det_last_fire_t = _now
 			self._fire_beep(fire0, fire1, shift0, shift1)
 			# optional: keep PWM running while in HOLD
 			self._beep_hold_start(fire0, fire1, shift0, shift1, int(lvl0), int(lvl1))
+			# Record frame during HOLD phase
+			try:
+				self._capture_record_frame()
+			except Exception:
+				pass
 			return
 
 		# If previously frozen and signal "lost" for long enough -> resume device DC adapt
@@ -2384,6 +2703,11 @@ class ScopeWindow:
 				self._device_set_dc_adapt(True)
 				# stop HOLD PWM
 				self._beep_hold_stop()
+				# Start POST capture phase
+				try:
+					self._capture_start_post()
+				except Exception:
+					pass
 
 	def _switch_to_latest_mode(self):
 		"""Возврат в режим LATEST (STREAM_MODE=0): 600 семплов, допускаются пропуски"""
@@ -4179,6 +4503,22 @@ class ScopeWindow:
 			self._last_full_status = _default_status_full
 			_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} GAP:{self.gap_count}{_counters}"
 			self._set_runtime_legend(_default_status, force=True)
+		
+		# --- Auto-capture: push frame to circular buffer and handle POST phase ---
+		try:
+			if self.base_buf_len is not None and self.base_buf_len > 0:
+				self._capture_push_frame()
+			# Handle POST phase countdown
+			if getattr(self, '_capture_state', 'idle') == 'finalizing':
+				if int(getattr(self, '_capture_post_countdown', 0)) > 0:
+					self._capture_post_countdown -= 1
+					self._capture_record_frame()
+				else:
+					# Finalize and save
+					self._capture_finalize()
+		except Exception as e:
+			if bool(getattr(self, 'debug', False)):
+				print(f"[CAPTURE] Error in _tick: {e}", flush=True)
 		
 		# Обновить view после всех изменений данных
 		self._update_view()
