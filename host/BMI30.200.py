@@ -105,6 +105,9 @@ class PwmBeeper:
 			if getattr(pi, 'connected', False):
 				self._backend = 'pigpio'
 				self._pi = pi
+				# Установить начальное состояние LOW (0)
+				pi.set_mode(self.gpio_pin, pigpio.OUTPUT)
+				pi.write(self.gpio_pin, 0)
 				return
 		except Exception:
 			pass
@@ -135,7 +138,7 @@ class PwmBeeper:
 			import RPi.GPIO as GPIO  # type: ignore
 			GPIO.setwarnings(False)
 			GPIO.setmode(GPIO.BCM)
-			GPIO.setup(self.gpio_pin, GPIO.OUT)
+			GPIO.setup(self.gpio_pin, GPIO.OUT, initial=GPIO.LOW)  # Явно LOW при инициализации
 			self._backend = 'rpi_gpio'
 			self._gpio = GPIO
 			return
@@ -340,6 +343,8 @@ class ScopeWindow:
 		self.reader_debug = _env_bool("BMI30_READER_DEBUG", self.debug)
 		# Легенда: по умолчанию компактная (без "мусора"); подробная — только по флагу.
 		self.legend_verbose = _env_bool("BMI30_LEGEND_VERBOSE", self.debug)
+		# Автозахват осциллограмм (инициализируем рано для GUI кнопки)
+		self._auto_capture_enabled = _env_bool('BMI30_AUTO_CAPTURE', False)
 		if self.debug:
 			print("[INIT] BMI30 GUI starting...", flush=True)
 		if PG_IMPORT_ERR:
@@ -449,6 +454,16 @@ class ScopeWindow:
 			pass
 		self._update_capture_btn_style()
 		legend_bar.addWidget(self.btn_capture, 0)
+		# Кнопка переключения метки (3 состояния: неизвестно / с меткой / без метки)
+		self.btn_label = QtWidgets.QPushButton("?")
+		self.btn_label.setToolTip("Метка сигнала: ? = неизвестно, ✓ = с меткой, ✗ = без метки")
+		self.btn_label.clicked.connect(self._cycle_label_state)
+		try:
+			self.btn_label.setFixedSize(21, 21)
+		except Exception:
+			pass
+		self._update_label_btn_style()
+		legend_bar.addWidget(self.btn_label, 0)
 		# Кнопка диагностики и мягкого рестарта
 		# Диагностика: делаем кнопку переключаемой и используем её для
 		# включения/выключения DC-вычитания (фиксация состояния).
@@ -1183,15 +1198,22 @@ class ScopeWindow:
 		
 		# --- Automatic capture system for signal analysis ---
 		# Circular buffer holds recent frames; on detection trigger, saves PRE+HOLD+POST frames to NPZ
-		self._auto_capture_enabled = _env_bool('BMI30_AUTO_CAPTURE', False)
+		# Примечание: self._auto_capture_enabled уже инициализирован в начале __init__
 		try:
-			self._capture_pre_frames = int(os.getenv('BMI30_CAPTURE_PRE', '30'))
+			self._capture_pre_frames = int(os.getenv('BMI30_CAPTURE_PRE', '36'))
 		except Exception:
-			self._capture_pre_frames = 30
+			self._capture_pre_frames = 36
 		try:
-			self._capture_post_frames = int(os.getenv('BMI30_CAPTURE_POST', '10'))
+			self._capture_post_frames = int(os.getenv('BMI30_CAPTURE_POST', '5'))
 		except Exception:
-			self._capture_post_frames = 10
+			self._capture_post_frames = 5
+		# Максимальное общее количество фреймов для записи (PRE + HOLD + POST)
+		try:
+			self._capture_max_frames = int(os.getenv('BMI30_CAPTURE_MAX', '41'))
+		except Exception:
+			self._capture_max_frames = 41
+		# Состояние метки: 0=неизвестно, 1=с меткой, 2=без метки
+		self._capture_label_state = 0  # По умолчанию: неизвестно
 		try:
 			self._capture_dir = str(os.getenv('BMI30_CAPTURE_DIR', './captures'))
 		except Exception:
@@ -2155,6 +2177,17 @@ class ScopeWindow:
 			return
 		try:
 			with self.data_lock:
+				# Копируем корреляционные массивы (уже вычисленные в _xcorr_compute)
+				prod0_arr = None
+				prod1_arr = None
+				if hasattr(self, '_xcorr_saved_prod0') and hasattr(self, '_xcorr_saved_prod1'):
+					try:
+						# Копируем корреляционные данные
+						prod0_arr = np.copy(self._xcorr_saved_prod0[:self.base_buf_len]) if self.base_buf_len else None
+						prod1_arr = np.copy(self._xcorr_saved_prod1[:self.base_buf_len]) if self.base_buf_len else None
+					except Exception:
+						pass
+				
 				# Copy current frame data (all 4 arrays: even/odd for both channels)
 				frame = {
 					'timestamp': time.time(),
@@ -2166,6 +2199,8 @@ class ScopeWindow:
 					'data0_odd': np.copy(self.data0_odd[:self.base_buf_len]) if self.base_buf_len else None,
 					'data1_even': np.copy(self.data1_even[:self.base_buf_len]) if self.base_buf_len else None,
 					'data1_odd': np.copy(self.data1_odd[:self.base_buf_len]) if self.base_buf_len else None,
+					'prod0': prod0_arr,  # Корреляционный массив ch0
+					'prod1': prod1_arr,  # Корреляционный массив ch1
 					'base_buf_len': self.base_buf_len,
 					'freq_hz': self.freq_hz,
 					'avg_n': getattr(self, 'avg_n', 20),
@@ -2195,13 +2230,18 @@ class ScopeWindow:
 
 	def _capture_trigger(self, reason: str = ''):
 		"""Trigger capture session on detection fire."""
-		if not bool(getattr(self, '_auto_capture_enabled', False)):
+		auto_cap = bool(getattr(self, '_auto_capture_enabled', False))
+		print(f"\n*** [CAPTURE] Trigger called: enabled={auto_cap}, reason={reason} ***\n", flush=True)
+		if not auto_cap:
+			print(f"[CAPTURE] Trigger skipped - disabled", flush=True)
 			return
 		try:
 			state = str(getattr(self, '_capture_state', 'idle'))
 			if state != 'idle':
+				print(f"[CAPTURE] Trigger skipped - state={state}", flush=True)
 				return  # Already capturing
 			self._capture_state = 'triggered'
+			print(f"[CAPTURE] Session starting...", flush=True)
 			# Initialize session
 			self._capture_session = {
 				'trigger_time': time.time(),
@@ -2224,8 +2264,7 @@ class ScopeWindow:
 			self._capture_frames_recorded = len(self._capture_session['frames'])
 			self._capture_post_countdown = 0
 			self._capture_state = 'recording'
-			if bool(getattr(self, 'debug', False)):
-				print(f"[CAPTURE] Session triggered: {reason}, PRE={self._capture_frames_recorded}", flush=True)
+			print(f"\n*** [CAPTURE] ✓✓✓ Session started: PRE={self._capture_frames_recorded} frames ***\n", flush=True)
 		except Exception as e:
 			print(f"[CAPTURE] Error triggering session: {e}", flush=True)
 			self._capture_state = 'idle'
@@ -2238,8 +2277,27 @@ class ScopeWindow:
 			state = str(getattr(self, '_capture_state', 'idle'))
 			if state != 'recording':
 				return
+			# Проверка: если достигли максимума фреймов, переходим в POST фазу
+			max_frames = int(getattr(self, '_capture_max_frames', 41))
+			current_count = len(self._capture_session.get('frames', []))
+			if current_count >= max_frames:
+				# Переходим в POST фазу (досрочно)
+				print(f"[CAPTURE] Max frames reached ({current_count}/{max_frames}), starting POST phase", flush=True)
+				self._capture_start_post()
+				return
 			# Copy current frame (same as _capture_push_frame but directly to session)
 			with self.data_lock:
+				# Копируем корреляционные массивы (уже вычисленные в _xcorr_compute)
+				prod0_arr = None
+				prod1_arr = None
+				if hasattr(self, '_xcorr_saved_prod0') and hasattr(self, '_xcorr_saved_prod1'):
+					try:
+						# Копируем корреляционные данные
+						prod0_arr = np.copy(self._xcorr_saved_prod0[:self.base_buf_len]) if self.base_buf_len else None
+						prod1_arr = np.copy(self._xcorr_saved_prod1[:self.base_buf_len]) if self.base_buf_len else None
+					except Exception:
+						pass
+				
 				frame = {
 					'timestamp': time.time(),
 					'seq0_even': getattr(self, 'seq0_even', None),
@@ -2250,6 +2308,8 @@ class ScopeWindow:
 					'data0_odd': np.copy(self.data0_odd[:self.base_buf_len]) if self.base_buf_len else None,
 					'data1_even': np.copy(self.data1_even[:self.base_buf_len]) if self.base_buf_len else None,
 					'data1_odd': np.copy(self.data1_odd[:self.base_buf_len]) if self.base_buf_len else None,
+					'prod0': prod0_arr,  # Корреляционный массив ch0
+					'prod1': prod1_arr,  # Корреляционный массив ch1
 					'base_buf_len': self.base_buf_len,
 					'freq_hz': self.freq_hz,
 					'avg_n': getattr(self, 'avg_n', 20),
@@ -2283,24 +2343,40 @@ class ScopeWindow:
 				return
 			self._capture_state = 'finalizing'
 			self._capture_post_countdown = int(getattr(self, '_capture_post_frames', 10))
-			if bool(getattr(self, 'debug', False)):
-				print(f"[CAPTURE] Starting POST phase, countdown={self._capture_post_countdown}", flush=True)
+			print(f"\n*** [CAPTURE] → POST phase, countdown={self._capture_post_countdown} ***\n", flush=True)
 		except Exception as e:
 			if bool(getattr(self, 'debug', False)):
 				print(f"[CAPTURE] Error starting POST: {e}", flush=True)
 
 	def _capture_finalize(self):
 		"""Finalize and save capture session to NPZ file."""
-		if not bool(getattr(self, '_auto_capture_enabled', False)):
+		auto_cap = bool(getattr(self, '_auto_capture_enabled', False))
+		print(f"\n*** [CAPTURE] Finalize called: enabled={auto_cap} ***\n", flush=True)
+		if not auto_cap:
+			print(f"[CAPTURE] Finalize skipped - disabled", flush=True)
 			return
 		try:
-			if not hasattr(self, '_capture_session') or not self._capture_session:
+			has_session = hasattr(self, '_capture_session') and bool(self._capture_session)
+			print(f"[CAPTURE] Has session: {has_session}", flush=True)
+			if not has_session:
+				print(f"[CAPTURE] No session to finalize", flush=True)
 				self._capture_state = 'idle'
 				return
-			# Generate filename with timestamp
+			# Generate filename with timestamp and label
 			ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-			filename = f"capture_{ts}.npz"
-			filepath = os.path.join(str(getattr(self, '_capture_dir', './captures')), filename)
+			label_state = int(getattr(self, '_capture_label_state', 0))
+			label_suffix = ["_unk", "_lbl", "_nolbl"][label_state]  # unknown/labeled/no-label
+			filename = f"capture_{ts}{label_suffix}.npz"
+			capture_dir = str(getattr(self, '_capture_dir', './captures'))
+			# Ensure directory exists before saving
+			try:
+				os.makedirs(capture_dir, exist_ok=True)
+			except Exception as e:
+				print(f"[CAPTURE] Не удалось создать папку {capture_dir}: {e}", flush=True)
+				self._capture_state = 'idle'
+				self._capture_session = None
+				return
+			filepath = os.path.join(capture_dir, filename)
 			
 			# Prepare arrays for NPZ
 			frames = self._capture_session.get('frames', [])
@@ -2320,6 +2396,8 @@ class ScopeWindow:
 			data0_odd_arr = np.zeros((n_frames, max_len), dtype=np.uint16)
 			data1_even_arr = np.zeros((n_frames, max_len), dtype=np.uint16)
 			data1_odd_arr = np.zeros((n_frames, max_len), dtype=np.uint16)
+			prod0_arr = np.zeros((n_frames, max_len), dtype=np.float32)  # Корреляция ch0
+			prod1_arr = np.zeros((n_frames, max_len), dtype=np.float32)  # Корреляция ch1
 			timestamps_arr = np.zeros(n_frames, dtype=np.float64)
 			seq0_even_arr = np.zeros(n_frames, dtype=np.int32)
 			seq0_odd_arr = np.zeros(n_frames, dtype=np.int32)
@@ -2350,6 +2428,8 @@ class ScopeWindow:
 					d0o = frame.get('data0_odd')
 					d1e = frame.get('data1_even')
 					d1o = frame.get('data1_odd')
+					p0 = frame.get('prod0')  # Корреляция ch0
+					p1 = frame.get('prod1')  # Корреляция ch1
 					if d0e is not None:
 						data0_even_arr[i, :buf_len] = d0e[:buf_len].astype(np.uint16)
 					if d0o is not None:
@@ -2358,6 +2438,10 @@ class ScopeWindow:
 						data1_even_arr[i, :buf_len] = d1e[:buf_len].astype(np.uint16)
 					if d1o is not None:
 						data1_odd_arr[i, :buf_len] = d1o[:buf_len].astype(np.uint16)
+					if p0 is not None:
+						prod0_arr[i, :buf_len] = p0[:buf_len].astype(np.float32)
+					if p1 is not None:
+						prod1_arr[i, :buf_len] = p1[:buf_len].astype(np.float32)
 				det_thr0_arr[i] = frame.get('det_thr0', 0)
 				det_thr1_arr[i] = frame.get('det_thr1', 0)
 				det_lvl0_arr[i] = frame.get('det_lvl0', 0)
@@ -2372,6 +2456,14 @@ class ScopeWindow:
 			
 			# Save to NPZ
 			metadata = self._capture_session.get('metadata', {})
+			# Peak sample = номер сэмпла где был максимум при срабатывании
+			peak_sample = int(getattr(self, '_capture_peak_sample', 0))
+			peak_shift = int(getattr(self, '_capture_peak_shift', 0))
+			peak_value = float(getattr(self, '_capture_peak_value', 0.0))
+			# Trigger sample = PRE phase length (триггер случился перед началом HOLD)
+			trigger_sample = int(metadata.get('pre_frames', 0))
+			# Label state: 0=unknown, 1=labeled, 2=no-label
+			label_state = int(getattr(self, '_capture_label_state', 0))
 			np.savez_compressed(
 				filepath,
 				# Frame data
@@ -2379,6 +2471,8 @@ class ScopeWindow:
 				data0_odd=data0_odd_arr,
 				data1_even=data1_even_arr,
 				data1_odd=data1_odd_arr,
+				prod0=prod0_arr,  # Корреляция ch0
+				prod1=prod1_arr,  # Корреляция ch1
 				timestamps=timestamps_arr,
 				seq0_even=seq0_even_arr,
 				seq0_odd=seq0_odd_arr,
@@ -2398,6 +2492,11 @@ class ScopeWindow:
 				det_frozen=det_frozen_arr,
 				# Metadata
 				n_frames=np.array([n_frames]),
+				trigger_sample=np.array([trigger_sample]),
+				peak_sample=np.array([peak_sample]),  # Номер сэмпла с пиком в prod массиве
+				peak_shift=np.array([peak_shift]),  # Фазовый сдвиг при котором найден пик
+				peak_value=np.array([peak_value]),  # Значение корреляции в точке пика
+				label_state=np.array([label_state]),  # Метка: 0=неизвестно, 1=с меткой, 2=без метки
 				buf_len=np.array([max_len]),
 				trigger_time=np.array([self._capture_session.get('trigger_time', 0.0)]),
 				reason=np.array([self._capture_session.get('reason', '')], dtype='U256'),
@@ -2663,10 +2762,125 @@ class ScopeWindow:
 				self._prev_beep_state = True
 				# Trigger capture session on first fire
 				try:
-					reason = f"ADC0={fire0} ADC1={fire1} thr0={thr_prev if fire0 else 0} thr1={thr_prev if fire1 else 0}"
+					thr0 = int(getattr(self, '_det_thr0', 0))
+					thr1 = int(getattr(self, '_det_thr1', 0))
+					# Находим номер сэмпла где пик (максимум) в корреляционных массивах
+					# ВАЖНО: используем pre-computed peak_idx из оптимального поиска фазового сдвига
+					peak_sample = 0
+					shift_val = 0
+					peak_value = 0.0
+					try:
+						if fire0:
+							# Используем уже вычисленный peak_idx из optimal phase search
+							if hasattr(self, '_phase_peak_idx_adc0'):
+								peak_sample = int(getattr(self, '_phase_peak_idx_adc0', 0))
+								shift_val = int(getattr(self, '_phase_shift_adc0', 0))
+								# Получаем значение в точке пика
+								if hasattr(self, '_phase_prod_adc0'):
+									prod_arr = self._phase_prod_adc0
+									if peak_sample < len(prod_arr):
+										peak_value = float(prod_arr[peak_sample])
+								# Детальная диагностика окрестности пика
+								print(f"\n*** [CAPTURE] ADC0 PEAK ANALYSIS ***", flush=True)
+								print(f"  Shift={shift_val}, Peak_idx={peak_sample}, Peak_value={peak_value:.2e}", flush=True)
+								if hasattr(self, '_phase_prod_adc0'):
+									prod = self._phase_prod_adc0
+									# Показываем 5 сэмплов до и после пика
+									start = max(0, peak_sample - 5)
+									end = min(len(prod), peak_sample + 6)
+									print(f"  Values around peak [{start}..{end-1}]:", flush=True)
+									for i in range(start, end):
+										marker = " <-- PEAK" if i == peak_sample else ""
+										print(f"    [{i}] = {prod[i]:.2e}{marker}", flush=True)
+							elif hasattr(self, '_xcorr_saved_prod0'):
+								# Fallback: простой поиск максимума
+								peak_sample = int(np.argmax(np.abs(self._xcorr_saved_prod0)))
+								peak_value = float(self._xcorr_saved_prod0[peak_sample])
+								print(f"\n*** [CAPTURE] ADC0 FALLBACK (no optimal shift) ***", flush=True)
+								print(f"  Peak_idx={peak_sample}, Peak_value={peak_value:.2e}", flush=True)
+							
+							# Дополнительно: проверим синхронность - покажем even и inverted odd в точке пика
+							if peak_sample > 0:
+								try:
+									with self.data_lock:
+										N = int(self.base_buf_len) if getattr(self, 'base_buf_len', None) else 0
+										if N > 0 and peak_sample < N:
+											even_val = int(self.data0_even[peak_sample])
+											odd_val = int(self.data0_odd[peak_sample])
+											# С учетом сдвига
+											shifted_idx = peak_sample + shift_val
+											if 0 <= shifted_idx < N:
+												odd_shifted_val = int(self.data0_odd[shifted_idx])
+												# Инвертированное значение (после центрирования)
+												odd_inv = -(odd_shifted_val - 32767)
+												even_centered = even_val - 32767
+												product = even_centered * odd_inv
+												print(f"  SYNC CHECK at peak_sample={peak_sample}:", flush=True)
+												print(f"    even[{peak_sample}] = {even_val} (centered: {even_centered})", flush=True)
+												print(f"    odd[{shifted_idx}] = {odd_shifted_val} (inv: {odd_inv})", flush=True)
+												print(f"    product = {product:.2e}", flush=True)
+								except Exception as e:
+									print(f"  SYNC CHECK failed: {e}", flush=True)
+						elif fire1:
+							if hasattr(self, '_phase_peak_idx_adc1'):
+								peak_sample = int(getattr(self, '_phase_peak_idx_adc1', 0))
+								shift_val = int(getattr(self, '_phase_shift_adc1', 0))
+								if hasattr(self, '_phase_prod_adc1'):
+									prod_arr = self._phase_prod_adc1
+									if peak_sample < len(prod_arr):
+										peak_value = float(prod_arr[peak_sample])
+								print(f"\n*** [CAPTURE] ADC1 PEAK ANALYSIS ***", flush=True)
+								print(f"  Shift={shift_val}, Peak_idx={peak_sample}, Peak_value={peak_value:.2e}", flush=True)
+								if hasattr(self, '_phase_prod_adc1'):
+									prod = self._phase_prod_adc1
+									start = max(0, peak_sample - 5)
+									end = min(len(prod), peak_sample + 6)
+									print(f"  Values around peak [{start}..{end-1}]:", flush=True)
+									for i in range(start, end):
+										marker = " <-- PEAK" if i == peak_sample else ""
+										print(f"    [{i}] = {prod[i]:.2e}{marker}", flush=True)
+							elif hasattr(self, '_xcorr_saved_prod1'):
+								peak_sample = int(np.argmax(np.abs(self._xcorr_saved_prod1)))
+								peak_value = float(self._xcorr_saved_prod1[peak_sample])
+								print(f"\n*** [CAPTURE] ADC1 FALLBACK (no optimal shift) ***", flush=True)
+								print(f"  Peak_idx={peak_sample}, Peak_value={peak_value:.2e}", flush=True)
+							
+							# Проверка синхронности для ADC1
+							if peak_sample > 0:
+								try:
+									with self.data_lock:
+										N = int(self.base_buf_len) if getattr(self, 'base_buf_len', None) else 0
+										if N > 0 and peak_sample < N:
+											even_val = int(self.data1_even[peak_sample])
+											odd_val = int(self.data1_odd[peak_sample])
+											shifted_idx = peak_sample + shift_val
+											if 0 <= shifted_idx < N:
+												odd_shifted_val = int(self.data1_odd[shifted_idx])
+												odd_inv = -(odd_shifted_val - 32767)
+												even_centered = even_val - 32767
+												product = even_centered * odd_inv
+												print(f"  SYNC CHECK at peak_sample={peak_sample}:", flush=True)
+												print(f"    even[{peak_sample}] = {even_val} (centered: {even_centered})", flush=True)
+												print(f"    odd[{shifted_idx}] = {odd_shifted_val} (inv: {odd_inv})", flush=True)
+												print(f"    product = {product:.2e}", flush=True)
+								except Exception as e:
+									print(f"  SYNC CHECK failed: {e}", flush=True)
+					except Exception as e:
+						print(f"*** [CAPTURE] ERROR in peak analysis: {e} ***", flush=True)
+						peak_sample = 0
+						shift_val = 0
+						peak_value = 0.0
+					# Сохраняем для использования в метаданных
+					self._capture_peak_sample = peak_sample
+					self._capture_peak_shift = shift_val
+					self._capture_peak_value = peak_value
+					reason = f"ADC0={fire0} ADC1={fire1} thr0={thr0 if fire0 else 0} thr1={thr1 if fire1 else 0} peak_sample={peak_sample} shift={shift_val}"
+					print(f"*** [CAPTURE] Detection fired: fire0={fire0}, fire1={fire1}, peak_sample={peak_sample}, shift={shift_val}, value={peak_value:.2e} ***\n", flush=True)
 					self._capture_trigger(reason)
-				except Exception:
-					pass
+				except Exception as e:
+					print(f"*** [CAPTURE] ERROR in trigger call: {e} ***", flush=True)
+					import traceback
+					traceback.print_exc()
 			self._det_last_fire_t = _now
 			self._fire_beep(fire0, fire1, shift0, shift1)
 			# optional: keep PWM running while in HOLD
@@ -2674,8 +2888,10 @@ class ScopeWindow:
 			# Record frame during HOLD phase
 			try:
 				self._capture_record_frame()
-			except Exception:
-				pass
+			except Exception as e:
+				print(f"*** [CAPTURE] ERROR in record_frame: {e} ***", flush=True)
+				import traceback
+				traceback.print_exc()
 			return
 
 		# If previously frozen and signal "lost" for long enough -> resume device DC adapt
@@ -5049,6 +5265,15 @@ class ScopeWindow:
 	def _toggle_capture(self):
 		"""Переключение автозахвата осциллограмм."""
 		self._auto_capture_enabled = self.btn_capture.isChecked()
+		print(f"\n{'='*60}\n[CAPTURE] Toggle: auto_capture_enabled={self._auto_capture_enabled}\n{'='*60}\n", flush=True)
+		# Создать папку captures при включении
+		if self._auto_capture_enabled:
+			try:
+				os.makedirs(self._capture_dir, exist_ok=True)
+			except Exception as e:
+				print(f"[CAPTURE] Ошибка создания папки {self._capture_dir}: {e}", flush=True)
+				self._auto_capture_enabled = False
+				self.btn_capture.setChecked(False)
 		self._update_capture_btn_style()
 		status = "включён" if self._auto_capture_enabled else "выключен"
 		self._set_status(f"Автозахват {status}", hold_sec=2.0)
@@ -5060,6 +5285,31 @@ class ScopeWindow:
 				self.btn_capture.setStyleSheet("background-color: #00cc00; color: white;")
 			else:
 				self.btn_capture.setStyleSheet("background-color: #cc0000; color: white;")
+		except Exception:
+			pass
+	
+	def _cycle_label_state(self):
+		"""Переключение состояния метки: 0→1→2→0 (неизвестно→с меткой→без метки→неизвестно)."""
+		self._capture_label_state = (self._capture_label_state + 1) % 3
+		self._update_label_btn_style()
+		labels = ["неизвестно", "с меткой", "без метки"]
+		self._set_status(f"Метка: {labels[self._capture_label_state]}", hold_sec=1.5)
+	
+	def _update_label_btn_style(self):
+		"""Обновление текста и цвета кнопки label."""
+		try:
+			if self._capture_label_state == 0:
+				# Неизвестно
+				self.btn_label.setText("?")
+				self.btn_label.setStyleSheet("background-color: #888888; color: white;")
+			elif self._capture_label_state == 1:
+				# С меткой
+				self.btn_label.setText("✓")
+				self.btn_label.setStyleSheet("background-color: #0080ff; color: white;")
+			else:
+				# Без метки
+				self.btn_label.setText("✗")
+				self.btn_label.setStyleSheet("background-color: #ff8000; color: white;")
 		except Exception:
 			pass
 

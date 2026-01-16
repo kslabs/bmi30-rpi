@@ -1647,35 +1647,37 @@ class USBStream:
                         if getattr(self.asm, 'independent', False):
                             qszA = self.asm.qA.qsize() if hasattr(self.asm, 'qA') else 0
                             qszB = self.asm.qB.qsize() if hasattr(self.asm, 'qB') else 0
-                            print(
-                                f"dt={dt_stat:.3f}s frames={frames_n} fps={fps_hz:.1f}/s bytes={int(bps_hz)}B/s "
-                                f"rxA={rx0_hz:.1f}/s rxB={rx1_hz:.1f}/s lossA={loss0:.1f}% lossB={loss1:.1f}% "
-                                f"tsStepA={ts_step0} tsStepB={ts_step1} tsLossA={tsloss0:.1f}% tsLossB={tsloss1:.1f}% "
-                                f"tsLossTotA={tsloss0_tot:.1f}% tsLossTotB={tsloss1_tot:.1f}% "
-                                f"rxGapA+={dg0} rxGapB+={dg1} "
-                                f"rxDupA+={dd0} rxDupB+={dd1} "
-                                f"rxRstA+={dr0} rxRstB+={dr1} "
-                                f"tsDupA+={td0} tsDupB+={td1} tsRstA+={tr0} tsRstB+={tr1} "
-                                f"crc_bad={self.crc_bad} magic_bad={self.magic_bad} "
-                                f"qA={qszA} qB={qszB} dropA={getattr(self.asm,'drop_a',0)} dropB={getattr(self.asm,'drop_b',0)}",
-                                flush=True,
-                            )
+                            # print(
+                            #     f"dt={dt_stat:.3f}s frames={frames_n} fps={fps_hz:.1f}/s bytes={int(bps_hz)}B/s "
+                            #     f"rxA={rx0_hz:.1f}/s rxB={rx1_hz:.1f}/s lossA={loss0:.1f}% lossB={loss1:.1f}% "
+                            #     f"tsStepA={ts_step0} tsStepB={ts_step1} tsLossA={tsloss0:.1f}% tsLossB={tsloss1:.1f}% "
+                            #     f"tsLossTotA={tsloss0_tot:.1f}% tsLossTotB={tsloss1_tot:.1f}% "
+                            #     f"rxGapA+={dg0} rxGapB+={dg1} "
+                            #     f"rxDupA+={dd0} rxDupB+={dd1} "
+                            #     f"rxRstA+={dr0} rxRstB+={dr1} "
+                            #     f"tsDupA+={td0} tsDupB+={td1} tsRstA+={tr0} tsRstB+={tr1} "
+                            #     f"crc_bad={self.crc_bad} magic_bad={self.magic_bad} "
+                            #     f"qA={qszA} qB={qszB} dropA={getattr(self.asm,'drop_a',0)} dropB={getattr(self.asm,'drop_b',0)}",
+                            #     flush=True,
+                            # )
                         else:
-                            print(
-                                f"dt={dt_stat:.3f}s frames={frames_n} fps={fps_hz:.1f}/s bytes={int(bps_hz)}B/s "
-                                f"rxA={rx0_hz:.1f}/s rxB={rx1_hz:.1f}/s lossA={loss0:.1f}% lossB={loss1:.1f}% "
-                                f"tsStepA={ts_step0} tsStepB={ts_step1} tsLossA={tsloss0:.1f}% tsLossB={tsloss1:.1f}% "
-                                f"tsLossTotA={tsloss0_tot:.1f}% tsLossTotB={tsloss1_tot:.1f}% "
-                                f"rxGapA+={dg0} rxGapB+={dg1} "
-                                f"rxDupA+={dd0} rxDupB+={dd1} "
-                                f"rxRstA+={dr0} rxRstB+={dr1} "
-                                f"tsDupA+={td0} tsDupB+={td1} tsRstA+={tr0} tsRstB+={tr1} "
-                                f"crc_bad={self.crc_bad} magic_bad={self.magic_bad} "
-                                f"stereo_ready={self.asm.q.qsize()} dropPairs={getattr(self.asm,'drop_pairs',0)}",
-                                flush=True,
-                            )
+                            pass
+                            # print(
+                            #     f"dt={dt_stat:.3f}s frames={frames_n} fps={fps_hz:.1f}/s bytes={int(bps_hz)}B/s "
+                            #     f"rxA={rx0_hz:.1f}/s rxB={rx1_hz:.1f}/s lossA={loss0:.1f}% lossB={loss1:.1f}% "
+                            #     f"tsStepA={ts_step0} tsStepB={ts_step1} tsLossA={tsloss0:.1f}% tsLossB={tsloss1:.1f}% "
+                            #     f"tsLossTotA={tsloss0_tot:.1f}% tsLossTotB={tsloss1_tot:.1f}% "
+                            #     f"rxGapA+={dg0} rxGapB+={dg1} "
+                            #     f"rxDupA+={dd0} rxDupB+={dd1} "
+                            #     f"rxRstA+={dr0} rxRstB+={dr1} "
+                            #     f"tsDupA+={td0} tsDupB+={td1} tsRstA+={tr0} tsRstB+={tr1} "
+                            #     f"crc_bad={self.crc_bad} magic_bad={self.magic_bad} "
+                            #     f"stereo_ready={self.asm.q.qsize()} dropPairs={getattr(self.asm,'drop_pairs',0)}",
+                            #     flush=True,
+                            # )
                     except Exception:
-                        print(f"dt={dt_stat:.3f}s frames={frames_n} fps={fps_hz:.1f}/s bytes={int(bps_hz)}B/s crc_bad={self.crc_bad} magic_bad={self.magic_bad}")
+                        pass
+                        # print(f"dt={dt_stat:.3f}s frames={frames_n} fps={fps_hz:.1f}/s bytes={int(bps_hz)}B/s crc_bad={self.crc_bad} magic_bad={self.magic_bad}")
 
                     # store snapshots for next tick
                     try:

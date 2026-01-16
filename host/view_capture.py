@@ -85,6 +85,7 @@ class CaptureViewer:
         # Info label
         self.info_lbl = QtWidgets.QLabel()
         self.info_lbl.setWordWrap(True)
+        self.info_lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)  # Копируемый текст
         layout.addWidget(self.info_lbl)
         
         # Control bar
@@ -113,11 +114,17 @@ class CaptureViewer:
         
         ctrl_bar.addSpacing(20)  # Spacer
         
-        self.btn_normalize = QtWidgets.QPushButton("📊 Нормализация")
-        self.btn_normalize.setCheckable(True)
-        self.btn_normalize.setChecked(False)  # По умолчанию выключена
-        self.btn_normalize.clicked.connect(self._toggle_normalize)
-        ctrl_bar.addWidget(self.btn_normalize)
+        self.btn_normalize_input = QtWidgets.QPushButton("📊 Норм. Входы")
+        self.btn_normalize_input.setCheckable(True)
+        self.btn_normalize_input.setChecked(False)  # По умолчанию выключена
+        self.btn_normalize_input.clicked.connect(self._toggle_normalize_input)
+        ctrl_bar.addWidget(self.btn_normalize_input)
+        
+        self.btn_normalize_product = QtWidgets.QPushButton("📊 Норм. Product")
+        self.btn_normalize_product.setCheckable(True)
+        self.btn_normalize_product.setChecked(False)  # По умолчанию выключена
+        self.btn_normalize_product.clicked.connect(self._toggle_normalize_product)
+        ctrl_bar.addWidget(self.btn_normalize_product)
         
         self.speed_lbl = QtWidgets.QLabel(f"Speed: {self.play_speed}x")
         ctrl_bar.addWidget(self.speed_lbl)
@@ -141,14 +148,48 @@ class CaptureViewer:
         self.plotw = pg.GraphicsLayoutWidget()
         layout.addWidget(self.plotw, 1)
         
-        self.p0 = self.plotw.addPlot(row=0, col=0, title="ADC0 (1/0)")
-        self.p1 = self.plotw.addPlot(row=1, col=0, title="ADC1 (1/0)")
+        # График ADC0: 3 кривых (even, odd, prod0)
+        self.p0 = self.plotw.addPlot(row=0, col=0, title="ADC0: Even/Odd + Correlation")
+        self.p0.showAxis('right')
+        self.vb_prod0 = pg.ViewBox()  # Отдельная ViewBox для correlation (правая ось)
+        self.p0.scene().addItem(self.vb_prod0)
+        self.p0.getAxis('right').linkToView(self.vb_prod0)
+        self.vb_prod0.setXLink(self.p0)
         
-        # Plot curves
-        self.curve0_even = self.p0.plot(pen=pg.mkPen('#ffb86b', width=1.5), symbol=None)
-        self.curve0_odd = self.p0.plot(pen=pg.mkPen('#00e5ff', width=1.5), symbol=None)
-        self.curve1_even = self.p1.plot(pen=pg.mkPen('#ff6b6b', width=1.5), symbol=None)
-        self.curve1_odd = self.p1.plot(pen=pg.mkPen('#00ffd5', width=1.5), symbol=None)
+        # График ADC1: 3 кривых (even, odd, prod1)
+        self.p1 = self.plotw.addPlot(row=1, col=0, title="ADC1: Even/Odd + Correlation")
+        self.p1.showAxis('right')
+        self.vb_prod1 = pg.ViewBox()  # Отдельная ViewBox для correlation (правая ось)
+        self.p1.scene().addItem(self.vb_prod1)
+        self.p1.getAxis('right').linkToView(self.vb_prod1)
+        self.vb_prod1.setXLink(self.p1)
+        
+        # Update views when resized
+        def update_views():
+            self.vb_prod0.setGeometry(self.p0.vb.sceneBoundingRect())
+            self.vb_prod1.setGeometry(self.p1.vb.sceneBoundingRect())
+        self.p0.vb.sigResized.connect(update_views)
+        self.p1.vb.sigResized.connect(update_views)
+        
+        # Входные кривые (левая ось)
+        self.curve0_even = self.p0.plot(pen=pg.mkPen('#ffb86b', width=1.5), symbol=None, name='Even')
+        self.curve0_odd = self.p0.plot(pen=pg.mkPen('#00e5ff', width=1.5), symbol=None, name='Odd')
+        self.curve1_even = self.p1.plot(pen=pg.mkPen('#ff6b6b', width=1.5), symbol=None, name='Even')
+        self.curve1_odd = self.p1.plot(pen=pg.mkPen('#00ffd5', width=1.5), symbol=None, name='Odd')
+        
+        # Корреляционные кривые (правая ось)
+        self.curve_prod0 = pg.PlotCurveItem(pen=pg.mkPen('#00ff00', width=2), symbol=None, name='Correlation')
+        self.curve_prod1 = pg.PlotCurveItem(pen=pg.mkPen('#ffff00', width=2), symbol=None, name='Correlation')
+        self.vb_prod0.addItem(self.curve_prod0)
+        self.vb_prod1.addItem(self.curve_prod1)
+        
+        # Trigger marker lines (вертикальная линия на пике)
+        self.trigger_line0 = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('r', width=2, style=QtCore.Qt.DashLine))
+        self.trigger_line1 = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('r', width=2, style=QtCore.Qt.DashLine))
+        self.trigger_line0.setVisible(False)
+        self.trigger_line1.setVisible(False)
+        self.p0.addItem(self.trigger_line0)
+        self.p1.addItem(self.trigger_line1)
         
         self.p0.showGrid(x=True, y=True, alpha=0.3)
         self.p1.showGrid(x=True, y=True, alpha=0.3)
@@ -160,6 +201,7 @@ class CaptureViewer:
         
         self.p0.setYRange(0, 65535, padding=0.02)
         self.p1.setYRange(0, 65535, padding=0.02)
+        # Product range будет установлен после загрузки данных
         
         # Timer for playback
         self.timer = QtCore.QTimer()
@@ -313,12 +355,22 @@ class CaptureViewer:
                 data1_even = self.data['ch1']
                 data1_odd = self.data['ch1']
                 buf_len = len(self.data['ch0'])
+                prod0 = None
+                prod1 = None
             else:
                 # New or intermediate format
                 data0_even = self.data['data0_even'][idx]
                 data0_odd = self.data['data0_odd'][idx]
                 data1_even = self.data['data1_even'][idx]
                 data1_odd = self.data['data1_odd'][idx]
+                
+                # Product data (может отсутствовать в старых файлах)
+                if 'prod0' in self.data:
+                    prod0 = self.data['prod0'][idx]
+                    prod1 = self.data['prod1'][idx]
+                else:
+                    prod0 = None
+                    prod1 = None
                 
                 # Find actual data length
                 if 'buf_len' in self.data:
@@ -332,6 +384,45 @@ class CaptureViewer:
             self.curve0_odd.setData(x, data0_odd[:buf_len])
             self.curve1_even.setData(x, data1_even[:buf_len])
             self.curve1_odd.setData(x, data1_odd[:buf_len])
+            
+            # Update product curves if available
+            if prod0 is not None and prod1 is not None:
+                self.curve_prod0.setData(x, prod0[:buf_len])
+                self.curve_prod1.setData(x, prod1[:buf_len])
+            else:
+                # Clear product curves for old files
+                self.curve_prod0.setData([], [])
+                self.curve_prod1.setData([], [])
+            
+            # Show trigger marker if peak_sample is available
+            if 'peak_sample' in self.data:
+                peak_sample = int(self.data['peak_sample'][0])
+                self.trigger_line0.setPos(peak_sample)
+                self.trigger_line1.setPos(peak_sample)
+                self.trigger_line0.setVisible(True)
+                self.trigger_line1.setVisible(True)
+                
+                # Показать значение в точке пика (для диагностики)
+                try:
+                    if prod0 is not None and peak_sample < len(prod0):
+                        peak_val0 = prod0[peak_sample]
+                        peak_val1 = prod1[peak_sample] if prod1 is not None and peak_sample < len(prod1) else 0
+                        # Вывести в консоль для проверки
+                        if idx == 0:  # Только для первого кадра
+                            print(f"[VIEWER] Peak at sample={peak_sample}: prod0={peak_val0:.2e}, prod1={peak_val1:.2e}", flush=True)
+                            # Показать окрестность
+                            if prod0 is not None:
+                                start = max(0, peak_sample - 3)
+                                end = min(len(prod0), peak_sample + 4)
+                                print(f"[VIEWER] prod0 around peak [{start}..{end-1}]:", flush=True)
+                                for i in range(start, end):
+                                    marker = " <--" if i == peak_sample else ""
+                                    print(f"  [{i}] = {prod0[i]:.2e}{marker}", flush=True)
+                except Exception as e:
+                    print(f"[VIEWER] Error checking peak value: {e}", flush=True)
+            else:
+                self.trigger_line0.setVisible(False)
+                self.trigger_line1.setVisible(False)
             
             # Update frame label
             self.frame_lbl.setText(f"{idx} / {self.n_frames}")
@@ -384,9 +475,22 @@ class CaptureViewer:
                 timestamp = float(self.data['timestamps'][idx])
                 rel_time = timestamp - trigger_time
                 
+                # Trigger sample info
+                trigger_sample = int(self.data['trigger_sample'][0]) if 'trigger_sample' in self.data else 0
+                peak_sample = int(self.data['peak_sample'][0]) if 'peak_sample' in self.data else 0
+                peak_shift = int(self.data['peak_shift'][0]) if 'peak_shift' in self.data else 0
+                peak_value = float(self.data['peak_value'][0]) if 'peak_value' in self.data else 0.0
+                
+                # Label state: 0=unknown, 1=labeled, 2=no-label
+                label_state = int(self.data['label_state'][0]) if 'label_state' in self.data else 0
+                label_text = ["Неизвестно", "С меткой", "Без метки"][label_state]
+                label_color = ["gray", "blue", "orange"][label_state]
+                
                 info_text = (
                     f"<b>Capture Info:</b> Profile={profile} Freq={freq_hz}Hz avg_n={avg_n} mode={stream_mode}<br>"
                     f"<b>Trigger:</b> {reason}<br>"
+                    f"<b>Метка:</b> <span style='color:{label_color};'>{label_text}</span><br>"
+                    f"<b>Peak:</b> <span style='color:red;'>Sample={peak_sample} Shift={peak_shift} Value={peak_value:.2e}</span> (Trigger frame={trigger_sample})<br>"
                     f"<b>Frame {idx}:</b> t={rel_time:+.3f}s | "
                     f"DC={'FROZEN' if det_frozen else 'RUN'} | "
                     f"A0: {det_amp0} thr={det_thr0} lvl={det_lvl0} sh={det_shift0} {'H' if det_hold0 else '-'} | "
@@ -434,9 +538,9 @@ class CaptureViewer:
             self.btn_play.setText("▶ Play")
             self.timer.stop()
     
-    def _toggle_normalize(self):
-        """Переключение автомасштабирования Y-оси."""
-        normalize = self.btn_normalize.isChecked()
+    def _toggle_normalize_input(self):
+        """Переключение автомасштабирования Y-оси для входных сигналов."""
+        normalize = self.btn_normalize_input.isChecked()
         try:
             if normalize:
                 # Включить автомасштабирование
@@ -447,7 +551,36 @@ class CaptureViewer:
                 self.p0.setYRange(0, 65535, padding=0.02)
                 self.p1.setYRange(0, 65535, padding=0.02)
         except Exception as e:
-            print(f"[VIEWER] Error toggling normalize: {e}")
+            print(f"[VIEWER] Error toggling normalize input: {e}")
+    
+    def _toggle_normalize_product(self):
+        """Переключение автомасштабирования Y-оси для product."""
+        normalize = self.btn_normalize_product.isChecked()
+        try:
+            if normalize:
+                # Включить автомасштабирование
+                self.vb_prod0.enableAutoRange(axis='y')
+                self.vb_prod1.enableAutoRange(axis='y')
+            else:
+                # Попытаться установить разумный диапазон на основе данных
+                if hasattr(self, 'data') and self.data is not None and 'prod0' in self.data:
+                    # Найти min/max по всем product данным
+                    prod_max = max(
+                        np.max(self.data['prod0']),
+                        np.max(self.data['prod1'])
+                    )
+                    prod_min = min(
+                        np.min(self.data['prod0']),
+                        np.min(self.data['prod1'])
+                    )
+                    self.vb_prod0.setYRange(prod_min, prod_max, padding=0.02)
+                    self.vb_prod1.setYRange(prod_min, prod_max, padding=0.02)
+                else:
+                    # Fallback для старых файлов без product
+                    self.vb_prod0.setYRange(-65535, 65535, padding=0.02)
+                    self.vb_prod1.setYRange(-65535, 65535, padding=0.02)
+        except Exception as e:
+            print(f"[VIEWER] Error toggling normalize product: {e}")
     
     def _play_tick(self):
         """Auto-advance frame during playback."""
