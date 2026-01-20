@@ -265,16 +265,29 @@ except Exception as e1:  # pragma: no cover
         PG_IMPORT_ERR = e1
 
 
-def save_config(desired_profile):
+def save_config(desired_profile, desired_freq=None):
     config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
     try:
+        data = {"desired_profile": desired_profile}
+        if desired_freq is not None:
+            data["desired_freq"] = desired_freq
+        else:
+            # Загружаем существующую частоту если она есть
+            try:
+                if os.path.exists(config_file):
+                    with open(config_file, "r") as f:
+                        old_data = json.load(f) or {}
+                    if "desired_freq" in old_data:
+                        data["desired_freq"] = old_data["desired_freq"]
+            except Exception:
+                pass
         with open(config_file, "w") as f:
-            json.dump({"desired_profile": desired_profile}, f)
+            json.dump(data, f)
     except Exception:
         pass
 
 def load_config():
-	"""Load desired_profile from config file (1=200Hz, 2=300Hz). Default=1."""
+	"""Load desired_profile from config file. Default=1."""
 	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
 	try:
 		with open(config_file, "r") as f:
@@ -285,6 +298,16 @@ def load_config():
 		return val
 	except Exception:
 		return 1
+
+def load_freq():
+	"""Load desired_freq from config file. Default=200."""
+	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+	try:
+		with open(config_file, "r") as f:
+			data = json.load(f) or {}
+		return int(data.get("desired_freq", 200))
+	except Exception:
+		return 200
 
 def load_avg_n():
     """Load avg_n from config file (fallback 20)."""
@@ -359,7 +382,9 @@ class ScopeWindow:
 		self.win.setCentralWidget(central)
 		layout = QtWidgets.QVBoxLayout(central)
 		# Загружаем desired_profile из config
-		self.desired_profile = load_config()  # 1=>200 Гц, 2=>300 Гц
+		self.desired_profile = load_config()
+		# Загружаем частоту из конфига
+		self.desired_freq = load_freq()
 		# По умолчанию — DC-вычитание не применяется в GUI (встроено в устройство)
 		self.dc_removal_enabled = False
 		# Переключатель нормализации XCorr (привязан к кнопке "звук")
@@ -417,6 +442,25 @@ class ScopeWindow:
 			pass
 		self.avg_box.currentIndexChanged.connect(self._on_avg_change)
 		legend_bar.addWidget(self.avg_box, 0)
+		
+		# Выбор частоты буферов
+		self.freq_box = QtWidgets.QComboBox()
+		self.freq_box.addItems(["200 Hz", "204 Hz", "205 Hz", "208 Hz", "210 Hz", "220 Hz", "225 Hz", "240 Hz", "250 Hz"])
+		# Блокируем сигналы при установке начального значения
+		try:
+			self.freq_box.blockSignals(True)
+		except Exception:
+			pass
+		# Устанавливаем загруженную частоту
+		self.freq_box.setCurrentText(f"{self.desired_freq} Hz")
+		try:
+			self.freq_box.blockSignals(False)
+		except Exception:
+			pass
+		self.freq_box.setToolTip("Частота следования буферов")
+		self.freq_box.currentTextChanged.connect(self._on_freq_change)
+		legend_bar.addWidget(self.freq_box, 0)
+		
 		self.btn_reconnect = QtWidgets.QPushButton("↻")
 		self.btn_reconnect.setToolTip("Ручное переподключение к устройству")
 		self.btn_reconnect.clicked.connect(self._manual_reconnect)
@@ -1023,7 +1067,8 @@ class ScopeWindow:
 			self.stop_warn_after = 5.0
 		self._instr = (
 			"Инструкция: 1) Прошивка должна обрабатывать START_STREAM (0x20) и слать кадры vendor bulk на EP IN 0x83. "
-			"SET_PROFILE (0x14) 1=200Гц / 2=300Гц используйте по необходимости (переключатель в GUI). "
+			"SET_PROFILE (0x14) переключает профиль устройства (используйте через GUI). "
+			"Частота задается отдельно через CMD_BLOCK_HZ (0x11). "
 			"Каждый кадр: заголовок 32 байта (magic 0xA55A LE), флаги 0x01 (ADC0) и 0x02 (ADC1); total_samples авто-фиксируется по первому рабочему кадру, payload = total_samples*2 байт. "
 			"Тестовый кадр (flag 0x80) может быть один в начале и пропускается. 4) Проверьте права доступа (udev) если устройство не открывается. 5) Кнопка 1 в GUI запускает поток."
 		)
@@ -1389,7 +1434,7 @@ class ScopeWindow:
 			# Имитируем получение данных исходя из текущего профиля
 			self.base_buf_len = self.expected_len_map.get(self.desired_profile, self.initial_expected)
 			self.base_buf_len_bytes = self.base_buf_len * 2
-			self.freq_hz = 200 if self.desired_profile == 1 else 300 if self.desired_profile == 2 else None
+			self.freq_hz = getattr(self, 'desired_freq', 200)
 			# Заполняем тестовыми данными
 			import math
 			for i in range(self.base_buf_len):
@@ -4113,12 +4158,8 @@ class ScopeWindow:
 							self.base_buf_len = first_len
 							self.base_buf_len_bytes = self.base_buf_len * 2
 							self._sliders_initialized = False
-							if getattr(self, 'desired_profile', None) == 1:
-								self.freq_hz = 200
-							elif getattr(self, 'desired_profile', None) == 2:
-								self.freq_hz = 300
-							else:
-								self.freq_hz = None
+							# Используем выбранную частоту
+							self.freq_hz = getattr(self, 'desired_freq', 200)
 							if bool(getattr(self, 'reader_debug', False)):
 								print(f"[READER] Buffer size changed: {old_len} -> {self.base_buf_len} семплов, freq={self.freq_hz}Hz", flush=True)
 				
@@ -5473,17 +5514,30 @@ class ScopeWindow:
 					_t.sleep(0.02)
 				except Exception:
 					pass
-			# частота блока 200/300 Гц
+			# Устанавливаем выбранную частоту
 			try:
+				freq_to_set = getattr(self, 'desired_freq', 200)
 				if hasattr(self.stream, 'set_block_rate'):
-					self.stream.set_block_rate(200 if self.desired_profile == 1 else 300)
+					self.stream.set_block_rate(freq_to_set)
 					try:
 						import time as _t
 						_t.sleep(0.1)
 					except Exception:
 						pass
-			except Exception:
-				pass
+				else:
+					# Fallback: отправляем команду напрямую
+					import struct
+					self.stream.send_cmd(0x11, struct.pack('<H', freq_to_set))
+					try:
+						import time as _t
+						_t.sleep(0.1)
+					except Exception:
+						pass
+			except Exception as e:
+				try:
+					print(f'[start] Failed to set frequency: {e}')
+				except:
+					pass
 			# старт
 			self.stream.send_cmd(CMD_START_STREAM, b"")
 		except Exception as e:
@@ -5825,12 +5879,18 @@ class ScopeWindow:
 			except Exception:
 				pass
 
-	def _on_freq_change(self, idx:int):
-		# 0 -> 200Hz (profile 1), 1 -> 300Hz (profile 2)
-		self.desired_profile = 1 if idx == 0 else 2
-		save_config(self.desired_profile)  # сохраняем выбор
+	def _on_freq_change(self, text:str):
+		# Парсим частоту из текста "XXX Hz"
+		try:
+			freq = int(text.split()[0])
+		except:
+			freq = 200
+		self.desired_freq = freq
+		# Для совместимости с существующим кодом сохраняем profile (используем 1 для всех частот)
+		self.desired_profile = 1
+		save_config(self.desired_profile, freq)  # сохраняем выбор
 		if self.stream is None:
-			self._set_status(f"Выбрана частота {200 if idx==0 else 300} Гц (нажмите 1 для запуска)")
+			self._set_status(f"Выбрана частота {freq} Гц (нажмите 1 для запуска)")
 			return
 		# Переключение на лету: остановим поток, отправим профиль и соответствующий NS и старт
 		try:
@@ -5861,24 +5921,30 @@ class ScopeWindow:
 					_t.sleep(0.1)
 				except Exception:
 					pass
-			# Явно задаём частоту блока под профиль
+			# Явно задаём частоту блока
 			try:
 				if hasattr(self.stream, 'set_block_rate'):
-					self.stream.set_block_rate(200 if self.desired_profile == 1 else 300)
-					try:
-						import time as _t
-						_t.sleep(0.1)
-					except Exception:
-						pass
-			except Exception:
-				pass
+					self.stream.set_block_rate(self.desired_freq)
+					print(f"[freq_change] Set block rate to {self.desired_freq} Hz via set_block_rate()")
+				else:
+					# Fallback: отправляем команду CMD_BLOCK_HZ (0x11) напрямую
+					import struct
+					self.stream.send_cmd(0x11, struct.pack('<H', self.desired_freq))
+					print(f"[freq_change] Set block rate to {self.desired_freq} Hz via CMD_BLOCK_HZ")
+				try:
+					import time as _t
+					_t.sleep(0.1)
+				except Exception:
+					pass
+			except Exception as e:
+				print(f"[freq_change] Failed to set frequency: {e}")
 			self.stream.send_cmd(CMD_START_STREAM, b"")
 			# Re-arm warmup after a profile switch and force RUN.
 			try:
 				self._det_reset_and_arm_warmup('freq_change')
 			except Exception:
 				pass
-			self._set_status(f"Переключена частота {200 if idx==0 else 300} Гц, ожидание данных…", hold_sec=1.5)
+			self._set_status(f"Переключена частота {self.desired_freq} Гц, ожидание данных…", hold_sec=1.5)
 			self.base_buf_len = None
 			self.base_buf_len_bytes = None
 			self.freq_hz = None
@@ -5931,6 +5997,35 @@ class ScopeWindow:
 				self._switch_to_avg_roi(new_n)
 		except Exception as e:
 			print(f"[AVG_ROI] Ошибка при применении avg_n={new_n}: {e}")
+
+	def _on_freq_change(self, text: str):
+		"""Handler for buffer frequency combo box (200-210 Hz)."""
+		try:
+			# Извлекаем число из строки "XXX Hz"
+			freq = int(text.split()[0])
+			
+			if not (200 <= freq <= 250):
+				self._set_status(f"Частота {freq} Гц вне диапазона 200-250 Гц", hold_sec=2.0)
+				return
+			
+			# Если stream не подключен, просто сохраняем значение
+			if self.stream is None:
+				self._set_status(f"Частота {freq} Гц будет установлена при подключении", hold_sec=2.0)
+				return
+			
+			# Отправляем команду на устройство
+			self.stream.set_buf_rate_fine(freq)
+			self._set_status(f"Частота буферов установлена: {freq} Гц", hold_sec=2.0)
+			
+			if bool(getattr(self, 'debug', False)):
+				print(f"[FREQ] Buffer rate set to {freq} Hz")
+				
+		except ValueError:
+			self._set_status(f"Неверный формат частоты: {text}", hold_sec=2.0)
+		except Exception as e:
+			self._set_status(f"Ошибка установки частоты: {e}", hold_sec=2.0)
+			if bool(getattr(self, 'debug', False)):
+				print(f"[FREQ] Error setting frequency: {e}")
 
 	def _on_close(self, ev):
 		try:

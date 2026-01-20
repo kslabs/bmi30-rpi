@@ -1180,6 +1180,26 @@ class USBStream:
         except Exception:
             pass
         print(f"[tx-err] cmd=0x{cmd:02X} failed after retries: {last_err}")
+    
+    def set_buf_rate_fine(self, hz: int):
+        """
+        Установить частоту следования буферов.
+        
+        Args:
+            hz: Целевая частота буферов (поддерживается 200-400 Гц)
+            
+        Raises:
+            ValueError: Если частота вне допустимого диапазона
+        """
+        if not (200 <= hz <= 400):
+            raise ValueError(f"Частота {hz} Гц вне диапазона 200-400 Гц")
+        
+        # CMD_SET_BUF_RATE_FINE = 0x1C
+        # Формат: [cmd, rate_hz[7:0], rate_hz[15:8]]
+        cmd = 0x1C
+        payload = bytes([hz & 0xFF, (hz >> 8) & 0xFF])
+        self.send_cmd(cmd, payload)
+    
     def _rx_loop(self):
         buf = bytearray()
         MAGIC_LE = b"\x5A\xA5"
