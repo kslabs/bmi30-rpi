@@ -266,25 +266,22 @@ except Exception as e1:  # pragma: no cover
 
 
 def save_config(desired_profile, desired_freq=None):
-    config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
-    try:
-        data = {"desired_profile": desired_profile}
-        if desired_freq is not None:
-            data["desired_freq"] = desired_freq
-        else:
-            # Загружаем существующую частоту если она есть
-            try:
-                if os.path.exists(config_file):
-                    with open(config_file, "r") as f:
-                        old_data = json.load(f) or {}
-                    if "desired_freq" in old_data:
-                        data["desired_freq"] = old_data["desired_freq"]
-            except Exception:
-                pass
-        with open(config_file, "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
+	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+	try:
+		data = {}
+		if os.path.exists(config_file):
+			try:
+				with open(config_file, "r") as f:
+					data = json.load(f) or {}
+			except Exception:
+				data = {}
+		data["desired_profile"] = desired_profile
+		if desired_freq is not None:
+			data["desired_freq"] = desired_freq
+		with open(config_file, "w") as f:
+			json.dump(data, f)
+	except Exception:
+		pass
 
 def load_config():
 	"""Load desired_profile from config file. Default=1."""
@@ -308,6 +305,38 @@ def load_freq():
 		return int(data.get("desired_freq", 200))
 	except Exception:
 		return 200
+
+def save_det_ratio(det_ratio: float):
+	"""Save detector ratio to config file (best-effort merge)."""
+	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+	try:
+		data = {}
+		if os.path.exists(config_file):
+			try:
+				with open(config_file, "r") as f:
+					data = json.load(f) or {}
+			except Exception:
+				data = {}
+		data["det_ratio"] = float(det_ratio)
+		with open(config_file, "w") as f:
+			json.dump(data, f)
+	except Exception:
+		pass
+
+def load_det_ratio() -> float:
+	"""Load detector ratio from config/env. Default=2.0."""
+	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+	try:
+		with open(config_file, "r") as f:
+			data = json.load(f) or {}
+		if "det_ratio" in data:
+			return float(data.get("det_ratio", 2.0))
+	except Exception:
+		pass
+	try:
+		return float(os.getenv("BMI30_DETECT_RATIO", "2.0"))
+	except Exception:
+		return 2.0
 
 def load_avg_n():
     """Load avg_n from config file (fallback 20)."""
@@ -460,6 +489,30 @@ class ScopeWindow:
 		self.freq_box.setToolTip("Частота следования буферов")
 		self.freq_box.currentTextChanged.connect(self._on_freq_change)
 		legend_bar.addWidget(self.freq_box, 0)
+		
+		# Выбор коэффициента срабатывания (det_ratio)
+		self.det_ratio_box = QtWidgets.QComboBox()
+		ratio_values = [round(1.5 + 0.1 * i, 1) for i in range(11)]
+		self.det_ratio_box.addItems([f"{v:.1f}" for v in ratio_values])
+		# Блокируем сигналы при установке начального значения
+		try:
+			self.det_ratio_box.blockSignals(True)
+		except Exception:
+			pass
+		# Устанавливаем текущий коэффициент (по умолчанию 2.0)
+		try:
+			cur_ratio = float(getattr(self, '_det_ratio', 2.0))
+		except Exception:
+			cur_ratio = 2.0
+		cur_ratio = max(1.5, min(2.5, round(cur_ratio, 1)))
+		self.det_ratio_box.setCurrentText(f"{cur_ratio:.1f}")
+		try:
+			self.det_ratio_box.blockSignals(False)
+		except Exception:
+			pass
+		self.det_ratio_box.setToolTip("Коэффициент срабатывания детектора (1.5–2.5)")
+		self.det_ratio_box.currentTextChanged.connect(self._on_det_ratio_change)
+		legend_bar.addWidget(self.det_ratio_box, 0)
 		
 		self.btn_reconnect = QtWidgets.QPushButton("↻")
 		self.btn_reconnect.setToolTip("Ручное переподключение к устройству")
@@ -1186,10 +1239,23 @@ class ScopeWindow:
 		self._beep_sweep_t0 = time.time()
 		# Detection parameters (u16 domain 0..65535)
 		try:
-			# Default is x2 threshold (can be overridden via env).
-			self._det_ratio = float(os.getenv("BMI30_DETECT_RATIO", "2.0"))
+			# Default is x2 threshold (can be overridden via config/env).
+			self._det_ratio = float(load_det_ratio())
 		except Exception:
 			self._det_ratio = 2.0
+		# Clamp to allowed UI range
+		try:
+			self._det_ratio = max(1.5, min(2.5, round(float(self._det_ratio), 1)))
+		except Exception:
+			self._det_ratio = 2.0
+		# If GUI already built, sync the combo box to the loaded value
+		try:
+			if getattr(self, 'det_ratio_box', None) is not None:
+				self.det_ratio_box.blockSignals(True)
+				self.det_ratio_box.setCurrentText(f"{self._det_ratio:.1f}")
+				self.det_ratio_box.blockSignals(False)
+		except Exception:
+			pass
 		try:
 			# Slightly longer default to avoid rapid re-trigger; does not block unfreeze while frozen.
 			self._det_cooldown_s = float(os.getenv("BMI30_DETECT_COOLDOWN", "1.0"))
@@ -1283,14 +1349,24 @@ class ScopeWindow:
 		self._capture_session = None  # dict with session metadata
 		self._capture_frames_recorded = 0
 		self._capture_post_countdown = 0
+		# capture de-duplication: only store new frames when seq/timestamp changes
+		self._capture_last_key = None
+		self._capture_last_record_key = None
+		self._capture_trigger_index = None
+		# post phase timing guard (finalize if no new frames for too long)
+		try:
+			self._capture_post_timeout_s = float(os.getenv('BMI30_CAPTURE_POST_TIMEOUT', '2.0'))
+		except Exception:
+			self._capture_post_timeout_s = 2.0
+		self._capture_post_started = 0.0
 		
-		# stream (ленивый запуск по кнопке 1)
+		# stream (ленивый запуск)
 		self.stream = None
 		self._connecting = False
 		self.usb_retry_timer = QtCore.QTimer()
 		self.usb_retry_timer.setInterval(1500)
 		self.usb_retry_timer.timeout.connect(self._try_connect)
-		self._set_status("Нажмите кнопку 1 для запуска потока (200 Гц по умолчанию)")
+		self._set_status("Поток запускается автоматически при выборе любой кнопки кроме 0")
 		# Сохраним порт info для power cycle без stream
 		self.last_port_info = None
 		# timer
@@ -1404,22 +1480,21 @@ class ScopeWindow:
 		except Exception:
 			_test_mode = False
 
-		# Автозапуск потока при старте приложения (по умолчанию включён)
+		# Восстановление режима и отправка параметров на устройство
 		try:
 			_autostart = str(os.getenv("BMI30_AUTOSTART", "1")).lower() not in ("0","false","no")
 		except Exception:
 			_autostart = True
-		if _autostart and not _test_mode:
-			# Автозапуск: запускаем тот режим, который выбран/восстановлен из bmi30_sel.json.
-			# Это важно, чтобы (например) sel=5 действительно включал AVG_ROI(20) без ручного клика.
+		if not _test_mode:
 			self.view_mode = 0
 			try:
 				idx = int(self.num_group.checkedId())
 			except Exception:
 				idx = 3
+			# Если выбран режим != 0 — применяем его и отправляем настройки
 			if idx != 0:
 				self._num_clicked(idx)
-				# also trigger extra handler (e.g., button 6 correlation) on autostart
+				# also trigger extra handler (e.g., button 6 correlation)
 				try:
 					self._on_num_clicked_extra(idx)
 				except Exception:
@@ -2216,11 +2291,31 @@ class ScopeWindow:
 		except Exception:
 			pass
 
+	def _capture_current_key(self):
+		"""Return a key that changes only when a new frame arrives."""
+		try:
+			se0 = getattr(self, 'seq0_even', None)
+			so0 = getattr(self, 'seq0_odd', None)
+			se1 = getattr(self, 'seq1_even', None)
+			so1 = getattr(self, 'seq1_odd', None)
+			lf = float(getattr(self, 'last_frame_t', 0.0) or 0.0)
+			if se0 is None and so0 is None and se1 is None and so1 is None and lf <= 0.0:
+				return None
+			return (se0, so0, se1, so1, lf)
+		except Exception:
+			return None
+
 	def _capture_push_frame(self):
 		"""Push current frame data to circular buffer (called from _tick after data update)."""
 		if not bool(getattr(self, '_auto_capture_enabled', False)):
 			return
 		try:
+			# Skip if no new frame since last push (prevents duplicate ticks)
+			cur_key = self._capture_current_key()
+			if cur_key is None:
+				return
+			if cur_key == getattr(self, '_capture_last_key', None):
+				return
 			with self.data_lock:
 				# Копируем корреляционные массивы (уже вычисленные в _xcorr_compute)
 				prod0_arr = None
@@ -2269,6 +2364,8 @@ class ScopeWindow:
 				max_size = int(getattr(self, '_capture_buffer_size', 50))
 				if len(self._capture_buffer) > max_size:
 					self._capture_buffer.pop(0)
+			# Mark last pushed key
+			self._capture_last_key = cur_key
 		except Exception as e:
 			if bool(getattr(self, 'debug', False)):
 				print(f"[CAPTURE] Error pushing frame: {e}", flush=True)
@@ -2299,6 +2396,7 @@ class ScopeWindow:
 					'stream_mode': getattr(self, 'stream_mode', 0),
 					'det_source': getattr(self, '_det_source', 'norm'),
 					'det_ratio': getattr(self, '_det_ratio', 2.0),
+					'pre_frames': int(getattr(self, '_capture_pre_frames', 30)),
 				}
 			}
 			# Copy PRE frames from circular buffer
@@ -2306,6 +2404,9 @@ class ScopeWindow:
 				pre_count = min(len(self._capture_buffer), int(getattr(self, '_capture_pre_frames', 30)))
 				if pre_count > 0:
 					self._capture_session['frames'].extend(self._capture_buffer[-pre_count:])
+			# Mark trigger index (frame after PRE)
+			self._capture_trigger_index = len(self._capture_session['frames'])
+			self._capture_last_record_key = None
 			self._capture_frames_recorded = len(self._capture_session['frames'])
 			self._capture_post_countdown = 0
 			self._capture_state = 'recording'
@@ -2314,22 +2415,29 @@ class ScopeWindow:
 			print(f"[CAPTURE] Error triggering session: {e}", flush=True)
 			self._capture_state = 'idle'
 
-	def _capture_record_frame(self):
+	def _capture_record_frame(self) -> bool:
 		"""Record current frame during active capture session (HOLD phase)."""
 		if not bool(getattr(self, '_auto_capture_enabled', False)):
-			return
+			return False
 		try:
 			state = str(getattr(self, '_capture_state', 'idle'))
-			if state != 'recording':
-				return
-			# Проверка: если достигли максимума фреймов, переходим в POST фазу
-			max_frames = int(getattr(self, '_capture_max_frames', 41))
-			current_count = len(self._capture_session.get('frames', []))
-			if current_count >= max_frames:
-				# Переходим в POST фазу (досрочно)
-				print(f"[CAPTURE] Max frames reached ({current_count}/{max_frames}), starting POST phase", flush=True)
-				self._capture_start_post()
-				return
+			if state not in ('recording', 'finalizing'):
+				return False
+			# Skip if no new frame since last record
+			cur_key = self._capture_current_key()
+			if cur_key is None:
+				return False
+			if cur_key == getattr(self, '_capture_last_record_key', None):
+				return False
+			# Проверка: если достигли максимума фреймов, переходим в POST фазу (только в recording)
+			if state == 'recording':
+				max_frames = int(getattr(self, '_capture_max_frames', 41))
+				current_count = len(self._capture_session.get('frames', []))
+				if current_count >= max_frames:
+					# Переходим в POST фазу (досрочно)
+					print(f"[CAPTURE] Max frames reached ({current_count}/{max_frames}), starting POST phase", flush=True)
+					self._capture_start_post()
+					return False
 			# Copy current frame (same as _capture_push_frame but directly to session)
 			with self.data_lock:
 				# Копируем корреляционные массивы (уже вычисленные в _xcorr_compute)
@@ -2374,9 +2482,12 @@ class ScopeWindow:
 			if hasattr(self, '_capture_session') and self._capture_session:
 				self._capture_session['frames'].append(frame)
 				self._capture_frames_recorded += 1
+				self._capture_last_record_key = cur_key
+				return True
 		except Exception as e:
 			if bool(getattr(self, 'debug', False)):
 				print(f"[CAPTURE] Error recording frame: {e}", flush=True)
+		return False
 
 	def _capture_start_post(self):
 		"""Start POST frame countdown (signal lost, capture last N frames)."""
@@ -2387,7 +2498,10 @@ class ScopeWindow:
 			if state != 'recording':
 				return
 			self._capture_state = 'finalizing'
-			self._capture_post_countdown = int(getattr(self, '_capture_post_frames', 10))
+			post_frames = int(getattr(self, '_capture_post_frames', 10))
+			# enforce at least 4 post frames
+			self._capture_post_countdown = max(4, post_frames)
+			self._capture_post_started = time.time()
 			print(f"\n*** [CAPTURE] → POST phase, countdown={self._capture_post_countdown} ***\n", flush=True)
 		except Exception as e:
 			if bool(getattr(self, 'debug', False)):
@@ -2507,6 +2621,8 @@ class ScopeWindow:
 			peak_value = float(getattr(self, '_capture_peak_value', 0.0))
 			# Trigger sample = PRE phase length (триггер случился перед началом HOLD)
 			trigger_sample = int(metadata.get('pre_frames', 0))
+			# Trigger frame index (first frame after PRE)
+			trigger_frame_index = int(getattr(self, '_capture_trigger_index', -1) or -1)
 			# Label state: 0=unknown, 1=labeled, 2=no-label
 			label_state = int(getattr(self, '_capture_label_state', 0))
 			np.savez_compressed(
@@ -2538,6 +2654,7 @@ class ScopeWindow:
 				# Metadata
 				n_frames=np.array([n_frames]),
 				trigger_sample=np.array([trigger_sample]),
+				trigger_frame_index=np.array([trigger_frame_index]),
 				peak_sample=np.array([peak_sample]),  # Номер сэмпла с пиком в prod массиве
 				peak_shift=np.array([peak_shift]),  # Фазовый сдвиг при котором найден пик
 				peak_value=np.array([peak_value]),  # Значение корреляции в точке пика
@@ -2692,11 +2809,30 @@ class ScopeWindow:
 			self._det_thr1 = int(lvl1)
 
 		ratio = float(getattr(self, '_det_ratio', 2.0))
+		# Clamp and quantize to [1.5..2.5] with 0.1 step
+		try:
+			ratio = float(min(2.5, max(1.5, ratio)))
+			ratio = round(ratio, 1)
+		except Exception:
+			ratio = 2.0
 
-		def _step_one(ch: int, lvl: int):
+		def _peak_idx(arr: np.ndarray) -> int:
+			try:
+				if arr is None or (not hasattr(arr, 'size')) or arr.size == 0:
+					return -1
+				with np.errstate(invalid='ignore'):
+					return int(np.nanargmax(np.abs(arr)))
+			except Exception:
+				return -1
+
+		peak0 = _peak_idx(prod0_arr)
+		peak1 = _peak_idx(prod1_arr)
+
+		def _step_one(ch: int, lvl: int, peak_idx: int):
 			thr_key = '_det_thr0' if ch == 0 else '_det_thr1'
 			ex_key = '_det_exceed0' if ch == 0 else '_det_exceed1'
 			hold_key = '_det_hold0' if ch == 0 else '_det_hold1'
+			peak_key = '_det_exceed_peak0' if ch == 0 else '_det_exceed_peak1'
 			seen_key = '_det_last_seen_t0' if ch == 0 else '_det_last_seen_t1'
 			present_key = '_det_last_present_t0' if ch == 0 else '_det_last_present_t1'
 			thr = int(getattr(self, thr_key, 1))
@@ -2727,8 +2863,8 @@ class ScopeWindow:
 			# Step sizes per user requirement:
 			# - detect: +4 / -1
 			# - no detect: +40 / -10
-			up = 4 if in_detect else 40
-			down = 1 if in_detect else 10
+			up = 5 if in_detect else 50
+			down = 1 if in_detect else 5
 			if int(lvl) > thr_prev:
 				thr_new = thr_prev + int(up)
 			else:
@@ -2738,12 +2874,30 @@ class ScopeWindow:
 			# Detect exceed vs previous threshold
 			exceed = bool(exceed_now)
 			cnt = int(getattr(self, ex_key, 0))
-			cnt = cnt + 1 if exceed else 0
+			if not exceed:
+				cnt = 0
+				setattr(self, peak_key, None)
+			else:
+				first_idx = getattr(self, peak_key, None)
+				if first_idx is None or cnt <= 0:
+					cnt = 1
+					setattr(self, peak_key, int(peak_idx))
+				else:
+					try:
+						if abs(int(peak_idx) - int(first_idx)) <= 20:
+							cnt += 1
+						else:
+							# shift window: treat current as first exceed
+							cnt = 1
+							setattr(self, peak_key, int(peak_idx))
+					except Exception:
+						cnt = 1
+						setattr(self, peak_key, int(peak_idx))
 			setattr(self, ex_key, cnt)
 			return bool(exceed)
 
-		ex0 = _step_one(0, lvl0)
-		ex1 = _step_one(1, lvl1)
+		ex0 = _step_one(0, lvl0, peak0)
+		ex1 = _step_one(1, lvl1, peak1)
 
 		fire0 = int(getattr(self, '_det_exceed0', 0)) >= 2
 		fire1 = int(getattr(self, '_det_exceed1', 0)) >= 2
@@ -2754,6 +2908,8 @@ class ScopeWindow:
 				try:
 					self._det_exceed0 = 0
 					self._det_exceed1 = 0
+					self._det_exceed_peak0 = None
+					self._det_exceed_peak1 = None
 					self._det_hold0 = False
 					self._det_hold1 = False
 					# Ensure we don't show/keep a frozen state during warmup.
@@ -3501,6 +3657,8 @@ class ScopeWindow:
 				self._det_hold1 = False
 				self._det_exceed0 = 0
 				self._det_exceed1 = 0
+				self._det_exceed_peak0 = None
+				self._det_exceed_peak1 = None
 				# Включаем адаптацию DC на устройстве
 				try:
 					self._device_set_dc_adapt(True)
@@ -3514,17 +3672,14 @@ class ScopeWindow:
 			self._phase_search_enabled = bool(int(idx) >= 6)
 		except Exception:
 			self._phase_search_enabled = False
+		# Если поток не запущен — перезапускаем на любой кнопке кроме 0
+		try:
+			if int(idx) != 0 and self.stream is None and not self._connecting:
+				self._activate_stream()
+		except Exception:
+			pass
 		if idx in (1, 2, 3):
 			mode_map = {1: 1, 2: 2, 3: 0}  # 1: канал 1, 2: канал 2, 3: оба
-			# Если поток не запущен - запустить его
-			if self.stream is None and not self._connecting:
-				self._activate_stream()
-				# Дать время на инициализацию
-				try:
-					import time as _t
-					_t.sleep(0.5)
-				except Exception:
-					pass
 			# Переключить в режим LATEST (600 семплов, STREAM_MODE=0)
 			if self.stream is not None:
 				self._switch_to_latest_mode()
@@ -3545,8 +3700,9 @@ class ScopeWindow:
 			self.avg20_enabled = False
 			# If already in STREAM_MODE=2, avoid full restart and update avg_n in-place
 			restart = not (getattr(self, 'stream_mode', 0) == 2 and self.stream is not None)
-			self._switch_to_avg_roi(avg_n=20, restart=restart)
-			self._set_status("AVG_ROI(20): усреднение на устройстве (DC handled by device)", hold_sec=3.0)
+			avg_n = int(getattr(self, 'avg_n', 20) or 20)
+			self._switch_to_avg_roi(avg_n=avg_n, restart=restart)
+			self._set_status(f"AVG_ROI({avg_n}): усреднение на устройстве (DC handled by device)", hold_sec=3.0)
 		elif idx == 6:
 			# Кнопка 6: не переключаем STREAM_MODE — включаем/выключаем корреляцию (overlay).
 			# Реальная корреляция управляется в `_on_num_clicked_extra` (подключена к клику кнопки).
@@ -3574,7 +3730,7 @@ class ScopeWindow:
 			self.view_len = 0
 			self.slider_start.setEnabled(False)
 			self.slider_len.setEnabled(False)
-			self._set_status("Поток остановлен (нажмите 1,2 или 3 для запуска)", hold_sec=2.0)
+			self._set_status("Поток остановлен", hold_sec=2.0)
 		if idx == 0:
 			try:
 				if os.path.exists(self.state_file):
@@ -4501,11 +4657,12 @@ class ScopeWindow:
 		# Обработка статуса подключения
 		if self.stream is None:
 			self._last_sample_ts = None
-			if self.num_group.checkedId() == 1:
+			if self.num_group.checkedId() != 0:
 				if not self._connecting:
 					self._set_status("Подключение…", hold_sec=1.5)
+					self._activate_stream()
 			else:
-				self._set_status("Нажмите кнопку 1 для запуска потока")
+				self._set_status("Поток остановлен")
 		
 		# Проверка disconnected (но продолжаем отображать данные)
 		if self.stream is not None and getattr(self.stream, 'disconnected', False):
@@ -4780,8 +4937,17 @@ class ScopeWindow:
 			# Handle POST phase countdown
 			if getattr(self, '_capture_state', 'idle') == 'finalizing':
 				if int(getattr(self, '_capture_post_countdown', 0)) > 0:
-					self._capture_post_countdown -= 1
-					self._capture_record_frame()
+					recorded = self._capture_record_frame()
+					if recorded:
+						self._capture_post_countdown -= 1
+					else:
+						# если новых кадров нет слишком долго — завершаем
+						try:
+							t0 = float(getattr(self, '_capture_post_started', 0.0) or 0.0)
+							if t0 > 0.0 and (time.time() - t0) >= float(getattr(self, '_capture_post_timeout_s', 2.0)):
+								self._capture_finalize()
+						except Exception:
+							pass
 				else:
 					# Finalize and save
 					self._capture_finalize()
@@ -5297,11 +5463,11 @@ class ScopeWindow:
 		self.view_start = 0
 		self.view_len = 0
 		self._reset_sliders()
-		if self.num_group.checkedId() == 1:
+		if self.num_group.checkedId() != 0:
 			self._set_status("Переподключение…", hold_sec=1.5)
 			self._activate_stream()
 		else:
-			self._set_status("Нажмите 1 для запуска")
+			self._set_status("Поток остановлен", hold_sec=1.5)
 
 	def _toggle_capture(self):
 		"""Переключение автозахвата осциллограмм."""
@@ -5774,7 +5940,7 @@ class ScopeWindow:
 			self._set_status(f"Power-cycle ошибка: {e}", hold_sec=3.0)
 
 	def _try_connect(self, first=False):
-		if self.num_group.checkedId() not in (1, 3):
+		if self.num_group.checkedId() == 0:
 			return
 		if self._connecting or self.stream is not None:
 			return
@@ -5813,6 +5979,11 @@ class ScopeWindow:
 					self._run_init_sequence()
 				except Exception as e_init:
 					print(f"[initseq] failed: {e_init}")
+			# Применим сохранённые параметры после подключения
+			try:
+				self._apply_saved_device_settings()
+			except Exception:
+				pass
 			self._set_status("Устройство подключено, ожидание данных…", hold_sec=1.5)
 			self.connect_t = time.time()
 			self.last_frame_t = 0
@@ -5879,6 +6050,41 @@ class ScopeWindow:
 			except Exception:
 				pass
 
+	def _apply_saved_device_settings(self):
+		"""Применить сохранённые параметры к устройству после подключения."""
+		if self.stream is None:
+			return
+		# Применим сохранённый режим (кнопки 1..6)
+		try:
+			idx = int(self.sel_saved or self.num_group.checkedId())
+		except Exception:
+			idx = None
+		if idx is not None and int(idx) != 0:
+			try:
+				self._num_clicked(int(idx))
+				try:
+					self._on_num_clicked_extra(int(idx))
+				except Exception:
+					pass
+			except Exception:
+				pass
+		# Применим сохранённую частоту
+		try:
+			freq = int(getattr(self, 'desired_freq', 0) or 0)
+		except Exception:
+			freq = 0
+		if freq:
+			try:
+				if hasattr(self.stream, 'set_buf_rate_fine'):
+					self.stream.set_buf_rate_fine(freq)
+				elif hasattr(self.stream, 'set_block_rate'):
+					self.stream.set_block_rate(freq)
+				else:
+					import struct
+					self.stream.send_cmd(0x11, struct.pack('<H', freq))
+			except Exception:
+				pass
+
 	def _on_freq_change(self, text:str):
 		# Парсим частоту из текста "XXX Hz"
 		try:
@@ -5892,77 +6098,19 @@ class ScopeWindow:
 		if self.stream is None:
 			self._set_status(f"Выбрана частота {freq} Гц (нажмите 1 для запуска)")
 			return
-		# Переключение на лету: остановим поток, отправим профиль и соответствующий NS и старт
+		# Переключение на лету: не роняем поток, только отправляем частоту
 		try:
-			# Остановим поток перед переключением
-			self.stream.send_cmd(CMD_STOP_STREAM, b"")
-			try:
-				import time as _t
-				_t.sleep(0.05)
-			except Exception:
-				pass
-			self.stream.send_cmd(CMD_SET_PROFILE, bytes([self.desired_profile]))
-			# небольшая пауза даёт прошивке переключить профиль
-			try:
-				import time as _t
-				_t.sleep(0.1)
-			except Exception:
-				pass
-			# SET_FRAME_SAMPLES — только профиль 2 и только если явно включено
-			if getattr(self, 'send_ns', False) and int(getattr(self, 'desired_profile', 2) or 2) == 2:
-				try:
-					from usb_vendor.usb_stream import CMD_SET_FRAME_SAMPLES  # type: ignore
-				except Exception:
-					CMD_SET_FRAME_SAMPLES = 0x17
-				ns = self.ns_map.get(self.desired_profile, self.initial_expected)
-				try:
-					self.stream.send_cmd(CMD_SET_FRAME_SAMPLES, int(ns).to_bytes(2,'little'))
-					import time as _t
-					_t.sleep(0.1)
-				except Exception:
-					pass
-			# Явно задаём частоту блока
-			try:
-				if hasattr(self.stream, 'set_block_rate'):
-					self.stream.set_block_rate(self.desired_freq)
-					print(f"[freq_change] Set block rate to {self.desired_freq} Hz via set_block_rate()")
-				else:
-					# Fallback: отправляем команду CMD_BLOCK_HZ (0x11) напрямую
-					import struct
-					self.stream.send_cmd(0x11, struct.pack('<H', self.desired_freq))
-					print(f"[freq_change] Set block rate to {self.desired_freq} Hz via CMD_BLOCK_HZ")
-				try:
-					import time as _t
-					_t.sleep(0.1)
-				except Exception:
-					pass
-			except Exception as e:
-				print(f"[freq_change] Failed to set frequency: {e}")
-			self.stream.send_cmd(CMD_START_STREAM, b"")
-			# Re-arm warmup after a profile switch and force RUN.
-			try:
-				self._det_reset_and_arm_warmup('freq_change')
-			except Exception:
-				pass
-			self._set_status(f"Переключена частота {self.desired_freq} Гц, ожидание данных…", hold_sec=1.5)
-			self.base_buf_len = None
-			self.base_buf_len_bytes = None
-			self.freq_hz = None
-			self.max_samples = 1200
-			self.data0 = np.zeros(self.max_samples, dtype=np.int16)
-			self.data1 = np.zeros(self.max_samples, dtype=np.int16)
-			self.data0_even = self.data0
-			self.data1_even = self.data1
-			self.data0_odd = np.zeros(self.max_samples, dtype=np.int16)
-			self.data1_odd = np.zeros(self.max_samples, dtype=np.int16)
-			self.timestamps = np.zeros(self.max_samples, dtype=np.float64)
-			self._last_sample_ts = None
-			self.view_len = self.max_samples
-			self.slider_start.setEnabled(False)
-			self.slider_len.setEnabled(False)
-			self.connect_t = time.time()
-			self.last_frame_t = 0
-			self.no_data_warned = False
+			if hasattr(self.stream, 'set_buf_rate_fine'):
+				self.stream.set_buf_rate_fine(self.desired_freq)
+				print(f"[freq_change] Set rate to {self.desired_freq} Hz via set_buf_rate_fine()")
+			elif hasattr(self.stream, 'set_block_rate'):
+				self.stream.set_block_rate(self.desired_freq)
+				print(f"[freq_change] Set block rate to {self.desired_freq} Hz via set_block_rate()")
+			else:
+				import struct
+				self.stream.send_cmd(0x11, struct.pack('<H', self.desired_freq))
+				print(f"[freq_change] Set block rate to {self.desired_freq} Hz via CMD_BLOCK_HZ")
+			self._set_status(f"Частота установлена: {self.desired_freq} Гц", hold_sec=1.5)
 		except Exception as e:
 			self._set_status(f"Ошибка смены частоты: {e}", hold_sec=2.0)
 
@@ -5976,56 +6124,39 @@ class ScopeWindow:
 		# save selection
 		save_avg_n(new_n)
 		self.avg_n = new_n
-		# If stream is not running, start and switch to AVG_ROI so setting takes effect
-		if self.stream is None:
-			self._set_status(f"Выбрано avg_n={new_n} (запускаю поток и переключаю AVG_ROI)", hold_sec=1.0)
-			try:
-				self._switch_to_avg_roi(new_n)
-			except Exception as e:
-				if bool(getattr(self, 'debug', False)):
-					print(f"[AVG_ROI] Не удалось автоматически переключить AVG_ROI: {e}")
-				self._set_status(f"Выбрано avg_n={new_n} (устройство не подключено)", hold_sec=2.0)
-				return
-		# If already in AVG_ROI, send only SET_STREAM_MODE with new avg_n; otherwise do full switch
+		# Если поток не подключен или режим не AVG_ROI — только сохраняем значение
+		if self.stream is None or getattr(self, 'stream_mode', 0) != 2:
+			self._set_status(f"Сохранено avg_n={new_n} (применится в режиме AVG_ROI)", hold_sec=1.5)
+			return
+		# Если уже в AVG_ROI, отправим новое значение avg_n
 		try:
-			if getattr(self, 'stream_mode', 0) == 2:
-				self.stream.send_cmd(CMD_SET_STREAM_MODE, bytes([0x02, new_n & 0xFF]))
-				self._set_status(f"Отправлен AVG_ROI avg_n={new_n}", hold_sec=2.0)
-				if bool(getattr(self, 'debug', False)):
-					print(f"[AVG_ROI] SET_STREAM_MODE=2 (avg_n={new_n}) отправлен по изменению меню")
-			else:
-				self._switch_to_avg_roi(new_n)
+			self.stream.send_cmd(CMD_SET_STREAM_MODE, bytes([0x02, new_n & 0xFF]))
+			self._set_status(f"Отправлен AVG_ROI avg_n={new_n}", hold_sec=2.0)
+			if bool(getattr(self, 'debug', False)):
+				print(f"[AVG_ROI] SET_STREAM_MODE=2 (avg_n={new_n}) отправлен по изменению меню")
 		except Exception as e:
-			print(f"[AVG_ROI] Ошибка при применении avg_n={new_n}: {e}")
+			if bool(getattr(self, 'debug', False)):
+				print(f"[AVG_ROI] Ошибка обработки avg_n={new_n}: {e}")
 
-	def _on_freq_change(self, text: str):
-		"""Handler for buffer frequency combo box (200-210 Hz)."""
+	def _on_det_ratio_change(self, text: str):
+		"""Handler for detector ratio combo box."""
 		try:
-			# Извлекаем число из строки "XXX Hz"
-			freq = int(text.split()[0])
-			
-			if not (200 <= freq <= 250):
-				self._set_status(f"Частота {freq} Гц вне диапазона 200-250 Гц", hold_sec=2.0)
-				return
-			
-			# Если stream не подключен, просто сохраняем значение
-			if self.stream is None:
-				self._set_status(f"Частота {freq} Гц будет установлена при подключении", hold_sec=2.0)
-				return
-			
-			# Отправляем команду на устройство
-			self.stream.set_buf_rate_fine(freq)
-			self._set_status(f"Частота буферов установлена: {freq} Гц", hold_sec=2.0)
-			
-			if bool(getattr(self, 'debug', False)):
-				print(f"[FREQ] Buffer rate set to {freq} Hz")
-				
-		except ValueError:
-			self._set_status(f"Неверный формат частоты: {text}", hold_sec=2.0)
-		except Exception as e:
-			self._set_status(f"Ошибка установки частоты: {e}", hold_sec=2.0)
-			if bool(getattr(self, 'debug', False)):
-				print(f"[FREQ] Error setting frequency: {e}")
+			val = float(str(text).strip())
+		except Exception:
+			val = 2.0
+		# clamp to allowed range and step
+		val = max(1.5, min(2.5, round(val, 1)))
+		self._det_ratio = val
+		try:
+			save_det_ratio(val)
+		except Exception:
+			pass
+		try:
+			self._set_status(f"Det ratio: {val:.1f}", hold_sec=1.0)
+		except Exception:
+			pass
+
+	# duplicate _on_freq_change removed
 
 	def _on_close(self, ev):
 		try:
