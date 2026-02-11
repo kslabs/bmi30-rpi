@@ -325,8 +325,8 @@ def load_freq():
 	except Exception:
 		return 200
 
-def save_det_ratio(det_ratio: float):
-	"""Save detector ratio to config file (best-effort merge)."""
+def save_det_params(det_ratio0: float, det_ratio1: float, det_add0: int, det_add1: int):
+	"""Save detector params to config file (best-effort merge)."""
 	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
 	try:
 		data = {}
@@ -336,7 +336,12 @@ def save_det_ratio(det_ratio: float):
 					data = json.load(f) or {}
 			except Exception:
 				data = {}
-		data["det_ratio"] = float(det_ratio)
+		data["det_ratio0"] = float(det_ratio0)
+		data["det_ratio1"] = float(det_ratio1)
+		data["det_add0"] = int(det_add0)
+		data["det_add1"] = int(det_add1)
+		# Backward-compat key (optional): keep det_ratio in sync with ADC1
+		data["det_ratio"] = float(det_ratio0)
 		with open(config_file, "w") as f:
 			json.dump(data, f)
 	except Exception:
@@ -356,6 +361,67 @@ def load_det_ratio() -> float:
 		return float(os.getenv("BMI30_DETECT_RATIO", "2.0"))
 	except Exception:
 		return 2.0
+
+def load_det_ratio_pair():
+	"""Load detector ratios for ADC1/ADC2. Default=load_det_ratio()."""
+	default_ratio = load_det_ratio()
+	r0 = default_ratio
+	r1 = default_ratio
+	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+	try:
+		with open(config_file, "r") as f:
+			data = json.load(f) or {}
+		if "det_ratio0" in data:
+			r0 = float(data.get("det_ratio0", r0))
+		if "det_ratio1" in data:
+			r1 = float(data.get("det_ratio1", r1))
+	except Exception:
+		pass
+	try:
+		env0 = os.getenv("BMI30_DETECT_RATIO0")
+		if env0 is not None:
+			r0 = float(env0)
+	except Exception:
+		pass
+	try:
+		env1 = os.getenv("BMI30_DETECT_RATIO1")
+		if env1 is not None:
+			r1 = float(env1)
+	except Exception:
+		pass
+	return r0, r1
+
+def load_det_add_pair():
+	"""Load detector additive offsets for ADC1/ADC2. Default=100."""
+	try:
+		default_add = int(float(os.getenv("BMI30_DETECT_ADD", "100")))
+	except Exception:
+		default_add = 100
+	a0 = default_add
+	a1 = default_add
+	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+	try:
+		with open(config_file, "r") as f:
+			data = json.load(f) or {}
+		if "det_add0" in data:
+			a0 = int(data.get("det_add0", a0))
+		if "det_add1" in data:
+			a1 = int(data.get("det_add1", a1))
+	except Exception:
+		pass
+	try:
+		env0 = os.getenv("BMI30_DETECT_ADD0")
+		if env0 is not None:
+			a0 = int(float(env0))
+	except Exception:
+		pass
+	try:
+		env1 = os.getenv("BMI30_DETECT_ADD1")
+		if env1 is not None:
+			a1 = int(float(env1))
+	except Exception:
+		pass
+	return a0, a1
 
 def load_avg_n():
     """Load avg_n from config file (fallback 20)."""
@@ -499,7 +565,6 @@ class ScopeWindow:
 		except Exception:
 			pass
 		self.avg_box.currentIndexChanged.connect(self._on_avg_change)
-		legend_bar.addWidget(self.avg_box, 0)
 		
 		# Выбор частоты буферов
 		self.freq_box = QtWidgets.QComboBox()
@@ -517,31 +582,101 @@ class ScopeWindow:
 			pass
 		self.freq_box.setToolTip("Частота следования буферов")
 		self.freq_box.currentTextChanged.connect(self._on_freq_change)
-		legend_bar.addWidget(self.freq_box, 0)
 		
-		# Выбор коэффициента срабатывания (det_ratio)
-		self.det_ratio_box = QtWidgets.QComboBox()
-		ratio_values = [round(1.1 + 0.1 * i, 1) for i in range(20)]
-		self.det_ratio_box.addItems([f"{v:.1f}" for v in ratio_values])
-		# Блокируем сигналы при установке начального значения
+		# Тип метки (3 позиции: Б/М/С) — заглушка, полная логика будет добавлена позже
 		try:
-			self.det_ratio_box.blockSignals(True)
+			self._mark_type_mode = int(os.getenv('BMI30_MARK_TYPE_MODE', '0'))
+		except Exception:
+			self._mark_type_mode = 0
+		try:
+			if self._mark_type_mode not in (0, 1, 2):
+				self._mark_type_mode = 0
+		except Exception:
+			self._mark_type_mode = 0
+		self.btn_mark_type = QtWidgets.QPushButton(["Б", "М", "С"][self._mark_type_mode])
+		self.btn_mark_type.setToolTip("Тип метки: Б/М/С")
+		try:
+			self.btn_mark_type.setFixedSize(32, 21)
 		except Exception:
 			pass
-		# Устанавливаем текущий коэффициент (по умолчанию 2.0)
+		self.btn_mark_type.clicked.connect(self._cycle_mark_type)
+		
+		# Количество детектирования (3 позиции: 1/2/3) — заглушка
 		try:
-			cur_ratio = float(getattr(self, '_det_ratio', 2.0))
+			self._det_count = int(os.getenv('BMI30_DET_COUNT', '1'))
 		except Exception:
-			cur_ratio = 2.0
-		cur_ratio = max(1.1, min(3.0, round(cur_ratio, 1)))
-		self.det_ratio_box.setCurrentText(f"{cur_ratio:.1f}")
+			self._det_count = 1
 		try:
-			self.det_ratio_box.blockSignals(False)
+			if self._det_count not in (1, 2, 3):
+				self._det_count = 1
+		except Exception:
+			self._det_count = 1
+		self.btn_det_count = QtWidgets.QPushButton(str(self._det_count))
+		self.btn_det_count.setToolTip("Количество детектирования: 1/2/3")
+		try:
+			self.btn_det_count.setFixedSize(32, 21)
 		except Exception:
 			pass
-		self.det_ratio_box.setToolTip("Коэффициент срабатывания детектора (1.1–3.0)")
-		self.det_ratio_box.currentTextChanged.connect(self._on_det_ratio_change)
-		legend_bar.addWidget(self.det_ratio_box, 0)
+		self.btn_det_count.clicked.connect(self._cycle_det_count)
+		
+		# Коэффициенты срабатывания (det_ratio) и добавочный порог (det_add) по ADC
+		ratio_values = [round(1.0 + 0.1 * i, 1) for i in range(21)]
+		add_values = [str(v) for v in range(0, 701, 100)]
+		self.det_ratio_box0 = QtWidgets.QComboBox()
+		self.det_ratio_box1 = QtWidgets.QComboBox()
+		self.det_add_box0 = QtWidgets.QComboBox()
+		self.det_add_box1 = QtWidgets.QComboBox()
+		for _box in (self.det_ratio_box0, self.det_ratio_box1):
+			_box.addItems([f"{v:.1f}" for v in ratio_values])
+		for _box in (self.det_add_box0, self.det_add_box1):
+			_box.addItems(add_values)
+		# Блокируем сигналы при установке начальных значений
+		try:
+			self.det_ratio_box0.blockSignals(True)
+			self.det_ratio_box1.blockSignals(True)
+			self.det_add_box0.blockSignals(True)
+			self.det_add_box1.blockSignals(True)
+		except Exception:
+			pass
+		try:
+			cur_ratio0 = float(getattr(self, '_det_ratio0', 2.0))
+		except Exception:
+			cur_ratio0 = 2.0
+		try:
+			cur_ratio1 = float(getattr(self, '_det_ratio1', 2.0))
+		except Exception:
+			cur_ratio1 = 2.0
+		cur_ratio0 = max(1.0, min(3.0, round(cur_ratio0, 1)))
+		cur_ratio1 = max(1.0, min(3.0, round(cur_ratio1, 1)))
+		self.det_ratio_box0.setCurrentText(f"{cur_ratio0:.1f}")
+		self.det_ratio_box1.setCurrentText(f"{cur_ratio1:.1f}")
+		try:
+			cur_add0 = int(getattr(self, '_det_add0', 100))
+		except Exception:
+			cur_add0 = 100
+		try:
+			cur_add1 = int(getattr(self, '_det_add1', 100))
+		except Exception:
+			cur_add1 = 100
+		cur_add0 = max(0, min(700, int(round(cur_add0 / 100.0) * 100)))
+		cur_add1 = max(0, min(700, int(round(cur_add1 / 100.0) * 100)))
+		self.det_add_box0.setCurrentText(str(cur_add0))
+		self.det_add_box1.setCurrentText(str(cur_add1))
+		try:
+			self.det_ratio_box0.blockSignals(False)
+			self.det_ratio_box1.blockSignals(False)
+			self.det_add_box0.blockSignals(False)
+			self.det_add_box1.blockSignals(False)
+		except Exception:
+			pass
+		self.det_ratio_box0.setToolTip("ADC1: коэффициент срабатывания (1.0–3.0)")
+		self.det_ratio_box1.setToolTip("ADC2: коэффициент срабатывания (1.0–3.0)")
+		self.det_add_box0.setToolTip("ADC1: добавочный порог (100–700)")
+		self.det_add_box1.setToolTip("ADC2: добавочный порог (100–700)")
+		self.det_ratio_box0.currentTextChanged.connect(lambda text, ch=0: self._on_det_ratio_change(text, ch))
+		self.det_ratio_box1.currentTextChanged.connect(lambda text, ch=1: self._on_det_ratio_change(text, ch))
+		self.det_add_box0.currentTextChanged.connect(lambda text, ch=0: self._on_det_add_change(text, ch))
+		self.det_add_box1.currentTextChanged.connect(lambda text, ch=1: self._on_det_add_change(text, ch))
 		
 		self.btn_reconnect = QtWidgets.QPushButton("↻")
 		self.btn_reconnect.setToolTip("Ручное переподключение к устройству")
@@ -552,7 +687,6 @@ class ScopeWindow:
 				_btn.setFixedSize(21, 21)
 			except Exception:
 				pass
-		legend_bar.addWidget(self.btn_reconnect, 0)
 		# Кнопка перезапитки USB-порта (через uhubctl)
 		self.btn_power = QtWidgets.QPushButton("⚡")
 		self.btn_power.setToolTip("Сбросить адаптацию порога (ускорить стартовую подстройку)")
@@ -567,7 +701,6 @@ class ScopeWindow:
 			self.btn_power.customContextMenuRequested.connect(self._copy_legend_from_btn)
 		except Exception:
 			pass
-		legend_bar.addWidget(self.btn_power, 0)
 		# Кнопка автозахвата осциллограмм
 		self.btn_capture = QtWidgets.QPushButton("⏺")
 		self.btn_capture.setToolTip("Автозахват осциллограмм при срабатывании детектора")
@@ -579,7 +712,6 @@ class ScopeWindow:
 		except Exception:
 			pass
 		self._update_capture_btn_style()
-		legend_bar.addWidget(self.btn_capture, 0)
 		# Кнопка переключения метки (3 состояния: неизвестно / с меткой / без метки)
 		self.btn_label = QtWidgets.QPushButton("?")
 		self.btn_label.setToolTip("Метка сигнала: ? = неизвестно, ✓ = с меткой, ✗ = без метки")
@@ -589,7 +721,6 @@ class ScopeWindow:
 		except Exception:
 			pass
 		self._update_label_btn_style()
-		legend_bar.addWidget(self.btn_label, 0)
 		# Кнопка диагностики и мягкого рестарта
 		# Диагностика: делаем кнопку переключаемой и используем её для
 		# включения/выключения DC-вычитания (фиксация состояния).
@@ -611,7 +742,6 @@ class ScopeWindow:
 			self._on_toggle_xcorr_norm(bool(self.xcorr_norm_enabled))
 		except Exception:
 			pass
-		legend_bar.addWidget(self.btn_diag, 0)
 		# Кнопка принудительного включения PWM (GPIO12) для проверки выхода ("динамик").
 		# Не зависит от детекции. По умолчанию выключена.
 		self.btn_pwm = QtWidgets.QPushButton("♪")
@@ -624,7 +754,6 @@ class ScopeWindow:
 		self._beep_force_mode = 0
 		self._update_pwm_btn_style()
 		self.btn_pwm.clicked.connect(self._on_toggle_force_pwm)
-		legend_bar.addWidget(self.btn_pwm, 0)
 		# Кнопка коммутации ADC (1/2/оба)
 		self.btn_sync = QtWidgets.QPushButton("")
 		self.btn_sync.setToolTip("ADC: 1/2/1+2")
@@ -655,7 +784,6 @@ class ScopeWindow:
 			self._btn_sync_s = None
 		self.btn_sync.clicked.connect(self._cycle_sync_mode)
 		self._update_sync_btn_style()
-		legend_bar.addWidget(self.btn_sync, 0)
 		# Кнопка передачи (TIM2 enable)
 		self.tim2_enabled = str(os.getenv("BMI30_TIM2_ENABLE", "1")).lower() not in ("0", "false", "no")
 		self.btn_tim2 = QtWidgets.QPushButton("TX")
@@ -671,7 +799,45 @@ class ScopeWindow:
 			pass
 		self.btn_tim2.toggled.connect(self._on_toggle_tim2)
 		self._update_tim2_btn_style()
-		legend_bar.addWidget(self.btn_tim2, 0)
+		
+		# --- Компоновка кнопок/переключателей в 2 ряда, прижато вправо ---
+		ctrl_box = QtWidgets.QWidget()
+		ctrl_v = QtWidgets.QVBoxLayout(ctrl_box)
+		ctrl_v.setContentsMargins(0, 0, 0, 0)
+		ctrl_v.setSpacing(2)
+		top_row = QtWidgets.QHBoxLayout()
+		top_row.setContentsMargins(0, 0, 0, 0)
+		top_row.setSpacing(4)
+		bot_row = QtWidgets.QHBoxLayout()
+		bot_row.setContentsMargins(0, 0, 0, 0)
+		bot_row.setSpacing(4)
+		# прижать содержимое рядов к правому краю
+		top_row.addStretch(1)
+		bot_row.addStretch(1)
+		# Порядок задан пользователем справа→налево; здесь добавляем слева→направо
+		# Верхний ряд: Тип метки, Частота, ADC1 коэффициент, ADC1 добавочный,
+		#             Ручное переподключение, Автозахват, Нормализация, TX
+		top_row.addWidget(self.btn_mark_type, 0)
+		top_row.addWidget(self.freq_box, 0)
+		top_row.addWidget(self.det_ratio_box0, 0)
+		top_row.addWidget(self.det_add_box0, 0)
+		top_row.addWidget(self.btn_reconnect, 0)
+		top_row.addWidget(self.btn_capture, 0)
+		top_row.addWidget(self.btn_diag, 0)
+		top_row.addWidget(self.btn_tim2, 0)
+		# Нижний ряд: Кол-во детектирования, Кол-во буферов среднего, ADC2 коэффициент,
+		#             ADC2 добавочный, Сброс адаптации, Метка сигнала, Нотка, 1/2
+		bot_row.addWidget(self.btn_det_count, 0)
+		bot_row.addWidget(self.avg_box, 0)
+		bot_row.addWidget(self.det_ratio_box1, 0)
+		bot_row.addWidget(self.det_add_box1, 0)
+		bot_row.addWidget(self.btn_power, 0)
+		bot_row.addWidget(self.btn_label, 0)
+		bot_row.addWidget(self.btn_pwm, 0)
+		bot_row.addWidget(self.btn_sync, 0)
+		ctrl_v.addLayout(top_row)
+		ctrl_v.addLayout(bot_row)
+		legend_bar.addWidget(ctrl_box, 0)
 		layout.addLayout(legend_bar)
 		# plots
 		self.plotw = pg.GraphicsLayoutWidget()
@@ -1334,20 +1500,44 @@ class ScopeWindow:
 		# Detection parameters (u16 domain 0..65535)
 		try:
 			# Default is x2 threshold (can be overridden via config/env).
-			self._det_ratio = float(load_det_ratio())
+			r0, r1 = load_det_ratio_pair()
 		except Exception:
-			self._det_ratio = 2.0
+			r0, r1 = 2.0, 2.0
+		try:
+			a0, a1 = load_det_add_pair()
+		except Exception:
+			a0, a1 = 100, 100
 		# Clamp to allowed UI range
 		try:
-			self._det_ratio = max(1.1, min(3.0, round(float(self._det_ratio), 1)))
+			self._det_ratio0 = max(1.0, min(3.0, round(float(r0), 1)))
+			self._det_ratio1 = max(1.0, min(3.0, round(float(r1), 1)))
 		except Exception:
-			self._det_ratio = 2.0
-		# If GUI already built, sync the combo box to the loaded value
+			self._det_ratio0 = 2.0
+			self._det_ratio1 = 2.0
 		try:
-			if getattr(self, 'det_ratio_box', None) is not None:
-				self.det_ratio_box.blockSignals(True)
-				self.det_ratio_box.setCurrentText(f"{self._det_ratio:.1f}")
-				self.det_ratio_box.blockSignals(False)
+			self._det_add0 = max(100, min(700, int(round(float(a0) / 100.0) * 100)))
+			self._det_add1 = max(100, min(700, int(round(float(a1) / 100.0) * 100)))
+		except Exception:
+			self._det_add0 = 100
+			self._det_add1 = 100
+		# If GUI already built, sync the combo boxes to the loaded values
+		try:
+			if getattr(self, 'det_ratio_box0', None) is not None:
+				self.det_ratio_box0.blockSignals(True)
+				self.det_ratio_box0.setCurrentText(f"{self._det_ratio0:.1f}")
+				self.det_ratio_box0.blockSignals(False)
+			if getattr(self, 'det_ratio_box1', None) is not None:
+				self.det_ratio_box1.blockSignals(True)
+				self.det_ratio_box1.setCurrentText(f"{self._det_ratio1:.1f}")
+				self.det_ratio_box1.blockSignals(False)
+			if getattr(self, 'det_add_box0', None) is not None:
+				self.det_add_box0.blockSignals(True)
+				self.det_add_box0.setCurrentText(str(self._det_add0))
+				self.det_add_box0.blockSignals(False)
+			if getattr(self, 'det_add_box1', None) is not None:
+				self.det_add_box1.blockSignals(True)
+				self.det_add_box1.setCurrentText(str(self._det_add1))
+				self.det_add_box1.blockSignals(False)
 		except Exception:
 			pass
 		try:
@@ -1489,6 +1679,18 @@ class ScopeWindow:
 		# авто-кик при зависании
 		self.auto_soft_kick = str(os.getenv("BMI30_AUTO_SOFT_KICK", "1")).lower() not in ("0","false","no")
 		self.last_soft_kick_t = 0.0
+		# авто-сброс STM32 при пропаже потока
+		self.auto_reset_on_stall = str(os.getenv("BMI30_AUTO_RESET_ON_STALL", "1")).lower() not in ("0","false","no")
+		try:
+			self.stall_reset_after = float(os.getenv("BMI30_STALL_RESET_AFTER", "15"))
+		except Exception:
+			self.stall_reset_after = 15.0
+		try:
+			self.stall_reset_cooldown = float(os.getenv("BMI30_STALL_RESET_COOLDOWN", "30"))
+		except Exception:
+			self.stall_reset_cooldown = 30.0
+		self._stall_reset_last_t = 0.0
+		self._stall_reset_inflight = False
 		# Флаг: поток остановлен пользователем (не выполнять автопинки)
 		self._stream_user_stopped = False
 		# нижняя панель: слева слайдеры, справа цифровые кнопки
@@ -2683,7 +2885,11 @@ class ScopeWindow:
 					'avg_n': getattr(self, 'avg_n', 20),
 					'stream_mode': getattr(self, 'stream_mode', 0),
 					'det_source': getattr(self, '_det_source', 'norm'),
-					'det_ratio': getattr(self, '_det_ratio', 2.0),
+					'det_ratio': getattr(self, '_det_ratio0', 2.0),
+					'det_ratio0': getattr(self, '_det_ratio0', 2.0),
+					'det_ratio1': getattr(self, '_det_ratio1', 2.0),
+					'det_add0': getattr(self, '_det_add0', 100),
+					'det_add1': getattr(self, '_det_add1', 100),
 					'pre_frames': int(getattr(self, '_capture_pre_frames', 30)),
 				}
 			}
@@ -2956,6 +3162,10 @@ class ScopeWindow:
 				stream_mode=np.array([metadata.get('stream_mode', 0)]),
 				det_source=np.array([metadata.get('det_source', 'norm')], dtype='U16'),
 				det_ratio=np.array([metadata.get('det_ratio', 2.0)]),
+				det_ratio0=np.array([metadata.get('det_ratio0', 2.0)]),
+				det_ratio1=np.array([metadata.get('det_ratio1', 2.0)]),
+				det_add0=np.array([metadata.get('det_add0', 100)]),
+				det_add1=np.array([metadata.get('det_add1', 100)]),
 			)
 			
 			print(f"[CAPTURE] Saved {n_frames} frames to {filepath}", flush=True)
@@ -3109,14 +3319,6 @@ class ScopeWindow:
 		if int(getattr(self, '_det_thr1', 0)) <= 0 and lvl1 > 0:
 			self._det_thr1 = int(lvl1)
 
-		ratio = float(getattr(self, '_det_ratio', 2.0))
-		# Clamp and quantize to [1.1..3.0] with 0.1 step
-		try:
-			ratio = float(min(3.0, max(1.1, ratio)))
-			ratio = round(ratio, 1)
-		except Exception:
-			ratio = 2.0
-
 		def _peak_idx(arr: np.ndarray) -> int:
 			try:
 				if arr is None or (not hasattr(arr, 'size')) or arr.size == 0:
@@ -3156,17 +3358,36 @@ class ScopeWindow:
 				pass
 			if float(lvl) >= loss_ratio * float(base_thr):
 				setattr(self, present_key, _now)
+			# Per-channel ratio/add with UI constraints
+			try:
+				ratio = float(getattr(self, '_det_ratio0' if ch == 0 else '_det_ratio1', 2.0))
+			except Exception:
+				ratio = 2.0
+			try:
+				ratio = float(min(3.0, max(1.0, ratio)))
+				ratio = round(ratio, 1)
+			except Exception:
+				ratio = 2.0
+			try:
+				add = int(getattr(self, '_det_add0' if ch == 0 else '_det_add1', 100))
+			except Exception:
+				add = 100
+			try:
+				add = int(round(float(add) / 100.0) * 100)
+			except Exception:
+				add = 100
+			add = max(0, min(700, int(add)))
 			# Decide whether we currently have "detection":
 			# - HOLD means we previously fired and are still in detected/present state.
-			# - exceed_now means current level is above ratio*threshold.
-			exceed_now = (float(lvl) > ratio * float(thr_prev))
+			# - exceed_now means current level is above ratio*threshold + add.
+			exceed_now = (float(lvl) > (ratio * float(thr_prev) + float(add)))
 			in_detect = bool(getattr(self, hold_key, False)) or bool(exceed_now)
 			# Step sizes per user requirement:
 			# - detect: +4 / -1
 			# - no detect: +40 / -10
 			# Во время прогрева/быстрого сброса умножаем шаги для ускорения адаптации.
-			up = (5 if in_detect else 50) * step_mul
-			down = (1 if in_detect else 5) * step_mul
+			up = (5 if in_detect else 200) * step_mul
+			down = (1 if in_detect else 10) * step_mul
 			if int(lvl) > thr_prev:
 				thr_new = thr_prev + int(up)
 			else:
@@ -3552,7 +3773,8 @@ class ScopeWindow:
 			self._mode_switch_in_progress = False
 
 	def _switch_to_lossless_roi(self, restart: bool = True):
-		"""Переключение в режим LOSSLESS_ROI (STREAM_MODE=1): строгий FIFO, ROI 280..480 (200 семплов)
+		"""Переключение в режим LOSSLESS_ROI (STREAM_MODE=1): строгий FIFO, ROI 200 семплов.
+		Старт ROI зависит от "тип метки" (Б/M/С) и вычисляется в _get_mark_type_roi_window().
 		Если `restart`=False и уже в STREAM_MODE=1, не перезапускаем поток/окна — только переключаем отображение/статус.
 		"""
 		# If caller requested no restart and already in desired mode, do light update only
@@ -3601,13 +3823,14 @@ class ScopeWindow:
 			if bool(getattr(self, 'debug', False)):
 				print("[LOSSLESS_ROI] STOP отправлен")
 			
-			# SET_WINDOWS: start0=280, len0=200, start1=0, len1=0 (только канал A)
+			roi_start, roi_len = self._get_mark_type_roi_window()
+			# SET_WINDOWS: одинаковое ROI для обоих каналов
 			# Формат: u16 start0 + u16 len0 + u16 start1 + u16 len1 (little-endian)
-			windows_data = struct.pack('<HHHH', 280, 200, 0, 0)
+			windows_data, sent_len = self._pack_set_windows_start(int(roi_start) & 0xFFFF, default_len=int(roi_len))
 			self.stream.send_cmd(CMD_SET_WINDOWS, windows_data)
 			time.sleep(0.02)
 			if bool(getattr(self, 'debug', False)):
-				print("[LOSSLESS_ROI] SET_WINDOWS(280, 200, 0, 0) отправлен")
+				print(f"[LOSSLESS_ROI] SET_WINDOWS(start={int(roi_start)}, len={int(sent_len)}) отправлен")
 			
 			# SET_STREAM_MODE: 1 (LOSSLESS_ROI)
 			self.stream.send_cmd(CMD_SET_STREAM_MODE, b"\x01")
@@ -3649,9 +3872,9 @@ class ScopeWindow:
 			if bool(getattr(self, 'debug', False)):
 				print("[LOSSLESS_ROI] GUI снижен до 5 FPS для минимизации блокировок")
 			
-			self._set_status("LOSSLESS_ROI: 2 канала × 2 осциллограммы × 200 семплов", hold_sec=3.0)
+			self._set_status(f"LOSSLESS_ROI: ROI={int(roi_len)} start={int(roi_start)} (тип метки)", hold_sec=3.0)
 			if bool(getattr(self, 'debug', False)):
-				print("[LOSSLESS_ROI] Режим активирован: ROI 280..480, 200 семплов, 2 канала по 2 кривых, без пропусков")
+				print(f"[LOSSLESS_ROI] Режим активирован: ROI start={int(roi_start)} len={int(roi_len)}")
 			
 		except Exception as e:
 			print(f"[LOSSLESS_ROI] Ошибка переключения: {e}")
@@ -3760,12 +3983,13 @@ class ScopeWindow:
 			if bool(getattr(self, 'debug', False)):
 				print("[AVG_ROI] STOP отправлен")
 
-			# SET_WINDOWS: both channels ROI 280..479 (200)
-			windows_data = struct.pack('<HHHH', 280, 200, 280, 200)
+			roi_start, _roi_len = self._get_mark_type_roi_window()
+			# SET_WINDOWS: both channels ROI with same start/len
+			windows_data, sent_len = self._pack_set_windows_start(int(roi_start) & 0xFFFF, default_len=int(_roi_len))
 			self.stream.send_cmd(CMD_SET_WINDOWS, windows_data)
 			time.sleep(0.02)
 			if bool(getattr(self, 'debug', False)):
-				print("[AVG_ROI] SET_WINDOWS(280,200, 280,200) отправлен")
+				print(f"[AVG_ROI] SET_WINDOWS(start={int(roi_start)}, len={int(sent_len)}) отправлен")
 
 			# SET_STREAM_MODE: 2 (AVG_ROI) + avg_n
 			self.stream.send_cmd(CMD_SET_STREAM_MODE, bytes([0x02, avg_n & 0xFF]))
@@ -3798,7 +4022,7 @@ class ScopeWindow:
 			self._set_view_mode(0)
 			self.stream_mode = 2
 			self.qtimer.setInterval(200)
-			self._set_status(f"AVG_ROI: усреднение на устройстве avg_n={avg_n}, ROI=200", hold_sec=3.0)
+			self._set_status(f"AVG_ROI: avg_n={avg_n}, ROI={int(roi_len)} start={int(roi_start)} (тип метки)", hold_sec=3.0)
 			if bool(getattr(self, 'debug', False)):
 				print("[AVG_ROI] Режим активирован")
 		except Exception as e:
@@ -5282,6 +5506,13 @@ class ScopeWindow:
 			else:
 				self._set_status(f"Нет приёма данных >{int(self.stop_warn_after)}с. Возможно устройство перестало слать. " + self._instr, hold_sec=4.0)
 			self.last_diag_t = now2
+			# Авто-сброс STM32 при полном отсутствии трафика
+			try:
+				rx_t = float(getattr(self.stream, 'last_rx_t', 0.0) or 0.0)
+				if rx_t > 0:
+					self._maybe_auto_reset_on_stall("нет приёма", now2 - rx_t)
+			except Exception:
+				pass
 		elif self.stream and self.base_buf_len is not None and (now2 - self.last_frame_t) > self.stop_warn_after and (now2 - self.last_diag_t) > self.diag_interval:
 			# Приём идёт, но нет новых стереопар (например, рассинхрон A/B)
 			if self.diag_to_console:
@@ -5289,6 +5520,11 @@ class ScopeWindow:
 			else:
 				self._set_status(f"Нет новых стереопар >{int(self.stop_warn_after)}с (приём идёт). Проверьте A/B и seq. Нажмите ↻ для переподключения.", hold_sec=3.0)
 			self.last_diag_t = now2
+			# Авто-сброс STM32 при зависшем потоке (нет новых кадров)
+			try:
+				self._maybe_auto_reset_on_stall("нет новых кадров", now2 - float(self.last_frame_t))
+			except Exception:
+				pass
 			# Попробуем мягко пнуть поток (без STOP), но не чаще чем раз в diag_interval
 			if (not bool(getattr(self, '_stream_user_stopped', False))) and self.auto_soft_kick and (now2 - self.last_soft_kick_t) > max(2.0, self.diag_interval):
 				try:
@@ -6030,6 +6266,137 @@ class ScopeWindow:
 		labels = ["неизвестно", "с меткой", "без метки"]
 		self._set_status(f"Метка: {labels[self._capture_label_state]}", hold_sec=1.5)
 	
+	def _cycle_mark_type(self):
+		"""Тип метки: 3 позиции Б/М/С (временная заглушка)."""
+		try:
+			self._mark_type_mode = (int(getattr(self, '_mark_type_mode', 0)) + 1) % 3
+		except Exception:
+			self._mark_type_mode = 0
+		modes = ["Б", "М", "С"]
+		try:
+			self.btn_mark_type.setText(modes[int(self._mark_type_mode)])
+		except Exception:
+			pass
+		# Покажем вычисленный ROI старт в статусе, чтобы сразу видеть что хост пытается сделать
+		try:
+			roi_start, roi_len = self._get_mark_type_roi_window()
+			sm = int(getattr(self, 'stream_mode', 0) or 0)
+			self._set_status(f"Тип метки: {modes[int(self._mark_type_mode)]} | ROI start={int(roi_start)} len={int(roi_len)} | mode={sm}", hold_sec=2.0)
+		except Exception:
+			try:
+				self._set_status(f"Тип метки: {modes[int(self._mark_type_mode)]}", hold_sec=1.5)
+			except Exception:
+				pass
+		# По ТЗ: устройство всегда формирует рабочую зону 200 семплов само,
+		# а хост указывает только старт этой зоны. Поэтому при смене Б/М/С
+		# отправляем новый старт на устройство (без STOP/START).
+		try:
+			self._send_mark_type_roi_start_to_device()
+		except Exception:
+			pass
+
+	def _get_mark_type_roi_window(self) -> tuple[int, int]:
+		"""Вернуть (start, len) ROI на устройстве по текущему типу метки.
+
+		Требование: длина ROI всегда фиксирована (200) и формируется устройством, меняется только старт.
+		Б: сдвиг вправо на +50, М: влево на -50, С: без сдвига.
+		"""
+		# Базовые значения "как сейчас" (можно менять через env без правки кода)
+		try:
+			base_start = int(os.getenv('BMI30_ROI_BASE_START', '280'))
+		except Exception:
+			base_start = 280
+		try:
+			roi_len = int(os.getenv('BMI30_ROI_LEN', '200'))
+		except Exception:
+			roi_len = 200
+		# Полная длина буфера для расчёта границ (по ТЗ сейчас 600)
+		try:
+			full_len = int(os.getenv('BMI30_FULL_LEN', '600'))
+		except Exception:
+			full_len = 600
+		try:
+			mt = int(getattr(self, '_mark_type_mode', 2))
+		except Exception:
+			mt = 2
+		# 0=Б, 1=М, 2=С
+		if mt == 0:
+			offset = 50
+		elif mt == 1:
+			offset = -50
+		else:
+			offset = 0
+		start = int(base_start + offset)
+		# Безопасное ограничение старта, чтобы окно не вылезало за пределы
+		try:
+			max_start = max(0, int(full_len) - int(roi_len))
+		except Exception:
+			max_start = 0
+		start = max(0, min(start, max_start))
+		return start, int(roi_len)
+
+	def _send_mark_type_roi_start_to_device(self):
+		"""Отправить на устройство параметры рабочей зоны (ROI) под текущий тип метки.
+
+		Дефолт: отправляем (start,len) из _get_mark_type_roi_window() (обычно len=200).
+		Если нужно переопределить len (в т.ч. поставить 0), задай env `BMI30_SET_WINDOWS_LEN`.
+		"""
+		if self.stream is None:
+			return
+		roi_start, roi_len = self._get_mark_type_roi_window()
+		start = int(roi_start) & 0xFFFF
+		windows_data, sent_len = self._pack_set_windows_start(start, default_len=int(roi_len))
+		self.stream.send_cmd(CMD_SET_WINDOWS, windows_data)
+		if bool(getattr(self, 'debug', False)):
+			print(f"[MARK_TYPE] SET_WINDOWS(start={int(roi_start)}, len={int(sent_len)}) отправлен")
+
+	def _get_set_windows_len(self, default_len: int) -> int:
+		"""Какую len отправлять в CMD_SET_WINDOWS.
+
+		По умолчанию используется `default_len` (обычно 200 из ROI-логики).
+		Можно переопределить через env `BMI30_SET_WINDOWS_LEN` (например 200 или 0).
+		"""
+		default_len = int(default_len)
+		if default_len < 0:
+			default_len = 0
+		if default_len > 0xFFFF:
+			default_len = 0xFFFF
+		raw = str(os.getenv('BMI30_SET_WINDOWS_LEN', '')).strip()
+		if raw == "":
+			return int(default_len)
+		try:
+			val = int(raw)
+		except Exception:
+			return int(default_len)
+		if val < 0:
+			val = 0
+		if val > 0xFFFF:
+			val = 0xFFFF
+		return int(val)
+
+	def _pack_set_windows_start(self, start_u16: int, default_len: int) -> tuple[bytes, int]:
+		"""Упаковать SET_WINDOWS(start,len,start,len) с длиной по умолчанию + override через env."""
+		start_u16 = int(start_u16) & 0xFFFF
+		ln = int(self._get_set_windows_len(default_len=default_len)) & 0xFFFF
+		return struct.pack('<HHHH', start_u16, ln, start_u16, ln), ln
+	
+	def _cycle_det_count(self):
+		"""Количество детектирования: 3 позиции 1/2/3 (временная заглушка)."""
+		try:
+			cur = int(getattr(self, '_det_count', 1))
+		except Exception:
+			cur = 1
+		next_val = 1 if cur >= 3 else (cur + 1)
+		self._det_count = int(next_val)
+		try:
+			self.btn_det_count.setText(str(self._det_count))
+		except Exception:
+			pass
+		try:
+			self._set_status(f"Детектирование: {int(self._det_count)}", hold_sec=1.5)
+		except Exception:
+			pass
+	
 	def _update_label_btn_style(self):
 		"""Обновление текста и цвета кнопки label."""
 		try:
@@ -6238,6 +6605,66 @@ class ScopeWindow:
 			self._send_start_stream()
 		except Exception as e:
 			raise
+
+	def _maybe_auto_reset_on_stall(self, reason: str, idle_s: float):
+		"""Авто-сброс STM32 при зависании потока (best-effort, с троттлингом)."""
+		try:
+			if bool(getattr(self, '_stream_user_stopped', False)):
+				return
+			if not bool(getattr(self, 'auto_reset_on_stall', False)):
+				return
+			try:
+				thr = float(getattr(self, 'stall_reset_after', 0.0) or 0.0)
+			except Exception:
+				thr = 0.0
+			if thr <= 0 or float(idle_s) < thr:
+				return
+			if bool(getattr(self, '_stall_reset_inflight', False)):
+				return
+			now = time.time()
+			try:
+				cooldown = float(getattr(self, 'stall_reset_cooldown', 0.0) or 0.0)
+			except Exception:
+				cooldown = 0.0
+			last_t = float(getattr(self, '_stall_reset_last_t', 0.0) or 0.0)
+			if cooldown > 0 and (now - last_t) < cooldown:
+				return
+			self._stall_reset_inflight = True
+			self._stall_reset_last_t = now
+			try:
+				self._set_status(f"Поток пропал ({reason}) — сброс STM32…", hold_sec=2.0)
+			except Exception:
+				pass
+
+			def _worker():
+				try:
+					# Попробуем SOFT_RESET через CDC (если доступен)
+					try:
+						self._send_soft_reset_via_cdc()
+					except Exception:
+						pass
+					# Отметим как disconnected и запросим аппаратный reset по существующему пути
+					try:
+						self._usb_err_need_hw_reset = True
+					except Exception:
+						pass
+					try:
+						if self.stream is not None:
+							self.stream.disconnected = True
+					except Exception:
+						pass
+				finally:
+					try:
+						self._stall_reset_inflight = False
+					except Exception:
+						pass
+
+			threading.Thread(target=_worker, daemon=True).start()
+		except Exception:
+			try:
+				self._stall_reset_inflight = False
+			except Exception:
+				pass
 
 	def _diagnose_and_kick(self):
 		"""Проверить EP0, выполнить DEEP_RESET, установить alt=1, проверить готовность и запустить поток.
@@ -6545,30 +6972,29 @@ class ScopeWindow:
 			import traceback
 			traceback.print_exc()
 			msg = str(e)
-			# если ошибка USB/занято/отключено — попытаться аппаратно перезапустить устройство
-			if any(x in msg for x in ("Resource busy", "[Errno 16]", "[Errno 19]", "[Errno 32]", "[Errno 110]", "No such device", "disconnected")):
-				try:
-					now = time.time()
-					min_reset_s = float(os.getenv("BMI30_USB_RESET_MIN_S", "8.0"))
-					min_power_s = float(os.getenv("BMI30_USB_POWERCYCLE_MIN_S", "30.0"))
-					last_reset = float(getattr(self, "_usb_connect_last_reset_t", 0.0) or 0.0)
-					last_power = float(getattr(self, "_usb_connect_last_power_t", 0.0) or 0.0)
-					self._usb_connect_err_count = int(getattr(self, "_usb_connect_err_count", 0)) + 1
-					if (now - last_reset) >= max(2.0, min_reset_s):
-						self._set_status("USB занят/отключён, аппаратный сброс…", hold_sec=2.0)
-						self._hardware_reset_device()
-						self._usb_connect_last_reset_t = now
-					# при серии ошибок попробуем power-cycle порта
-					if int(getattr(self, "_usb_connect_err_count", 0)) >= 3 and (now - last_power) >= max(5.0, min_power_s):
-						self._set_status("USB занят/отключён, перезапитка порта…", hold_sec=2.0)
-						try:
-							self._power_cycle_usb_port()
-						except Exception:
-							pass
-						self._usb_connect_last_power_t = now
-						self._usb_connect_err_count = 0
-				except Exception:
-					pass
+			# При любой ошибке подключения выполняем аппаратный сброс (с троттлингом)
+			try:
+				now = time.time()
+				min_reset_s = float(os.getenv("BMI30_USB_RESET_MIN_S", "8.0"))
+				min_power_s = float(os.getenv("BMI30_USB_POWERCYCLE_MIN_S", "30.0"))
+				last_reset = float(getattr(self, "_usb_connect_last_reset_t", 0.0) or 0.0)
+				last_power = float(getattr(self, "_usb_connect_last_power_t", 0.0) or 0.0)
+				self._usb_connect_err_count = int(getattr(self, "_usb_connect_err_count", 0)) + 1
+				if (now - last_reset) >= max(2.0, min_reset_s):
+					self._set_status("Ошибка подключения, аппаратный сброс…", hold_sec=2.0)
+					self._hardware_reset_device()
+					self._usb_connect_last_reset_t = now
+				# при серии ошибок попробуем power-cycle порта
+				if int(getattr(self, "_usb_connect_err_count", 0)) >= 3 and (now - last_power) >= max(5.0, min_power_s):
+					self._set_status("Ошибка подключения, перезапитка порта…", hold_sec=2.0)
+					try:
+						self._power_cycle_usb_port()
+					except Exception:
+						pass
+					self._usb_connect_last_power_t = now
+					self._usb_connect_err_count = 0
+			except Exception:
+				pass
 			self._set_status(f"Нет устройства ({e})", hold_sec=2.0)
 		finally:
 			self._connecting = False
@@ -6707,21 +7133,56 @@ class ScopeWindow:
 			if bool(getattr(self, 'debug', False)):
 				print(f"[AVG_ROI] Ошибка обработки avg_n={new_n}: {e}")
 
-	def _on_det_ratio_change(self, text: str):
-		"""Handler for detector ratio combo box."""
+	def _on_det_ratio_change(self, text: str, ch: int = 0):
+		"""Handler for detector ratio combo box (per ADC)."""
 		try:
 			val = float(str(text).strip())
 		except Exception:
 			val = 2.0
 		# clamp to allowed range and step
-		val = max(1.1, min(3.0, round(val, 1)))
-		self._det_ratio = val
+		val = max(1.0, min(3.0, round(val, 1)))
+		if int(ch) == 0:
+			self._det_ratio0 = val
+		else:
+			self._det_ratio1 = val
 		try:
-			save_det_ratio(val)
+			save_det_params(
+				float(getattr(self, '_det_ratio0', 2.0)),
+				float(getattr(self, '_det_ratio1', 2.0)),
+				int(getattr(self, '_det_add0', 100)),
+				int(getattr(self, '_det_add1', 100)),
+			)
 		except Exception:
 			pass
 		try:
-			self._set_status(f"Det ratio: {val:.1f}", hold_sec=1.0)
+			adc_name = "ADC1" if int(ch) == 0 else "ADC2"
+			self._set_status(f"{adc_name} det ratio: {val:.1f}", hold_sec=1.0)
+		except Exception:
+			pass
+
+	def _on_det_add_change(self, text: str, ch: int = 0):
+		"""Handler for detector additive threshold combo box (per ADC)."""
+		try:
+			val = int(float(str(text).strip()))
+		except Exception:
+			val = 100
+		val = max(0, min(700, int(round(val / 100.0) * 100)))
+		if int(ch) == 0:
+			self._det_add0 = val
+		else:
+			self._det_add1 = val
+		try:
+			save_det_params(
+				float(getattr(self, '_det_ratio0', 2.0)),
+				float(getattr(self, '_det_ratio1', 2.0)),
+				int(getattr(self, '_det_add0', 100)),
+				int(getattr(self, '_det_add1', 100)),
+			)
+		except Exception:
+			pass
+		try:
+			adc_name = "ADC1" if int(ch) == 0 else "ADC2"
+			self._set_status(f"{adc_name} det add: {val}", hold_sec=1.0)
 		except Exception:
 			pass
 
