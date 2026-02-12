@@ -585,14 +585,14 @@ class ScopeWindow:
 		
 		# Тип метки (3 позиции: Б/М/С) — заглушка, полная логика будет добавлена позже
 		try:
-			self._mark_type_mode = int(os.getenv('BMI30_MARK_TYPE_MODE', '0'))
+			self._mark_type_mode = int(os.getenv('BMI30_MARK_TYPE_MODE', '2'))
 		except Exception:
-			self._mark_type_mode = 0
+			self._mark_type_mode = 2
 		try:
 			if self._mark_type_mode not in (0, 1, 2):
-				self._mark_type_mode = 0
+				self._mark_type_mode = 2
 		except Exception:
-			self._mark_type_mode = 0
+			self._mark_type_mode = 2
 		self.btn_mark_type = QtWidgets.QPushButton(["Б", "М", "С"][self._mark_type_mode])
 		self.btn_mark_type.setToolTip("Тип метки: Б/М/С")
 		try:
@@ -6299,7 +6299,7 @@ class ScopeWindow:
 		"""Вернуть (start, len) ROI на устройстве по текущему типу метки.
 
 		Требование: длина ROI всегда фиксирована (200) и формируется устройством, меняется только старт.
-		Б: сдвиг вправо на +50, М: влево на -50, С: без сдвига.
+		Б: сдвиг вправо на +70, М: влево на -50, С: без сдвига.
 		"""
 		# Базовые значения "как сейчас" (можно менять через env без правки кода)
 		try:
@@ -6321,7 +6321,7 @@ class ScopeWindow:
 			mt = 2
 		# 0=Б, 1=М, 2=С
 		if mt == 0:
-			offset = 50
+			offset = 70
 		elif mt == 1:
 			offset = -50
 		else:
