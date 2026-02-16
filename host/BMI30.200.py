@@ -3734,7 +3734,7 @@ class ScopeWindow:
 			half = 0.5 * float(mean_max)
 			side_means = []
 			side_idxs = []
-			for off in (-21, 21):
+			for off in (-42, 42):
 				idx = int(peak_idx) + int(off)
 				if 0 <= idx < N and float(arr_abs[idx]) > float(half):
 					s0 = max(0, idx - 2)
@@ -3751,12 +3751,12 @@ class ScopeWindow:
 				mean_signal = float(np.mean(side_means))
 			except Exception:
 				mean_signal = 0.0
-			# Noise region: outside humps ±21
+			# Noise region: outside humps ±42
 			hump_min = int(min(side_idxs))
 			hump_max = int(max(side_idxs))
 			noise_chunks = []
-			left_end = max(0, hump_min - 21)
-			right_start = min(N, hump_max + 21)
+			left_end = max(0, hump_min - 42)
+			right_start = min(N, hump_max + 42)
 			if left_end > 0:
 				noise_chunks.append(arr_abs[:left_end])
 			if right_start < N:
@@ -3892,7 +3892,7 @@ class ScopeWindow:
 					first_idx = getattr(self, peak_key, None)
 					if first_idx is None:
 						setattr(self, peak_key, int(peak_idx))
-					elif abs(int(peak_idx) - int(first_idx)) > 12:
+					elif abs(int(peak_idx) - int(first_idx)) > 100:
 						# Новый пик далеко от прошлого: сдвигаем опорный индекс.
 						setattr(self, peak_key, int(peak_idx))
 				except Exception:
@@ -6123,11 +6123,34 @@ class ScopeWindow:
 			_counters = f" | 🔊:{self._beep_fire_count} ❄️:{self._freeze_fire_count}"
 		except Exception:
 			_counters = ''
+		
+		# Параметры детектирования метки Б для диагностики
+		_detect_b = ''
+		try:
+			mark_type_b = int(getattr(self, '_mark_type_mode', 2)) == 0
+			if mark_type_b:
+				# ADC0 (канал 0)
+				ratio0 = float(getattr(self, '_det_last_ratio0', 0.0) or 0.0)
+				ratio_thr0 = float(getattr(self, '_det_ratio0', 2.0) or 2.0)
+				signal0 = float(getattr(self, '_det_last_mean_signal0', 0.0) or 0.0)
+				noise0 = float(getattr(self, '_det_last_mean_noise0', 0.0) or 0.0)
+				exceed0 = "✓" if ratio0 > ratio_thr0 else " "
+				# ADC1 (канал 1)
+				ratio1 = float(getattr(self, '_det_last_ratio1', 0.0) or 0.0)
+				ratio_thr1 = float(getattr(self, '_det_ratio1', 2.0) or 2.0)
+				signal1 = float(getattr(self, '_det_last_mean_signal1', 0.0) or 0.0)
+				noise1 = float(getattr(self, '_det_last_mean_noise1', 0.0) or 0.0)
+				exceed1 = "✓" if ratio1 > ratio_thr1 else " "
+				# Фиксированная ширина полей: ratio(5.1f), signal(5.0f)
+				_detect_b = f" | [Б] ADC0:{exceed0} S/N:{ratio0:5.1f}/{ratio_thr0:3.1f} sig:{signal0:5.0f} | ADC1:{exceed1} S/N:{ratio1:5.1f}/{ratio_thr1:3.1f} sig:{signal1:5.0f}"
+		except Exception:
+			_detect_b = ''
+		
 		# Полный статус сохраняем для копирования (правый клик по ⚡)
 		_default_status_full = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} Aeo:{self.afps_even:.1f}/{self.afps_odd:.1f}{_dt_a} Beo:{self.bfps_even:.1f}/{self.bfps_odd:.1f}{_dt_b}{_phase} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} STEP:{getattr(self,'seq_step',1)} R:{getattr(self,'seq_reorder_count',0)} GA:{getattr(self,'gap_a',0)} GB:{getattr(self,'gap_b',0)} SA:{getattr(self,'step_a',1)} SB:{getattr(self,'step_b',1)} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}{asm_stat}"
 		self._last_full_status = _default_status_full
-		# Компактный статус для отображения (убираем PH/SEG/VIEW/BUF/FREQ, добавляем счетчики)
-		_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} GAP:{self.gap_count}{_counters}"
+		# Компактный статус для отображения: FPS в формате A/B, счетчики, параметры детектирования
+		_default_status = f"fps:{self.afps:.1f}/{self.bfps:.1f}{_counters}{_detect_b}"
 		# Forced PWM from GUI: highest priority, independent from detection.
 		try:
 			mode = int(getattr(self, '_beep_force_mode', 0))
