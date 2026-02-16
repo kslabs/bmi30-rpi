@@ -1198,6 +1198,8 @@ class ScopeWindow:
 		self._hw_reset_on_start_done = False
 		# Flag set by reader when new data copied; polled in GUI tick to trigger xcorr compute
 		self._need_xcorr = False
+		# Флаг для немедленного детектирования при получении новых пакетов
+		self._need_detect = False
 		# Optimal phase shift computation results (global variables for next task)
 		# ADC0 results
 		self._phase_shift_adc0 = 0  # optimal phase shift in samples for ADC0
@@ -3498,6 +3500,48 @@ class ScopeWindow:
 			self._capture_frames_recorded = 0
 			self._capture_post_countdown = 0
 
+	def _quick_detect(self):
+		"""Быстрое детектирование без полного вычисления корреляции.
+		
+		Вызывается немедленно при получении новых пакетов для минимизации задержки.
+		Вычисляет простое произведение even * (-odd) без оптимизации сдвига фазы.
+		"""
+		try:
+			with self.data_lock:
+				N = int(self.base_buf_len) if getattr(self, 'base_buf_len', None) else int(getattr(self, 'view_len', self.max_samples))
+				N = max(1, min(N, self.max_samples))
+				if N <= 1:
+					return
+				# Копируем буферы
+				e0 = np.array(self.data0_even[:N], copy=True).astype(np.float64)
+				o0 = np.array(self.data0_odd[:N], copy=True).astype(np.float64)
+				e1 = np.array(self.data1_even[:N], copy=True).astype(np.float64)
+				o1 = np.array(self.data1_odd[:N], copy=True).astype(np.float64)
+			
+			# Центрируем сигналы (0..65535 -> -32767..+32768)
+			e0_c = e0 - 32767.0
+			o0_c = o0 - 32767.0
+			e1_c = e1 - 32767.0
+			o1_c = o1 - 32767.0
+			
+			# Инвертируем нечетные
+			o0_inv = -o0_c
+			o1_inv = -o1_c
+			
+			# Вычисляем произведение (без сдвига фазы для скорости)
+			prod0_center = e0_c * o0_inv
+			prod1_center = e1_c * o1_inv
+			
+			# Нормализуем к [-1..1]
+			denom = 32768.0 * 32768.0
+			prod0_norm = prod0_center / (denom + 1e-12)
+			prod1_norm = prod1_center / (denom + 1e-12)
+			
+			# Вызываем детектирование
+			self._update_signal_detection(prod0_norm, prod1_norm, 0, 0, source='norm')
+		except Exception:
+			pass
+
 	def _update_signal_detection(self, prod0_arr: np.ndarray, prod1_arr: np.ndarray, shift0: int, shift1: int, source: str = 'norm'):
 		"""Per-channel signal detection.
 
@@ -3855,19 +3899,30 @@ class ScopeWindow:
 					setattr(self, peak_key, int(peak_idx))
 			return bool(exceed)
 
-		# Одно детектирование = одна новая пара even/odd на конкретном ADC.
+		# Одно детектирование = изменение ЛЮБОГО из пакетов (even ИЛИ odd) на конкретном ADC.
+		# ВАЖНО: для повторного детектирования достаточно получить ОДИН новый пакет!
 		try:
-			k0 = (getattr(self, 'seq0_even', None), getattr(self, 'seq0_odd', None))
-			new_pair0 = (k0 != getattr(self, '_det_last_pair_key0', None))
+			k0_even = getattr(self, 'seq0_even', None)
+			k0_odd = getattr(self, 'seq0_odd', None)
+			last_even0 = getattr(self, '_det_last_seq0_even', None)
+			last_odd0 = getattr(self, '_det_last_seq0_odd', None)
+			# Новое детектирование если изменился ЛЮБОЙ из пакетов
+			new_pair0 = (k0_even != last_even0) or (k0_odd != last_odd0)
 			if new_pair0:
-				self._det_last_pair_key0 = k0
+				self._det_last_seq0_even = k0_even
+				self._det_last_seq0_odd = k0_odd
 		except Exception:
 			new_pair0 = True
 		try:
-			k1 = (getattr(self, 'seq1_even', None), getattr(self, 'seq1_odd', None))
-			new_pair1 = (k1 != getattr(self, '_det_last_pair_key1', None))
+			k1_even = getattr(self, 'seq1_even', None)
+			k1_odd = getattr(self, 'seq1_odd', None)
+			last_even1 = getattr(self, '_det_last_seq1_even', None)
+			last_odd1 = getattr(self, '_det_last_seq1_odd', None)
+			# Новое детектирование если изменился ЛЮБОЙ из пакетов
+			new_pair1 = (k1_even != last_even1) or (k1_odd != last_odd1)
 			if new_pair1:
-				self._det_last_pair_key1 = k1
+				self._det_last_seq1_even = k1_even
+				self._det_last_seq1_odd = k1_odd
 		except Exception:
 			new_pair1 = True
 
@@ -3885,8 +3940,10 @@ class ScopeWindow:
 			self._det_start_consec1 = 0
 			self._det_hits0 = deque(maxlen=12)
 			self._det_hits1 = deque(maxlen=12)
-			self._det_last_pair_key0 = None
-			self._det_last_pair_key1 = None
+			self._det_last_seq0_even = None
+			self._det_last_seq0_odd = None
+			self._det_last_seq1_even = None
+			self._det_last_seq1_odd = None
 
 		try:
 			need_n = int(getattr(self, '_det_count', 1) or 1)
@@ -5504,8 +5561,8 @@ class ScopeWindow:
 							if ts is not None:
 								self._ts_a_even = ts
 						
-						# Host DC adaptation disabled — do not update host DC offset arrays.
-						# Device performs DC compensation; skip any host-side DC adaptation or DC-based averaging.
+					# Флаг для немедленного детектирования
+					self._need_detect = True
 					
 					if ch1 is not None:
 						try:
@@ -5555,8 +5612,8 @@ class ScopeWindow:
 							if ts is not None:
 								self._ts_b_even = ts
 						
-						# Host DC adaptation disabled — device provides DC compensation.
-						# Skipping any host-side DC update or DC-based averaging for channel 1.
+					# Флаг для немедленного детектирования
+					self._need_detect = True
 					
 					# Сохранять DC offset в файл каждые 10 минут (при STREAM_MODE=1)
 					if getattr(self, 'stream_mode', 0) == 1 and (current_time - self.dc_last_save >= self.dc_save_interval):
@@ -6152,6 +6209,17 @@ class ScopeWindow:
 		# Runtime-легенда (стабильная): обновляем чаще, но с троттлингом и без прыжков высоты
 		try:
 			self._set_runtime_legend(_default_status)
+		except Exception:
+			pass
+
+		# Быстрое детектирование: выполняется сразу при получении новых пакетов (независимо от кнопки 6)
+		try:
+			if getattr(self, '_need_detect', False):
+				self._need_detect = False
+				try:
+					self._quick_detect()
+				except Exception:
+					pass
 		except Exception:
 			pass
 
