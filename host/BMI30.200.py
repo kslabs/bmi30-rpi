@@ -7141,7 +7141,7 @@ class ScopeWindow:
 			mt = 2
 		# 0=Б, 1=М, 2=С
 		if mt == 0:
-			offset = 70
+			offset = 80
 		elif mt == 1:
 			offset = -50
 		else:
@@ -7933,6 +7933,11 @@ class ScopeWindow:
 		# (актуально после reset, когда прошивка теряет windows/start)
 		try:
 			self._send_mark_type_roi_start_to_device()
+		except Exception:
+			pass
+		# Быстрая компенсация DC после reset (восстановление постоянной составляющей)
+		try:
+			self._device_calib_dc_fast(frames=30)
 		except Exception:
 			pass
 		# Восстановим параметры коммутации/передачи, которые может сбросить прошивка.
