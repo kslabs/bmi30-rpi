@@ -187,6 +187,11 @@ if command -v setxkbmap >/dev/null 2>&1; then
     setxkbmap -model 'pc105' -layout 'us,ru' -variant ',' -option '' -option 'grp:ctrl_shift_toggle,grp_led:scroll' >/dev/null 2>&1 || true
 fi
 
+# Защита от залипания модификаторов после Alt+Shift со стороны Windows-клиента.
+if command -v xdotool >/dev/null 2>&1; then
+    xdotool keyup Alt_L keyup Alt_R keyup Super_L keyup Super_R >/dev/null 2>&1 || true
+fi
+
 # Запуск xxkb с повторами: панель/трей в XRDP может появиться позже.
 if command -v xxkb >/dev/null 2>&1; then
     (
@@ -256,6 +261,11 @@ sleep 2
 setxkbmap -option '' >/dev/null 2>&1
 setxkbmap -model pc105 -layout us,ru -variant , -option '' -option grp:ctrl_shift_toggle,grp_led:scroll >/dev/null 2>&1
 
+# Защита от «залипших» Alt/Meta после Alt+Shift в Windows.
+if command -v xdotool >/dev/null 2>&1; then
+    xdotool keyup Alt_L keyup Alt_R keyup Super_L keyup Super_R >/dev/null 2>&1 || true
+fi
+
 if command -v xxkb >/dev/null 2>&1; then
     (
         for i in $(seq 1 20); do
@@ -283,6 +293,38 @@ EOF
             printf '\n@/home/techaid/.local/bin/session-keyboard-init\n' >> /home/techaid/.config/lxsession/LXDE-pi/autostart
         fi
         chown techaid:techaid /home/techaid/.config/lxsession/LXDE-pi/autostart || true
+
+        # Аварийный сброс раскладки/модификаторов без переподключения RDP.
+        cat > /usr/local/bin/bmi30-reset-keyboard.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export DISPLAY=:0
+if [[ -r /var/run/lightdm/root/:0 ]]; then
+    export XAUTHORITY=/var/run/lightdm/root/:0
+else
+    export XAUTHORITY=/home/techaid/.Xauthority
+fi
+
+/usr/bin/setxkbmap -model pc105 -layout us,ru -variant , -option '' -option grp:ctrl_shift_toggle,grp_led:scroll >/dev/null 2>&1 || true
+if command -v xdotool >/dev/null 2>&1; then
+    xdotool keyup Alt_L keyup Alt_R keyup Meta_L keyup Meta_R keyup Super_L keyup Super_R keyup Shift_L keyup Shift_R keyup Control_L keyup Control_R >/dev/null 2>&1 || true
+fi
+EOF
+        chmod 755 /usr/local/bin/bmi30-reset-keyboard.sh
+
+        install -d -m 755 /home/techaid/Desktop
+        cat > /home/techaid/Desktop/BMI30_Reset_Keyboard.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=BMI30: Сброс клавиатуры
+Comment=Сброс XKB и модификаторов без переподключения RDP
+Exec=sudo /usr/local/bin/bmi30-reset-keyboard.sh
+Terminal=false
+Icon=input-keyboard
+EOF
+        chmod 755 /home/techaid/Desktop/BMI30_Reset_Keyboard.desktop
+        chown techaid:techaid /home/techaid/Desktop/BMI30_Reset_Keyboard.desktop || true
     fi
 
     if [[ -f /etc/xrdp/xrdp.ini ]]; then
@@ -429,12 +471,55 @@ Type=simple
 ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /tmp/.X11-unix/X0 ] && exit 0; sleep 1; done; exit 1'
 ExecStartPre=/usr/local/bin/bmi30-force-display-mode.sh
 ExecStartPre=/bin/sh -c 'DISPLAY=:0 XAUTHORITY=/var/run/lightdm/root/:0 /usr/bin/setxkbmap -model pc105 -layout us,ru -variant , -option "" -option grp:ctrl_shift_toggle,grp_led:scroll 2>/dev/null || true'
-ExecStart=/usr/bin/x11vnc -display :0 -auth guess -forever -loop -shared -rfbport 5900 -localhost -noxdamage -norepeat -xkb -nomodtweak -clear_keys -clear_all -skip_keycodes 64,108,205 -o /var/log/bmi30-x11vnc.log
+ExecStart=/usr/bin/x11vnc -display :0 -auth guess -forever -loop -shared -rfbport 5900 -localhost -noxdamage -norepeat -xkb -nomodtweak -clear_keys -clear_all -skip_keycodes 64,108,133,134,205,206,207 -o /var/log/bmi30-x11vnc.log
 Restart=always
 RestartSec=2
 
 [Install]
 WantedBy=graphical.target
+EOF
+
+    # Лёгкий автосброс Alt/Meta без постоянной нагрузки CPU:
+    # oneshot-сервис запускается timer-ом раз в 2 секунды.
+    cat > /usr/local/bin/bmi30-clear-modifiers.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export DISPLAY=:0
+if [[ -r /var/run/lightdm/root/:0 ]]; then
+    export XAUTHORITY=/var/run/lightdm/root/:0
+else
+    export XAUTHORITY=/home/techaid/.Xauthority
+fi
+
+if command -v xdotool >/dev/null 2>&1; then
+    xdotool keyup Alt_L keyup Alt_R keyup Meta_L keyup Meta_R keyup Super_L keyup Super_R >/dev/null 2>&1 || true
+fi
+EOF
+    chmod 755 /usr/local/bin/bmi30-clear-modifiers.sh
+
+    cat > /etc/systemd/system/bmi30-clear-modifiers.service <<'EOF'
+[Unit]
+Description=BMI30 clear stuck Alt/Meta modifiers (oneshot)
+After=display-manager.service graphical.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bmi30-clear-modifiers.sh
+EOF
+
+    cat > /etc/systemd/system/bmi30-clear-modifiers.timer <<'EOF'
+[Unit]
+Description=BMI30 periodic modifier cleanup timer
+
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=2
+AccuracySec=1
+Unit=bmi30-clear-modifiers.service
+
+[Install]
+WantedBy=timers.target
 EOF
 }
 
