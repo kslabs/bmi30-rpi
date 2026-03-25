@@ -564,13 +564,6 @@ class ScopeWindow:
 		self._ui_state = load_ui_state()
 		# Автозахват осциллограмм (инициализируем рано для GUI кнопки)
 		self._auto_capture_enabled = _cfg_bool(self._ui_state.get('auto_capture_enabled', None), _env_bool('BMI30_AUTO_CAPTURE', False))
-		# Режим сглаживания: 0=выкл, 1=med3, 2=med5, 3=avg7, 4=avg9, 5=avg11 (быстрые)
-		try:
-			self._smooth_mode = int(self._ui_state.get('smooth_mode', 0) or 0)
-			if self._smooth_mode < 0 or self._smooth_mode > 5:
-				self._smooth_mode = 0
-		except Exception:
-			self._smooth_mode = 0
 		if self.debug:
 			print("[INIT] BMI30 GUI starting...", flush=True)
 		if PG_IMPORT_ERR:
@@ -697,7 +690,7 @@ class ScopeWindow:
 			self._det_count = 1
 		try:
 			if self._det_count not in (1, 2, 3, 4, 5, 6):
-				self._det_count = 2
+				self._det_count = 1
 		except Exception:
 			self._det_count = 1
 		self.btn_det_count = QtWidgets.QPushButton(str(self._det_count))
@@ -787,15 +780,6 @@ class ScopeWindow:
 		except Exception:
 			pass
 		self._update_capture_btn_style()
-		# Кнопка выбора режима сглаживания (6 режимов: 0-выкл, 1-5 разные фильтры)
-		self.btn_smooth = QtWidgets.QPushButton("0")
-		self.btn_smooth.setToolTip("Сглаживание: 0=выкл, 1=med3, 2=med5, 3=avg7, 4=avg9, 5=avg11 (3-5 быстрые)")
-		self.btn_smooth.clicked.connect(self._cycle_smooth_mode)
-		try:
-			self.btn_smooth.setFixedSize(21, 21)
-		except Exception:
-			pass
-		self._update_smooth_btn_style()
 		# Кнопка переключения метки (3 состояния: неизвестно / с меткой / без метки)
 		self.btn_label = QtWidgets.QPushButton("?")
 		self.btn_label.setToolTip("Метка сигнала: ? = неизвестно, ✓ = с меткой, ✗ = без метки")
@@ -921,7 +905,6 @@ class ScopeWindow:
 		top_row.addWidget(self.det_add_box0, 0)
 		top_row.addWidget(self.btn_reconnect, 0)
 		top_row.addWidget(self.btn_capture, 0)
-		top_row.addWidget(self.btn_smooth, 0)
 		top_row.addWidget(self.btn_diag, 0)
 		top_row.addWidget(self.btn_tim2, 0)
 		# Нижний ряд: Кол-во детектирования, Кол-во буферов среднего, ADC2 коэффициент,
@@ -1215,8 +1198,6 @@ class ScopeWindow:
 		self._hw_reset_on_start_done = False
 		# Flag set by reader when new data copied; polled in GUI tick to trigger xcorr compute
 		self._need_xcorr = False
-		# Флаг для немедленного детектирования при получении новых пакетов
-		self._need_detect = False
 		# Optimal phase shift computation results (global variables for next task)
 		# ADC0 results
 		self._phase_shift_adc0 = 0  # optimal phase shift in samples for ADC0
@@ -1653,8 +1634,8 @@ class ScopeWindow:
 			self._det_ratio0 = max(1.0, min(20.0, float(r0)))
 			self._det_ratio1 = max(1.0, min(20.0, float(r1)))
 		except Exception:
-			self._det_ratio0 = 3.0
-			self._det_ratio1 = 3.0
+			self._det_ratio0 = 2.0
+			self._det_ratio1 = 2.0
 		try:
 			self._det_add0 = max(100, min(700, int(round(float(a0) / 100.0) * 100)))
 			self._det_add1 = max(100, min(700, int(round(float(a1) / 100.0) * 100)))
@@ -1870,7 +1851,11 @@ class ScopeWindow:
 		# цифровые кнопки справа
 		self.state_file = os.path.join(os.path.dirname(__file__), 'bmi30_sel.json')
 		self.sel_saved = self._load_saved_sel()
-		# Валидация уже внутри _load_saved_sel()
+		try:
+			if int(self.sel_saved or 0) == 6:
+				self.sel_saved = 5
+		except Exception:
+			pass
 		self.num_group = QtWidgets.QButtonGroup()
 		self.num_group.setExclusive(True)
 		self.num_buttons = []
@@ -1897,7 +1882,7 @@ class ScopeWindow:
 		# без stretch — слайдеры тянутся до кнопок
 		bottom.addLayout(btns_layout)
 		# apply saved selection
-		if self.sel_saved and 1 <= self.sel_saved <= 7:
+		if self.sel_saved and 1 <= self.sel_saved <=7:
 			self.num_buttons[self.sel_saved].setChecked(True)
 		else:
 			self.num_buttons[0].setChecked(True)
@@ -3513,48 +3498,6 @@ class ScopeWindow:
 			self._capture_frames_recorded = 0
 			self._capture_post_countdown = 0
 
-	def _quick_detect(self):
-		"""Быстрое детектирование без полного вычисления корреляции.
-		
-		Вызывается немедленно при получении новых пакетов для минимизации задержки.
-		Вычисляет простое произведение even * (-odd) без оптимизации сдвига фазы.
-		"""
-		try:
-			with self.data_lock:
-				N = int(self.base_buf_len) if getattr(self, 'base_buf_len', None) else int(getattr(self, 'view_len', self.max_samples))
-				N = max(1, min(N, self.max_samples))
-				if N <= 1:
-					return
-				# Копируем буферы
-				e0 = np.array(self.data0_even[:N], copy=True).astype(np.float64)
-				o0 = np.array(self.data0_odd[:N], copy=True).astype(np.float64)
-				e1 = np.array(self.data1_even[:N], copy=True).astype(np.float64)
-				o1 = np.array(self.data1_odd[:N], copy=True).astype(np.float64)
-			
-			# Центрируем сигналы (0..65535 -> -32767..+32768)
-			e0_c = e0 - 32767.0
-			o0_c = o0 - 32767.0
-			e1_c = e1 - 32767.0
-			o1_c = o1 - 32767.0
-			
-			# Инвертируем нечетные
-			o0_inv = -o0_c
-			o1_inv = -o1_c
-			
-			# Вычисляем произведение (без сдвига фазы для скорости)
-			prod0_center = e0_c * o0_inv
-			prod1_center = e1_c * o1_inv
-			
-			# Нормализуем к [-1..1]
-			denom = 32768.0 * 32768.0
-			prod0_norm = prod0_center / (denom + 1e-12)
-			prod1_norm = prod1_center / (denom + 1e-12)
-			
-			# Вызываем детектирование
-			self._update_signal_detection(prod0_norm, prod1_norm, 0, 0, source='norm')
-		except Exception:
-			pass
-
 	def _update_signal_detection(self, prod0_arr: np.ndarray, prod1_arr: np.ndarray, shift0: int, shift1: int, source: str = 'norm'):
 		"""Per-channel signal detection.
 
@@ -3747,7 +3690,7 @@ class ScopeWindow:
 			half = 0.5 * float(mean_max)
 			side_means = []
 			side_idxs = []
-			for off in (-42, 42):
+			for off in (-21, 21):
 				idx = int(peak_idx) + int(off)
 				if 0 <= idx < N and float(arr_abs[idx]) > float(half):
 					s0 = max(0, idx - 2)
@@ -3764,12 +3707,12 @@ class ScopeWindow:
 				mean_signal = float(np.mean(side_means))
 			except Exception:
 				mean_signal = 0.0
-			# Noise region: outside humps ±42
+			# Noise region: outside humps ±21
 			hump_min = int(min(side_idxs))
 			hump_max = int(max(side_idxs))
 			noise_chunks = []
-			left_end = max(0, hump_min - 42)
-			right_start = min(N, hump_max + 42)
+			left_end = max(0, hump_min - 21)
+			right_start = min(N, hump_max + 21)
 			if left_end > 0:
 				noise_chunks.append(arr_abs[:left_end])
 			if right_start < N:
@@ -3905,37 +3848,26 @@ class ScopeWindow:
 					first_idx = getattr(self, peak_key, None)
 					if first_idx is None:
 						setattr(self, peak_key, int(peak_idx))
-					elif abs(int(peak_idx) - int(first_idx)) > 100:
+					elif abs(int(peak_idx) - int(first_idx)) > 12:
 						# Новый пик далеко от прошлого: сдвигаем опорный индекс.
 						setattr(self, peak_key, int(peak_idx))
 				except Exception:
 					setattr(self, peak_key, int(peak_idx))
 			return bool(exceed)
 
-		# Одно детектирование = изменение ЛЮБОГО из пакетов (even ИЛИ odd) на конкретном ADC.
-		# ВАЖНО: для повторного детектирования достаточно получить ОДИН новый пакет!
+		# Одно детектирование = одна новая пара even/odd на конкретном ADC.
 		try:
-			k0_even = getattr(self, 'seq0_even', None)
-			k0_odd = getattr(self, 'seq0_odd', None)
-			last_even0 = getattr(self, '_det_last_seq0_even', None)
-			last_odd0 = getattr(self, '_det_last_seq0_odd', None)
-			# Новое детектирование если изменился ЛЮБОЙ из пакетов
-			new_pair0 = (k0_even != last_even0) or (k0_odd != last_odd0)
+			k0 = (getattr(self, 'seq0_even', None), getattr(self, 'seq0_odd', None))
+			new_pair0 = (k0 != getattr(self, '_det_last_pair_key0', None))
 			if new_pair0:
-				self._det_last_seq0_even = k0_even
-				self._det_last_seq0_odd = k0_odd
+				self._det_last_pair_key0 = k0
 		except Exception:
 			new_pair0 = True
 		try:
-			k1_even = getattr(self, 'seq1_even', None)
-			k1_odd = getattr(self, 'seq1_odd', None)
-			last_even1 = getattr(self, '_det_last_seq1_even', None)
-			last_odd1 = getattr(self, '_det_last_seq1_odd', None)
-			# Новое детектирование если изменился ЛЮБОЙ из пакетов
-			new_pair1 = (k1_even != last_even1) or (k1_odd != last_odd1)
+			k1 = (getattr(self, 'seq1_even', None), getattr(self, 'seq1_odd', None))
+			new_pair1 = (k1 != getattr(self, '_det_last_pair_key1', None))
 			if new_pair1:
-				self._det_last_seq1_even = k1_even
-				self._det_last_seq1_odd = k1_odd
+				self._det_last_pair_key1 = k1
 		except Exception:
 			new_pair1 = True
 
@@ -3953,10 +3885,8 @@ class ScopeWindow:
 			self._det_start_consec1 = 0
 			self._det_hits0 = deque(maxlen=12)
 			self._det_hits1 = deque(maxlen=12)
-			self._det_last_seq0_even = None
-			self._det_last_seq0_odd = None
-			self._det_last_seq1_even = None
-			self._det_last_seq1_odd = None
+			self._det_last_pair_key0 = None
+			self._det_last_pair_key1 = None
 
 		try:
 			need_n = int(getattr(self, '_det_count', 1) or 1)
@@ -4900,11 +4830,7 @@ class ScopeWindow:
 		try:
 			with open(os.path.join(os.path.dirname(__file__), 'bmi30_sel.json'), 'r', encoding='utf-8') as f:
 				obj = json.load(f)
-			val = int(obj.get('sel'))
-			# Валидация: максимум кнопка 5
-			if val > 5:
-				return 5
-			return val
+			return int(obj.get('sel'))
 		except Exception:
 			return None
 
@@ -5543,8 +5469,6 @@ class ScopeWindow:
 						except Exception:
 							par = 0
 							seqv = 0
-						# ВАЖНО: НЕ применяем фильтр здесь - детектирование должно работать с исходными данными!
-						# Фильтр применяется только для отображения в _update_view()
 						tgt = self.data0_odd if par else self.data0_even
 						tgt[:len(ch0)] = ch0
 						# mark that new data arrived and we should recompute xcorr (schedule outside lock)
@@ -5580,8 +5504,8 @@ class ScopeWindow:
 							if ts is not None:
 								self._ts_a_even = ts
 						
-					# Флаг для немедленного детектирования
-					self._need_detect = True
+						# Host DC adaptation disabled — do not update host DC offset arrays.
+						# Device performs DC compensation; skip any host-side DC adaptation or DC-based averaging.
 					
 					if ch1 is not None:
 						try:
@@ -5596,8 +5520,6 @@ class ScopeWindow:
 						except Exception:
 							par = 0
 							seqv = 0
-						# ВАЖНО: НЕ применяем фильтр здесь - детектирование должно работать с исходными данными!
-						# Фильтр применяется только для отображения в _update_view()
 						tgt = self.data1_odd if par else self.data1_even
 						tgt[:len(ch1)] = ch1
 						# mark that new data arrived and we should recompute xcorr (schedule outside lock)
@@ -5633,8 +5555,8 @@ class ScopeWindow:
 							if ts is not None:
 								self._ts_b_even = ts
 						
-					# Флаг для немедленного детектирования
-					self._need_detect = True
+						# Host DC adaptation disabled — device provides DC compensation.
+						# Skipping any host-side DC update or DC-based averaging for channel 1.
 					
 					# Сохранять DC offset в файл каждые 10 минут (при STREAM_MODE=1)
 					if getattr(self, 'stream_mode', 0) == 1 and (current_time - self.dc_last_save >= self.dc_save_interval):
@@ -6144,34 +6066,11 @@ class ScopeWindow:
 			_counters = f" | 🔊:{self._beep_fire_count} ❄️:{self._freeze_fire_count}"
 		except Exception:
 			_counters = ''
-		
-		# Параметры детектирования метки Б для диагностики
-		_detect_b = ''
-		try:
-			mark_type_b = int(getattr(self, '_mark_type_mode', 2)) == 0
-			if mark_type_b:
-				# ADC0 (канал 0)
-				ratio0 = float(getattr(self, '_det_last_ratio0', 0.0) or 0.0)
-				ratio_thr0 = float(getattr(self, '_det_ratio0', 2.0) or 2.0)
-				signal0 = float(getattr(self, '_det_last_mean_signal0', 0.0) or 0.0)
-				noise0 = float(getattr(self, '_det_last_mean_noise0', 0.0) or 0.0)
-				exceed0 = "✓" if ratio0 > ratio_thr0 else " "
-				# ADC1 (канал 1)
-				ratio1 = float(getattr(self, '_det_last_ratio1', 0.0) or 0.0)
-				ratio_thr1 = float(getattr(self, '_det_ratio1', 2.0) or 2.0)
-				signal1 = float(getattr(self, '_det_last_mean_signal1', 0.0) or 0.0)
-				noise1 = float(getattr(self, '_det_last_mean_noise1', 0.0) or 0.0)
-				exceed1 = "✓" if ratio1 > ratio_thr1 else " "
-				# Компактный формат: только текущее S/N (порог N виден в меню)
-				_detect_b = f" | [Б] ADC0:{exceed0} S/N:{ratio0:4.1f} sig:{signal0:5.0f} | ADC1:{exceed1} S/N:{ratio1:4.1f} sig:{signal1:5.0f}"
-		except Exception:
-			_detect_b = ''
-		
 		# Полный статус сохраняем для копирования (правый клик по ⚡)
 		_default_status_full = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} Aeo:{self.afps_even:.1f}/{self.afps_odd:.1f}{_dt_a} Beo:{self.bfps_even:.1f}/{self.bfps_odd:.1f}{_dt_b}{_phase} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} STEP:{getattr(self,'seq_step',1)} R:{getattr(self,'seq_reorder_count',0)} GA:{getattr(self,'gap_a',0)} GB:{getattr(self,'gap_b',0)} SA:{getattr(self,'step_a',1)} SB:{getattr(self,'step_b',1)} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}{asm_stat}"
 		self._last_full_status = _default_status_full
-		# Компактный статус для отображения: FPS в формате A/B, счетчики, параметры детектирования
-		_default_status = f"fps:{self.afps:.1f}/{self.bfps:.1f}{_counters}{_detect_b}"
+		# Компактный статус для отображения (убираем PH/SEG/VIEW/BUF/FREQ, добавляем счетчики)
+		_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} GAP:{self.gap_count}{_counters}"
 		# Forced PWM from GUI: highest priority, independent from detection.
 		try:
 			mode = int(getattr(self, '_beep_force_mode', 0))
@@ -6256,17 +6155,6 @@ class ScopeWindow:
 		except Exception:
 			pass
 
-		# Быстрое детектирование: выполняется сразу при получении новых пакетов (независимо от кнопки 6)
-		try:
-			if getattr(self, '_need_detect', False):
-				self._need_detect = False
-				try:
-					self._quick_detect()
-				except Exception:
-					pass
-		except Exception:
-			pass
-
 		# Пер-пакетный триггер корреляции: если reader пометил новые данные и кнопка 6 активна,
 		# выполним вычисление в GUI-потоке (здесь мы в GUI-потоке, т.к. _tick вызывается qtimer).
 		try:
@@ -6309,13 +6197,6 @@ class ScopeWindow:
 			except Exception:
 				self._set_status("Нет данных (нет первых кадров). Нажмите ↻ для повторной попытки. " + self._instr, hold_sec=2.0)
 			self.no_data_warned = True
-		# Авто-сброс STM32 если нет первых кадров слишком долго (независимо от флага no_data_warned).
-		# _maybe_auto_reset_on_stall сам управляет troттлингом (stall_reset_after / stall_reset_cooldown).
-		if self.stream and self.base_buf_len is None and self.connect_t and (now2 - self.connect_t) > 2.0 and not bool(getattr(self, '_stream_user_stopped', False)):
-			try:
-				self._maybe_auto_reset_on_stall("нет первых кадров", now2 - float(self.connect_t))
-			except Exception:
-				pass
 		elif self.stream and (now2 - float(getattr(self.stream, 'last_rx_t', 0.0))) > self.stop_warn_after and (now2 - self.last_diag_t) > self.diag_interval:
 			# Совсем нет приёма данных (ни STAT, ни кадров)
 			if self.diag_to_console:
@@ -7108,90 +6989,6 @@ class ScopeWindow:
 				self.btn_capture.setStyleSheet("background-color: #cc0000; color: white;")
 		except Exception:
 			pass
-	
-	def _cycle_smooth_mode(self):
-		"""Циклическое переключение режима сглаживания: 0→1→2→3→4→5→0."""
-		try:
-			self._smooth_mode = (int(getattr(self, '_smooth_mode', 0)) + 1) % 6
-		except Exception:
-			self._smooth_mode = 0
-		self._update_smooth_btn_style()
-		try:
-			save_ui_state(smooth_mode=int(self._smooth_mode))
-		except Exception:
-			pass
-		modes = ["выкл", "med3", "med5", "avg7", "avg9", "avg11"]
-		self._set_status(f"Сглаживание: {modes[self._smooth_mode]}", hold_sec=2.0)
-	
-	def _update_smooth_btn_style(self):
-		"""Обновление текста и цвета кнопки сглаживания."""
-		try:
-			mode = int(getattr(self, '_smooth_mode', 0))
-			self.btn_smooth.setText(str(mode))
-			# Цветовая схема: серый(выкл) → зеленый → оранжевый → красный → синий
-			colors = ["#666666", "#00aa00", "#ffaa00", "#ff6600", "#ff0000", "#0088ff"]
-			color = colors[mode]
-			if mode == 0:
-				self.btn_smooth.setStyleSheet(f"background-color: {color}; color: #ccc;")
-			else:
-				self.btn_smooth.setStyleSheet(f"background-color: {color}; color: white; font-weight: bold;")
-		except Exception:
-			pass
-	
-	def _apply_smooth_filter(self, arr: np.ndarray) -> np.ndarray:
-		"""Применить выбранный фильтр сглаживания к массиву данных.
-		
-		Режимы:
-		0 - без фильтра
-		1 - медиана 3 (±1) - медленный, но эффективен против импульсов
-		2 - медиана 5 (±2) - медленный, но эффективен против импульсов
-		3 - усреднение 7 (быстрое, хорошее для общего шума)
-		4 - усреднение 9 (быстрое, сильное сглаживание)
-		5 - усреднение 11 (быстрое, максимальное сглаживание)
-		
-		Края массива сохраняются без изменений, чтобы избежать искажений.
-		"""
-		mode = int(getattr(self, '_smooth_mode', 0))
-		if mode == 0 or arr is None or len(arr) < 3:
-			return arr
-		
-		# Режимы 1-2: медианный фильтр (медленный, но эффективен против импульсных помех)
-		if mode == 1 or mode == 2:
-			window = mode * 2 + 1  # 3 или 5
-			half_win = window // 2  # 1 или 2
-			
-			if len(arr) < window:
-				return arr
-			
-			filtered = np.copy(arr)
-			for i in range(half_win, len(arr) - half_win):
-				filtered[i] = np.median(arr[i-half_win:i+half_win+1])
-			return filtered
-		
-		# Режимы 3-5: быстрое скользящее среднее через convolution (в 100+ раз быстрее)
-		if mode == 3:
-			window = 7
-		elif mode == 4:
-			window = 9
-		else:  # mode == 5
-			window = 11
-		
-		if len(arr) < window:
-			return arr
-		
-		half_win = window // 2
-		
-		# Используем np.convolve с mode='valid' для корректной обработки
-		kernel = np.ones(window) / window
-		filtered_middle = np.convolve(arr, kernel, mode='valid')
-		
-		# Создаём результат с сохранением краёв
-		filtered = np.copy(arr)
-		# Копируем отфильтрованную середину (valid убирает по half_win с каждого края)
-		filtered[half_win:len(arr)-half_win] = filtered_middle
-		# Края остаются без изменений (сохраняются исходные значения)
-		
-		return filtered.astype(arr.dtype)
 	
 	def _cycle_label_state(self):
 		"""Переключение состояния метки: 0→1→2→0 (неизвестно→с меткой→без метки→неизвестно)."""
@@ -8136,11 +7933,6 @@ class ScopeWindow:
 		# (актуально после reset, когда прошивка теряет windows/start)
 		try:
 			self._send_mark_type_roi_start_to_device()
-		except Exception:
-			pass
-		# Быстрая компенсация DC после reset (восстановление постоянной составляющей)
-		try:
-			self._device_calib_dc_fast(frames=30)
 		except Exception:
 			pass
 		# Восстановим параметры коммутации/передачи, которые может сбросить прошивка.

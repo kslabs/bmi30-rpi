@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WLAN_STA="wlan0"
+WLAN_AP="wlan0ap"
+PASS="12345678"
+NETWORK_NAME_PREFIX="BMI30-"
+NETWORK_SERIAL_SUFFIX_LEN=9
+
+detect_serial() {
+  local serial=""
+
+  if [[ -r /proc/device-tree/serial-number ]]; then
+    serial="$(tr -d '\000\r\n ' < /proc/device-tree/serial-number || true)"
+  fi
+
+  if [[ -z "$serial" && -r /sys/firmware/devicetree/base/serial-number ]]; then
+    serial="$(tr -d '\000\r\n ' < /sys/firmware/devicetree/base/serial-number || true)"
+  fi
+
+  if [[ -z "$serial" && -r /proc/cpuinfo ]]; then
+    serial="$(awk -F': ' '/^Serial/ {print $2; exit}' /proc/cpuinfo | tr -d ' \t\n' || true)"
+  fi
+
+  if [[ -z "$serial" && -r /etc/machine-id ]]; then
+    serial="$(tr -d ' \t\n' < /etc/machine-id || true)"
+  fi
+
+  serial="$(printf '%s' "$serial" | tr -cd '0-9A-Fa-f')"
+  if [[ -z "$serial" ]]; then
+    echo "Unable to determine serial" >&2
+    exit 1
+  fi
+
+  printf '%s' "${serial^^}"
+}
+
+serial="$(detect_serial)"
+suffix="${serial: -$NETWORK_SERIAL_SUFFIX_LEN}"
+SSID="${NETWORK_NAME_PREFIX}${suffix}"
+CON="$SSID"
+
+if ! ip link show "$WLAN_AP" >/dev/null 2>&1; then
+  iw dev "$WLAN_STA" interface add "$WLAN_AP" type __ap
+fi
+
+nmcli dev set "$WLAN_AP" managed yes
+
+chan="6"
+if nmcli -t -f DEVICE,STATE dev status | grep -q "^${WLAN_STA}:connected"; then
+  sta_chan="$(nmcli -t -f ACTIVE,CHAN dev wifi | awk -F: '$1=="yes"{print $2; exit}')"
+  if [[ -n "$sta_chan" ]]; then
+    chan="$sta_chan"
+  fi
+fi
+
+target_uuid=""
+declare -a candidate_uuids=()
+
+while IFS=: read -r connection_name connection_uuid connection_type; do
+  [[ "$connection_type" == "802-11-wireless" || "$connection_type" == "wifi" ]] || continue
+
+  current_if="$(nmcli -g connection.interface-name connection show "$connection_uuid" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+  current_mode="$(nmcli -g 802-11-wireless.mode connection show "$connection_uuid" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+  current_ssid="$(nmcli -g 802-11-wireless.ssid connection show "$connection_uuid" 2>/dev/null || true)"
+  lowered_name="$(printf '%s' "$connection_name" | tr '[:upper:]' '[:lower:]')"
+
+  if [[ "$connection_name" == "$CON" ]]; then
+    target_uuid="$connection_uuid"
+    candidate_uuids+=("$connection_uuid")
+    continue
+  fi
+
+  if [[ "$current_if" == "$WLAN_AP" || "$current_mode" == "ap" || "$lowered_name" == hotspot-bmi30.* || "$current_ssid" == BMI30.* || "$current_ssid" == BMI30-* ]]; then
+    candidate_uuids+=("$connection_uuid")
+  fi
+done < <(nmcli -t -f NAME,UUID,TYPE connection show 2>/dev/null || true)
+
+if [[ -z "$target_uuid" && ${#candidate_uuids[@]} -gt 0 ]]; then
+  target_uuid="${candidate_uuids[0]}"
+fi
+
+if [[ -n "$target_uuid" ]]; then
+  nmcli con modify "$target_uuid" \
+    connection.id "$CON" \
+    connection.interface-name "$WLAN_AP" \
+    802-11-wireless.ssid "$SSID" \
+    802-11-wireless.mode ap \
+    802-11-wireless.band bg \
+    802-11-wireless.channel "$chan" \
+    ipv4.method shared \
+    ipv6.method ignore \
+    wifi-sec.key-mgmt wpa-psk \
+    wifi-sec.psk "$PASS" \
+    connection.autoconnect yes
+else
+  nmcli con add type wifi ifname "$WLAN_AP" con-name "$CON" ssid "$SSID"
+  nmcli con modify "$CON" \
+    connection.interface-name "$WLAN_AP" \
+    802-11-wireless.mode ap \
+    802-11-wireless.band bg \
+    802-11-wireless.channel "$chan" \
+    ipv4.method shared \
+    ipv6.method ignore \
+    wifi-sec.key-mgmt wpa-psk \
+    wifi-sec.psk "$PASS" \
+    connection.autoconnect yes
+fi
+
+for connection_uuid in "${candidate_uuids[@]}"; do
+  [[ "$connection_uuid" == "$target_uuid" ]] && continue
+  nmcli con delete "$connection_uuid" >/dev/null 2>&1 || true
+done
+
+nmcli con up "$CON" >/dev/null

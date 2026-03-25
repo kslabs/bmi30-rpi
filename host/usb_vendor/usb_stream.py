@@ -1746,14 +1746,34 @@ class USBStream:
 
                 first = ('A', getattr(self.asm, 'qA', None)) if rr == 0 else ('B', getattr(self.asm, 'qB', None))
                 second = ('B', getattr(self.asm, 'qB', None)) if rr == 0 else ('A', getattr(self.asm, 'qA', None))
+                # Fast path: check both queues without blocking first.
+                # This avoids spending the whole timeout on an empty preferred queue
+                # while data is already waiting in the other queue.
                 for tag, q in (first, second):
                     if q is None:
                         continue
                     try:
-                        item = q.get(timeout=_remaining())
+                        item = q.get_nowait()
                         return (tag, item)
                     except queue.Empty:
                         continue
+
+                # Slow path: wait in short slices and alternate both queues.
+                # This keeps latency low and prevents artificial FPS cap (~1/timeout).
+                rem = _remaining()
+                if rem <= 0.0:
+                    return None
+                while rem > 0.0:
+                    wait_slice = min(0.01, rem)
+                    for tag, q in (first, second):
+                        if q is None:
+                            continue
+                        try:
+                            item = q.get(timeout=wait_slice)
+                            return (tag, item)
+                        except queue.Empty:
+                            continue
+                    rem = _remaining()
                 return None
             else:
                 return self.asm.q.get(timeout=timeout)

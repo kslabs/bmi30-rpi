@@ -697,7 +697,7 @@ class ScopeWindow:
 			self._det_count = 1
 		try:
 			if self._det_count not in (1, 2, 3, 4, 5, 6):
-				self._det_count = 2
+				self._det_count = 1
 		except Exception:
 			self._det_count = 1
 		self.btn_det_count = QtWidgets.QPushButton(str(self._det_count))
@@ -1653,8 +1653,8 @@ class ScopeWindow:
 			self._det_ratio0 = max(1.0, min(20.0, float(r0)))
 			self._det_ratio1 = max(1.0, min(20.0, float(r1)))
 		except Exception:
-			self._det_ratio0 = 3.0
-			self._det_ratio1 = 3.0
+			self._det_ratio0 = 2.0
+			self._det_ratio1 = 2.0
 		try:
 			self._det_add0 = max(100, min(700, int(round(float(a0) / 100.0) * 100)))
 			self._det_add1 = max(100, min(700, int(round(float(a1) / 100.0) * 100)))
@@ -5543,8 +5543,12 @@ class ScopeWindow:
 						except Exception:
 							par = 0
 							seqv = 0
-						# ВАЖНО: НЕ применяем фильтр здесь - детектирование должно работать с исходными данными!
-						# Фильтр применяется только для отображения в _update_view()
+						# Применяем сглаживание, если включено
+						if getattr(self, '_smooth_mode', 0) > 0:
+							try:
+								ch0 = self._apply_smooth_filter(ch0)
+							except Exception:
+								pass
 						tgt = self.data0_odd if par else self.data0_even
 						tgt[:len(ch0)] = ch0
 						# mark that new data arrived and we should recompute xcorr (schedule outside lock)
@@ -5596,8 +5600,12 @@ class ScopeWindow:
 						except Exception:
 							par = 0
 							seqv = 0
-						# ВАЖНО: НЕ применяем фильтр здесь - детектирование должно работать с исходными данными!
-						# Фильтр применяется только для отображения в _update_view()
+						# Применяем сглаживание, если включено
+						if getattr(self, '_smooth_mode', 0) > 0:
+							try:
+								ch1 = self._apply_smooth_filter(ch1)
+							except Exception:
+								pass
 						tgt = self.data1_odd if par else self.data1_even
 						tgt[:len(ch1)] = ch1
 						# mark that new data arrived and we should recompute xcorr (schedule outside lock)
@@ -6309,13 +6317,6 @@ class ScopeWindow:
 			except Exception:
 				self._set_status("Нет данных (нет первых кадров). Нажмите ↻ для повторной попытки. " + self._instr, hold_sec=2.0)
 			self.no_data_warned = True
-		# Авто-сброс STM32 если нет первых кадров слишком долго (независимо от флага no_data_warned).
-		# _maybe_auto_reset_on_stall сам управляет troттлингом (stall_reset_after / stall_reset_cooldown).
-		if self.stream and self.base_buf_len is None and self.connect_t and (now2 - self.connect_t) > 2.0 and not bool(getattr(self, '_stream_user_stopped', False)):
-			try:
-				self._maybe_auto_reset_on_stall("нет первых кадров", now2 - float(self.connect_t))
-			except Exception:
-				pass
 		elif self.stream and (now2 - float(getattr(self.stream, 'last_rx_t', 0.0))) > self.stop_warn_after and (now2 - self.last_diag_t) > self.diag_interval:
 			# Совсем нет приёма данных (ни STAT, ни кадров)
 			if self.diag_to_console:

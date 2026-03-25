@@ -2,11 +2,45 @@
 	"version": "2.0.0",
 	"tasks": [
 		{
+			"label": "⛔ ОСТАНОВИТЬ BMI30",
+			"type": "shell",
+			"command": "pkill -9 -f BMI30.200.py; echo 'Процесс BMI30.200.py остановлен'; sleep 1",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared",
+				"showReuseMessage": false,
+				"clear": false
+			},
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Переключить версию BMI30",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"${workspaceFolder}/switch_version.sh"
+			],
+			"presentation": {
+				"echo": false,
+				"reveal": "always",
+				"focus": true,
+				"panel": "dedicated",
+				"showReuseMessage": false,
+				"clear": true
+			},
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
 			"label": "Run BMI30.200.py",
 			"type": "shell",
-			"command": "/home/techaid/Documents/.usbvenv/bin/python",
+			"command": "bash",
 			"args": [
-				"/home/techaid/Documents/host/BMI30.200.py"
+				"-lc",
+				"cd '${workspaceFolder}' && if [[ -x .usbvenv/bin/python ]]; then exec ./.usbvenv/bin/python host/BMI30.200.py; elif [[ -x .venv/bin/python ]]; then exec ./.venv/bin/python host/BMI30.200.py; else echo 'Не найден Python в .usbvenv/bin/python или .venv/bin/python'; exit 1; fi"
 			],
 			"isBackground": false,
 			"problemMatcher": [
