@@ -497,6 +497,11 @@ def render_html_page(data: dict[str, Any]) -> bytes:
     </fieldset>
   </div>
 
+  <div style="text-align:center;padding:4px 0 2px">
+    <a href="/portal-done" style="display:inline-block;background:#0f8a70;color:#fff;text-decoration:none;
+       border-radius:10px;padding:10px 32px;font-size:14px;font-weight:600;">Continue</a>
+  </div>
+
     <p class="footer">Updated: {generated} · auto-refresh {REFRESH_S}&#x202f;s
         &nbsp;·&nbsp; <a href="/api/status">JSON API</a></p>
 
@@ -515,6 +520,13 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
     def _handle_request(self, send_body: bool) -> None:
         path = self.path.split("?", 1)[0]
+
+        # Android CNA: пользователь нажал "Continue" → отдаём 204, браузер закрывается
+        if path == "/portal-done":
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
 
         if path == "/logo":
             logo = load_logo_bytes(detect_logo_path())
