@@ -10,7 +10,10 @@ NETWORK_NAME_PREFIX="BMI30-"
 NETWORK_SERIAL_SUFFIX_LEN=9
 WIFI_HOSTAPD_UPDATED=0
 WIFI_NM_AP_UPDATED=0
-
+HOTSPOT_PORTAL_UPDATED=0
+# Авто-очистка включена: контролируем только Alt и сбрасываем
+# только при 2 подряд срабатываниях (чтобы не мешать обычному вводу).
+MODIFIER_AUTO_CLEAN="${BMI30_MODIFIER_AUTO_CLEAN:-1}"
 # Headless display preset when no physical monitor is connected.
 # Recommended presets:
 # - FHD_60: 1920x1080@60 (best default for normal RDP work)
@@ -99,8 +102,8 @@ install_packages() {
     if ! apt-get install -y -qq xxkb >/dev/null 2>&1; then
         log WARN "Пакет xxkb не установлен автоматически. Останется индикация раскладки через LED Scroll Lock."
     fi
-    if ! apt-get install -y -qq wmctrl xdotool >/dev/null 2>&1; then
-        log WARN "Пакеты wmctrl/xdotool не установлены автоматически. Восстановление размеров и позиций окон будет ограничено."
+    if ! apt-get install -y -qq wmctrl xdotool xinput >/dev/null 2>&1; then
+        log WARN "Пакеты wmctrl/xdotool/xinput не установлены автоматически. Восстановление окон и anti-stuck клавиатуры будут ограничены."
     fi
 }
 
@@ -187,9 +190,12 @@ if command -v setxkbmap >/dev/null 2>&1; then
     setxkbmap -model 'pc105' -layout 'us,ru' -variant ',' -option '' -option 'grp:ctrl_shift_toggle,grp_led:scroll' >/dev/null 2>&1 || true
 fi
 
-# Защита от залипания модификаторов после Alt+Shift со стороны Windows-клиента.
-if command -v xdotool >/dev/null 2>&1; then
-    xdotool keyup Alt_L keyup Alt_R keyup Super_L keyup Super_R >/dev/null 2>&1 || true
+# Сразу сбрасываем модификаторы и запускаем watchdog в текущей X-сессии.
+if [ -x /usr/local/bin/bmi30-clear-modifiers.sh ]; then
+    /usr/local/bin/bmi30-clear-modifiers.sh "${DISPLAY:-}" "${XAUTHORITY:-}" >/dev/null 2>&1 || true
+fi
+if [ -x /usr/local/bin/bmi30-modifier-watchdog.sh ]; then
+    /usr/local/bin/bmi30-modifier-watchdog.sh "${DISPLAY:-}" "${XAUTHORITY:-}" >/dev/null 2>&1 &
 fi
 
 # Запуск xxkb с повторами: панель/трей в XRDP может появиться позже.
@@ -261,9 +267,12 @@ sleep 2
 setxkbmap -option '' >/dev/null 2>&1
 setxkbmap -model pc105 -layout us,ru -variant , -option '' -option grp:ctrl_shift_toggle,grp_led:scroll >/dev/null 2>&1
 
-# Защита от «залипших» Alt/Meta после Alt+Shift в Windows.
-if command -v xdotool >/dev/null 2>&1; then
-    xdotool keyup Alt_L keyup Alt_R keyup Super_L keyup Super_R >/dev/null 2>&1 || true
+# Защита от «залипших» модификаторов в текущей сессии.
+if [ -x /usr/local/bin/bmi30-clear-modifiers.sh ]; then
+    /usr/local/bin/bmi30-clear-modifiers.sh "${DISPLAY:-}" "${XAUTHORITY:-}" >/dev/null 2>&1 || true
+fi
+if [ -x /usr/local/bin/bmi30-modifier-watchdog.sh ]; then
+    /usr/local/bin/bmi30-modifier-watchdog.sh "${DISPLAY:-}" "${XAUTHORITY:-}" >/dev/null 2>&1 &
 fi
 
 if command -v xxkb >/dev/null 2>&1; then
@@ -299,16 +308,24 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-export DISPLAY=:0
-if [[ -r /var/run/lightdm/root/:0 ]]; then
-    export XAUTHORITY=/var/run/lightdm/root/:0
-else
-    export XAUTHORITY=/home/techaid/.Xauthority
+target_display="${1:-${DISPLAY:-:0}}"
+target_xauthority="${2:-${XAUTHORITY:-}}"
+
+export DISPLAY="$target_display"
+if [[ -z "$target_xauthority" ]]; then
+    if [[ "$target_display" == ":0" && -r /var/run/lightdm/root/:0 ]]; then
+        target_xauthority=/var/run/lightdm/root/:0
+    elif [[ -r /home/techaid/.Xauthority ]]; then
+        target_xauthority=/home/techaid/.Xauthority
+    fi
+fi
+if [[ -n "$target_xauthority" ]]; then
+    export XAUTHORITY="$target_xauthority"
 fi
 
 /usr/bin/setxkbmap -model pc105 -layout us,ru -variant , -option '' -option grp:ctrl_shift_toggle,grp_led:scroll >/dev/null 2>&1 || true
-if command -v xdotool >/dev/null 2>&1; then
-    xdotool keyup Alt_L keyup Alt_R keyup Meta_L keyup Meta_R keyup Super_L keyup Super_R keyup Shift_L keyup Shift_R keyup Control_L keyup Control_R >/dev/null 2>&1 || true
+if [ -x /usr/local/bin/bmi30-clear-modifiers.sh ]; then
+    /usr/local/bin/bmi30-clear-modifiers.sh "$target_display" "${target_xauthority:-}" >/dev/null 2>&1 || true
 fi
 EOF
         chmod 755 /usr/local/bin/bmi30-reset-keyboard.sh
@@ -319,7 +336,7 @@ EOF
 Type=Application
 Name=BMI30: Сброс клавиатуры
 Comment=Сброс XKB и модификаторов без переподключения RDP
-Exec=sudo /usr/local/bin/bmi30-reset-keyboard.sh
+Exec=/usr/local/bin/bmi30-reset-keyboard.sh
 Terminal=false
 Icon=input-keyboard
 EOF
@@ -471,7 +488,8 @@ Type=simple
 ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /tmp/.X11-unix/X0 ] && exit 0; sleep 1; done; exit 1'
 ExecStartPre=/usr/local/bin/bmi30-force-display-mode.sh
 ExecStartPre=/bin/sh -c 'DISPLAY=:0 XAUTHORITY=/var/run/lightdm/root/:0 /usr/bin/setxkbmap -model pc105 -layout us,ru -variant , -option "" -option grp:ctrl_shift_toggle,grp_led:scroll 2>/dev/null || true'
-ExecStart=/usr/bin/x11vnc -display :0 -auth guess -forever -loop -shared -rfbport 5900 -localhost -noxdamage -norepeat -xkb -nomodtweak -clear_keys -clear_all -skip_keycodes 64,108,133,134,205,206,207 -o /var/log/bmi30-x11vnc.log
+# One x11vnc client at a time: avoids accumulating parallel XRDP->VNC bridges that overload Xorg.
+ExecStart=/usr/bin/x11vnc -display :0 -auth guess -forever -nevershared -rfbport 5900 -localhost -noxdamage -norepeat -xkb -nomodtweak -clear_keys -clear_all -skip_keycodes 64,108,133,134,205,206,207 -o /var/log/bmi30-x11vnc.log
 Restart=always
 RestartSec=2
 
@@ -479,33 +497,215 @@ RestartSec=2
 WantedBy=graphical.target
 EOF
 
-    # Лёгкий автосброс Alt/Meta без постоянной нагрузки CPU:
-    # oneshot-сервис запускается timer-ом раз в 2 секунды.
+    # Универсальный helper anti-stuck модификаторов:
+    # контролируем только Alt и сбрасываем его только при 2 подряд срабатываниях.
     cat > /usr/local/bin/bmi30-clear-modifiers.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-export DISPLAY=:0
-if [[ -r /var/run/lightdm/root/:0 ]]; then
-    export XAUTHORITY=/var/run/lightdm/root/:0
-else
-    export XAUTHORITY=/home/techaid/.Xauthority
+target_display="${1:-${DISPLAY:-:0}}"
+target_xauthority="${2:-${XAUTHORITY:-}}"
+
+if [[ -z "$target_display" ]]; then
+    exit 0
+fi
+
+export DISPLAY="$target_display"
+if [[ -z "$target_xauthority" ]]; then
+    if [[ "$target_display" == ":0" && -r /var/run/lightdm/root/:0 ]]; then
+        target_xauthority=/var/run/lightdm/root/:0
+    elif [[ -r /home/techaid/.Xauthority ]]; then
+        target_xauthority=/home/techaid/.Xauthority
+    fi
+fi
+if [[ -n "$target_xauthority" ]]; then
+    export XAUTHORITY="$target_xauthority"
+fi
+
+state_dir="/tmp/bmi30-modifier-state"
+state_name="$(printf '%s' "${USER:-techaid}-${target_display}" | tr -c 'A-Za-z0-9_.-' '_')"
+state_file="${state_dir}/${state_name}.alt-count"
+
+mkdir -p "$state_dir" >/dev/null 2>&1 || true
+
+is_alt_down=0
+if command -v xinput >/dev/null 2>&1; then
+    kbd_id="$(xinput list --id-only 'Virtual core keyboard' 2>/dev/null || true)"
+    if [[ -n "$kbd_id" ]]; then
+        qstate="$(xinput --query-state "$kbd_id" 2>/dev/null || true)"
+        for kc in ${BMI30_ALT_KEYCODES:-64 108}; do
+            if printf '%s\n' "$qstate" | grep -q "key\[$kc\]=down"; then
+                is_alt_down=1
+                break
+            fi
+        done
+    fi
+fi
+
+if [[ "$is_alt_down" -eq 0 ]]; then
+    printf '0' > "$state_file" 2>/dev/null || true
+    exit 0
+fi
+
+cnt=0
+if [[ -r "$state_file" ]]; then
+    cnt="$(cat "$state_file" 2>/dev/null || echo 0)"
+fi
+if ! [[ "$cnt" =~ ^[0-9]+$ ]]; then
+    cnt=0
+fi
+cnt=$((cnt + 1))
+
+if [[ "$cnt" -lt 2 ]]; then
+    printf '%s' "$cnt" > "$state_file" 2>/dev/null || true
+    exit 0
 fi
 
 if command -v xdotool >/dev/null 2>&1; then
-    xdotool keyup Alt_L keyup Alt_R keyup Meta_L keyup Meta_R keyup Super_L keyup Super_R >/dev/null 2>&1 || true
+    xdotool keyup Alt_L keyup Alt_R >/dev/null 2>&1 || true
+    if [[ "${BMI30_CLEAR_TOGGLE_KEYS:-0}" == "1" ]]; then
+        xdotool keyup Shift_L keyup Shift_R keyup Control_L keyup Control_R >/dev/null 2>&1 || true
+    fi
 fi
+printf '0' > "$state_file" 2>/dev/null || true
 EOF
     chmod 755 /usr/local/bin/bmi30-clear-modifiers.sh
 
+    cat > /usr/local/bin/bmi30-clear-modifiers-all.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+run_clear() {
+    local display="$1"
+    local xauthority="$2"
+
+    if [[ -z "$display" ]]; then
+        return 0
+    fi
+
+    if [[ -n "$xauthority" && ! -r "$xauthority" ]]; then
+        return 0
+    fi
+
+    /usr/local/bin/bmi30-clear-modifiers.sh "$display" "$xauthority" >/dev/null 2>&1 || true
+}
+
+collect_from_environ() {
+    local pid="$1"
+    local env_file="/proc/$pid/environ"
+    local display=""
+    local xauthority=""
+
+    [[ -r "$env_file" ]] || return 0
+
+    while IFS= read -r -d '' entry; do
+        case "$entry" in
+            DISPLAY=*)
+                display="${entry#DISPLAY=}"
+                ;;
+            XAUTHORITY=*)
+                xauthority="${entry#XAUTHORITY=}"
+                ;;
+        esac
+    done < "$env_file" 2>/dev/null || return 0
+
+    if [[ -n "$display" ]]; then
+        printf '%s|%s\n' "$display" "$xauthority"
+    fi
+}
+
+collect_from_xorg() {
+    ps -eo args= | while IFS= read -r cmd; do
+        case "$cmd" in
+            *"Xorg :"*) ;;
+            *) continue ;;
+        esac
+
+        set -- $cmd
+        local display=""
+        local xauthority=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                :*)
+                    if [[ -z "$display" ]]; then
+                        display="$1"
+                    fi
+                    shift
+                    ;;
+                -auth)
+                    shift
+                    if [[ $# -gt 0 ]]; then
+                        xauthority="$1"
+                        shift
+                    fi
+                    ;;
+                *)
+                    shift
+                    ;;
+            esac
+        done
+
+        if [[ -n "$display" ]]; then
+            printf '%s|%s\n' "$display" "$xauthority"
+        fi
+    done
+}
+
+{
+    for pid in /proc/[0-9]*; do
+        collect_from_environ "${pid##*/}"
+    done
+    collect_from_xorg
+    printf ':0|/var/run/lightdm/root/:0\n'
+    printf ':0|/home/techaid/.Xauthority\n'
+} | awk -F'|' 'NF { key=$1 "|" $2; if (!seen[key]++) print $1 "|" $2 }' | while IFS='|' read -r display xauthority; do
+    run_clear "$display" "$xauthority"
+done
+EOF
+    chmod 755 /usr/local/bin/bmi30-clear-modifiers-all.sh
+
+    cat > /usr/local/bin/bmi30-modifier-watchdog.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+target_display="${1:-${DISPLAY:-}}"
+target_xauthority="${2:-${XAUTHORITY:-}}"
+
+if [[ -z "$target_display" ]] || ! command -v xdotool >/dev/null 2>&1; then
+    exit 0
+fi
+
+export DISPLAY="$target_display"
+if [[ -n "$target_xauthority" ]]; then
+    export XAUTHORITY="$target_xauthority"
+fi
+
+lock_name="$(printf '%s' "${USER:-techaid}-${target_display}" | tr -c 'A-Za-z0-9_.-' '_')"
+lock_dir="/tmp/bmi30-modifier-watchdog-${lock_name}.lock"
+if ! mkdir "$lock_dir" 2>/dev/null; then
+    exit 0
+fi
+
+cleanup() {
+    rmdir "$lock_dir" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+while :; do
+    /usr/local/bin/bmi30-clear-modifiers.sh "$DISPLAY" "${XAUTHORITY:-}" >/dev/null 2>&1 || true
+    sleep 1
+done
+EOF
+    chmod 755 /usr/local/bin/bmi30-modifier-watchdog.sh
+
     cat > /etc/systemd/system/bmi30-clear-modifiers.service <<'EOF'
 [Unit]
-Description=BMI30 clear stuck Alt/Meta modifiers (oneshot)
+Description=BMI30 clear stuck modifiers on local display (oneshot)
 After=display-manager.service graphical.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/bmi30-clear-modifiers.sh
+ExecStart=/usr/local/bin/bmi30-clear-modifiers-all.sh
 EOF
 
     cat > /etc/systemd/system/bmi30-clear-modifiers.timer <<'EOF'
@@ -1524,6 +1724,10 @@ if [[ -n "$target_uuid" ]]; then
         ipv4.method shared \
         ipv6.method ignore \
         wifi-sec.key-mgmt wpa-psk \
+        wifi-sec.proto rsn \
+        wifi-sec.pairwise ccmp \
+        wifi-sec.group ccmp \
+        wifi-sec.pmf 1 \
         wifi-sec.psk "$PASS" \
         connection.autoconnect yes
 else
@@ -1536,6 +1740,10 @@ else
         ipv4.method shared \
         ipv6.method ignore \
         wifi-sec.key-mgmt wpa-psk \
+        wifi-sec.proto rsn \
+        wifi-sec.pairwise ccmp \
+        wifi-sec.group ccmp \
+        wifi-sec.pmf 1 \
         wifi-sec.psk "$PASS" \
         connection.autoconnect yes
 fi
@@ -1549,6 +1757,57 @@ nmcli con up "$CON" >/dev/null
 EOF
 
         chmod 755 /usr/local/bin/bmi30-hotspot.sh
+}
+
+configure_hotspot_info_page() {
+    local script_dir server_src server_dst service_path dnsmasq_dir dnsmasq_conf
+
+    script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+    server_src="$script_dir/hotspot_info_server.py"
+    server_dst="/usr/local/bin/bmi30-hotspot-info-server.py"
+    service_path="/etc/systemd/system/bmi30-hotspot-info.service"
+    dnsmasq_dir="/etc/NetworkManager/dnsmasq-shared.d"
+    dnsmasq_conf="$dnsmasq_dir/90-bmi30-hotspot-portal.conf"
+
+    if [[ ! -f "$server_src" ]]; then
+        log WARN "Не найден hotspot_info_server.py рядом со скриптом, web-страница hotspot не будет установлена"
+        return
+    fi
+
+    log INFO "Устанавливаю web-страницу статуса для hotspot"
+
+    backup_file "$server_dst"
+    install -m 755 "$server_src" "$server_dst"
+
+    backup_file "$service_path"
+    cat > "$service_path" <<'EOF'
+[Unit]
+Description=BMI30 Hotspot Info Web Page
+After=network-online.target NetworkManager.service bmi30-hotspot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/bmi30-hotspot-info-server.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    mkdir -p "$dnsmasq_dir"
+    backup_file "$dnsmasq_conf"
+    cat > "$dnsmasq_conf" <<'EOF'
+# Captive portal: перехватываем ВСЕ DNS-запросы клиентов хотспота.
+# address=/#/... — wildcard — любой домен → IP хотспота.
+# Это нужно для корректного срабатывания captive portal на iOS, Android, Windows и Linux:
+# каждая ОС обращается к своим проверочным доменам (captive.apple.com, connectivitycheck.gstatic.com
+# и т.д.), и все они должны резолвиться в наш IP.
+address=/#/10.42.0.1
+EOF
+
+    HOTSPOT_PORTAL_UPDATED=1
 }
 
 configure_firewall() {
@@ -1566,18 +1825,31 @@ configure_firewall() {
     ufw allow 3702/udp >/dev/null 2>&1 || true
     ufw allow 5357/tcp >/dev/null 2>&1 || true
     ufw allow 161/udp >/dev/null 2>&1 || true
+    ufw allow 80/tcp >/dev/null 2>&1 || true
 }
 
 restart_services() {
     log INFO "Перезапускаю сетевые службы"
     systemctl daemon-reload || true
 
-    for service in avahi-daemon smbd nmbd wsdd snmpd lldpd xrdp bmi30-x11vnc; do
+    for service in avahi-daemon smbd nmbd wsdd snmpd lldpd xrdp bmi30-x11vnc bmi30-hotspot-info; do
         if systemctl list-unit-files "${service}.service" >/dev/null 2>&1; then
             systemctl enable "$service" >/dev/null 2>&1 || true
             systemctl restart "$service" || true
         fi
     done
+
+    # Таймер очистки модификаторов оставляем включенным:
+    # helper контролирует только Alt и срабатывает только на 2 подряд детектах.
+    if systemctl list-unit-files bmi30-clear-modifiers.timer >/dev/null 2>&1; then
+        if [[ "$MODIFIER_AUTO_CLEAN" == "1" ]]; then
+            systemctl enable bmi30-clear-modifiers.timer >/dev/null 2>&1 || true
+            systemctl restart bmi30-clear-modifiers.timer >/dev/null 2>&1 || true
+        else
+            systemctl stop bmi30-clear-modifiers.timer >/dev/null 2>&1 || true
+            systemctl disable bmi30-clear-modifiers.timer >/dev/null 2>&1 || true
+        fi
+    fi
 
     if [[ "$WIFI_HOSTAPD_UPDATED" -eq 1 ]] && systemctl list-unit-files hostapd.service >/dev/null 2>&1; then
         systemctl enable hostapd >/dev/null 2>&1 || true
@@ -1587,7 +1859,7 @@ restart_services() {
     if command -v nmcli >/dev/null 2>&1; then
         nmcli connection reload >/dev/null 2>&1 || true
 
-        if [[ "$WIFI_NM_AP_UPDATED" -eq 1 ]]; then
+        if [[ "$WIFI_NM_AP_UPDATED" -eq 1 || "$HOTSPOT_PORTAL_UPDATED" -eq 1 ]]; then
             while IFS=: read -r connection_uuid connection_type connection_name; do
                 [[ "$connection_type" == "wifi" || "$connection_type" == "802-11-wireless" ]] || continue
 
@@ -1632,6 +1904,7 @@ main() {
     configure_lldp "$display_name" "$MANUFACTURER" "$MODEL" "$serial_tail"
     configure_wifi_name "$display_name"
     configure_bmi30_hotspot_service
+    configure_hotspot_info_page
     configure_headless_display
     configure_workspace_restore
     configure_rdp_session
