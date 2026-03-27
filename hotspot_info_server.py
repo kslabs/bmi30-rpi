@@ -386,11 +386,11 @@ def render_html_page(data: dict[str, Any]) -> bytes:
     .hero{{background:linear-gradient(140deg,#e2f4ef 0%,#fff8ed 100%);
            border:1px solid #b8ddd3;border-radius:18px;padding:18px 20px}}
     .hero-top{{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}}
-    .badge{{display:inline-block;background:#0f8a70;color:#fff;
-            font-size:11px;font-weight:700;letter-spacing:.09em;
-            padding:2px 10px;border-radius:20px}}
-    .hero h1{{font-size:20px;font-weight:700;line-height:1.2;margin-bottom:4px}}
-    .hero p{{font-size:13px;color:#5e7077}}
+    .badge{{display:flex;align-items:center;background:#0f8a70;color:#fff;
+            font-size:16px;font-weight:800;letter-spacing:.08em;
+            padding:0 16px;border-radius:12px;height:40px;white-space:nowrap}}
+    .hero h1{{font-size:20px;font-weight:700;line-height:1.2;margin-bottom:4px;text-align:center}}
+    .hero p{{font-size:13px;color:#5e7077;text-align:center}}
     /* Cards */
     .card{{background:#fff;border:1px solid #ddd6cc;border-radius:14px;padding:14px 16px}}
     .card h2{{font-size:14px;font-weight:600;margin-bottom:10px;color:#1d2a2e}}
