@@ -305,6 +305,12 @@ class USBStream:
             fm_env_val = None
         # По умолчанию быстрый режим ВКЛЮЧЕН (всегда рабочий режим)
         self.fast_mode = True if fast_mode is None and fm_env_val is None else bool(fast_mode if fast_mode is not None else fm_env_val)
+        try:
+            # Passive mode: host opens USB and reads status/data, but does not
+            # proactively reconfigure or start the STM32 on healthy connect.
+            self.passive_connect = str(os.getenv('BMI30_PASSIVE_CONNECT', '1')).lower() not in ('0', 'false', 'no')
+        except Exception:
+            self.passive_connect = True
 
         # Save assembler pairing overrides (None -> use env)
         self._asm_relaxed_override = assembler_relaxed
@@ -598,67 +604,68 @@ class USBStream:
                     time.sleep(0.02)
                 except Exception:
                     pass
-            try:
-                send_profile = str(os.getenv('BMI30_SEND_PROFILE','0')).lower() not in ('0','false','no')
-            except Exception:
-                send_profile = False
-            # Быстрый режим принудительно шлёт профиль и Ns до START
-            if self.fast_mode:
+            if not self.passive_connect:
                 try:
-                    prof = int(self.profile if self.profile is not None else 2)
-                    self.send_cmd(CMD_SET_PROFILE, bytes([prof & 0xFF])); time.sleep(0.2 if prof == 1 else 0.01)
+                    send_profile = str(os.getenv('BMI30_SEND_PROFILE','0')).lower() not in ('0','false','no')
                 except Exception:
-                    pass
-                try:
-                    # SET_FULL_MODE(1/0)
-                    self.send_cmd(CMD_SET_FULL_MODE, bytes([1 if self.full else 0])); time.sleep(0.05)
-                except Exception:
-                    pass
-                # Важно: SET_FRAME_SAMPLES (0x17) нельзя слать для профиля 1 — ломает поток.
-                # Для профиля 2 можно слать только если хост явно попросил (frame_samples!=None).
-                if self.frame_samples is not None and int(self.profile or 2) == 2:
+                    send_profile = False
+                # Быстрый режим принудительно шлёт профиль и Ns до START
+                if self.fast_mode:
                     try:
-                        ns = max(1, int(self.frame_samples)) & 0xFFFF
-                        self.send_cmd(CMD_SET_FRAME_SAMPLES, ns.to_bytes(2, 'little'))
+                        prof = int(self.profile if self.profile is not None else 2)
+                        self.send_cmd(CMD_SET_PROFILE, bytes([prof & 0xFF])); time.sleep(0.2 if prof == 1 else 0.01)
+                    except Exception:
+                        pass
+                    try:
+                        # SET_FULL_MODE(1/0)
+                        self.send_cmd(CMD_SET_FULL_MODE, bytes([1 if self.full else 0])); time.sleep(0.05)
+                    except Exception:
+                        pass
+                    # Важно: SET_FRAME_SAMPLES (0x17) нельзя слать для профиля 1 — ломает поток.
+                    # Для профиля 2 можно слать только если хост явно попросил (frame_samples!=None).
+                    if self.frame_samples is not None and int(self.profile or 2) == 2:
+                        try:
+                            ns = max(1, int(self.frame_samples)) & 0xFFFF
+                            self.send_cmd(CMD_SET_FRAME_SAMPLES, ns.to_bytes(2, 'little'))
+                            time.sleep(0.05)
+                        except Exception:
+                            pass
+                    # В fast-режиме дополнительно задаём частоту блока (200/300 Гц) перед START
+                    try:
+                        rate_hz = 200 if int(self.profile or 1) == 1 else 300
+                        self.set_block_rate(rate_hz)
                         time.sleep(0.05)
                     except Exception:
                         pass
-                # В fast-режиме дополнительно задаём частоту блока (200/300 Гц) перед START
+                elif send_profile:
+                    try:
+                        if self.profile is not None:
+                            self.send_cmd(CMD_SET_PROFILE, bytes([int(self.profile) & 0xFF])); time.sleep(0.02)
+                    except Exception:
+                        pass
                 try:
-                    rate_hz = 200 if int(self.profile or 1) == 1 else 300
-                    self.set_block_rate(rate_hz)
-                    time.sleep(0.05)
+                    self.send_cmd(CMD_SET_FULL_MODE, bytes([1 if self.full else 0])); time.sleep(0.02)
                 except Exception:
                     pass
-            elif send_profile:
+                if self.frame_samples is not None and int(self.profile or 2) == 2:
+                    try:
+                        # u16 LE (только для профиля 2; профиль 1 ломается при SET_FRAME_SAMPLES)
+                        ns = max(1, int(self.frame_samples)) & 0xFFFF
+                        self.send_cmd(CMD_SET_FRAME_SAMPLES, ns.to_bytes(2, 'little'))
+                        time.sleep(0.02)
+                    except Exception:
+                        pass
+                # Профиль 1 требует больше времени на инициализацию
+                delay = 0.3 if (int(self.profile if self.profile is not None else 2) == 1) else 0.05
+                time.sleep(delay)
+                self.send_cmd(CMD_START_STREAM, b"")
+                time.sleep(0.05)
+                # EP0 статус-пинг сразу после старта — выключен по умолчанию
                 try:
-                    if self.profile is not None:
-                        self.send_cmd(CMD_SET_PROFILE, bytes([int(self.profile) & 0xFF])); time.sleep(0.02)
+                    if str(os.getenv('BMI30_EP0_AFTER_START','0')).lower() not in ('0','false','no'):
+                        self._get_status_ep0()
                 except Exception:
                     pass
-            try:
-                self.send_cmd(CMD_SET_FULL_MODE, bytes([1 if self.full else 0])); time.sleep(0.02)
-            except Exception:
-                pass
-            if self.frame_samples is not None and int(self.profile or 2) == 2:
-                try:
-                    # u16 LE (только для профиля 2; профиль 1 ломается при SET_FRAME_SAMPLES)
-                    ns = max(1, int(self.frame_samples)) & 0xFFFF
-                    self.send_cmd(CMD_SET_FRAME_SAMPLES, ns.to_bytes(2, 'little'))
-                    time.sleep(0.02)
-                except Exception:
-                    pass
-            # Профиль 1 требует больше времени на инициализацию
-            delay = 0.3 if (int(self.profile if self.profile is not None else 2) == 1) else 0.05
-            time.sleep(delay)
-            self.send_cmd(CMD_START_STREAM, b"")
-            time.sleep(0.05)
-            # EP0 статус-пинг сразу после старта — выключен по умолчанию
-            try:
-                if str(os.getenv('BMI30_EP0_AFTER_START','0')).lower() not in ('0','false','no'):
-                    self._get_status_ep0()
-            except Exception:
-                pass
         except Exception:
             pass
     # Консервативный старт: без дополнительных пинков/GET_STATUS (сделаем только по запросу)
@@ -666,6 +673,9 @@ class USBStream:
         self.frames = 0; self.bytes = 0; self.crc_bad = 0; self.magic_bad = 0
         self.test_seen = 0
         self.last_stat = None
+        self.last_err_step_pkt = None
+        self.last_err_step_vals = None
+        self.last_err_step_t = 0.0
         # Track per-channel RX sequence continuity (adc_id=0/1).
         # This matches the user's definition of "no losses": each channel independently.
         self.seq_last_ch0: int | None = None
@@ -1044,6 +1054,14 @@ class USBStream:
             return
         self._ensure_alt(self.intf_num, desired_alt=int(alt))
 
+    def request_err_step(self):
+        """Quietly request short bulk status `0x31`; device replies with `[0x31, err, step]`."""
+        try:
+            _ = self.dev.write(EP_OUT, bytes([0x31]), timeout=300)
+            return True
+        except Exception:
+            return False
+
     # --- internals ---
     def _ensure_alt(self, intf_num:int, desired_alt:int, retries:int=2):
         """Установить alt: стандартный SET_INTERFACE (0x0B) как основной, вендор SET_ALT(0x31) как fallback.
@@ -1211,14 +1229,14 @@ class USBStream:
                 if e.errno == 110: # timeout
                     # При длительном отсутствии рабочих кадров попробуем единоразовый fallback
                     now_t = time.time()
-                    if (not self._working_seen) and (not self._fallback_done) and (now_t - self.connected_t > 1.6):
+                    if (not self.passive_connect) and (not self._working_seen) and (not self._fallback_done) and (now_t - self.connected_t > 1.6):
                         self._do_fallback_start()
                     # Keepalive/мягкий рестарт: если давно не было вообще RX
                     if (now_t - self.last_rx_t) > float(getattr(self, 'keepalive_sec', 2.0)) and (now_t - self.keepalive_last) > 0.9:
                         # EP0 keepalive, даже если bulk OUT залип
                         self._get_status_ep0()
                         self.keepalive_last = now_t
-                    if (not getattr(self, 'disable_restart', False)) and (now_t - self.last_rx_t) > float(getattr(self, 'restart_after', 4.0)) and (now_t - self.last_restart_t) > float(getattr(self, 'restart_min_interval', 3.0)):
+                    if (not self.passive_connect) and (not getattr(self, 'disable_restart', False)) and (now_t - self.last_rx_t) > float(getattr(self, 'restart_after', 4.0)) and (now_t - self.last_restart_t) > float(getattr(self, 'restart_min_interval', 3.0)):
                         try:
                             # Выполним мягкий «чистый» рестарт: STOP + очистка EP + переустановка altsetting
                             self._prepare_clean_start(stop_first=True)
@@ -1287,6 +1305,18 @@ class USBStream:
                         continue
                     # если STAT неполный (маловероятно) — не трогаем, ждём доклейку
                     break
+                # Короткий служебный пакет 0x31: ожидаем как минимум [0x31, err, step].
+                # Сохраняем отдельно, чтобы GUI мог показать err/step без вмешательства в поток кадров.
+                if pos < n:
+                    rem = bytes(mv[pos:n])
+                    if rem and rem[0] == 0x31 and len(rem) <= 16:
+                        self.last_err_step_pkt = rem
+                        self.last_err_step_t = time.time()
+                        if len(rem) >= 3:
+                            self.last_err_step_vals = (int(rem[1]), int(rem[2]))
+                        else:
+                            self.last_err_step_vals = None
+                        pos = n
                 if pos < n:
                     buf.extend(mv[pos:].tobytes())
             if data:
@@ -1365,7 +1395,7 @@ class USBStream:
                 # Автопроверка: если хост явно задал frame_samples (и это профиль 2),
                 # а устройство пошло с другим total_samples — один раз попробуем пере-применить конфиг.
                 try:
-                    if (not self._rate_mismatch_fixed) and self.frame_samples is not None and int(getattr(self, 'profile', 2) or 2) == 2:
+                    if (not self.passive_connect) and (not self._rate_mismatch_fixed) and self.frame_samples is not None and int(getattr(self, 'profile', 2) or 2) == 2:
                         exp = int(self.frame_samples)
                         if int(total_samples) != exp:
                             self._rate_mismatch_fixed = True
@@ -1491,7 +1521,7 @@ class USBStream:
                 self._working_seen = True
             now=time.time()
             # Если видим только STAT и нет рабочих кадров — один раз пробуем fallback
-            if (not self._working_seen) and (not self._fallback_done) and (now - self.connected_t > 1.6):
+            if (not self.passive_connect) and (not self._working_seen) and (not self._fallback_done) and (now - self.connected_t > 1.6):
                 self._do_fallback_start()
             if now - self.stat_t >= 1.0:
                 with self.lock:

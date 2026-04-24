@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import html
+import ipaddress
 import json
 import mimetypes
 import os
@@ -22,8 +23,6 @@ HOTSPOT_CONN = os.getenv("BMI30_HOTSPOT_CONN",  "BMI30-Hotspot")
 SSH_USER     = os.getenv("BMI30_SSH_USER",      "techaid")
 SSH_PORT     = int(os.getenv("BMI30_SSH_PORT",  "22"))
 RDP_PORT     = int(os.getenv("BMI30_RDP_PORT",  "3389"))
-
-LOGIN_URL = f"http://{HOTSPOT_IP}/login"
 CONFIG_JSON = os.getenv("BMI30_CONFIG_JSON", os.path.join(os.path.dirname(__file__), "host", "bmi30_config.json"))
 DEVICE_SYNC_CACHE_S = max(1, int(os.getenv("BMI30_DEVICE_SYNC_CACHE_S", "3")))
 SYNC_STATUS_OFFSET_S = os.getenv("BMI30_SYNC_STATUS_OFFSET", "").strip()
@@ -37,8 +36,9 @@ LOGO_CANDIDATES = [
 ]
 
 # Connectivity-probe пути каждой ОС.
-# Мы отвечаем 302 → LOGIN_URL, чтобы ОС показала всплывающее окно / уведомление
-# «Требуется вход в сеть» и открыла встроенный браузер captive portal.
+# Для probe URL мы отдаем саму HTML-страницу, а для прочих путей делаем
+# относительный redirect на /login, чтобы портал одинаково работал и по Wi-Fi,
+# и по Ethernet, где IP может отличаться от HOTSPOT_IP.
 PROBE_PATHS: frozenset[str] = frozenset({
     "/generate_204",              # Android, Chrome, Chrome OS
     "/gen_204",                   # Android alt
@@ -269,7 +269,26 @@ def detect_default_route() -> str:
     return ""
 
 
-def collect_remote_access_targets() -> dict[str, Any]:
+def extract_request_host_ip(host_header: str) -> str | None:
+    if not host_header:
+        return None
+
+    candidate = host_header.strip()
+    if not candidate:
+        return None
+
+    if candidate.startswith("[") and "]" in candidate:
+        candidate = candidate[1:candidate.index("]")]
+    elif candidate.count(":") == 1:
+        candidate = candidate.split(":", 1)[0]
+
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def collect_remote_access_targets(preferred_ip: str | None = None) -> dict[str, Any]:
     hotspot = detect_hotspot_connection()
     interfaces = collect_ipv4_interfaces()
     default_iface = detect_default_route()
@@ -279,6 +298,18 @@ def collect_remote_access_targets() -> dict[str, Any]:
     for item in interfaces:
         if item["role"] == "hotspot":
             hotspot_ip = item["ip"]
+            break
+
+    access_ip = hotspot_ip
+    access_role = "hotspot"
+    access_iface = hotspot.get("interface") or "wlan0ap"
+    if preferred_ip:
+        for item in interfaces:
+            if item["ip"] != preferred_ip:
+                continue
+            access_ip = item["ip"]
+            access_role = item["role"]
+            access_iface = item["iface"]
             break
 
     sync_mode = detect_sync_mode()
@@ -294,6 +325,12 @@ def collect_remote_access_targets() -> dict[str, Any]:
             "interface": hotspot.get("interface") or "wlan0ap",
             "ip": hotspot_ip,
             "web_url": f"http://{hotspot_ip}/",
+        },
+        "access": {
+            "ip": access_ip,
+            "role": access_role,
+            "interface": access_iface,
+            "web_url": f"http://{access_ip}/",
         },
         "sync_mode": sync_mode,
         "logo": {
@@ -344,6 +381,8 @@ def render_html_page(data: dict[str, Any]) -> bytes:
     hostname   = html.escape(data["hostname"])
     ssid       = html.escape(data["hotspot"]["ssid"])
     hotspot_ip = html.escape(data["hotspot"]["ip"])
+    access_ip  = html.escape(data.get("access", {}).get("ip", data["hotspot"]["ip"]))
+    access_role = html.escape(data.get("access", {}).get("role", "hotspot"))
     sync_mode  = html.escape(data.get("sync_mode", {}).get("value", "off").upper())
     sync_src   = html.escape(data.get("sync_mode", {}).get("source", "unknown"))
     sync_ok    = bool(data.get("sync_mode", {}).get("device_responded", False))
@@ -457,19 +496,20 @@ def render_html_page(data: dict[str, Any]) -> bytes:
 
   <div class="card">
         <h2>Remote Access</h2>
+        <p style="font-size:12px;color:#607079;margin-bottom:8px">Current access path: {access_role} via {access_ip}</p>
     <table>
             <tr><th>Method</th><th>Address / command</th></tr>
       <tr>
         <td>SSH</td>
-        <td class="mono">ssh {ssh_user}@{hotspot_ip}</td>
+                <td class="mono">ssh {ssh_user}@{access_ip}</td>
       </tr>
       <tr>
         <td>RDP</td>
-        <td class="mono">{hotspot_ip}:{rdp_port}</td>
+                <td class="mono">{access_ip}:{rdp_port}</td>
       </tr>
       <tr>
                 <td>Web</td>
-        <td><a href="http://{hotspot_ip}/">http://{hotspot_ip}/</a></td>
+                <td><a href="http://{access_ip}/">http://{access_ip}/</a></td>
       </tr>
     </table>
   </div>
@@ -520,6 +560,7 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
     def _handle_request(self, send_body: bool) -> None:
         path = self.path.split("?", 1)[0]
+        preferred_ip = extract_request_host_ip(self.headers.get("Host", ""))
 
         # Android CNA: пользователь нажал "Continue" → отдаём 204, браузер закрывается
         if path == "/portal-done":
@@ -546,7 +587,7 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
         # JSON API
         if path == "/api/status":
-            data = collect_remote_access_targets()
+            data = collect_remote_access_targets(preferred_ip=preferred_ip)
             payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -562,7 +603,7 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
         # и для Android/Windows/Linux: ответ отличается от ожидаемого "internet ok",
         # поэтому ОС помечает сеть как captive portal и показывает страницу входа.
         if path in PROBE_PATHS:
-            data = collect_remote_access_targets()
+            data = collect_remote_access_targets(preferred_ip=preferred_ip)
             payload = render_html_page(data)
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -575,7 +616,7 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
         # Информационная страница
         if path in INFO_PATHS:
-            data = collect_remote_access_targets()
+            data = collect_remote_access_targets(preferred_ip=preferred_ip)
             payload = render_html_page(data)
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -588,7 +629,7 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
         # Всё остальное — редирект на страницу входа
         self.send_response(HTTPStatus.FOUND)
-        self.send_header("Location", LOGIN_URL)
+        self.send_header("Location", "/login")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 

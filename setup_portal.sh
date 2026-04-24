@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+sudo rpi-eeprom-config#!/usr/bin/env bash
 # setup_portal.sh — Быстрая установка BMI30 Captive Portal (без полного install-скрипта)
 # Запуск: sudo bash setup_portal.sh
 set -euo pipefail

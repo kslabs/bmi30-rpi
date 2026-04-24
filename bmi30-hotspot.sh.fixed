@@ -22,13 +22,9 @@ detect_serial() {
     serial="$(awk -F': ' '/^Serial/ {print $2; exit}' /proc/cpuinfo | tr -d ' \t\n' || true)"
   fi
 
-  if [[ -z "$serial" && -r /etc/machine-id ]]; then
-    serial="$(tr -d ' \t\n' < /etc/machine-id || true)"
-  fi
-
   serial="$(printf '%s' "$serial" | tr -cd '0-9A-Fa-f')"
-  if [[ -z "$serial" ]]; then
-    echo "Unable to determine serial" >&2
+  if [[ -z "$serial" || ${#serial} -lt 12 ]]; then
+    echo "Unable to determine Raspberry Pi hardware serial" >&2
     exit 1
   fi
 
@@ -91,6 +87,10 @@ if [[ -n "$target_uuid" ]]; then
     ipv4.method shared \
     ipv6.method ignore \
     wifi-sec.key-mgmt wpa-psk \
+    wifi-sec.proto rsn \
+    wifi-sec.pairwise ccmp \
+    wifi-sec.group ccmp \
+    wifi-sec.pmf 1 \
     wifi-sec.psk "$PASS" \
     connection.autoconnect yes
 else
@@ -103,6 +103,10 @@ else
     ipv4.method shared \
     ipv6.method ignore \
     wifi-sec.key-mgmt wpa-psk \
+    wifi-sec.proto rsn \
+    wifi-sec.pairwise ccmp \
+    wifi-sec.group ccmp \
+    wifi-sec.pmf 1 \
     wifi-sec.psk "$PASS" \
     connection.autoconnect yes
 fi

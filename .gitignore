@@ -69,3 +69,12 @@ config.local.json
 # Runtime state (GUI)
 host/bmi30_sel.json
 host/dc_offset_samples*.npz
+host/bmi30_config.json
+
+# Local/generated device state
+.codex/
+backups/
+backup_output.txt
+status.json
+host/*.restore-backup-*
+host/*.codex-broken-backup-*

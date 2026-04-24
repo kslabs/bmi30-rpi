@@ -1,0 +1,20 @@
+# Пример конфигурации для utilities/backup_to_cloud.sh
+# Скопируйте в backup_to_cloud.conf и отредактируйте под себя.
+
+# Что архивировать (по умолчанию: /home/techaid/Documents)
+SOURCE_DIR="/home/techaid/Documents"
+
+# Куда класть локальные архивы
+BACKUP_ROOT="/home/techaid/Documents/backups"
+
+# Куда выгружать через rclone (пример: gdrive:)
+REMOTE_TARGET="gdrive:"
+
+# ID папки Google Drive
+REMOTE_FOLDER_ID="1q7nYpi-rXyjx5XOgZ_G0rfQ2xyrLh-BC"
+
+# Сколько дней хранить локальные архивы
+LOCAL_RETENTION_DAYS="30"
+
+# Расписание авто-бэкапа
+ON_CALENDAR="*-*-* 23:00:00"

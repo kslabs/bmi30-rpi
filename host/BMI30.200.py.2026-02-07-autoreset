@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 import os
-import sys, time, json, os as _os_alias, struct
+import sys, time, json, os as _os_alias, struct, signal
+import importlib
 import threading
 import datetime
 # Qt env: avoid GTK theme/plugin conflicts on RPi (Bookworm)
@@ -20,12 +21,19 @@ if "QT_QPA_PLATFORM" not in os.environ:
 		os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ.setdefault("QT_STYLE_OVERRIDE", "Fusion")
 os.environ.pop("QT_QPA_PLATFORMTHEME", None)
+_qt_logging_rules = str(os.environ.get("QT_LOGGING_RULES", "") or "").strip()
+if "qt.core.qobject.connect.warning=false" not in _qt_logging_rules:
+	if _qt_logging_rules:
+		_qt_logging_rules += ";qt.core.qobject.connect.warning=false"
+	else:
+		_qt_logging_rules = "qt.core.qobject.connect.warning=false"
+	os.environ["QT_LOGGING_RULES"] = _qt_logging_rules
 import numpy as np  # type: ignore
 import serial, glob
 import threading, queue
 
 try:
-	from usb_vendor.usb_stream import USBStream, CMD_SET_PROFILE, CMD_STOP_STREAM, CMD_START_STREAM, CMD_SOFT_RESET, CMD_DEEP_RESET, CMD_SET_WINDOWS, CMD_SET_STREAM_MODE, CMD_ASYNC, CMD_SET_TIM2_ENABLE  # type: ignore
+	from usb_vendor.usb_stream import USBStream, CMD_SET_PROFILE, CMD_STOP_STREAM, CMD_START_STREAM, CMD_SOFT_RESET, CMD_DEEP_RESET, CMD_SET_WINDOWS, CMD_SET_STREAM_MODE, CMD_ASYNC, CMD_SET_TIM2_ENABLE, CMD_GET_STATUS  # type: ignore
 except Exception:
 	from usb_vendor.usb_stream import USBStream  # type: ignore
 	CMD_SET_PROFILE = 0x14
@@ -43,6 +51,15 @@ except Exception:
 	CMD_SET_ALT = 0x31
 	CMD_SET_TIM2_ENABLE = 0x1E
 	CMD_SET_TX_ENABLE = 0x33
+
+# Optional: explicit TX enable command (present in newer usb_stream.py)
+try:
+	from usb_vendor.usb_stream import CMD_SET_TX_ENABLE  # type: ignore
+except Exception:
+	try:
+		CMD_SET_TX_ENABLE = int(os.getenv("BMI30_CMD_SET_TX_ENABLE", "0x33"), 0)
+	except Exception:
+		CMD_SET_TX_ENABLE = 0x33
 
 # Optional: device-side DC adaptation toggle (not present in older usb_stream.py)
 try:
@@ -70,6 +87,24 @@ except Exception:
 		CMD_SET_SYNC_MODE = int(os.getenv("BMI30_CMD_SET_SYNC_MODE", "0x1D"), 0)
 	except Exception:
 		CMD_SET_SYNC_MODE = 0x1D
+
+
+def _import_gpio_module(module_name: str):
+	"""Import GPIO-related module, falling back to system dist-packages from venv."""
+	try:
+		return importlib.import_module(module_name)
+	except Exception:
+		pass
+	for extra_path in (
+		"/usr/lib/python3/dist-packages",
+		f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages",
+	):
+		try:
+			if os.path.isdir(extra_path) and extra_path not in sys.path:
+				sys.path.append(extra_path)
+		except Exception:
+			pass
+	return importlib.import_module(module_name)
 
 
 class PwmBeeper:
@@ -117,22 +152,9 @@ class PwmBeeper:
 	def _init_backend(self):
 		if not self._enabled:
 			return
-		# Try pigpio first
+		# Try lgpio first on Pi5/CM5 to avoid noisy pigpio fallback.
 		try:
-			import pigpio  # type: ignore
-			pi = pigpio.pi()
-			if getattr(pi, 'connected', False):
-				self._backend = 'pigpio'
-				self._pi = pi
-				# Установить начальное состояние LOW (0)
-				pi.set_mode(self.gpio_pin, pigpio.OUTPUT)
-				pi.write(self.gpio_pin, 0)
-				return
-		except Exception:
-			pass
-		# Try lgpio (recommended on Pi5 / modern distros)
-		try:
-			import lgpio  # type: ignore
+			lgpio = _import_gpio_module('lgpio')  # type: ignore
 			chip = 0
 			try:
 				chip = int(os.getenv('BMI30_GPIOCHIP', '0') or 0)
@@ -152,9 +174,22 @@ class PwmBeeper:
 		except Exception:
 			self._lg = None
 			self._lg_h = None
+		# Try pigpio after lgpio
+		try:
+			pigpio = _import_gpio_module('pigpio')  # type: ignore
+			pi = pigpio.pi()
+			if getattr(pi, 'connected', False):
+				self._backend = 'pigpio'
+				self._pi = pi
+				# Установить начальное состояние LOW (0)
+				pi.set_mode(self.gpio_pin, pigpio.OUTPUT)
+				pi.write(self.gpio_pin, 0)
+				return
+		except Exception:
+			pass
 		# Fallback: RPi.GPIO software PWM
 		try:
-			import RPi.GPIO as GPIO  # type: ignore
+			GPIO = _import_gpio_module('RPi.GPIO')  # type: ignore
 			GPIO.setwarnings(False)
 			GPIO.setmode(GPIO.BCM)
 			GPIO.setup(self.gpio_pin, GPIO.OUT, initial=GPIO.LOW)  # Явно LOW при инициализации
@@ -555,12 +590,13 @@ class ScopeWindow:
 		legend_bar.addWidget(self.btn_reconnect, 0)
 		# Кнопка перезапитки USB-порта (через uhubctl)
 		self.btn_power = QtWidgets.QPushButton("⚡")
-		self.btn_power.setToolTip("Сбросить адаптацию порога (ускорить стартовую подстройку)")
+		self.btn_power.setToolTip("Сбросить порог; в режиме 5 держать DC-подстройку до центра 32767")
 		self.btn_power.clicked.connect(self._reset_det_adapt)
 		try:
 			self.btn_power.setFixedSize(21, 21)
 		except Exception:
 			pass
+		self._update_dc_autotune_btn_style()
 		# правый клик по кнопке питания копирует заголовок в буфер обмена
 		try:
 			self.btn_power.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
@@ -658,8 +694,12 @@ class ScopeWindow:
 		legend_bar.addWidget(self.btn_sync, 0)
 		# Кнопка передачи (TIM2 enable)
 		self.tim2_enabled = str(os.getenv("BMI30_TIM2_ENABLE", "1")).lower() not in ("0", "false", "no")
+		self.tim2_applied = False
+		self.tim2_pending = False
+		self._tim2_request_seq = 0
+		self._tim2_result_queue = queue.Queue()
 		self.btn_tim2 = QtWidgets.QPushButton("TX")
-		self.btn_tim2.setToolTip("Передача TIM2: ВКЛ/ВЫКЛ")
+		self.btn_tim2.setToolTip("Передача TIM2/TX: ВКЛ/ВЫКЛ")
 		self.btn_tim2.setCheckable(True)
 		try:
 			self.btn_tim2.setChecked(bool(self.tim2_enabled))
@@ -1185,6 +1225,12 @@ class ScopeWindow:
 		self.last_diag_t = 0.0
 		# отслеживание общего приёма данных (по транспорту), чтобы не ругаться на "остановку" при отсутствии пар
 		self._last_rx_seen = 0.0
+		# Диагностика источника потери потока: RPi/USB vs STM32/stream logic.
+		self._stream_fault_kind = "ok"
+		self._stream_fault_msg = ""
+		self._stream_fault_probe_t = 0.0
+		self._stream_fault_probe_ok = None
+		self._stream_fault_probe_msg = ""
 		self._last_sample_ts: float | None = None
 		# счётчики диагностики парирования (чтобы не падать при отсутствии mismatch)
 		self._pair_mismatch_count = 0
@@ -1292,6 +1338,14 @@ class ScopeWindow:
 		# the first frames may immediately freeze.
 		self._det_warmup_until = 0.0
 		self._det_warmup_dc_fix_last_t = 0.0
+		# Одноразовый автодовод DC в режиме 5: держим ускоренную подстройку,
+		# пока все активные буферы не окажутся отцентрованы вокруг 32767.
+		self._dc_autotune_active = False
+		self._dc_autotune_started_t = 0.0
+		self._dc_autotune_last_cmd_t = 0.0
+		self._dc_autotune_last_status_t = 0.0
+		self._dc_autotune_attempts = 0
+		self._dc_autotune_fast_frames = 0
 		# Beeper: PWM0/GPIO12 best-effort (no-op if not available)
 		try:
 			gpio_pin = int(os.getenv("BMI30_BEEP_GPIO", "12"))
@@ -1459,7 +1513,7 @@ class ScopeWindow:
 		self._connecting = False
 		self.usb_retry_timer = QtCore.QTimer()
 		self.usb_retry_timer.setInterval(1500)
-		self.usb_retry_timer.timeout.connect(self._try_connect)
+		self.usb_retry_timer.timeout.connect(self._try_connect_safe)
 		self._set_status("Поток запускается автоматически при выборе любой кнопки кроме 0")
 		# Сохраним порт info для power cycle без stream
 		self.last_port_info = None
@@ -1473,7 +1527,7 @@ class ScopeWindow:
 			gui_fps = 16
 		interval = max(10, int(1000 / gui_fps))  # минимум 10мс
 		self.qtimer.setInterval(interval)
-		self.qtimer.timeout.connect(self._tick)
+		self.qtimer.timeout.connect(self._tick_safe)
 		self.qtimer.start()
 
 		# Start background mode-switch worker to avoid blocking GUI on USB commands
@@ -1492,7 +1546,7 @@ class ScopeWindow:
 		# авто-сброс STM32 при пропаже потока
 		self.auto_reset_on_stall = str(os.getenv("BMI30_AUTO_RESET_ON_STALL", "1")).lower() not in ("0","false","no")
 		try:
-			self.stall_reset_after = float(os.getenv("BMI30_STALL_RESET_AFTER", "2"))
+			self.stall_reset_after = float(os.getenv("BMI30_STALL_RESET_AFTER", "2.0"))
 		except Exception:
 			self.stall_reset_after = 2.0
 		try:
@@ -1501,6 +1555,14 @@ class ScopeWindow:
 			self.stall_reset_cooldown = 10.0
 		self._stall_reset_last_t = 0.0
 		self._stall_reset_inflight = False
+		self._auto_reset_just_occurred = False  # флаг: произошел авторесет, нужно переключиться на режим 5
+		self._connect_started_t = 0.0
+		self._connect_attempt_id = 0
+		self._connect_result_q = queue.Queue()
+		try:
+			self.connect_timeout_s = float(os.getenv("BMI30_CONNECT_TIMEOUT_S", "12.0"))
+		except Exception:
+			self.connect_timeout_s = 12.0
 		# Флаг: поток остановлен пользователем (не выполнять автопинки)
 		self._stream_user_stopped = False
 		# нижняя панель: слева слайдеры, справа цифровые кнопки
@@ -1638,13 +1700,15 @@ class ScopeWindow:
 			port = self._find_cdc_port()
 			if port is None:
 				print("[RESET] CDC порт не найден, пропускаем SOFT_RESET")
-				return
-			with serial.Serial(port, 115200, timeout=1) as ser:
+				return False
+			with serial.Serial(port, 115200, timeout=0.2, write_timeout=0.2) as ser:
 				ser.write(bytes([CMD_SOFT_RESET]))
 				time.sleep(0.1)
 				print("[RESET] SOFT_RESET sent via CDC")
+				return True
 		except Exception as e:
 			print(f"[RESET] SOFT_RESET via CDC failed: {e}")
+			return False
 
 	def _hardware_reset_device(self) -> bool:
 		"""Аппаратный сброс через GPIO (open-collector): краткий LOW, затем Hi-Z."""
@@ -1653,26 +1717,50 @@ class ScopeWindow:
 		except Exception:
 			gpio_pin = 17
 		try:
-			pulse_ms = int(os.getenv("BMI30_HW_RESET_PULSE_MS", "100"))
+			pulse_ms = int(os.getenv("BMI30_HW_RESET_PULSE_MS", "500"))
 		except Exception:
-			pulse_ms = 100
+			pulse_ms = 500
 		try:
-			wait_s = float(os.getenv("BMI30_HW_RESET_WAIT_S", "3.0"))
+			# По умолчанию 0.5 сек (быстро), можно переопределить через env
+			wait_s = float(os.getenv("BMI30_HW_RESET_WAIT_S", "0.5"))
 		except Exception:
-			wait_s = 3.0
+			wait_s = 0.5
 		if gpio_pin <= 0:
 			return False
 		if pulse_ms <= 0:
-			pulse_ms = 100
+			pulse_ms = 500
 		if wait_s < 0:
 			wait_s = 0.0
+		try:
+			print(f"[HW-RESET] begin pin={gpio_pin} pulse_ms={pulse_ms} wait_s={wait_s}", flush=True)
+		except Exception:
+			pass
 		try:
 			self._set_status(f"Аппаратный сброс GPIO{gpio_pin}…", hold_sec=1.5)
 		except Exception:
 			pass
-		# Try pigpio first
+		# Try lgpio first on Pi5/CM5 to avoid noisy pigpio fallback.
 		try:
-			import pigpio  # type: ignore
+			lgpio = _import_gpio_module('lgpio')  # type: ignore
+			chip = lgpio.gpiochip_open(0)
+			lgpio.gpio_claim_output(chip, gpio_pin, 0)
+			time.sleep(max(0.01, pulse_ms / 1000.0))
+			lgpio.gpio_claim_input(chip, gpio_pin)
+			lgpio.gpiochip_close(chip)
+			time.sleep(wait_s)
+			try:
+				print("[HW-RESET] done backend=lgpio result=OK", flush=True)
+			except Exception:
+				pass
+			return True
+		except Exception as e_lgpio:
+			try:
+				print(f"[HW-RESET] lgpio failed: {e_lgpio}", flush=True)
+			except Exception:
+				pass
+		# Try pigpio after lgpio
+		try:
+			pigpio = _import_gpio_module('pigpio')  # type: ignore
 			pi = pigpio.pi()
 			if getattr(pi, 'connected', False):
 				pi.set_mode(gpio_pin, pigpio.OUTPUT)
@@ -1681,24 +1769,19 @@ class ScopeWindow:
 				pi.set_mode(gpio_pin, pigpio.INPUT)  # Hi-Z
 				pi.stop()
 				time.sleep(wait_s)
+				try:
+					print("[HW-RESET] done backend=pigpio result=OK", flush=True)
+				except Exception:
+					pass
 				return True
-		except Exception:
-			pass
-		# Try lgpio (Pi5-friendly)
-		try:
-			import lgpio  # type: ignore
-			chip = lgpio.gpiochip_open(0)
-			lgpio.gpio_claim_output(chip, gpio_pin, 0)
-			time.sleep(max(0.01, pulse_ms / 1000.0))
-			lgpio.gpio_claim_input(chip, gpio_pin)
-			lgpio.gpiochip_close(chip)
-			time.sleep(wait_s)
-			return True
-		except Exception:
-			pass
+		except Exception as e_pigpio:
+			try:
+				print(f"[HW-RESET] pigpio failed: {e_pigpio}", flush=True)
+			except Exception:
+				pass
 		# Fallback: RPi.GPIO
 		try:
-			import RPi.GPIO as GPIO  # type: ignore
+			GPIO = _import_gpio_module('RPi.GPIO')  # type: ignore
 			GPIO.setwarnings(False)
 			GPIO.setmode(GPIO.BCM)
 			GPIO.setup(gpio_pin, GPIO.OUT, initial=GPIO.LOW)
@@ -1706,9 +1789,115 @@ class ScopeWindow:
 			GPIO.setup(gpio_pin, GPIO.IN, pull_up_down=GPIO.PUD_OFF)
 			GPIO.cleanup(gpio_pin)
 			time.sleep(wait_s)
+			try:
+				print("[HW-RESET] done backend=RPi.GPIO result=OK", flush=True)
+			except Exception:
+				pass
 			return True
-		except Exception:
+		except Exception as e_gpio:
+			try:
+				print(f"[HW-RESET] all backends failed, last=RPi.GPIO err={e_gpio}", flush=True)
+			except Exception:
+				pass
 			return False
+
+	def _probe_device_status_ep0(self, force: bool = False):
+		"""Проверить, отвечает ли устройство на GET_STATUS по EP0."""
+		now = time.time()
+		try:
+			last_t = float(getattr(self, '_stream_fault_probe_t', 0.0) or 0.0)
+		except Exception:
+			last_t = 0.0
+		if (not force) and (now - last_t) < 0.7:
+			return getattr(self, '_stream_fault_probe_ok', None), str(getattr(self, '_stream_fault_probe_msg', '') or '')
+		ok = None
+		msg = ""
+		try:
+			st = getattr(self, 'stream', None)
+			dev = getattr(st, 'dev', None) if st is not None else None
+			if dev is None:
+				ok = None
+				msg = "нет USB device"
+			else:
+				data = dev.ctrl_transfer(0xC0, CMD_GET_STATUS, 0, 0, 64, timeout=250)
+				bs = bytes(data) if data is not None else b""
+				if st is not None and bs:
+					try:
+						st.last_stat = bs
+					except Exception:
+						pass
+				if len(bs) >= 4 and bs[:4] == b'STAT':
+					ok = True
+					msg = f"EP0 OK len={len(bs)}"
+				elif len(bs) > 0:
+					ok = True
+					msg = f"EP0 resp len={len(bs)}"
+				else:
+					ok = False
+					msg = "EP0 empty"
+		except Exception as e:
+			ok = False
+			try:
+				errno = getattr(e, 'errno', None)
+			except Exception:
+				errno = None
+			if errno is not None:
+				msg = f"EP0 err errno={errno}: {e}"
+			else:
+				msg = f"EP0 err: {e}"
+		self._stream_fault_probe_t = now
+		self._stream_fault_probe_ok = ok
+		self._stream_fault_probe_msg = msg
+		return ok, msg
+
+	def _classify_stream_fault(self, now_t: float | None = None):
+		"""Классифицировать пропажу потока: USB/RPi vs STM32 vs парирование."""
+		if now_t is None:
+			now_t = time.time()
+		if self.stream is None:
+			return ("stream_off", "Поток остановлен")
+		try:
+			if bool(getattr(self.stream, 'disconnected', False)):
+				return ("usb_disconnected", "RPi/USB: устройство исчезло или переоткрылось")
+		except Exception:
+			pass
+		try:
+			stop_after = float(getattr(self, 'stop_warn_after', 5.0) or 5.0)
+		except Exception:
+			stop_after = 5.0
+		try:
+			rx_t = float(getattr(self.stream, 'last_rx_t', 0.0) or 0.0)
+		except Exception:
+			rx_t = 0.0
+		try:
+			frame_t = float(getattr(self, 'last_frame_t', 0.0) or 0.0)
+		except Exception:
+			frame_t = 0.0
+		has_frames = bool(getattr(self, 'base_buf_len', None) is not None)
+		idle_rx = (float(now_t) - rx_t) if rx_t > 0.0 else float('inf')
+		idle_frame = (float(now_t) - frame_t) if frame_t > 0.0 else float('inf')
+		if idle_rx <= stop_after:
+			if has_frames and idle_frame > stop_after:
+				return ("pairing_stall", "RPi получает USB, но нет новых стереопар")
+			if not has_frames:
+				return ("waiting_frames", "USB жив, но рабочих кадров ещё нет")
+			return ("ok", "Поток жив")
+		ep0_ok, ep0_msg = self._probe_device_status_ep0(force=False)
+		if ep0_ok is True:
+			return ("stm32_stream_stall", f"STM32 отвечает на EP0, но bulk поток молчит ({ep0_msg})")
+		if ep0_ok is False:
+			return ("rpi_usb_fault", f"RPi/USB не получает даже EP0 ({ep0_msg})")
+		return ("no_rx_unknown", "Нет USB приёма, причина пока не определена")
+
+	def _update_stream_fault_state(self, now_t: float | None = None):
+		"""Обновить кэш диагноза пропажи потока."""
+		try:
+			kind, msg = self._classify_stream_fault(now_t=now_t)
+		except Exception as e:
+			kind, msg = ("fault_unknown", f"Диагностика потока недоступна: {e}")
+		self._stream_fault_kind = str(kind)
+		self._stream_fault_msg = str(msg)
+		return kind, msg
 
 	def _maybe_auto_reset_on_stall(self, reason: str, idle_s: float):
 		"""Авто-сброс STM32 при зависании потока (best-effort, с троттлингом)."""
@@ -1730,11 +1919,21 @@ class ScopeWindow:
 				cooldown = float(getattr(self, 'stall_reset_cooldown', 0.0) or 0.0)
 			except Exception:
 				cooldown = 0.0
+			
+			# На ранней стадии подключения (первые 5 сек) — это ускорение cooldown
+			try:
+				ct = float(self.connect_t or 0.0)
+				if ct > 0 and (now - ct) < 5.0:
+					cooldown = max(1.0, cooldown * 0.5)  # вполовину меньше cooldown
+			except Exception:
+				pass
+			
 			last_t = float(getattr(self, '_stall_reset_last_t', 0.0) or 0.0)
 			if cooldown > 0 and (now - last_t) < cooldown:
 				return
 			self._stall_reset_inflight = True
 			self._stall_reset_last_t = now
+			self._auto_reset_just_occurred = True  # флаг для переключения на режим 5
 			try:
 				self._set_status(f"Поток пропал ({reason}) — сброс STM32…", hold_sec=2.0)
 			except Exception:
@@ -4085,6 +4284,11 @@ class ScopeWindow:
 			self._phase_search_enabled = bool(int(idx) >= 6)
 		except Exception:
 			self._phase_search_enabled = False
+		if int(idx) != 5:
+			try:
+				self._stop_dc_autotune(reason='выход из режима 5', announce=False)
+			except Exception:
+				pass
 		# Если поток не запущен — перезапускаем на любой кнопке кроме 0
 		try:
 			if int(idx) != 0 and self.stream is None and not self._connecting:
@@ -5094,6 +5298,46 @@ class ScopeWindow:
 	
 	def _tick(self):
 		"""GUI thread: читает из shared buffers и отображает данные ВСЕГДА"""
+		self._process_connect_results()
+		# --- Подтверждение TIM2/TX от устройства (из фонового worker) ---
+		while True:
+			try:
+				tim2_req_id, tim2_expected, tim2_ok = self._tim2_result_queue.get_nowait()
+			except queue.Empty:
+				break
+			if int(tim2_req_id) != int(getattr(self, '_tim2_request_seq', 0)):
+				continue
+			self.tim2_pending = False
+			if bool(tim2_ok):
+				self.tim2_applied = bool(tim2_expected)
+				self._set_status("TIM2/TX: подтверждено устройством", hold_sec=1.2)
+			else:
+				self.tim2_applied = False
+				self._set_status("TIM2/TX: устройство не подтвердило состояние", hold_sec=1.6)
+			self._update_tim2_btn_style()
+		# Watchdog подключения: если connect завис дольше порога, считаем попытку неуспешной и перезапускаем.
+		if self.stream is None and bool(getattr(self, '_connecting', False)):
+			try:
+				cst = float(getattr(self, '_connect_started_t', 0.0) or 0.0)
+				timeout_s = float(getattr(self, 'connect_timeout_s', 8.0) or 8.0)
+				if cst > 0.0 and timeout_s > 0.0 and (time.time() - cst) > timeout_s:
+					self._set_status(f"Таймаут подключения >{timeout_s:g}с, перезапуск…", hold_sec=1.0)
+					self._connecting = False
+					self._connect_started_t = 0.0
+					self._connect_attempt_id = int(getattr(self, '_connect_attempt_id', 0)) + 1
+			except Exception:
+				pass
+		# После авто-сброса переключаемся на кнопку 5 только в GUI-потоке.
+		if self.stream is not None and bool(getattr(self, '_auto_reset_just_occurred', False)):
+			try:
+				btn5 = self.num_group.button(5)
+				if btn5 is not None:
+					btn5.setChecked(True)
+					self._num_clicked(5)
+				self._auto_reset_just_occurred = False
+				print("[GUI] Auto-reset completed, switched to mode 5", flush=True)
+			except Exception as e:
+				print(f"[GUI] Failed to switch mode after auto-reset: {e}", flush=True)
 		# Обработка статуса подключения
 		if self.stream is None:
 			self._last_sample_ts = None
@@ -5107,6 +5351,11 @@ class ScopeWindow:
 		# Проверка disconnected (но продолжаем отображать данные)
 		if self.stream is not None and getattr(self.stream, 'disconnected', False):
 			try:
+				self._stream_fault_kind = "usb_disconnected"
+				self._stream_fault_msg = "RPi/USB: поток разорван, устройство marked disconnected"
+			except Exception:
+				pass
+			try:
 				self.stream.close()
 			except Exception:
 				pass
@@ -5116,6 +5365,16 @@ class ScopeWindow:
 				need_hw = bool(getattr(self, '_usb_err_need_hw_reset', False))
 			except Exception:
 				need_hw = False
+			try:
+				connect_age = float(time.time() - float(getattr(self, 'connect_t', 0.0) or 0.0))
+			except Exception:
+				connect_age = 0.0
+			try:
+				had_frames = float(getattr(self, 'last_frame_t', 0.0) or 0.0) > 0.0
+			except Exception:
+				had_frames = False
+			if (not had_frames) and connect_age <= 10.0:
+				need_hw = True
 			if need_hw:
 				try:
 					self._usb_err_need_hw_reset = False
@@ -5134,6 +5393,8 @@ class ScopeWindow:
 				return
 			self._set_status("USB занят/отключён, переподключение…", hold_sec=2.0)
 			self.usb_retry_timer.start()
+
+		self._tick_dc_autotune()
 		
 		# Читаем данные из shared buffers с блокировкой (ВСЕГДА, даже если stream=None)
 		with self.data_lock:
@@ -5250,11 +5511,18 @@ class ScopeWindow:
 			_counters = f" | 🔊:{self._beep_fire_count} ❄️:{self._freeze_fire_count}"
 		except Exception:
 			_counters = ''
+		_fault_short = ''
+		try:
+			_fault_kind, _fault_msg = self._update_stream_fault_state()
+			if str(_fault_kind) not in ('ok', 'stream_off'):
+				_fault_short = f" | FLOW:{str(_fault_kind)}"
+		except Exception:
+			_fault_short = ''
 		# Полный статус сохраняем для копирования (правый клик по ⚡)
 		_default_status_full = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} Aeo:{self.afps_even:.1f}/{self.afps_odd:.1f}{_dt_a} Beo:{self.bfps_even:.1f}/{self.bfps_odd:.1f}{_dt_b}{_phase} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} STEP:{getattr(self,'seq_step',1)} R:{getattr(self,'seq_reorder_count',0)} GA:{getattr(self,'gap_a',0)} GB:{getattr(self,'gap_b',0)} SA:{getattr(self,'step_a',1)} SB:{getattr(self,'step_b',1)} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}{asm_stat}"
 		self._last_full_status = _default_status_full
 		# Компактный статус для отображения (убираем PH/SEG/VIEW/BUF/FREQ, добавляем счетчики)
-		_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} GAP:{self.gap_count}{_counters}"
+		_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} GAP:{self.gap_count}{_counters}{_fault_short}"
 		# Forced PWM from GUI: highest priority, independent from detection.
 		try:
 			mode = int(getattr(self, '_beep_force_mode', 0))
@@ -5340,6 +5608,10 @@ class ScopeWindow:
 			pass
 		# предупреждение если нет данных
 		now2 = time.time()
+		try:
+			fault_kind, fault_msg = self._update_stream_fault_state(now2)
+		except Exception:
+			fault_kind, fault_msg = ("fault_unknown", "")
 		
 		# БЫСТРАЯ ПРОВЕРКА АВТОРЕСЕТА: каждый тик, без привязки к diag_interval
 		# Срабатывает через stall_reset_after (2 сек) вместо 15+ секунд
@@ -5361,7 +5633,18 @@ class ScopeWindow:
 				
 				# Если превышен порог - запускаем сброс
 				if thr > 0 and idle_s >= thr:
-					reason = "нет приёма" if idle_rx > idle_frame else "нет кадров"
+					if idle_rx > idle_frame:
+						if str(fault_kind) == 'stm32_stream_stall':
+							reason = "STM32 bulk молчит"
+						elif str(fault_kind) == 'rpi_usb_fault':
+							reason = "RPi/USB fault"
+						else:
+							reason = "нет приёма"
+					else:
+						if str(fault_kind) == 'pairing_stall':
+							reason = "USB есть, нет стереопар"
+						else:
+							reason = "нет кадров"
 					self._maybe_auto_reset_on_stall(reason, idle_s)
 			except Exception:
 				pass
@@ -5387,10 +5670,11 @@ class ScopeWindow:
 			self.no_data_warned = True
 		elif self.stream and (now2 - float(getattr(self.stream, 'last_rx_t', 0.0))) > self.stop_warn_after and (now2 - self.last_diag_t) > self.diag_interval:
 			# Совсем нет приёма данных (ни STAT, ни кадров)
+			fault_text = str(fault_msg or "Нет приёма данных. Причина не определена.")
 			if self.diag_to_console:
-				print(f"[diag] Нет приёма данных >{int(self.stop_warn_after)}с. Возможно устройство перестало слать.")
+				print(f"[diag] {fault_text}")
 			else:
-				self._set_status(f"Нет приёма данных >{int(self.stop_warn_after)}с. Возможно устройство перестало слать. " + self._instr, hold_sec=4.0)
+				self._set_status(f"{fault_text}. " + self._instr, hold_sec=4.0)
 			self.last_diag_t = now2
 			# Авто-сброс STM32 при полном отсутствии трафика
 			try:
@@ -5401,10 +5685,11 @@ class ScopeWindow:
 				pass
 		elif self.stream and self.base_buf_len is not None and (now2 - self.last_frame_t) > self.stop_warn_after and (now2 - self.last_diag_t) > self.diag_interval:
 			# Приём идёт, но нет новых стереопар (например, рассинхрон A/B)
+			fault_text = str(fault_msg or "RPi получает USB, но нет новых стереопар.")
 			if self.diag_to_console:
-				print(f"[diag] Нет новых стереопар >{int(self.stop_warn_after)}с (приём идёт). Проверьте A/B и seq. Нажмите ↻ для переподключения.")
+				print(f"[diag] {fault_text}")
 			else:
-				self._set_status(f"Нет новых стереопар >{int(self.stop_warn_after)}с (приём идёт). Проверьте A/B и seq. Нажмите ↻ для переподключения.", hold_sec=3.0)
+				self._set_status(f"{fault_text}. Проверьте A/B и seq. Нажмите ↻ для переподключения.", hold_sec=3.0)
 			self.last_diag_t = now2
 			# Авто-сброс STM32 при зависшем потоке (нет новых кадров)
 			try:
@@ -5434,9 +5719,16 @@ class ScopeWindow:
 				_counters = f" | 🔊:{self._beep_fire_count} ❄️:{self._freeze_fire_count}"
 			except Exception:
 				_counters = ''
+			_fault_short = ''
+			try:
+				_fault_kind, _fault_msg = self._update_stream_fault_state()
+				if str(_fault_kind) not in ('ok', 'stream_off'):
+					_fault_short = f" | FLOW:{str(_fault_kind)}"
+			except Exception:
+				_fault_short = ''
 			_default_status_full = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} CH0:{len(self.data0)} GAP:{self.gap_count} SEQ:{self.last_seq} STEP:{getattr(self,'seq_step',1)} R:{getattr(self,'seq_reorder_count',0)} GA:{getattr(self,'gap_a',0)} GB:{getattr(self,'gap_b',0)} SA:{getattr(self,'step_a',1)} SB:{getattr(self,'step_b',1)} VIEW[{self.view_start}:{self.view_start+self.view_len}]{buf_info}{_zero_part}"
 			self._last_full_status = _default_status_full
-			_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} GAP:{self.gap_count}{_counters}"
+			_default_status = f"Afps:{self.afps:.1f} Bfps:{self.bfps:.1f} GAP:{self.gap_count}{_counters}{_fault_short}"
 			self._set_runtime_legend(_default_status, force=True)
 		
 		# --- Auto-capture: push frame to circular buffer and handle POST phase ---
@@ -6050,8 +6342,242 @@ class ScopeWindow:
 		except Exception:
 			pass
 
+	def _update_dc_autotune_btn_style(self):
+		"""Подсветить кнопку ускорения, пока активен автодовод DC."""
+		try:
+			if bool(getattr(self, '_dc_autotune_active', False)):
+				self.btn_power.setStyleSheet("background-color: #ffd34d; color: #000000; font-weight: bold;")
+				self.btn_power.setToolTip("DC автоцентрирование активно: держим подстройку до центра 32767")
+			else:
+				self.btn_power.setStyleSheet("")
+				self.btn_power.setToolTip("Сбросить порог; в режиме 5 держать DC-подстройку до центра 32767")
+		except Exception:
+			pass
+
+	def _stop_dc_autotune(self, success: bool = False, reason: str = "", metrics: dict | None = None, announce: bool = True):
+		"""Остановить режим автоцентрирования DC."""
+		was_active = bool(getattr(self, '_dc_autotune_active', False))
+		self._dc_autotune_active = False
+		self._dc_autotune_started_t = 0.0
+		self._dc_autotune_last_cmd_t = 0.0
+		self._dc_autotune_last_status_t = 0.0
+		self._dc_autotune_attempts = 0
+		self._dc_autotune_fast_frames = 0
+		self._update_dc_autotune_btn_style()
+		if not was_active or not announce:
+			return
+		try:
+			if success:
+				max_off = float((metrics or {}).get('max_mean_off', 0.0) or 0.0)
+				self._set_status(f"DC автоцентр завершён: max off={max_off:.0f}", hold_sec=2.5)
+			elif reason:
+				self._set_status(f"DC автоцентр остановлен: {reason}", hold_sec=2.0)
+		except Exception:
+			pass
+
+	def _collect_dc_autotune_metrics(self) -> dict:
+		"""Собрать метрики центрирования для всех активных буферов вокруг 32767."""
+		try:
+			center = float(os.getenv('BMI30_DC_AUTOTUNE_CENTER', '32767'))
+		except Exception:
+			center = 32767.0
+		try:
+			center_tol = float(os.getenv('BMI30_DC_AUTOTUNE_MEAN_TOL', '256'))
+		except Exception:
+			center_tol = 256.0
+		try:
+			min_side_frac = float(os.getenv('BMI30_DC_AUTOTUNE_SIDE_FRAC', '0.12'))
+		except Exception:
+			min_side_frac = 0.12
+		try:
+			min_span = float(os.getenv('BMI30_DC_AUTOTUNE_MIN_SPAN', '48'))
+		except Exception:
+			min_span = 48.0
+		try:
+			adc1_en, adc2_en = self._adc_enable_flags()
+		except Exception:
+			adc1_en, adc2_en = True, True
+		with self.data_lock:
+			n = int(self.base_buf_len or 0)
+			if n <= 0:
+				return {'ready': False, 'reason': 'ожидание буфера'}
+			series = []
+			if adc1_en:
+				series.append(("ADC1 even", np.asarray(self.data0_even[:n], dtype=np.float64).copy()))
+				series.append(("ADC1 odd", np.asarray(self.data0_odd[:n], dtype=np.float64).copy()))
+			if adc2_en:
+				series.append(("ADC2 even", np.asarray(self.data1_even[:n], dtype=np.float64).copy()))
+				series.append(("ADC2 odd", np.asarray(self.data1_odd[:n], dtype=np.float64).copy()))
+		if not series:
+			return {'ready': False, 'reason': 'нет активных каналов'}
+		rows = []
+		centered_all = True
+		max_mean_off = 0.0
+		worst_name = ''
+		worst_side_frac = 1.0
+		for name, arr in series:
+			if arr.size == 0:
+				return {'ready': False, 'reason': 'ожидание данных'}
+			try:
+				finite = arr[np.isfinite(arr)]
+			except Exception:
+				finite = arr
+			if finite.size == 0:
+				return {'ready': False, 'reason': 'ожидание данных'}
+			mean_val = float(np.mean(finite))
+			mean_off = abs(mean_val - center)
+			below_frac = float(np.count_nonzero(finite < center)) / float(finite.size)
+			above_frac = float(np.count_nonzero(finite > center)) / float(finite.size)
+			side_frac = min(below_frac, above_frac)
+			span = float(np.max(finite) - np.min(finite))
+			# Если сигнал почти плоский, достаточно попасть средним в центр.
+			if span <= min_span:
+				centered = (mean_off <= center_tol)
+			else:
+				centered = (mean_off <= center_tol) and (side_frac >= min_side_frac)
+			rows.append({
+				'name': name,
+				'centered': bool(centered),
+				'mean_off': float(mean_off),
+				'side_frac': float(side_frac),
+				'span': float(span),
+			})
+			if mean_off >= max_mean_off:
+				max_mean_off = float(mean_off)
+				worst_name = str(name)
+				worst_side_frac = float(side_frac)
+			if not centered:
+				centered_all = False
+		ok_count = sum(1 for row in rows if row.get('centered'))
+		return {
+			'ready': True,
+			'centered': bool(centered_all),
+			'rows': rows,
+			'ok_count': int(ok_count),
+			'total': int(len(rows)),
+			'max_mean_off': float(max_mean_off),
+			'worst_name': str(worst_name),
+			'worst_side_frac': float(worst_side_frac),
+			'center': float(center),
+			'center_tol': float(center_tol),
+		}
+
+	def _run_dc_autotune_kick(self, metrics: dict | None = None):
+		"""Отправить очередной импульс быстрой DC-калибровки."""
+		if self.stream is None:
+			return
+		now = time.time()
+		try:
+			self._device_set_dc_adapt(True)
+		except Exception:
+			pass
+		try:
+			fast_frames = int(getattr(self, '_dc_autotune_fast_frames', 0) or 0)
+		except Exception:
+			fast_frames = 0
+		if fast_frames > 0:
+			try:
+				self._device_calib_dc_fast(fast_frames)
+			except Exception:
+				pass
+		try:
+			self._det_fast_adapt_until = max(float(getattr(self, '_det_fast_adapt_until', 0.0) or 0.0), now + 1.0)
+			self._det_warmup_until = max(float(getattr(self, '_det_warmup_until', 0.0) or 0.0), now + 1.0)
+		except Exception:
+			pass
+		self._dc_autotune_last_cmd_t = now
+		self._dc_autotune_last_status_t = now
+		self._dc_autotune_attempts = int(getattr(self, '_dc_autotune_attempts', 0)) + 1
+		try:
+			if metrics and bool(metrics.get('ready', False)):
+				ok_count = int(metrics.get('ok_count', 0) or 0)
+				total = int(metrics.get('total', 0) or 0)
+				max_off = float(metrics.get('max_mean_off', 0.0) or 0.0)
+				worst_name = str(metrics.get('worst_name', '') or '')
+				side = 100.0 * float(metrics.get('worst_side_frac', 0.0) or 0.0)
+				txt = f"DC автоцентр: {ok_count}/{total} OK | {worst_name} off={max_off:.0f} side={side:.0f}% | kick {self._dc_autotune_attempts}"
+			else:
+				txt = f"DC автоцентр: ожидание данных | kick {self._dc_autotune_attempts}"
+			self._set_status(txt, hold_sec=1.5)
+		except Exception:
+			pass
+
+	def _tick_dc_autotune(self):
+		"""Поддерживать ускоренную DC-подстройку, пока буферы не отцентрованы."""
+		if not bool(getattr(self, '_dc_autotune_active', False)):
+			return
+		now = time.time()
+		try:
+			max_s = float(os.getenv('BMI30_DC_AUTOTUNE_MAX_S', '20.0'))
+			if (not np.isfinite(max_s)) or max_s <= 0.0:
+				max_s = 20.0
+		except Exception:
+			max_s = 20.0
+		try:
+			started_t = float(getattr(self, '_dc_autotune_started_t', 0.0) or 0.0)
+		except Exception:
+			started_t = 0.0
+		if started_t > 0.0 and (now - started_t) >= max_s:
+			self._stop_dc_autotune(reason=f'таймаут {max_s:.0f}с', announce=True)
+			return
+		try:
+			if int(self.num_group.checkedId()) != 5:
+				self._stop_dc_autotune(reason='выход из режима 5', announce=False)
+				return
+		except Exception:
+			pass
+		self._update_dc_autotune_btn_style()
+		if self.stream is None:
+			if started_t > 0.0 and (now - started_t) >= min(5.0, max_s):
+				self._stop_dc_autotune(reason='нет потока', announce=False)
+			return
+		try:
+			if int(getattr(self, 'stream_mode', -1)) != 2:
+				return
+		except Exception:
+			return
+		try:
+			retry_s = float(os.getenv('BMI30_DC_AUTOTUNE_RETRY_S', '1.5'))
+			if (not np.isfinite(retry_s)) or retry_s <= 0.0:
+				retry_s = 1.5
+		except Exception:
+			retry_s = 1.5
+		try:
+			self._det_fast_adapt_until = max(float(getattr(self, '_det_fast_adapt_until', 0.0) or 0.0), now + 1.0)
+			self._det_warmup_until = max(float(getattr(self, '_det_warmup_until', 0.0) or 0.0), now + 1.0)
+		except Exception:
+			pass
+		metrics = self._collect_dc_autotune_metrics()
+		if not bool(metrics.get('ready', False)):
+			if (now - float(getattr(self, '_dc_autotune_last_cmd_t', 0.0) or 0.0)) >= retry_s:
+				self._run_dc_autotune_kick(metrics)
+			return
+		if bool(metrics.get('centered', False)):
+			try:
+				self._det_fast_adapt_until = max(float(getattr(self, '_det_fast_adapt_until', 0.0) or 0.0), now + 0.5)
+			except Exception:
+				pass
+			self._stop_dc_autotune(success=True, metrics=metrics, announce=True)
+			return
+		last_cmd_t = float(getattr(self, '_dc_autotune_last_cmd_t', 0.0) or 0.0)
+		if (now - last_cmd_t) >= retry_s:
+			self._run_dc_autotune_kick(metrics)
+		else:
+			last_status_t = float(getattr(self, '_dc_autotune_last_status_t', 0.0) or 0.0)
+			if (now - last_status_t) >= 0.8:
+				try:
+					ok_count = int(metrics.get('ok_count', 0) or 0)
+					total = int(metrics.get('total', 0) or 0)
+					max_off = float(metrics.get('max_mean_off', 0.0) or 0.0)
+					worst_name = str(metrics.get('worst_name', '') or '')
+					side = 100.0 * float(metrics.get('worst_side_frac', 0.0) or 0.0)
+					self._set_status(f"DC автоцентр: {ok_count}/{total} OK | {worst_name} off={max_off:.0f} side={side:.0f}%", hold_sec=1.0)
+				except Exception:
+					pass
+				self._dc_autotune_last_status_t = now
+
 	def _reset_det_adapt(self):
-		"""Сбросить пороги детектора и ускорить адаптацию на короткое время."""
+		"""Сбросить пороги детектора; в режиме 5 — довести DC до центра 32767."""
 		try:
 			fast_sec = float(os.getenv('BMI30_DETECT_FAST_SEC', '3.0'))
 			if (not np.isfinite(fast_sec)) or fast_sec <= 0.0:
@@ -6068,6 +6594,11 @@ class ScopeWindow:
 			self._det_fast_adapt_until = float(time.time() + fast_sec)
 		except Exception:
 			pass
+		mode5_autotune = False
+		try:
+			mode5_autotune = int(self.num_group.checkedId()) == 5
+		except Exception:
+			mode5_autotune = False
 		# Сбросить пороги, чтобы быстро пересчитались из текущего уровня
 		try:
 			self._det_thr0 = int(getattr(self, '_det_thr_init', 0) or 0)
@@ -6078,31 +6609,96 @@ class ScopeWindow:
 			self._det_hold1 = False
 			dc_fast_sent = False
 			try:
-				if int(self.num_group.checkedId()) == 5 and fast_frames > 0:
-					self._device_calib_dc_fast(fast_frames)
-					dc_fast_sent = True
+				if mode5_autotune:
+					self._dc_autotune_active = True
+					self._dc_autotune_started_t = time.time()
+					self._dc_autotune_last_cmd_t = 0.0
+					self._dc_autotune_last_status_t = 0.0
+					self._dc_autotune_attempts = 0
+					self._dc_autotune_fast_frames = int(fast_frames)
+					try:
+						self._device_set_dc_adapt(True)
+					except Exception:
+						pass
+					self._update_dc_autotune_btn_style()
+					self._run_dc_autotune_kick()
+					dc_fast_sent = bool(fast_frames > 0)
+				elif fast_frames > 0:
+					self._stop_dc_autotune(announce=False)
 			except Exception:
 				dc_fast_sent = False
 			txt = f"Сброс порога: быстрая адаптация ~{fast_sec:.1f}с"
-			if dc_fast_sent:
+			if mode5_autotune:
+				txt = f"DC автоцентрирование до 32767 запущено | пороги ускорены ~{fast_sec:.1f}с"
+				if dc_fast_sent:
+					txt += f" | fast {int(fast_frames)}f"
+			elif dc_fast_sent:
 				txt += f" | DC fast {int(fast_frames)}f"
 			self._set_status(txt, hold_sec=2.0)
 		except Exception:
 			pass
 
 	def _manual_reconnect(self):
-		# Принудительно закрыть и заново начать поиск
+		# Полный restart: teardown потока/reader + аппаратный reset STM32 + новое подключение.
 		try:
-			if self.stream:
-				self.stream.close()
+			self._set_status("Ручное переподключение: аппаратный рестарт STM32…", hold_sec=2.0)
 		except Exception:
 			pass
-		# Аппаратный сброс через GPIO (best-effort)
 		try:
-			self._hardware_reset_device()
+			self._restart_stream(hardware_reset=True, reason='manual_reconnect')
+		except Exception as e:
+			try:
+				self._set_status(f"Ошибка переподключения: {e}", hold_sec=2.5)
+			except Exception:
+				pass
+
+	def _reset_stream_runtime_state(self, reason: str = ''):
+		"""Сбросить runtime-состояние потока перед reconnect/restart."""
+		try:
+			self._stop_dc_autotune(reason='перезапуск потока', announce=False)
 		except Exception:
 			pass
+		try:
+			if self.usb_retry_timer.isActive():
+				self.usb_retry_timer.stop()
+		except Exception:
+			pass
+		old_thread = getattr(self, 'reader_thread', None)
+		old_stream = getattr(self, 'stream', None)
+		try:
+			self.reader_running = False
+		except Exception:
+			pass
+		try:
+			self._connecting = False
+		except Exception:
+			pass
+		# Сначала мягко останавливаем поток на устройстве, затем закрываем транспорт.
+		try:
+			if old_stream is not None:
+				try:
+					self._send_stop_stream()
+					time.sleep(0.05)
+				except Exception:
+					pass
+				try:
+					setattr(old_stream, 'disconnected', True)
+				except Exception:
+					pass
+				try:
+					old_stream.close()
+				except Exception:
+					pass
+		except Exception:
+			pass
+		try:
+			if old_thread is not None and old_thread.is_alive() and threading.current_thread() is not old_thread:
+				old_thread.join(timeout=0.6)
+		except Exception:
+			pass
+		self.reader_thread = None
 		self.stream = None
+		self._stream_user_stopped = False
 		self.base_buf_len = None
 		self.base_buf_len_bytes = None
 		self.freq_hz = None
@@ -6110,14 +6706,52 @@ class ScopeWindow:
 		self.data1 = np.zeros(0, dtype=np.int16)
 		self.timestamps = np.zeros(0, dtype=np.float64)
 		self._last_sample_ts = None
+		self.last_frame_t = 0
+		self.no_data_warned = False
 		self.view_start = 0
 		self.view_len = 0
+		self.tim2_pending = False
+		self.tim2_applied = False
+		self._tim2_request_seq = int(getattr(self, '_tim2_request_seq', 0)) + 1
+		try:
+			while True:
+				self._tim2_result_queue.get_nowait()
+		except queue.Empty:
+			pass
+		try:
+			self._usb_err_need_hw_reset = False
+		except Exception:
+			pass
+		try:
+			self._usb_connect_err_count = 0
+		except Exception:
+			pass
+		try:
+			self._reset_phase_splitter(f"restart:{reason or 'manual'}")
+		except Exception:
+			pass
 		self._reset_sliders()
-		if self.num_group.checkedId() != 0:
-			self._set_status("Переподключение…", hold_sec=1.5)
-			self._activate_stream()
-		else:
-			self._set_status("Поток остановлен", hold_sec=1.5)
+		self._update_tim2_btn_style()
+
+	def _restart_stream(self, hardware_reset: bool = False, reason: str = ''):
+		"""Полный restart потока с optional аппаратным reset STM32."""
+		self._reset_stream_runtime_state(reason=reason)
+		if self.num_group.checkedId() == 0:
+			try:
+				self._set_status("Поток остановлен", hold_sec=1.5)
+			except Exception:
+				pass
+			return
+		if hardware_reset:
+			try:
+				self._hardware_reset_device()
+			except Exception:
+				pass
+		try:
+			self._set_status("Перезапуск потока…", hold_sec=1.5)
+		except Exception:
+			pass
+		self._activate_stream()
 
 	def _toggle_capture(self):
 		"""Переключение автозахвата осциллограмм."""
@@ -6591,155 +7225,259 @@ class ScopeWindow:
 		except Exception as e:
 			self._set_status(f"Power-cycle ошибка: {e}", hold_sec=3.0)
 
+	def _queue_connect_result(self, kind: str, attempt_id: int, payload):
+		try:
+			self._connect_result_q.put_nowait((str(kind), int(attempt_id), payload))
+		except Exception:
+			if str(kind) == 'success' and payload is not None:
+				try:
+					payload.close()
+				except Exception:
+					pass
+
+	def _process_connect_results(self):
+		try:
+			q = self._connect_result_q
+		except Exception:
+			return
+		while True:
+			try:
+				kind, attempt_id, payload = q.get_nowait()
+			except queue.Empty:
+				break
+			except Exception:
+				break
+			try:
+				if str(kind) == 'success':
+					self._finalize_connect_success(int(attempt_id), payload)
+				elif str(kind) == 'error':
+					self._finalize_connect_error(int(attempt_id), payload)
+			except Exception as e:
+				try:
+					import traceback
+					print(f"[GUI] connect-result handler failed: kind={kind} attempt={attempt_id} err={e}", flush=True)
+					traceback.print_exc()
+				except Exception:
+					pass
+				try:
+					if str(kind) == 'success' and payload is not None:
+						payload.close()
+				except Exception:
+					pass
+
+	def _try_connect_safe(self):
+		try:
+			self._try_connect()
+		except Exception as e:
+			try:
+				import traceback
+				print(f"[GUI] _try_connect crashed: {e}", flush=True)
+				traceback.print_exc()
+			except Exception:
+				pass
+			try:
+				self._connecting = False
+			except Exception:
+				pass
+			try:
+				if not self.usb_retry_timer.isActive():
+					self.usb_retry_timer.start()
+			except Exception:
+				pass
+
+	def _tick_safe(self):
+		try:
+			self._tick()
+		except Exception as e:
+			try:
+				import traceback
+				print(f"[GUI] _tick crashed: {e}", flush=True)
+				traceback.print_exc()
+			except Exception:
+				pass
+			try:
+				self._set_status(f"GUI recovered after error: {e}", hold_sec=2.0)
+			except Exception:
+				pass
+
+	def _finalize_connect_success(self, attempt_id: int, stream_obj):
+		if stream_obj is None:
+			return
+		if int(getattr(self, '_connect_attempt_id', 0)) != int(attempt_id):
+			try:
+				stream_obj.close()
+			except Exception:
+				pass
+			return
+		self.stream = stream_obj
+		self._connecting = False
+		self._connect_started_t = 0.0
+		try:
+			self._usb_connect_err_count = 0
+		except Exception:
+			pass
+		try:
+			self._det_reset_and_arm_warmup('connect')
+		except Exception:
+			pass
+		try:
+			self.last_port_info = self.stream.port_info
+		except Exception:
+			pass
+		if self.apply_init_sequence:
+			try:
+				self._run_init_sequence()
+			except Exception as e_init:
+				print(f"[initseq] failed: {e_init}")
+		try:
+			self._apply_saved_device_settings()
+		except Exception as e_saved:
+			print(f"[CONNECT] apply_saved_device_settings failed: {e_saved}", flush=True)
+		try:
+			self._stream_fault_kind = "ok"
+			self._stream_fault_msg = "Поток жив"
+			self._stream_fault_probe_t = 0.0
+			self._stream_fault_probe_ok = None
+			self._stream_fault_probe_msg = ""
+		except Exception:
+			pass
+		self._set_status("Устройство подключено, ожидание данных…", hold_sec=1.5)
+		self.connect_t = time.time()
+		self.last_frame_t = 0
+		self.no_data_warned = False
+		if not self.reader_running:
+			self.reader_running = True
+			self.reader_thread = threading.Thread(target=self._reader_thread_func, daemon=True)
+			self.reader_thread.start()
+		try:
+			self._det_reset_and_arm_warmup('activate')
+		except Exception:
+			pass
+		expected = self.expected_len_map.get(self.desired_profile, self.initial_expected)
+		freq = 200 if self.desired_profile == 1 else 300 if self.desired_profile == 2 else None
+		msg = f"Старт потока… ожидание данных… BUF≈{expected} семплов"
+		if freq:
+			msg += f" (профиль {freq} Гц)"
+		self._set_status(msg, hold_sec=1.5)
+		try:
+			print(f"[start] Профиль={self.desired_profile} ожидаемый BUF={expected} семплов", flush=True)
+		except Exception:
+			pass
+		try:
+			self._send_start_stream()
+			print("[activate] Sent CMD_START_STREAM (ensure streaming)", flush=True)
+		except Exception:
+			pass
+		try:
+			self.usb_retry_timer.stop()
+		except Exception:
+			pass
+
+	def _finalize_connect_error(self, attempt_id: int, err):
+		if int(getattr(self, '_connect_attempt_id', 0)) != int(attempt_id):
+			return
+		self.stream = None
+		self._connecting = False
+		self._connect_started_t = 0.0
+		self.tim2_pending = False
+		self.tim2_applied = False
+		self._update_tim2_btn_style()
+		try:
+			if isinstance(err, SystemExit):
+				print(f"[ERROR] SystemExit: {err}", flush=True)
+				self._set_status(str(err), hold_sec=2.0)
+			else:
+				print(f"[CONNECT] Exception: {err}", flush=True)
+				msg = str(err)
+				if any(x in msg for x in ("Resource busy", "[Errno 16]", "[Errno 19]", "[Errno 32]", "[Errno 110]", "No such device", "disconnected", "timeout", "hung", "busy", "Errno")):
+					try:
+						now = time.time()
+						last_reset = float(getattr(self, "_usb_connect_last_reset_t", 0.0) or 0.0)
+						if (now - last_reset) >= 2.0:
+							print("[CONNECT] Attempting immediate hardware reset", flush=True)
+							self._hardware_reset_device()
+							self._usb_connect_last_reset_t = now
+					except Exception:
+						pass
+				self._set_status(f"Нет устройства ({err})", hold_sec=2.0)
+		finally:
+			try:
+				if not self.usb_retry_timer.isActive():
+					self.usb_retry_timer.start()
+			except Exception:
+				pass
+
 	def _try_connect(self, first=False):
 		if self.num_group.checkedId() == 0:
 			return
 		if self._connecting or self.stream is not None:
 			return
+		self._connect_attempt_id = int(getattr(self, '_connect_attempt_id', 0)) + 1
+		attempt_id = int(self._connect_attempt_id)
 		self._connecting = True
+		self._connect_started_t = time.time()
 		msg_prefix = "Подключение" if not first else "Инициализация"
-		try:
-			self._set_status(f"{msg_prefix} к устройству…", hold_sec=1.5)
-			# восстановим глобальный флаг running в модуле usb_stream (после close() он мог стать False)
+		self._set_status(f"{msg_prefix} к устройству…", hold_sec=1.5)
+		
+		# Запустить подключение в отдельном потоке (без nested-thread гонок)
+		def _connect_worker(_attempt_id: int):
 			try:
-				import usb_vendor.usb_stream as _usm  # type: ignore
-				if getattr(_usm, 'running', True) is False:
-					_usm.running = True
-			except Exception:
-				pass
-			# frame_samples (SET_FRAME_SAMPLES) безопасен только для профиля 2; профиль 1 не трогаем
-			fs = self.expected_len_map.get(self.desired_profile, self.initial_expected) if (self.send_ns and int(self.desired_profile or 2) == 2) else None
-			# Для 200 Гц некоторые прошивки ожидают явной установки block rate — включим отправку частоты на старте
-			try:
-				os.environ['BMI30_SEND_BLOCK_RATE'] = '1'
-			except Exception:
-				pass
-			if bool(getattr(self, 'debug', False)):
-				print(f"[CONNECT] Creating USBStream, profile={self.desired_profile}, fs={fs}", flush=True)
-			self.stream = USBStream(profile=self.desired_profile, full=True, test_as_data=self.test_as_data, frame_samples=fs, fast_mode=True, assembler_independent=self.independent_channels)
-			# успешное подключение — сбросим счётчики ошибок переподключения
-			try:
-				self._usb_connect_err_count = 0
-			except Exception:
-				pass
-			# On every fresh connect: immediately force RUN state and start warmup from *now*.
-			# This prevents "FROZEN right after startup" and ignores early unstable thresholds.
-			try:
-				self._det_reset_and_arm_warmup('connect')
-			except Exception:
-				pass
-			# Сохраним порт info для power cycle без stream
-			self.last_port_info = self.stream.port_info
-			# Явная конфигурация устройства по согласованной последовательности
-			if self.apply_init_sequence:
+				# восстановим глобальный флаг running в модуле usb_stream
 				try:
-					self._run_init_sequence()
-				except Exception as e_init:
-					print(f"[initseq] failed: {e_init}")
-			# Применим сохранённые параметры после подключения
-			try:
-				self._apply_saved_device_settings()
-			except Exception:
-				pass
-			self._set_status("Устройство подключено, ожидание данных…", hold_sec=1.5)
-			self.connect_t = time.time()
-			self.last_frame_t = 0
-			self.no_data_warned = False
-			# Запускаем reader thread
-			if bool(getattr(self, 'debug', False)):
-				print(f"[CONNECT] reader_running={self.reader_running}, starting thread...", flush=True)
-			if not self.reader_running:
-				self.reader_running = True
-				self.reader_thread = threading.Thread(target=self._reader_thread_func, daemon=True)
-				self.reader_thread.start()
-				if bool(getattr(self, 'debug', False)):
-					print("[GUI] Reader thread started", flush=True)
-			else:
-				if bool(getattr(self, 'debug', False)):
-					print("[GUI] Reader thread already running", flush=True)
-		except SystemExit as se:
-			self.stream = None
-			print(f"[ERROR] SystemExit: {se}", flush=True)
-			self._set_status(str(se), hold_sec=2.0)
-		except Exception as e:
-			self.stream = None
-			print(f"[ERROR] Exception during connect: {e}", flush=True)
-			import traceback
-			traceback.print_exc()
-			msg = str(e)
-			# если ошибка USB/занято/отключено — попытаться аппаратно перезапустить устройство
-			if any(x in msg for x in ("Resource busy", "[Errno 16]", "[Errno 19]", "[Errno 32]", "[Errno 110]", "No such device", "disconnected")):
-				try:
-					now = time.time()
-					min_reset_s = float(os.getenv("BMI30_USB_RESET_MIN_S", "8.0"))
-					min_power_s = float(os.getenv("BMI30_USB_POWERCYCLE_MIN_S", "30.0"))
-					last_reset = float(getattr(self, "_usb_connect_last_reset_t", 0.0) or 0.0)
-					last_power = float(getattr(self, "_usb_connect_last_power_t", 0.0) or 0.0)
-					self._usb_connect_err_count = int(getattr(self, "_usb_connect_err_count", 0)) + 1
-					if (now - last_reset) >= max(2.0, min_reset_s):
-						self._set_status("USB занят/отключён, аппаратный сброс…", hold_sec=2.0)
-						self._hardware_reset_device()
-						self._usb_connect_last_reset_t = now
-					# при серии ошибок попробуем power-cycle порта
-					if int(getattr(self, "_usb_connect_err_count", 0)) >= 3 and (now - last_power) >= max(5.0, min_power_s):
-						self._set_status("USB занят/отключён, перезапитка порта…", hold_sec=2.0)
-						try:
-							self._power_cycle_usb_port()
-						except Exception:
-							pass
-						self._usb_connect_last_power_t = now
-						self._usb_connect_err_count = 0
+					import usb_vendor.usb_stream as _usm  # type: ignore
+					if getattr(_usm, 'running', True) is False:
+						_usm.running = True
 				except Exception:
 					pass
-			self._set_status(f"Нет устройства ({e})", hold_sec=2.0)
-		finally:
-			self._connecting = False
-			if self.stream is None:
-				if not self.usb_retry_timer.isActive():
-					self.usb_retry_timer.start()
-			else:
-				self.usb_retry_timer.stop()
+				
+				# Быстрая проверка перед созданием USBStream
+				try:
+					os.environ['BMI30_SEND_BLOCK_RATE'] = '1'
+				except Exception:
+					pass
+				
+				fs = self.expected_len_map.get(self.desired_profile, self.initial_expected) if (self.send_ns and int(self.desired_profile or 2) == 2) else None
+				stream_obj = USBStream(profile=self.desired_profile, full=True, test_as_data=self.test_as_data, frame_samples=fs, fast_mode=True, assembler_independent=self.independent_channels)
+				# Если эта попытка уже устарела, не трогаем текущее состояние.
+				if int(getattr(self, '_connect_attempt_id', 0)) != int(_attempt_id):
+					try:
+						stream_obj.close()
+					except Exception:
+						pass
+					return
+				self._queue_connect_result('success', _attempt_id, stream_obj)
+			except SystemExit as se:
+				self._queue_connect_result('error', _attempt_id, se)
+			except Exception as e:
+				self._queue_connect_result('error', _attempt_id, e)
+		
+		# Запустить worker и сразу вернуться (НЕ дожидаться)
+		threading.Thread(target=_connect_worker, args=(attempt_id,), daemon=True).start()
 
 	def _activate_stream(self):
 		if not self.usb_retry_timer.isActive():
 			self.usb_retry_timer.start()
-		# Optional: auto hardware reset on first activation
+		# Optional: auto hardware reset on first activation.
 		try:
 			if not bool(getattr(self, '_hw_reset_on_start_done', False)):
 				auto_hw = str(os.getenv("BMI30_HW_RESET_ON_START", "1")).lower() not in ("0", "false", "no")
 				if auto_hw:
-					self._hardware_reset_device()
+					hw_ok = bool(self._hardware_reset_device())
+					if hw_ok:
+						print("[HW-RESET] startup reset OK", flush=True)
+					else:
+						print("[HW-RESET] startup reset FAILED", flush=True)
 				self._hw_reset_on_start_done = True
 		except Exception:
+			print("[HW-RESET] startup reset EXCEPTION", flush=True)
+		# Быстрый soft-reset best-effort, без обязательного hardware reset перед connect
+		try:
+			self._send_soft_reset_via_cdc()
+		except Exception:
 			pass
-		self._send_soft_reset_via_cdc()
+		# Запустить подключение сразу.
+		# Финализация подключения и обязательный START выполняются в _finalize_connect_success().
 		self._try_connect(first=True)
-		# Транспорт при подключении посылает минимальный START сам.
-		# Не дублируем SET_PROFILE/START здесь, чтобы не подавить первые A/B кадры.
-		if self.stream is not None:
-			# Arm warmup from actual stream start and force RUN state.
-			# (User may wait before pressing "1", so GUI-start warmup is not reliable.)
-			try:
-				self._det_reset_and_arm_warmup('activate')
-			except Exception:
-				pass
-			# Показать ожидаемое число семплов одного буфера по профилю
-			expected = self.expected_len_map.get(self.desired_profile, self.initial_expected)
-			freq = 200 if self.desired_profile == 1 else 300 if self.desired_profile == 2 else None
-			msg = f"Старт потока… ожидание данных… BUF≈{expected} семплов"
-			if freq:
-				msg += f" (профиль {freq} Гц)"
-			self._set_status(msg, hold_sec=1.5)
-			try:
-				print(f"[start] Профиль={self.desired_profile} ожидаемый BUF={expected} семплов")
-			except Exception:
-				pass
-			# Ensure device streaming is started (best-effort). Some devices require explicit START.
-			try:
-				self._send_start_stream()
-				print("[activate] Sent CMD_START_STREAM (ensure streaming)")
-			except Exception:
-				pass
 
 	def _apply_saved_device_settings(self):
 		"""Применить сохранённые параметры к устройству после подключения."""
@@ -6955,51 +7693,104 @@ class ScopeWindow:
 	def _update_tim2_btn_style(self):
 		"""Обновить стиль кнопки передачи TIM2."""
 		try:
-			en = bool(getattr(self, 'tim2_enabled', False))
+			if bool(getattr(self, 'tim2_pending', False)):
+				self.btn_tim2.setStyleSheet("background-color: #b8860b; color: white; font-weight: bold; border:1px solid #7a5a00;")
+				self.btn_tim2.setToolTip("Передача TIM2/TX: ожидание подтверждения устройства")
+				return
+		except Exception:
+			pass
+		try:
+			en = bool(getattr(self, 'tim2_applied', False))
 		except Exception:
 			en = False
 		try:
 			if en:
 				self.btn_tim2.setStyleSheet("background-color: #008800; color: white; font-weight: bold; border:1px solid #005500;")
-				self.btn_tim2.setToolTip("Передача TIM2: ВКЛ")
+				self.btn_tim2.setToolTip("Передача TIM2/TX: ВКЛ")
 			else:
 				self.btn_tim2.setStyleSheet("background-color: #880000; color: white; font-weight: bold; border:1px solid #550000;")
-				self.btn_tim2.setToolTip("Передача TIM2: ВЫКЛ")
+				if bool(getattr(self, 'tim2_enabled', False)) and self.stream is None:
+					self.btn_tim2.setToolTip("Передача TIM2/TX: ожидает USB")
+				elif bool(getattr(self, 'tim2_enabled', False)):
+					self.btn_tim2.setToolTip("Передача TIM2/TX: запрос не подтвержден")
+				else:
+					self.btn_tim2.setToolTip("Передача TIM2/TX: ВЫКЛ")
 		except Exception:
 			pass
 
-	def _send_tim2_enable(self, enabled: bool):
+	def _send_tim2_enable(self, enabled: bool, update_ui: bool = True):
 		"""Отправить CMD_SET_TIM2_ENABLE (0x1E)."""
 		try:
 			if self.stream is None:
-				return
+				return False
 			if hasattr(self.stream, 'set_tim2_enable'):
 				self.stream.set_tim2_enable(bool(enabled))
 			else:
 				payload = b"\x01" if bool(enabled) else b"\x00"
 				self.stream.send_cmd(CMD_SET_TIM2_ENABLE, payload)
+			return True
 		except Exception as e:
-			try:
-				self._set_status(f"TIM2: ошибка ({e})", hold_sec=2.0)
-			except Exception:
-				pass
+			if update_ui:
+				try:
+					self._set_status(f"TIM2: ошибка ({e})", hold_sec=2.0)
+				except Exception:
+					pass
+			return False
 
-	def _send_tx_enable(self, enabled: bool):
+	def _send_tx_enable(self, enabled: bool, update_ui: bool = True):
 		"""Отправить CMD_SET_TX_ENABLE (0x33)."""
 		try:
 			if self.stream is None:
-				return
+				return False
 			payload = b"\x01" if bool(enabled) else b"\x00"
 			# через USBStream, если реализовано
 			if hasattr(self.stream, 'set_tx_enable'):
 				self.stream.set_tx_enable(bool(enabled))
 			else:
 				self.stream.send_cmd(CMD_SET_TX_ENABLE, payload)
+			return True
 		except Exception as e:
+			if update_ui:
+				try:
+					self._set_status(f"TX: ошибка ({e})", hold_sec=2.0)
+				except Exception:
+					pass
+			return False
+
+	def _confirm_tim2_by_device_status(self, expected: bool, attempts: int = 3) -> bool:
+		"""Best-effort подтверждение через ответ устройства STAT (GET_STATUS)."""
+		try:
+			if self.stream is None or not hasattr(self.stream, '_get_status_ep0'):
+				return False
+		except Exception:
+			return False
+		for _ in range(max(1, int(attempts))):
 			try:
-				self._set_status(f"TX: ошибка ({e})", hold_sec=2.0)
+				self.stream._get_status_ep0()
+				st = getattr(self.stream, 'last_stat', None)
+				if isinstance(st, (bytes, bytearray)) and len(st) >= 64 and st[:4] == b'STAT':
+					mask_s = os.getenv('BMI30_TX_STATUS_MASK', '').strip()
+					if mask_s:
+						off = int(os.getenv('BMI30_TX_STATUS_OFFSET', '48'))
+						mask = int(mask_s, 0) & 0xFF
+						if 0 <= off < len(st):
+							bit_on = (int(st[off]) & mask) != 0
+							return bool(bit_on) == bool(expected)
+						return False
+					return True
 			except Exception:
 				pass
+			time.sleep(0.05)
+		return False
+
+	def _tim2_apply_worker(self, request_id: int, enabled: bool):
+		"""Фоновое применение TIM2/TX + подтверждение по ответу устройства."""
+		ok_tim2 = self._send_tim2_enable(bool(enabled), update_ui=False)
+		ok_tx = self._send_tx_enable(bool(enabled), update_ui=False)
+		status_ok = False
+		if ok_tim2 and ok_tx:
+			status_ok = self._confirm_tim2_by_device_status(bool(enabled), attempts=3)
+		self._tim2_result_queue.put((int(request_id), bool(enabled), bool(ok_tim2 and ok_tx and status_ok)))
 
 	def _send_start_stream(self):
 		"""START потока с учётом TIM2 enable (если разрешено)."""
@@ -7009,7 +7800,13 @@ class ScopeWindow:
 			# пользовательский стоп снят
 			self._stream_user_stopped = False
 			if bool(getattr(self, 'tim2_enabled', False)):
-				self._send_tim2_enable(True)
+				ok_tim2 = self._send_tim2_enable(True)
+				ok_tx = self._send_tx_enable(True)
+				self.tim2_applied = bool(ok_tim2 and ok_tx)
+			else:
+				self.tim2_applied = False
+			self.tim2_pending = False
+			self._update_tim2_btn_style()
 			self.stream.send_cmd(CMD_START_STREAM, b"")
 		except Exception:
 			pass
@@ -7046,22 +7843,25 @@ class ScopeWindow:
 			self.tim2_enabled = bool(enabled)
 		except Exception:
 			self.tim2_enabled = False
-		self._update_tim2_btn_style()
 		try:
 			if self.stream is None:
+				self.tim2_applied = False
+				self.tim2_pending = False
+				self._update_tim2_btn_style()
+				self._set_status("TIM2/TX: нет USB, команда будет применена при подключении", hold_sec=1.5)
 				return
-			if self.tim2_enabled:
-				self._stream_user_stopped = False
-				# Включаем внешний передатчик, поток не трогаем
-				self._send_tx_enable(True)
-				self._set_status("TX: передача ВКЛ", hold_sec=1.5)
-			else:
-				# Не останавливаем поток: выключаем только внешний передатчик
-				self._send_tx_enable(False)
-				self._stream_user_stopped = False
-				self._set_status("TX: передача ВЫКЛ (стрим продолжается)", hold_sec=1.5)
+			self._stream_user_stopped = False
+			self.tim2_pending = True
+			self.tim2_applied = False
+			self._tim2_request_seq = int(getattr(self, '_tim2_request_seq', 0)) + 1
+			req_id = int(self._tim2_request_seq)
+			self._update_tim2_btn_style()
+			threading.Thread(target=self._tim2_apply_worker, args=(req_id, bool(self.tim2_enabled)), daemon=True).start()
+			self._set_status("TIM2/TX: отправка команды, ожидание ответа устройства…", hold_sec=1.2)
 		except Exception:
-			pass
+			self.tim2_pending = False
+			self.tim2_applied = False
+		self._update_tim2_btn_style()
 
 	def run(self):
 		self.win.resize(900, 600)
