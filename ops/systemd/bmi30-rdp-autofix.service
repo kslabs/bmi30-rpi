@@ -1,0 +1,8 @@
+[Unit]
+Description=BMI30 RDP auto-recovery watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bmi30-rdp-autofix.sh

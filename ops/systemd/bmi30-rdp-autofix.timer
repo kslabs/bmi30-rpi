@@ -1,0 +1,12 @@
+[Unit]
+Description=Run BMI30 RDP auto-recovery periodically during startup stabilization
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=20s
+AccuracySec=2s
+Unit=bmi30-rdp-autofix.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
