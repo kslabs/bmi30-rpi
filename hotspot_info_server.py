@@ -2,33 +2,59 @@
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
+import hashlib
 import html
+import hmac
+import ipaddress
 import json
 import mimetypes
 import os
+import ssl
 import socket
 import subprocess
+import threading
 import time
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import parse_qs
 
 
 PORT         = int(os.getenv("BMI30_HOTSPOT_INFO_PORT",      "80"))
+HTTPS_PORT   = int(os.getenv("BMI30_HOTSPOT_INFO_HTTPS_PORT", "443"))
 REFRESH_S    = max(10, int(os.getenv("BMI30_HOTSPOT_INFO_REFRESH_S", "30")))
 HOTSPOT_IP   = os.getenv("BMI30_HOTSPOT_IP",   "10.42.0.1")
 HOTSPOT_CONN = os.getenv("BMI30_HOTSPOT_CONN",  "BMI30-Hotspot")
 SSH_USER     = os.getenv("BMI30_SSH_USER",      "techaid")
 SSH_PORT     = int(os.getenv("BMI30_SSH_PORT",  "22"))
 RDP_PORT     = int(os.getenv("BMI30_RDP_PORT",  "3389"))
-
-LOGIN_URL = f"http://{HOTSPOT_IP}/login"
+TLS_CERT_PATH = os.getenv("BMI30_TLS_CERT_PATH", "/etc/ssl/bmi30/portal.crt")
+TLS_KEY_PATH  = os.getenv("BMI30_TLS_KEY_PATH",  "/etc/ssl/bmi30/portal.key")
+ENABLE_HTTPS = os.getenv("BMI30_ENABLE_HTTPS", "0").strip().lower() in {"1", "true", "yes", "on"}
+FORCE_HTTPS = os.getenv("BMI30_FORCE_HTTPS", "0").strip().lower() in {"1", "true", "yes", "on"}
+PORTAL_USERNAME = os.getenv("BMI30_PORTAL_USERNAME", "admin")
+PORTAL_PASSWORD = os.getenv("BMI30_PORTAL_PASSWORD", "admin")
+PORTAL_ENGINEER_USERNAME = os.getenv("BMI30_PORTAL_ENGINEER_USERNAME", "").strip()
+PORTAL_ENGINEER_PASSWORD = os.getenv("BMI30_PORTAL_ENGINEER_PASSWORD", "")
+PORTAL_ENGINEER_PASSWORD_HASH = os.getenv("BMI30_PORTAL_ENGINEER_PASSWORD_HASH", "").strip()
+PORTAL_SESSION_COOKIE = "bmi30_portal_session"
+PORTAL_SESSION_TTL_S = max(60, int(os.getenv("BMI30_PORTAL_SESSION_TTL_S", str(7 * 24 * 60 * 60))))
+PORTAL_PASSWORD_HASH_ITERATIONS = max(100_000, int(os.getenv("BMI30_PORTAL_PASSWORD_HASH_ITERATIONS", "390000")))
 CONFIG_JSON = os.getenv("BMI30_CONFIG_JSON", os.path.join(os.path.dirname(__file__), "host", "bmi30_config.json"))
 DEVICE_SYNC_CACHE_S = max(1, int(os.getenv("BMI30_DEVICE_SYNC_CACHE_S", "3")))
 SYNC_STATUS_OFFSET_S = os.getenv("BMI30_SYNC_STATUS_OFFSET", "").strip()
-LOGO_CANDIDATES = [
-    os.getenv("BMI30_PORTAL_LOGO_PATH", "").strip(),
+PAGE_REV = os.getenv("BMI30_PAGE_REV", str(int(os.path.getmtime(__file__))))
+TAGIT_LOGO_CANDIDATES = [
+    os.getenv("BMI30_PORTAL_TAGIT_LOGO_PATH", "").strip(),
+    os.path.join(os.path.dirname(__file__), "docs", "Tagit_Logo.png"),
+    "/home/techaid/Documents/docs/Tagit_Logo.png",
+]
+
+AM_LOGO_CANDIDATES = [
+    os.getenv("BMI30_PORTAL_AM_LOGO_PATH", "").strip(),
     os.path.join(os.path.dirname(__file__), "docs", "AM-Secure-Logo@4x-100.jpg"),
     os.path.join(os.path.dirname(__file__), "logo.png"),
     os.path.join(os.path.dirname(__file__), "assets", "logo.png"),
@@ -36,12 +62,29 @@ LOGO_CANDIDATES = [
     "/usr/local/share/bmi30/logo.png",
 ]
 
-# Connectivity-probe пути каждой ОС.
-# Мы отвечаем 302 → LOGIN_URL, чтобы ОС показала всплывающее окно / уведомление
-# «Требуется вход в сеть» и открыла встроенный браузер captive portal.
-PROBE_PATHS: frozenset[str] = frozenset({
+FAVICON_ICO_CANDIDATES = [
+    os.getenv("BMI30_PORTAL_FAVICON_ICO_PATH", "").strip(),
+    os.path.join(os.path.dirname(__file__), "docs", "favicon.ico"),
+    "/home/techaid/Documents/docs/favicon.ico",
+    "/usr/local/share/bmi30/favicon.ico",
+]
+
+FAVICON_PNG_CANDIDATES = [
+    os.getenv("BMI30_PORTAL_FAVICON_PNG_PATH", "").strip(),
+    os.path.join(os.path.dirname(__file__), "docs", "favicon.png"),
+    "/home/techaid/Documents/docs/favicon.png",
+    "/usr/local/share/bmi30/favicon.png",
+]
+
+ANDROID_PROBE_PATHS: frozenset[str] = frozenset({
     "/generate_204",              # Android, Chrome, Chrome OS
     "/gen_204",                   # Android alt
+})
+
+# Connectivity-probe пути каждой ОС.
+# Android надёжнее распознаёт captive portal через 302 redirect на /login,
+# а Apple/Windows/Linux корректно работают, если отдать HTML прямо на probe URL.
+PROBE_PATHS: frozenset[str] = ANDROID_PROBE_PATHS | frozenset({
     "/hotspot-detect.html",       # iOS / macOS (Apple CNA)
     "/library/test/success.html", # iOS alt
     "/canonical.html",            # iOS alt
@@ -63,6 +106,212 @@ _SYNC_CACHE: dict[str, Any] = {
     "source": "device",
 }
 
+HTTPS_RUNTIME_ENABLED = False
+
+DC_MODE_NAMES = {
+    0: "FREEZE",
+    1: "WORK",
+    2: "DETECT",
+    3: "BOOT_FAST",
+}
+
+DC_MODE_VALUES = {name: value for value, name in DC_MODE_NAMES.items()}
+
+DEFAULT_DC_CONFIG: dict[str, Any] = {
+    "mode": "WORK",
+    "work_settle_s": 900.0,
+    "detect_initial_settle_s": 60.0,
+    "detect_final_settle_s": 15.0,
+    "detect_ramp_s": 300.0,
+    "fast_settle_s": 5.0,
+    "fast_duration_s": 30.0,
+}
+
+
+def is_https_enabled() -> bool:
+    return HTTPS_RUNTIME_ENABLED
+
+
+def format_web_url(ip: str, scheme: str) -> str:
+    port = HTTPS_PORT if scheme == "https" else PORT
+    needs_port = (scheme == "https" and port != 443) or (scheme == "http" and port != 80)
+    suffix = f":{port}" if needs_port else ""
+    return f"{scheme}://{ip}{suffix}/"
+
+
+def with_rev(path: str) -> str:
+    sep = "&" if "?" in path else "?"
+    return f"{path}{sep}v={PAGE_REV}"
+
+
+def _load_machine_id() -> bytes:
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            with open(path, "rb") as f:
+                machine_id = f.read().strip()
+            if machine_id:
+                return machine_id
+        except OSError:
+            continue
+    return b""
+
+
+def _build_portal_session_secret() -> bytes:
+    configured_secret = os.getenv("BMI30_PORTAL_SESSION_SECRET", "").strip()
+    if configured_secret:
+        return configured_secret.encode("utf-8")
+
+    digest = hashlib.sha256()
+    digest.update(b"bmi30-portal-session")
+    digest.update(_load_machine_id() or os.urandom(32))
+    digest.update(PORTAL_USERNAME.encode("utf-8", errors="ignore"))
+    digest.update(PORTAL_PASSWORD.encode("utf-8", errors="ignore"))
+    digest.update(PORTAL_ENGINEER_USERNAME.encode("utf-8", errors="ignore"))
+    digest.update(PORTAL_ENGINEER_PASSWORD.encode("utf-8", errors="ignore"))
+    digest.update(PORTAL_ENGINEER_PASSWORD_HASH.encode("utf-8", errors="ignore"))
+    return digest.digest()
+
+
+PORTAL_SESSION_SECRET = _build_portal_session_secret()
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def _format_cookie_expires(expires_at: int) -> str:
+    return dt.datetime.fromtimestamp(expires_at, tz=dt.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+
+def constant_time_equals(left: str, right: str) -> bool:
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+
+
+def hash_portal_password(password: str, *, salt: bytes | None = None, iterations: int = PORTAL_PASSWORD_HASH_ITERATIONS) -> str:
+    if salt is None:
+        salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${_b64url_encode(salt)}${_b64url_encode(digest)}"
+
+
+def verify_portal_password_hash(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, iteration_s, salt_b64, digest_b64 = stored_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        iterations = int(iteration_s)
+        if iterations < 100_000:
+            return False
+        salt = _b64url_decode(salt_b64)
+        expected_digest = _b64url_decode(digest_b64)
+    except Exception:
+        return False
+
+    candidate_digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations,
+        dklen=len(expected_digest),
+    )
+    return hmac.compare_digest(candidate_digest, expected_digest)
+
+
+def is_engineer_account_enabled() -> bool:
+    return bool(PORTAL_ENGINEER_USERNAME and (PORTAL_ENGINEER_PASSWORD_HASH or PORTAL_ENGINEER_PASSWORD))
+
+
+def authenticate_portal_credentials(username: str, password: str) -> dict[str, str] | None:
+    if constant_time_equals(username, PORTAL_USERNAME) and constant_time_equals(password, PORTAL_PASSWORD):
+        return {"username": PORTAL_USERNAME, "role": "user"}
+
+    if is_engineer_account_enabled() and constant_time_equals(username, PORTAL_ENGINEER_USERNAME):
+        if PORTAL_ENGINEER_PASSWORD_HASH and verify_portal_password_hash(password, PORTAL_ENGINEER_PASSWORD_HASH):
+            return {"username": PORTAL_ENGINEER_USERNAME, "role": "engineer"}
+        if PORTAL_ENGINEER_PASSWORD and constant_time_equals(password, PORTAL_ENGINEER_PASSWORD):
+            return {"username": PORTAL_ENGINEER_USERNAME, "role": "engineer"}
+
+    return None
+
+
+def create_portal_session_token(username: str, expires_at: int, role: str = "user") -> str:
+    payload = json.dumps({"u": username, "exp": expires_at, "r": role}, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    payload_b64 = _b64url_encode(payload)
+    signature = hmac.new(PORTAL_SESSION_SECRET, payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{payload_b64}.{signature}"
+
+
+def parse_portal_session_token(token: str) -> dict[str, Any] | None:
+    if not token or len(token) > 1024 or "." not in token:
+        return None
+
+    payload_b64, signature = token.rsplit(".", 1)
+    expected_signature = hmac.new(PORTAL_SESSION_SECRET, payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected_signature):
+        return None
+
+    try:
+        payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    try:
+        username = str(payload.get("u", ""))
+        expires_at = int(payload.get("exp", 0))
+        role = str(payload.get("r", "user"))
+    except (TypeError, ValueError):
+        return None
+
+    if role == "user":
+        expected_username = PORTAL_USERNAME
+    elif role == "engineer" and is_engineer_account_enabled():
+        expected_username = PORTAL_ENGINEER_USERNAME
+    else:
+        return None
+
+    if username != expected_username or expires_at <= 0:
+        return None
+
+    return {"u": username, "exp": expires_at, "r": role}
+
+
+def build_portal_session_cookie(token: str, *, remember: bool, secure: bool) -> str:
+    jar = SimpleCookie()
+    jar[PORTAL_SESSION_COOKIE] = token
+    morsel = jar[PORTAL_SESSION_COOKIE]
+    morsel["path"] = "/"
+    morsel["httponly"] = True
+    morsel["samesite"] = "Lax"
+    if secure:
+        morsel["secure"] = True
+    if remember:
+        expires_at = int(time.time()) + PORTAL_SESSION_TTL_S
+        morsel["max-age"] = str(PORTAL_SESSION_TTL_S)
+        morsel["expires"] = _format_cookie_expires(expires_at)
+    return morsel.OutputString()
+
+
+def build_expired_portal_session_cookie(*, secure: bool) -> str:
+    jar = SimpleCookie()
+    jar[PORTAL_SESSION_COOKIE] = ""
+    morsel = jar[PORTAL_SESSION_COOKIE]
+    morsel["path"] = "/"
+    morsel["httponly"] = True
+    morsel["samesite"] = "Lax"
+    if secure:
+        morsel["secure"] = True
+    morsel["max-age"] = "0"
+    morsel["expires"] = "Thu, 01 Jan 1970 00:00:00 GMT"
+    return morsel.OutputString()
+
 
 def run_command(*args: str) -> str:
     try:
@@ -72,6 +321,111 @@ def run_command(*args: str) -> str:
     if proc.returncode != 0:
         return ""
     return proc.stdout.strip()
+
+
+def _load_config_json() -> dict[str, Any]:
+    try:
+        with open(CONFIG_JSON, "r", encoding="utf-8") as f:
+            payload = json.load(f) or {}
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_config_json(payload: dict[str, Any]) -> None:
+    directory = os.path.dirname(CONFIG_JSON) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{CONFIG_JSON}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp_path, CONFIG_JSON)
+
+
+def _float_form_value(form: dict[str, str], key: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(str(form.get(key, default)).strip())
+    except Exception:
+        value = float(default)
+    return max(float(minimum), min(float(maximum), value))
+
+
+def _normalize_dc_config(raw: Any = None) -> dict[str, Any]:
+    source = raw if isinstance(raw, dict) else {}
+    cfg = dict(DEFAULT_DC_CONFIG)
+    cfg.update({k: source.get(k, v) for k, v in DEFAULT_DC_CONFIG.items()})
+    mode = str(cfg.get("mode", "WORK")).strip().upper().replace("-", "_")
+    if mode not in DC_MODE_VALUES:
+        mode = "WORK"
+    cfg["mode"] = mode
+    cfg["work_settle_s"] = _float_form_value(cfg, "work_settle_s", 900.0, 1.0, 86400.0)
+    cfg["detect_initial_settle_s"] = _float_form_value(cfg, "detect_initial_settle_s", 60.0, 0.1, 86400.0)
+    cfg["detect_final_settle_s"] = _float_form_value(cfg, "detect_final_settle_s", 15.0, 0.1, 86400.0)
+    cfg["detect_ramp_s"] = _float_form_value(cfg, "detect_ramp_s", 300.0, 0.0, 86400.0)
+    cfg["fast_settle_s"] = _float_form_value(cfg, "fast_settle_s", 5.0, 0.1, 3600.0)
+    cfg["fast_duration_s"] = _float_form_value(cfg, "fast_duration_s", 30.0, 0.0, 86400.0)
+    return cfg
+
+
+def load_dc_config() -> dict[str, Any]:
+    return _normalize_dc_config(_load_config_json().get("dc_config"))
+
+
+def save_dc_config(cfg: dict[str, Any]) -> None:
+    payload = _load_config_json()
+    payload["dc_config"] = _normalize_dc_config(cfg)
+    payload["dc_config_updated_at"] = int(time.time())
+    _save_config_json(payload)
+
+
+def dc_config_from_form(form: dict[str, str]) -> dict[str, Any]:
+    mode = form.get("mode", "WORK").strip().upper().replace("-", "_")
+    return _normalize_dc_config({
+        "mode": mode,
+        "work_settle_s": _float_form_value(form, "work_settle_s", 900.0, 1.0, 86400.0),
+        "detect_initial_settle_s": _float_form_value(form, "detect_initial_settle_s", 60.0, 0.1, 86400.0),
+        "detect_final_settle_s": _float_form_value(form, "detect_final_settle_s", 15.0, 0.1, 86400.0),
+        "detect_ramp_s": _float_form_value(form, "detect_ramp_s", 300.0, 0.0, 86400.0),
+        "fast_settle_s": _float_form_value(form, "fast_settle_s", 5.0, 0.1, 3600.0),
+        "fast_duration_s": _float_form_value(form, "fast_duration_s", 30.0, 0.0, 86400.0),
+    })
+
+
+def apply_dc_config_to_device(cfg: dict[str, Any]) -> tuple[bool, str]:
+    cfg = _normalize_dc_config(cfg)
+    mode_value = DC_MODE_VALUES.get(str(cfg["mode"]), 1)
+    detect_settle_s = cfg["detect_initial_settle_s"]
+    script = (
+        "import sys;"
+        "sys.path.insert(0, '/home/techaid/Documents/host');"
+        "from usb_vendor.usb_stream import USBStream;"
+        f"s=USBStream(profile=1, full=True, fast_mode=True);"
+        "\n"
+        "try:\n"
+        f" s.set_dc_config_seconds(mode={mode_value}, work_settle_s={cfg['work_settle_s']!r}, detect_settle_s={detect_settle_s!r}, fast_settle_s={cfg['fast_settle_s']!r}, fast_duration_s={cfg['fast_duration_s']!r})\n"
+        " print('SET_DC_CONFIG sent')\n"
+        " try:\n"
+        "  print(s.get_dc_config())\n"
+        " except Exception as e:\n"
+        "  print('readback unavailable: %s' % e)\n"
+        "finally:\n"
+        " s._running=False\n"
+    )
+    try:
+        proc = subprocess.run(
+            ["python3", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=4.0,
+        )
+    except Exception as exc:
+        return False, f"Unable to contact device: {exc}"
+
+    output = (proc.stdout or proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return False, output or f"USB apply failed with exit code {proc.returncode}"
+    return True, output or "SET_DC_CONFIG sent"
 
 
 def _load_ui_sync_mode_from_config() -> str:
@@ -166,8 +520,8 @@ def detect_sync_mode() -> dict[str, Any]:
     return {"value": mode, "source": source, "device_responded": True}
 
 
-def detect_logo_path() -> str:
-    for candidate in LOGO_CANDIDATES:
+def detect_logo_path(candidates: list[str]) -> str:
+    for candidate in candidates:
         if not candidate:
             continue
         try:
@@ -188,6 +542,810 @@ def load_logo_bytes(path: str) -> tuple[bytes, str] | None:
         return data, (ctype or "application/octet-stream")
     except Exception:
         return None
+
+
+def render_style_bootstrap() -> str:
+    return """  <script>
+    (function () {
+      try {
+        var theme = localStorage.getItem('bmi30.portal.theme') || 'auto';
+        if (theme !== 'auto' && theme !== 'light' && theme !== 'dark') {
+          theme = 'auto';
+        }
+        var style = localStorage.getItem('bmi30.portal.style') || 'crystal';
+        if (style !== 'glass' && style !== 'crystal' && style !== 'neumorph') {
+          style = 'crystal';
+        }
+        var effectiveTheme = theme;
+        if (theme === 'auto') {
+          effectiveTheme = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+        }
+        document.documentElement.dataset.themePref = theme;
+        document.documentElement.dataset.themeMode = effectiveTheme;
+        document.documentElement.dataset.uiStyle = style;
+      } catch (error) {
+        document.documentElement.dataset.themePref = 'auto';
+        document.documentElement.dataset.themeMode = 'dark';
+        document.documentElement.dataset.uiStyle = 'crystal';
+      }
+    }());
+  </script>"""
+
+
+def render_debug_style_css() -> str:
+    return """  <style>
+    html[data-theme-mode="light"]{
+      color-scheme:light;
+      --bg:#eef4f1;--bg-2:#d7e3de;--glass:rgba(255,255,255,.60);--glass-strong:rgba(255,255,255,.74);
+      --glass-fallback:#f8fbf9;--panel:rgba(255,255,255,.62);--panel-fallback:#f8fbf9;--text:#17252a;
+      --muted:#5d6e74;--line:rgba(255,255,255,.68);--line-soft:rgba(23,37,42,.12);--accent:#0f8a70;
+      --accent-2:#f28f3b;--accent-soft:rgba(15,138,112,.16);--warm:rgba(242,143,59,.14);--grid-line:rgba(15,138,112,.075);
+      --panel-shadow:0 2px 1px rgba(255,255,255,.36),0 14px 28px rgba(29,42,46,.16),0 34px 72px rgba(29,42,46,.20),inset 1px 1px 0 rgba(255,255,255,.86),inset -1px -1px 0 rgba(60,82,86,.16),inset 0 18px 32px rgba(255,255,255,.22);
+      --panel-hover-shadow:0 2px 1px rgba(255,255,255,.40),0 18px 34px rgba(29,42,46,.18),0 42px 84px rgba(29,42,46,.24),inset 1px 1px 0 rgba(255,255,255,.92),inset -1px -1px 0 rgba(60,82,86,.18),inset 0 20px 36px rgba(255,255,255,.25);
+      --edge-shadow:rgba(31,48,52,.18);--input-bg:rgba(255,255,255,.58);--portal-border:rgba(242,143,59,.46);
+      --form-error-border:#f1beb5;--form-error-bg:rgba(255,242,239,.78);--form-error-text:#a33b2d;
+      --footer:#718287;--note-bg:rgba(255,255,255,.44);--note-border:rgba(15,138,112,.25);--note-text:#4c605a;--shine:.72;
+    }
+    html[data-theme-mode="dark"]{
+      color-scheme:dark;
+      --bg:#0b1210;--bg-2:#14201c;--glass:rgba(23,34,31,.66);--glass-strong:rgba(31,45,41,.76);
+      --glass-fallback:#18211d;--panel:rgba(23,34,31,.68);--panel-fallback:#18211d;--text:#ecf2ee;
+      --muted:#a7b5ae;--line:rgba(220,255,244,.18);--line-soft:rgba(220,255,244,.10);--accent:#47c7a7;
+      --accent-2:#f0a75e;--accent-soft:rgba(71,199,167,.13);--warm:rgba(240,167,94,.13);--grid-line:rgba(71,199,167,.105);
+      --panel-shadow:0 2px 1px rgba(255,255,255,.06),0 16px 34px rgba(0,0,0,.42),0 42px 88px rgba(0,0,0,.52),inset 1px 1px 0 rgba(255,255,255,.18),inset -1px -1px 0 rgba(0,0,0,.50),inset 0 18px 34px rgba(255,255,255,.045);
+      --panel-hover-shadow:0 2px 1px rgba(255,255,255,.08),0 20px 40px rgba(0,0,0,.48),0 52px 96px rgba(0,0,0,.58),inset 1px 1px 0 rgba(255,255,255,.22),inset -1px -1px 0 rgba(0,0,0,.54),inset 0 20px 38px rgba(255,255,255,.06);
+      --edge-shadow:rgba(0,0,0,.46);--input-bg:rgba(9,15,13,.52);--portal-border:rgba(240,167,94,.42);
+      --form-error-border:#8c463a;--form-error-bg:rgba(53,27,23,.78);--form-error-text:#f6b4a9;
+      --footer:#87958e;--note-bg:rgba(20,32,28,.58);--note-border:rgba(71,199,167,.24);--note-text:#bfd5cc;--shine:.24;
+    }
+    html[data-ui-style="crystal"]{
+      color-scheme:light;
+      --bg:#f7f2ea;--bg-2:#fef9f3;--glass:rgba(255,255,255,.44);--glass-strong:rgba(255,255,255,.66);
+      --glass-fallback:#fffaf5;--panel:rgba(255,255,255,.48);--panel-fallback:#fffaf5;--text:#1f2333;
+      --muted:#656b7d;--line:rgba(255,255,255,.84);--line-soft:rgba(78,88,116,.14);--accent:#e85d3f;
+      --accent-2:#2f7dff;--accent-soft:rgba(232,93,63,.17);--warm:rgba(255,176,84,.24);--grid-line:rgba(78,88,116,.05);
+      --edge-shadow:rgba(63,73,101,.23);--input-bg:rgba(255,255,255,.50);--portal-border:rgba(232,93,63,.36);
+      --form-error-border:rgba(215,80,58,.35);--form-error-bg:rgba(255,242,238,.75);--form-error-text:#962f22;
+      --footer:#72788d;--note-bg:rgba(255,255,255,.45);--note-border:rgba(47,125,255,.20);--note-text:#545d74;
+      --crystal-rim:rgba(122,132,168,.46);--crystal-blue:rgba(47,125,255,.34);--crystal-cyan:rgba(28,195,179,.27);
+      --crystal-warm:rgba(232,93,63,.38);--crystal-gold:rgba(255,191,78,.33);--crystal-violet:rgba(132,112,255,.17);--shine:.92;
+      --panel-shadow:0 1px 0 rgba(255,255,255,.98),0 10px 22px rgba(123,95,72,.13),0 30px 66px rgba(95,72,53,.16),inset 0 1px 0 rgba(255,255,255,.98),inset 0 0 0 1px rgba(255,255,255,.56),inset 0 18px 28px rgba(255,255,255,.36),inset 0 -20px 30px rgba(113,90,120,.10);
+      --panel-hover-shadow:0 1px 0 rgba(255,255,255,1),0 14px 30px rgba(123,95,72,.18),0 38px 80px rgba(95,72,53,.22),inset 0 1px 0 rgba(255,255,255,1),inset 0 0 0 1px rgba(255,255,255,.62),inset 0 20px 32px rgba(255,255,255,.40),inset 0 -22px 34px rgba(113,90,120,.12);
+    }
+    html[data-ui-style="crystal"][data-theme-mode="dark"]{
+      color-scheme:dark;
+      --bg:#171924;--bg-2:#23283a;--glass:rgba(48,53,71,.62);--glass-strong:rgba(61,68,90,.74);
+      --glass-fallback:#252b3e;--panel:rgba(49,55,74,.66);--panel-fallback:#252b3e;--text:#f5f6ff;
+      --muted:#b7bdd4;--line:rgba(236,240,255,.24);--line-soft:rgba(236,240,255,.13);--accent:#ff8f66;
+      --accent-2:#7db0ff;--accent-soft:rgba(255,143,102,.18);--warm:rgba(255,197,98,.15);--grid-line:rgba(125,176,255,.07);
+      --edge-shadow:rgba(0,0,0,.50);--input-bg:rgba(13,17,31,.50);--portal-border:rgba(255,143,102,.36);
+      --form-error-border:rgba(255,140,115,.38);--form-error-bg:rgba(74,33,35,.68);--form-error-text:#ffc5ba;
+      --footer:#9da4bd;--note-bg:rgba(33,38,56,.58);--note-border:rgba(125,176,255,.26);--note-text:#cfd6eb;
+      --crystal-rim:rgba(213,225,255,.26);--crystal-blue:rgba(109,159,255,.28);--crystal-cyan:rgba(70,215,199,.22);
+      --crystal-warm:rgba(255,141,96,.30);--crystal-gold:rgba(255,197,98,.22);--shine:.40;
+      --panel-shadow:0 1px 0 rgba(255,255,255,.16),0 14px 28px rgba(0,0,0,.36),0 38px 84px rgba(0,0,0,.54),inset 0 1px 0 rgba(255,255,255,.20),inset 0 -18px 28px rgba(0,0,0,.24),inset 0 16px 28px rgba(255,255,255,.05);
+      --panel-hover-shadow:0 1px 0 rgba(255,255,255,.18),0 18px 34px rgba(0,0,0,.42),0 48px 96px rgba(0,0,0,.60),inset 0 1px 0 rgba(255,255,255,.24),inset 0 -20px 30px rgba(0,0,0,.26),inset 0 18px 30px rgba(255,255,255,.06);
+    }
+    html[data-ui-style="crystal"] body{
+      background:
+        radial-gradient(920px 520px at 12% 8%,rgba(255,255,255,.92),rgba(255,255,255,0) 62%),
+        radial-gradient(760px 460px at 92% 20%,rgba(66,128,255,.16),rgba(66,128,255,0) 66%),
+        radial-gradient(720px 420px at 68% 84%,rgba(255,168,84,.18),rgba(255,168,84,0) 64%),
+        linear-gradient(180deg,#fff8f1 0%,#f5efe7 46%,#fdf8f2 100%);
+    }
+    html[data-ui-style="crystal"] body::before{
+      background:
+        radial-gradient(560px 260px at 3% 8%,rgba(255,255,255,.65),rgba(255,255,255,0) 70%),
+        radial-gradient(480px 280px at 98% 82%,rgba(26,205,196,.13),rgba(26,205,196,0) 68%),
+        linear-gradient(90deg,rgba(255,255,255,.30),rgba(255,255,255,0) 18%,rgba(255,255,255,0) 80%,rgba(255,255,255,.18));
+      background-size:auto;
+      mask-image:none;
+      -webkit-mask-image:none;
+      opacity:.86;
+    }
+    html[data-ui-style="crystal"] .hero,
+    html[data-ui-style="crystal"] .card,
+    html[data-ui-style="crystal"] .security-note,
+    html[data-ui-style="crystal"] .panel{
+      border-radius:32px;
+      background:
+        radial-gradient(220px 116px at 8% 0%,rgba(255,255,255,.92),rgba(255,255,255,0) 72%),
+        radial-gradient(260px 140px at 102% 94%,var(--crystal-warm),rgba(255,255,255,0) 70%),
+        radial-gradient(260px 140px at -2% 100%,var(--crystal-blue),rgba(255,255,255,0) 68%),
+        linear-gradient(180deg,rgba(255,255,255,.66),rgba(255,255,255,.26) 54%,rgba(255,255,255,.42));
+      border:1px solid rgba(255,255,255,.74);
+      box-shadow:var(--panel-shadow);
+      backdrop-filter:blur(28px) saturate(1.58) contrast(1.03);
+      -webkit-backdrop-filter:blur(28px) saturate(1.58) contrast(1.03);
+      isolation:isolate;
+    }
+    html[data-ui-style="crystal"] .hero::before,
+    html[data-ui-style="crystal"] .card::before,
+    html[data-ui-style="crystal"] .security-note::before,
+    html[data-ui-style="crystal"] .panel::before{
+      background:
+        linear-gradient(180deg,rgba(255,255,255,.96),rgba(255,255,255,.28) 16%,rgba(255,255,255,0) 45%),
+        linear-gradient(118deg,rgba(255,255,255,.62),rgba(255,255,255,0) 32%),
+        linear-gradient(90deg,var(--crystal-blue),rgba(255,255,255,0) 15%,rgba(255,255,255,0) 83%,var(--crystal-warm));
+      mix-blend-mode:screen;
+      opacity:var(--shine);
+    }
+    html[data-ui-style="crystal"] .hero::after,
+    html[data-ui-style="crystal"] .card::after,
+    html[data-ui-style="crystal"] .security-note::after,
+    html[data-ui-style="crystal"] .panel::after{
+      background:
+        linear-gradient(90deg,var(--crystal-blue),rgba(255,255,255,0) 10%,rgba(255,255,255,0) 87%,var(--crystal-warm)),
+        linear-gradient(0deg,var(--crystal-gold),rgba(255,255,255,0) 16%,rgba(255,255,255,0) 84%,var(--crystal-cyan)),
+        linear-gradient(145deg,rgba(255,255,255,.55),rgba(255,255,255,0) 38%),
+        linear-gradient(315deg,var(--edge-shadow),rgba(0,0,0,0) 42%);
+      mix-blend-mode:normal;
+      opacity:.72;
+    }
+    html[data-ui-style="crystal"] .card:hover{
+      box-shadow:var(--panel-hover-shadow);
+    }
+    html[data-ui-style="crystal"] .hero{
+      min-height:190px;
+      border-radius:0 0 34px 34px;
+      background:
+        radial-gradient(420px 150px at 10% 0%,rgba(255,255,255,.92),rgba(255,255,255,0) 78%),
+        radial-gradient(500px 210px at 88% 16%,rgba(25,118,255,.13),rgba(25,118,255,0) 72%),
+        linear-gradient(180deg,rgba(255,255,255,.62),rgba(255,255,255,.22) 56%,rgba(255,255,255,.34));
+    }
+    html[data-ui-style="crystal"] .hero h1,
+    html[data-ui-style="crystal"] .card h2,
+    html[data-ui-style="crystal"] h1,
+    html[data-ui-style="crystal"] h2,
+    html[data-ui-style="crystal"] h3,
+    html[data-ui-style="crystal"] .metric strong,
+    html[data-ui-style="crystal"] dd{
+      color:var(--text);
+      text-shadow:0 1px 0 rgba(255,255,255,.78);
+    }
+    html[data-ui-style="crystal"] .hero p,
+    html[data-ui-style="crystal"] dt,
+    html[data-ui-style="crystal"] .subtle,
+    html[data-ui-style="crystal"] .access-note,
+    html[data-ui-style="crystal"] p,
+    html[data-ui-style="crystal"] .metric span{
+      color:var(--muted);
+    }
+    html[data-ui-style="crystal"] .data-table th,
+    html[data-ui-style="crystal"] .data-table td,
+    html[data-ui-style="crystal"] .metric{
+      border-color:rgba(99,118,142,.16);
+    }
+    html[data-ui-style="crystal"] .sbtn,
+    html[data-ui-style="crystal"] .link,
+    html[data-ui-style="crystal"] .menu-btn,
+    html[data-ui-style="crystal"] .mode-option{
+      position:relative;
+      overflow:hidden;
+      border-radius:999px;
+      background:
+        radial-gradient(38px 24px at 10% 20%,rgba(255,255,255,.94),rgba(255,255,255,0) 72%),
+        radial-gradient(56px 34px at 100% 88%,var(--crystal-blue),rgba(255,255,255,0) 72%),
+        linear-gradient(180deg,rgba(255,255,255,.86),rgba(255,255,255,.40) 52%,rgba(192,166,144,.22));
+      border-color:rgba(255,255,255,.86);
+      color:var(--text);
+      box-shadow:0 1px 0 rgba(255,255,255,1),0 8px 14px rgba(59,80,105,.10),0 20px 40px rgba(52,78,108,.15),inset 0 1px 0 rgba(255,255,255,1),inset 0 0 0 1px rgba(255,255,255,.55),inset -1px 0 0 rgba(73,93,119,.17),inset 0 -13px 20px rgba(82,104,132,.13),inset 0 14px 22px rgba(255,255,255,.34);
+    }
+    html[data-ui-style="crystal"] .sbtn::before,
+    html[data-ui-style="crystal"] .link::before,
+    html[data-ui-style="crystal"] .menu-btn::before,
+    html[data-ui-style="crystal"] .mode-option::before{
+      content:"";position:absolute;left:12px;right:12px;top:3px;height:38%;border-radius:999px;
+      background:
+        linear-gradient(180deg,rgba(255,255,255,.90),rgba(255,255,255,.12)),
+        linear-gradient(90deg,var(--crystal-warm),rgba(255,255,255,0) 22%,rgba(255,255,255,0) 78%,var(--crystal-blue));
+      pointer-events:none;opacity:.82;
+    }
+    html[data-ui-style="crystal"] .sbtn:hover,
+    html[data-ui-style="crystal"] .link:hover,
+    html[data-ui-style="crystal"] .menu-btn:hover,
+    html[data-ui-style="crystal"] .mode-option:hover{
+      background:
+        radial-gradient(52px 32px at 12% 18%,rgba(255,255,255,.96),rgba(255,255,255,0) 70%),
+        radial-gradient(74px 42px at 100% 92%,var(--crystal-warm),rgba(255,255,255,0) 72%),
+        linear-gradient(180deg,rgba(255,255,255,.92),rgba(255,255,255,.46) 50%,rgba(232,93,63,.24));
+      transform:translateY(-2px);
+      box-shadow:0 1px 0 rgba(255,255,255,1),0 12px 20px rgba(59,80,105,.16),0 28px 54px rgba(52,78,108,.22),inset 0 1px 0 rgba(255,255,255,1),inset 1px 0 0 rgba(255,255,255,.78),inset -1px 0 0 rgba(73,93,119,.19),inset 0 -12px 20px rgba(82,104,132,.16),inset 0 15px 23px rgba(255,255,255,.34);
+    }
+    html[data-ui-style="crystal"] .sbtn:active,
+    html[data-ui-style="crystal"] .link:active,
+    html[data-ui-style="crystal"] .menu-btn:active,
+    html[data-ui-style="crystal"] .mode-option:active{
+      transform:translateY(1px);
+      box-shadow:inset 0 3px 10px rgba(57,79,90,.22),0 4px 12px rgba(45,66,78,.10);
+    }
+    html[data-ui-style="crystal"] .menu-btn[aria-selected="true"],
+    html[data-ui-style="crystal"] .mode-option:has(input:checked),
+    html[data-ui-style="crystal"] .debug-option[aria-pressed="true"]{
+      border-color:rgba(240,103,45,.52);
+      background:
+        radial-gradient(44px 28px at 12% 18%,rgba(255,255,255,.95),rgba(255,255,255,0) 70%),
+        linear-gradient(180deg,rgba(255,255,255,.72),rgba(255,255,255,.26) 46%,rgba(240,103,45,.28)),
+        var(--accent-soft);
+      box-shadow:0 1px 0 rgba(255,255,255,.95),0 14px 28px rgba(240,103,45,.18),inset 0 1px 0 rgba(255,255,255,.96),inset 0 -12px 18px rgba(240,103,45,.10);
+    }
+    html[data-ui-style="crystal"] .sbtn{
+      min-height:60px;
+      font-size:16px;
+      font-weight:800;
+      color:#fff;
+      text-shadow:0 1px 1px rgba(129,45,25,.34);
+      background:
+        radial-gradient(70px 34px at 14% 16%,rgba(255,255,255,.76),rgba(255,255,255,0) 68%),
+        radial-gradient(100px 54px at 96% 96%,rgba(255,206,76,.46),rgba(255,206,76,0) 68%),
+        linear-gradient(180deg,#ff8a52 0%,#f0642f 54%,#dc4a27 100%);
+      border-color:rgba(255,220,201,.90);
+      box-shadow:0 1px 0 rgba(255,255,255,.96),0 10px 16px rgba(205,85,42,.20),0 24px 46px rgba(220,74,39,.25),inset 0 1px 0 rgba(255,255,255,.72),inset 0 0 0 1px rgba(255,255,255,.35),inset 0 -15px 22px rgba(119,36,25,.20),inset 0 14px 22px rgba(255,255,255,.24);
+    }
+    html[data-ui-style="crystal"] .sbtn:hover{
+      background:
+        radial-gradient(82px 40px at 14% 16%,rgba(255,255,255,.82),rgba(255,255,255,0) 70%),
+        radial-gradient(116px 58px at 96% 96%,rgba(255,213,88,.50),rgba(255,213,88,0) 70%),
+        linear-gradient(180deg,#ff9662 0%,#f56b35 54%,#df4f29 100%);
+      box-shadow:0 1px 0 rgba(255,255,255,1),0 14px 22px rgba(205,85,42,.24),0 30px 58px rgba(220,74,39,.30),inset 0 1px 0 rgba(255,255,255,.78),inset 0 0 0 1px rgba(255,255,255,.40),inset 0 -15px 24px rgba(119,36,25,.22),inset 0 16px 24px rgba(255,255,255,.28);
+    }
+    html[data-ui-style="crystal"] .fld input,
+    html[data-ui-style="crystal"] .field input,
+    html[data-ui-style="crystal"] .cbtn,
+    html[data-ui-style="crystal"] .debug-option,
+    html[data-ui-style="crystal"] .debug-close{
+      border-radius:999px;
+      min-height:48px;
+      padding-left:18px;
+      padding-right:18px;
+      background:
+        radial-gradient(70px 34px at 12% 0%,rgba(255,255,255,.86),rgba(255,255,255,0) 70%),
+        linear-gradient(180deg,rgba(255,255,255,.56),rgba(255,255,255,.22) 54%,rgba(210,222,235,.18));
+      border-color:rgba(255,255,255,.80);
+      color:var(--text);
+      box-shadow:0 1px 0 rgba(255,255,255,.95),0 9px 18px rgba(58,78,102,.08),inset 0 1px 0 rgba(255,255,255,.92),inset 0 0 0 1px rgba(255,255,255,.40),inset 0 -10px 16px rgba(91,111,134,.08);
+    }
+    html[data-ui-style="crystal"] body{
+      background:
+        radial-gradient(900px 520px at 50% -12%,rgba(255,255,255,.96),rgba(255,255,255,0) 62%),
+        linear-gradient(180deg,#f7f9fc 0%,#edf2f7 48%,#f9fbfd 100%);
+    }
+    html[data-ui-style="crystal"] body::before{
+      background:
+        linear-gradient(135deg,rgba(35,130,255,.045),rgba(255,255,255,0) 34%),
+        linear-gradient(315deg,rgba(255,116,46,.05),rgba(255,255,255,0) 36%);
+      opacity:1;
+    }
+    html[data-ui-style="crystal"] .hero,
+    html[data-ui-style="crystal"] .card,
+    html[data-ui-style="crystal"] .security-note,
+    html[data-ui-style="crystal"] .panel{
+      border:2px solid rgba(255,255,255,.92);
+      background:
+        linear-gradient(180deg,rgba(255,255,255,.46),rgba(255,255,255,.18) 47%,rgba(255,255,255,.35) 100%);
+      box-shadow:
+        0 1px 0 rgba(255,255,255,1),
+        0 14px 26px rgba(70,86,104,.18),
+        0 34px 76px rgba(58,75,96,.18),
+        inset 0 2px 1px rgba(255,255,255,.95),
+        inset 0 0 0 1px rgba(255,255,255,.48),
+        inset 0 -24px 34px rgba(73,91,114,.16),
+        inset 0 22px 34px rgba(255,255,255,.24);
+      backdrop-filter:blur(18px) saturate(1.25);
+      -webkit-backdrop-filter:blur(18px) saturate(1.25);
+    }
+    html[data-ui-style="crystal"] .hero::before,
+    html[data-ui-style="crystal"] .card::before,
+    html[data-ui-style="crystal"] .security-note::before,
+    html[data-ui-style="crystal"] .panel::before{
+      inset:7px 10px auto 10px;
+      height:34%;
+      border-radius:max(18px,calc(1em + 14px));
+      background:
+        linear-gradient(180deg,rgba(255,255,255,.96),rgba(255,255,255,.38) 52%,rgba(255,255,255,0));
+      mix-blend-mode:screen;
+      opacity:.86;
+    }
+    html[data-ui-style="crystal"] .hero::after,
+    html[data-ui-style="crystal"] .card::after,
+    html[data-ui-style="crystal"] .security-note::after,
+    html[data-ui-style="crystal"] .panel::after{
+      inset:0;
+      padding:2px;
+      background:
+        linear-gradient(125deg,rgba(45,143,255,.70),rgba(255,255,255,.98) 22%,rgba(255,179,68,.70) 45%,rgba(255,255,255,.92) 66%,rgba(28,204,190,.68) 88%);
+      -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+      -webkit-mask-composite:xor;
+      mask-composite:exclude;
+      mix-blend-mode:normal;
+      opacity:.88;
+    }
+    html[data-ui-style="crystal"] .card:hover{
+      box-shadow:
+        0 1px 0 rgba(255,255,255,1),
+        0 18px 32px rgba(70,86,104,.21),
+        0 42px 90px rgba(58,75,96,.22),
+        inset 0 2px 1px rgba(255,255,255,1),
+        inset 0 0 0 1px rgba(255,255,255,.54),
+        inset 0 -24px 36px rgba(73,91,114,.17),
+        inset 0 24px 38px rgba(255,255,255,.28);
+    }
+    html[data-ui-style="crystal"] .sbtn,
+    html[data-ui-style="crystal"] .link,
+    html[data-ui-style="crystal"] .menu-btn,
+    html[data-ui-style="crystal"] .mode-option,
+    html[data-ui-style="crystal"] .debug-option,
+    html[data-ui-style="crystal"] .fld input,
+    html[data-ui-style="crystal"] .field input{
+      border:2px solid rgba(255,255,255,.92);
+      box-shadow:
+        0 1px 0 rgba(255,255,255,1),
+        0 10px 18px rgba(70,86,104,.16),
+        0 22px 42px rgba(58,75,96,.13),
+        inset 0 2px 1px rgba(255,255,255,.92),
+        inset 0 0 0 1px rgba(255,255,255,.42),
+        inset 0 -13px 21px rgba(73,91,114,.13),
+        inset 0 14px 22px rgba(255,255,255,.22);
+    }
+    html[data-ui-style="crystal"] .link,
+    html[data-ui-style="crystal"] .menu-btn,
+    html[data-ui-style="crystal"] .mode-option,
+    html[data-ui-style="crystal"] .debug-option,
+    html[data-ui-style="crystal"] .fld input,
+    html[data-ui-style="crystal"] .field input{
+      background:
+        linear-gradient(180deg,rgba(255,255,255,.62),rgba(255,255,255,.22) 48%,rgba(255,255,255,.38));
+      color:var(--text);
+    }
+    html[data-ui-style="crystal"] .sbtn{
+      background:
+        linear-gradient(180deg,rgba(255,255,255,.42),rgba(255,255,255,.08) 30%,rgba(255,255,255,0) 31%),
+        linear-gradient(180deg,#ff9464 0%,#f06632 53%,#d94a25 100%);
+      box-shadow:
+        0 1px 0 rgba(255,255,255,1),
+        0 12px 20px rgba(196,76,34,.25),
+        0 28px 56px rgba(196,76,34,.23),
+        inset 0 2px 1px rgba(255,255,255,.72),
+        inset 0 0 0 1px rgba(255,255,255,.34),
+        inset 0 -15px 22px rgba(115,37,24,.23),
+        inset 0 16px 24px rgba(255,255,255,.20);
+    }
+    html[data-ui-style="crystal"] .sbtn::before,
+    html[data-ui-style="crystal"] .link::before,
+    html[data-ui-style="crystal"] .menu-btn::before,
+    html[data-ui-style="crystal"] .mode-option::before{
+      left:14px;
+      right:14px;
+      top:5px;
+      height:32%;
+      background:linear-gradient(180deg,rgba(255,255,255,.92),rgba(255,255,255,.18));
+      opacity:.88;
+    }
+    html[data-ui-style="crystal"] body{
+      background:linear-gradient(180deg,#f6f8fb 0%,#edf1f5 52%,#f8fafc 100%);
+    }
+    html[data-ui-style="crystal"] body::before{
+      display:none;
+    }
+    html[data-ui-style="crystal"] .hero,
+    html[data-ui-style="crystal"] .card,
+    html[data-ui-style="crystal"] .security-note,
+    html[data-ui-style="crystal"] .panel{
+      background:
+        linear-gradient(180deg,rgba(255,255,255,.74),rgba(255,255,255,.46) 48%,rgba(255,255,255,.66));
+      border:1px solid rgba(255,255,255,.96);
+      box-shadow:
+        0 1px 0 rgba(255,255,255,1),
+        0 12px 24px rgba(62,76,92,.14),
+        0 30px 64px rgba(62,76,92,.14),
+        inset 0 1px 0 rgba(255,255,255,1),
+        inset 0 0 0 1px rgba(255,255,255,.55),
+        inset 0 -18px 28px rgba(68,84,102,.10),
+        inset 0 18px 28px rgba(255,255,255,.28);
+      backdrop-filter:blur(10px) saturate(1.05);
+      -webkit-backdrop-filter:blur(10px) saturate(1.05);
+    }
+    html[data-ui-style="crystal"] .hero::before,
+    html[data-ui-style="crystal"] .card::before,
+    html[data-ui-style="crystal"] .security-note::before,
+    html[data-ui-style="crystal"] .panel::before{
+      inset:5px 10px auto 10px;
+      height:30%;
+      border-radius:inherit;
+      background:linear-gradient(180deg,rgba(255,255,255,.82),rgba(255,255,255,.22),rgba(255,255,255,0));
+      opacity:.72;
+    }
+    html[data-ui-style="crystal"] .hero::after,
+    html[data-ui-style="crystal"] .card::after,
+    html[data-ui-style="crystal"] .security-note::after,
+    html[data-ui-style="crystal"] .panel::after{
+      inset:0;
+      padding:1px;
+      background:linear-gradient(135deg,rgba(255,255,255,1),rgba(139,165,195,.30) 35%,rgba(255,255,255,.86) 58%,rgba(118,145,176,.30));
+      -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+      -webkit-mask-composite:xor;
+      mask-composite:exclude;
+      opacity:.78;
+    }
+    html[data-ui-style="crystal"] .hero{
+      background:
+        linear-gradient(180deg,rgba(255,255,255,.78),rgba(255,255,255,.50) 50%,rgba(255,255,255,.68));
+    }
+    html[data-ui-style="crystal"] .sbtn,
+    html[data-ui-style="crystal"] .link,
+    html[data-ui-style="crystal"] .menu-btn,
+    html[data-ui-style="crystal"] .mode-option,
+    html[data-ui-style="crystal"] .debug-option,
+    html[data-ui-style="crystal"] .fld input,
+    html[data-ui-style="crystal"] .field input{
+      background:
+        linear-gradient(180deg,rgba(255,255,255,.78),rgba(255,255,255,.40) 50%,rgba(255,255,255,.62));
+      border:1px solid rgba(255,255,255,.96);
+      box-shadow:
+        0 1px 0 rgba(255,255,255,1),
+        0 8px 16px rgba(62,76,92,.12),
+        inset 0 1px 0 rgba(255,255,255,1),
+        inset 0 -10px 16px rgba(68,84,102,.10),
+        inset 0 10px 16px rgba(255,255,255,.24);
+      color:var(--text);
+    }
+    html[data-ui-style="crystal"] .sbtn{
+      background:
+        linear-gradient(180deg,rgba(255,255,255,.50),rgba(255,255,255,.12) 32%,rgba(255,255,255,0) 33%),
+        linear-gradient(180deg,#ff8f5a 0%,#f26731 54%,#dc4f2a 100%);
+      color:#fff;
+      box-shadow:
+        0 1px 0 rgba(255,255,255,1),
+        0 10px 18px rgba(196,76,34,.24),
+        0 24px 48px rgba(196,76,34,.20),
+        inset 0 1px 0 rgba(255,255,255,.76),
+        inset 0 -13px 20px rgba(115,37,24,.22),
+        inset 0 13px 20px rgba(255,255,255,.20);
+    }
+    html[data-ui-style="crystal"] .sbtn:hover{
+      background:
+        linear-gradient(180deg,rgba(255,255,255,.56),rgba(255,255,255,.16) 32%,rgba(255,255,255,0) 33%),
+        linear-gradient(180deg,#ff9868 0%,#f46e39 54%,#e2542d 100%);
+    }
+    html[data-ui-style="neumorph"]{
+      color-scheme:light;
+      --bg:#d9d9d9;--bg-2:#d9d9d9;--glass:#d9d9d9;--glass-strong:#e1e1e1;
+      --glass-fallback:#d9d9d9;--panel:#d9d9d9;--panel-fallback:#d9d9d9;--text:#31343a;
+      --muted:#74777d;--line:rgba(120,124,132,.18);--line-soft:rgba(120,124,132,.16);--accent:#596068;
+      --accent-2:#f0642f;--accent-soft:rgba(255,255,255,.22);--warm:rgba(255,255,255,0);--grid-line:rgba(0,0,0,0);
+      --edge-shadow:rgba(158,158,158,.55);--input-bg:#d9d9d9;--portal-border:rgba(255,255,255,.35);
+      --form-error-border:rgba(198,92,76,.28);--form-error-bg:#ded6d4;--form-error-text:#9a3b30;
+      --footer:#777a80;--note-bg:#d9d9d9;--note-border:rgba(120,124,132,.18);--note-text:#646970;--shine:.0;
+      --neumo-hi:rgba(255,255,255,.82);--neumo-lo:rgba(156,156,156,.52);
+      --panel-shadow:12px 12px 24px var(--neumo-lo),-12px -12px 24px var(--neumo-hi);
+      --panel-hover-shadow:14px 14px 28px rgba(150,150,150,.56),-14px -14px 28px rgba(255,255,255,.88);
+    }
+    html[data-ui-style="neumorph"][data-theme-mode="dark"]{
+      color-scheme:dark;
+      --bg:#25282d;--bg-2:#25282d;--glass:#25282d;--glass-strong:#2b2f35;
+      --glass-fallback:#25282d;--panel:#25282d;--panel-fallback:#25282d;--text:#edf0f4;
+      --muted:#a9afb8;--line:rgba(255,255,255,.08);--line-soft:rgba(255,255,255,.07);--accent:#c7ccd4;
+      --accent-2:#ff8a55;--accent-soft:rgba(255,255,255,.05);--warm:rgba(255,255,255,0);--grid-line:rgba(0,0,0,0);
+      --edge-shadow:rgba(0,0,0,.52);--input-bg:#25282d;--portal-border:rgba(255,255,255,.08);
+      --form-error-border:rgba(255,138,110,.24);--form-error-bg:#322927;--form-error-text:#ffc1b6;
+      --footer:#999fa8;--note-bg:#25282d;--note-border:rgba(255,255,255,.08);--note-text:#bac1cb;--shine:.0;
+      --neumo-hi:rgba(255,255,255,.07);--neumo-lo:rgba(0,0,0,.48);
+      --panel-shadow:12px 12px 24px var(--neumo-lo),-12px -12px 24px var(--neumo-hi);
+      --panel-hover-shadow:14px 14px 28px rgba(0,0,0,.54),-14px -14px 28px rgba(255,255,255,.08);
+    }
+    html[data-ui-style="neumorph"] body{
+      background:linear-gradient(145deg,var(--bg),var(--bg-2));
+      color:var(--text);
+    }
+    html[data-ui-style="neumorph"] body::before{
+      display:none;
+    }
+    html[data-ui-style="neumorph"] .hero,
+    html[data-ui-style="neumorph"] .card,
+    html[data-ui-style="neumorph"] .security-note,
+    html[data-ui-style="neumorph"] .panel,
+    html[data-ui-style="neumorph"] .debug-drawer{
+      overflow:hidden;
+      background:var(--panel);
+      border:0;
+      border-radius:28px;
+      box-shadow:var(--panel-shadow);
+      backdrop-filter:none;
+      -webkit-backdrop-filter:none;
+    }
+    html[data-ui-style="neumorph"] .hero{
+      min-height:184px;
+      border-radius:0 0 30px 30px;
+    }
+    html[data-ui-style="neumorph"] .hero::before,
+    html[data-ui-style="neumorph"] .hero::after,
+    html[data-ui-style="neumorph"] .card::before,
+    html[data-ui-style="neumorph"] .card::after,
+    html[data-ui-style="neumorph"] .security-note::before,
+    html[data-ui-style="neumorph"] .security-note::after,
+    html[data-ui-style="neumorph"] .panel::before,
+    html[data-ui-style="neumorph"] .panel::after{
+      content:none;
+    }
+    html[data-ui-style="neumorph"] .card:hover{
+      transform:translateY(-1px);
+      box-shadow:var(--panel-hover-shadow);
+    }
+    html[data-ui-style="neumorph"] .hero h1,
+    html[data-ui-style="neumorph"] .card h2,
+    html[data-ui-style="neumorph"] h1,
+    html[data-ui-style="neumorph"] h2,
+    html[data-ui-style="neumorph"] h3,
+    html[data-ui-style="neumorph"] dd,
+    html[data-ui-style="neumorph"] .metric strong{
+      color:var(--text);
+      text-shadow:1px 1px 0 rgba(255,255,255,.35);
+    }
+    html[data-ui-style="neumorph"][data-theme-mode="dark"] .hero h1,
+    html[data-ui-style="neumorph"][data-theme-mode="dark"] .card h2,
+    html[data-ui-style="neumorph"][data-theme-mode="dark"] h1,
+    html[data-ui-style="neumorph"][data-theme-mode="dark"] h2,
+    html[data-ui-style="neumorph"][data-theme-mode="dark"] h3,
+    html[data-ui-style="neumorph"][data-theme-mode="dark"] dd,
+    html[data-ui-style="neumorph"][data-theme-mode="dark"] .metric strong{
+      text-shadow:1px 1px 0 rgba(0,0,0,.35);
+    }
+    html[data-ui-style="neumorph"] .hero p,
+    html[data-ui-style="neumorph"] dt,
+    html[data-ui-style="neumorph"] .subtle,
+    html[data-ui-style="neumorph"] .access-note,
+    html[data-ui-style="neumorph"] p,
+    html[data-ui-style="neumorph"] .metric span{
+      color:var(--muted);
+    }
+    html[data-ui-style="neumorph"] .data-table th,
+    html[data-ui-style="neumorph"] .data-table td,
+    html[data-ui-style="neumorph"] .metric,
+    html[data-ui-style="neumorph"] .summary-item,
+    html[data-ui-style="neumorph"] .section{
+      border-color:var(--line-soft);
+    }
+    html[data-ui-style="neumorph"] .sbtn,
+    html[data-ui-style="neumorph"] .link,
+    html[data-ui-style="neumorph"] .menu-btn,
+    html[data-ui-style="neumorph"] .mode-option,
+    html[data-ui-style="neumorph"] .debug-option,
+    html[data-ui-style="neumorph"] .debug-close,
+    html[data-ui-style="neumorph"] .cbtn{
+      position:relative;
+      overflow:hidden;
+      background:var(--panel);
+      border:0;
+      border-radius:999px;
+      color:var(--text);
+      box-shadow:7px 7px 14px var(--neumo-lo),-7px -7px 14px var(--neumo-hi);
+      backdrop-filter:none;
+      -webkit-backdrop-filter:none;
+    }
+    html[data-ui-style="neumorph"] .sbtn::before,
+    html[data-ui-style="neumorph"] .link::before,
+    html[data-ui-style="neumorph"] .menu-btn::before,
+    html[data-ui-style="neumorph"] .mode-option::before{
+      content:none;
+    }
+    html[data-ui-style="neumorph"] .sbtn:hover,
+    html[data-ui-style="neumorph"] .link:hover,
+    html[data-ui-style="neumorph"] .menu-btn:hover,
+    html[data-ui-style="neumorph"] .mode-option:hover{
+      background:var(--panel);
+      border:0;
+      transform:translateY(-1px);
+      box-shadow:9px 9px 18px var(--neumo-lo),-9px -9px 18px var(--neumo-hi);
+    }
+    html[data-ui-style="neumorph"] .sbtn:active,
+    html[data-ui-style="neumorph"] .link:active,
+    html[data-ui-style="neumorph"] .menu-btn:active,
+    html[data-ui-style="neumorph"] .mode-option:active,
+    html[data-ui-style="neumorph"] .debug-option:active{
+      transform:translateY(0);
+      box-shadow:inset 6px 6px 12px var(--neumo-lo),inset -6px -6px 12px var(--neumo-hi);
+    }
+    html[data-ui-style="neumorph"] .menu-btn[aria-selected="true"],
+    html[data-ui-style="neumorph"] .mode-option:has(input:checked),
+    html[data-ui-style="neumorph"] .debug-option[aria-pressed="true"]{
+      color:var(--accent-2);
+      background:var(--panel);
+      border:0;
+      box-shadow:inset 6px 6px 12px var(--neumo-lo),inset -6px -6px 12px var(--neumo-hi);
+    }
+    html[data-ui-style="neumorph"] .fld input,
+    html[data-ui-style="neumorph"] .field input{
+      min-height:44px;
+      background:var(--panel);
+      border:0;
+      border-radius:999px;
+      color:var(--text);
+      box-shadow:inset 6px 6px 12px var(--neumo-lo),inset -6px -6px 12px var(--neumo-hi);
+    }
+    html[data-ui-style="neumorph"] .fld input:focus-visible,
+    html[data-ui-style="neumorph"] .field input:focus-visible,
+    html[data-ui-style="neumorph"] .sbtn:focus-visible,
+    html[data-ui-style="neumorph"] .link:focus-visible{
+      outline:2px solid color-mix(in srgb,var(--accent-2) 46%,transparent);
+      outline-offset:3px;
+    }
+    html[data-ui-style="neumorph"] .remember input{
+      accent-color:var(--accent-2);
+    }
+    html[data-ui-style="neumorph"] .debug-tab{
+      background:var(--panel);
+      border:0;
+      border-radius:12px 0 0 12px;
+      box-shadow:7px 7px 14px var(--neumo-lo),-5px -5px 12px var(--neumo-hi);
+    }
+    html[data-ui-style="neumorph"] .debug-drawer{
+      border-left:0;
+      border-radius:28px 0 0 28px;
+    }
+    .debug-tab{
+      position:fixed;right:0;top:50%;z-index:60;transform:translateY(-50%);
+      border:1px solid var(--line);border-right:0;border-radius:8px 0 0 8px;
+      background:var(--glass-strong);color:var(--text);padding:10px 8px;font-size:12px;font-weight:700;
+      box-shadow:0 10px 24px rgba(29,42,46,.18),inset 1px 1px 0 rgba(255,255,255,.54);
+      cursor:pointer;writing-mode:vertical-rl;letter-spacing:.02em;
+      backdrop-filter:blur(18px) saturate(1.2);-webkit-backdrop-filter:blur(18px) saturate(1.2);
+    }
+    .debug-drawer{
+      position:fixed;right:0;top:0;bottom:0;z-index:70;width:min(320px,calc(100vw - 24px));
+      padding:18px;background:var(--glass-strong);color:var(--text);border-left:1px solid var(--line);
+      box-shadow:-24px 0 58px rgba(20,34,38,.22),inset 1px 0 0 rgba(255,255,255,.28);
+      transform:translateX(100%);transition:transform .18s ease;
+      backdrop-filter:blur(22px) saturate(1.35);-webkit-backdrop-filter:blur(22px) saturate(1.35);
+    }
+    html[data-debug-open="true"] .debug-drawer{transform:translateX(0)}
+    html[data-debug-open="true"] .debug-tab{display:none}
+    .debug-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:20px}
+    .debug-title{font-size:15px;font-weight:800}
+    .debug-close{inline-size:32px;block-size:32px;border-radius:999px;border:1px solid var(--line);background:var(--input-bg);color:var(--text);cursor:pointer;font-weight:800}
+    .debug-group{display:grid;gap:8px;margin-bottom:18px}
+    .debug-label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:800}
+    .debug-seg{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}
+    .debug-seg.style{grid-template-columns:repeat(3,1fr)}
+    .debug-option{min-height:34px;border:1px solid var(--line);border-radius:8px;background:var(--input-bg);color:var(--text);font-size:12px;font-weight:700;cursor:pointer}
+    .debug-option[aria-pressed="true"]{border-color:var(--accent);background:var(--accent-soft);box-shadow:inset 1px 1px 0 rgba(255,255,255,.34),0 8px 18px rgba(15,138,112,.13)}
+    .debug-note{font-size:12px;line-height:1.5;color:var(--muted)}
+    @media (max-width:640px){
+      .debug-tab{top:auto;bottom:18px;writing-mode:horizontal-tb;border-right:1px solid var(--line);border-radius:8px 0 0 8px}
+    }
+  </style>"""
+
+
+def render_debug_panel() -> str:
+    return """<button class="debug-tab" type="button" data-debug-open>Debug</button>
+<aside class="debug-drawer" aria-label="Theme panel">
+  <div class="debug-head">
+    <div class="debug-title">Theme</div>
+    <button class="debug-close" type="button" data-debug-close aria-label="Close debug panel">X</button>
+  </div>
+  <div class="debug-group">
+    <div class="debug-label">Mode</div>
+    <div class="debug-seg" style="grid-template-columns:repeat(3,1fr)">
+      <button class="debug-option" type="button" data-theme-option="auto">Auto</button>
+      <button class="debug-option" type="button" data-theme-option="light">Light</button>
+      <button class="debug-option" type="button" data-theme-option="dark">Dark</button>
+    </div>
+  </div>
+  <div class="debug-group">
+    <div class="debug-label">Style</div>
+    <div class="debug-seg style">
+      <button class="debug-option" type="button" data-style-option="glass">Glass</button>
+      <button class="debug-option" type="button" data-style-option="crystal">Crystal</button>
+      <button class="debug-option" type="button" data-style-option="neumorph">Neumo</button>
+    </div>
+  </div>
+  <p class="debug-note">Theme and style are saved only in this browser.</p>
+</aside>"""
+
+
+def render_debug_panel_script() -> str:
+    return """<script>
+  (function () {
+    var root = document.documentElement;
+    var themeButtons = Array.prototype.slice.call(document.querySelectorAll('[data-theme-option]'));
+    var styleButtons = Array.prototype.slice.call(document.querySelectorAll('[data-style-option]'));
+    var openButton = document.querySelector('[data-debug-open]');
+    var closeButton = document.querySelector('[data-debug-close]');
+    var mediaQuery = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+    var themePref = root.dataset.themePref || localStorage.getItem('bmi30.portal.theme') || 'auto';
+    if (themePref !== 'auto' && themePref !== 'light' && themePref !== 'dark') {
+      themePref = 'auto';
+    }
+    var style = root.dataset.uiStyle || 'crystal';
+    if (style !== 'glass' && style !== 'crystal' && style !== 'neumorph') {
+      style = 'crystal';
+    }
+    root.dataset.uiStyle = style;
+
+    function store(key, value) {
+      try {
+        localStorage.setItem(key, value);
+      } catch (error) {}
+    }
+
+    function resolveTheme(pref) {
+      if (pref === 'auto') {
+        return (mediaQuery && mediaQuery.matches) ? 'dark' : 'light';
+      }
+      return pref;
+    }
+
+    function paintButtons() {
+      themeButtons.forEach(function (button) {
+        button.setAttribute('aria-pressed', button.dataset.themeOption === themePref ? 'true' : 'false');
+      });
+      styleButtons.forEach(function (button) {
+        button.setAttribute('aria-pressed', button.dataset.styleOption === style ? 'true' : 'false');
+      });
+    }
+
+    function applyTheme(pref, persist) {
+      themePref = pref || 'auto';
+      if (themePref !== 'auto' && themePref !== 'light' && themePref !== 'dark') {
+        themePref = 'auto';
+      }
+      root.dataset.themePref = themePref;
+      root.dataset.themeMode = resolveTheme(themePref);
+      if (persist !== false) {
+        store('bmi30.portal.theme', themePref);
+      }
+      paintButtons();
+    }
+
+    function setStyle(nextStyle) {
+      style = nextStyle || 'crystal';
+      if (style !== 'glass' && style !== 'crystal' && style !== 'neumorph') {
+        style = 'crystal';
+      }
+      root.dataset.uiStyle = style;
+      store('bmi30.portal.style', style);
+      paintButtons();
+    }
+
+    themeButtons.forEach(function (button) {
+      button.addEventListener('click', function () {
+        applyTheme(button.dataset.themeOption, true);
+      });
+    });
+    styleButtons.forEach(function (button) {
+      button.addEventListener('click', function () {
+        setStyle(button.dataset.styleOption);
+      });
+    });
+    if (mediaQuery) {
+      var handleSystemThemeChange = function () {
+        if (themePref === 'auto') {
+          applyTheme('auto', false);
+        }
+      };
+      if (typeof mediaQuery.addEventListener === 'function') {
+        mediaQuery.addEventListener('change', handleSystemThemeChange);
+      } else if (typeof mediaQuery.addListener === 'function') {
+        mediaQuery.addListener(handleSystemThemeChange);
+      }
+    }
+    if (openButton) {
+      openButton.addEventListener('click', function () {
+        root.dataset.debugOpen = 'true';
+      });
+    }
+    if (closeButton) {
+      closeButton.addEventListener('click', function () {
+        delete root.dataset.debugOpen;
+      });
+    }
+    document.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape') {
+        delete root.dataset.debugOpen;
+      }
+    });
+    applyTheme(themePref, false);
+  }());
+</script>"""
 
 
 def detect_hotspot_connection() -> dict[str, Any]:
@@ -269,7 +1427,26 @@ def detect_default_route() -> str:
     return ""
 
 
-def collect_remote_access_targets() -> dict[str, Any]:
+def extract_request_host_ip(host_header: str) -> str | None:
+    if not host_header:
+        return None
+
+    candidate = host_header.strip()
+    if not candidate:
+        return None
+
+    if candidate.startswith("[") and "]" in candidate:
+        candidate = candidate[1:candidate.index("]")]
+    elif candidate.count(":") == 1:
+        candidate = candidate.split(":", 1)[0]
+
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def collect_remote_access_targets(preferred_ip: str | None = None) -> dict[str, Any]:
     hotspot = detect_hotspot_connection()
     interfaces = collect_ipv4_interfaces()
     default_iface = detect_default_route()
@@ -281,8 +1458,22 @@ def collect_remote_access_targets() -> dict[str, Any]:
             hotspot_ip = item["ip"]
             break
 
+    access_ip = hotspot_ip
+    access_role = "hotspot"
+    access_iface = hotspot.get("interface") or "wlan0ap"
+    if preferred_ip:
+        for item in interfaces:
+            if item["ip"] != preferred_ip:
+                continue
+            access_ip = item["ip"]
+            access_role = item["role"]
+            access_iface = item["iface"]
+            break
+
     sync_mode = detect_sync_mode()
-    logo_path = detect_logo_path()
+    tagit_logo_path = detect_logo_path(TAGIT_LOGO_CANDIDATES)
+    am_logo_path = detect_logo_path(AM_LOGO_CANDIDATES)
+    web_scheme = "https" if is_https_enabled() and FORCE_HTTPS else "http"
 
     payload = {
         "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -293,12 +1484,24 @@ def collect_remote_access_targets() -> dict[str, Any]:
             "ssid": hotspot.get("ssid") or hotspot.get("connection_id") or "BMI30-Hotspot",
             "interface": hotspot.get("interface") or "wlan0ap",
             "ip": hotspot_ip,
-            "web_url": f"http://{hotspot_ip}/",
+            "web_url": format_web_url(hotspot_ip, web_scheme),
+        },
+        "access": {
+            "ip": access_ip,
+            "role": access_role,
+            "interface": access_iface,
+            "web_url": format_web_url(access_ip, web_scheme),
         },
         "sync_mode": sync_mode,
-        "logo": {
-            "available": bool(logo_path),
-            "url": "/logo" if logo_path else "",
+        "logos": {
+            "tagit": {
+                "available": bool(tagit_logo_path),
+                "url": "/logo-tagit" if tagit_logo_path else "",
+            },
+            "am": {
+                "available": bool(am_logo_path),
+                "url": "/logo-am" if am_logo_path else "",
+            },
         },
         "interfaces": interfaces,
         "services": {
@@ -306,6 +1509,8 @@ def collect_remote_access_targets() -> dict[str, Any]:
             "ssh": SSH_PORT,
             "rdp": RDP_PORT,
             "web": PORT,
+            "web_scheme": web_scheme,
+            "web_tls": HTTPS_PORT,
         },
     }
     return payload
@@ -340,17 +1545,32 @@ def render_interface_cards(data: dict[str, Any]) -> str:
     return "\n".join(items)
 
 
-def render_html_page(data: dict[str, Any]) -> bytes:
+def render_html_page(
+    data: dict[str, Any],
+    auth_error: str = "",
+    entered_username: str = "",
+    remember_session: bool = True,
+) -> bytes:
     hostname   = html.escape(data["hostname"])
     ssid       = html.escape(data["hotspot"]["ssid"])
     hotspot_ip = html.escape(data["hotspot"]["ip"])
+    access_ip  = html.escape(data.get("access", {}).get("ip", data["hotspot"]["ip"]))
+    access_role = html.escape(data.get("access", {}).get("role", "hotspot"))
     sync_mode  = html.escape(data.get("sync_mode", {}).get("value", "off").upper())
     sync_src   = html.escape(data.get("sync_mode", {}).get("source", "unknown"))
     sync_ok    = bool(data.get("sync_mode", {}).get("device_responded", False))
-    has_logo   = bool(data.get("logo", {}).get("available", False))
+    has_tagit_logo = bool(data.get("logos", {}).get("tagit", {}).get("available", False))
+    has_am_logo = bool(data.get("logos", {}).get("am", {}).get("available", False))
     ssh_user   = html.escape(data["services"].get("ssh_user", "techaid"))
     rdp_port   = data["services"]["rdp"]
+    web_scheme = str(data["services"].get("web_scheme", "http"))
     generated  = html.escape(data["generated_at"])
+    entered_username = html.escape(entered_username)
+    remember_checked_attr = " checked" if remember_session else ""
+    auth_error_html = (
+        f'<p class="form-error" role="alert">{html.escape(auth_error)}</p>'
+        if auth_error else ""
+    )
 
     # Строки таблицы интерфейсов (loopback не нужен)
     iface_rows: list[str] = []
@@ -362,86 +1582,253 @@ def render_html_page(data: dict[str, Any]) -> bytes:
         iname  = html.escape(ifc["iface"])
         ip     = html.escape(ifc["ip"])
         iface_rows.append(
-            f'<tr><td class="role">{rlabel}</td>'
-            f'<td class="iname">{iname}</td>'
-            f'<td class="mono">{ip}</td></tr>'
+            f'<tr><td class="role" data-label="Type">{rlabel}</td>'
+            f'<td class="iname" data-label="Interface">{iname}</td>'
+            f'<td class="mono" data-label="IP Address">{ip}</td></tr>'
         )
     iface_table = "\n".join(iface_rows) or '<tr><td colspan="3">no data</td></tr>'
-    logo_html = '<img class="logo" src="/logo" alt="Company logo">' if has_logo else ''
+    tagit_logo_html = '<img class="logo logo-left" src="/logo-tagit" alt="TAGIT logo">' if has_tagit_logo else ''
+    am_logo_html = '<img class="logo logo-right" src="/logo-am" alt="AM Secure logo">' if has_am_logo else ''
+    remote_rows = f"""
+      <tr>
+        <td data-label="Method">SSH</td>
+        <td class="mono" data-label="Address / command">ssh {ssh_user}@{access_ip}</td>
+      </tr>
+      <tr>
+        <td data-label="Method">RDP</td>
+        <td class="mono" data-label="Address / command">{access_ip}:{rdp_port}</td>
+      </tr>
+      <tr>
+        <td data-label="Method">Web</td>
+                <td data-label="Address / command"><a href="{format_web_url(access_ip, web_scheme)}">{format_web_url(access_ip, web_scheme)}</a></td>
+      </tr>
+    """
 
     body = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="refresh" content="{REFRESH_S}">
-    <title>BMI30 - Connection Info</title>
+{render_style_bootstrap()}
+  <link rel="icon" href="{with_rev('/favicon.ico')}" sizes="any">
+  <link rel="icon" href="{with_rev('/favicon.png')}" type="image/png">
+  <title>BMI30 - Connection Info</title>
   <style>
+    :root{{
+      color-scheme:light dark;
+      --bg:#eef4f1;
+      --bg-2:#d7e3de;
+      --glass:rgba(255,255,255,.60);
+      --glass-strong:rgba(255,255,255,.74);
+      --glass-fallback:#f8fbf9;
+      --text:#17252a;
+      --muted:#5d6e74;
+      --line:rgba(255,255,255,.68);
+      --line-soft:rgba(23,37,42,.12);
+      --accent:#0f8a70;
+      --accent-2:#f28f3b;
+      --accent-soft:rgba(15,138,112,.16);
+      --warm:rgba(242,143,59,.14);
+      --grid-line:rgba(15,138,112,.075);
+      --panel-shadow:0 2px 1px rgba(255,255,255,.36), 0 14px 28px rgba(29,42,46,.16), 0 34px 72px rgba(29,42,46,.20), inset 1px 1px 0 rgba(255,255,255,.86), inset -1px -1px 0 rgba(60,82,86,.16), inset 0 18px 32px rgba(255,255,255,.22);
+      --panel-hover-shadow:0 2px 1px rgba(255,255,255,.40), 0 18px 34px rgba(29,42,46,.18), 0 42px 84px rgba(29,42,46,.24), inset 1px 1px 0 rgba(255,255,255,.92), inset -1px -1px 0 rgba(60,82,86,.18), inset 0 20px 36px rgba(255,255,255,.25);
+      --edge-shadow:rgba(31,48,52,.18);
+      --input-bg:rgba(255,255,255,.58);
+      --portal-border:rgba(242,143,59,.46);
+      --form-error-border:#f1beb5;
+      --form-error-bg:rgba(255,242,239,.78);
+      --form-error-text:#a33b2d;
+      --footer:#718287;
+      --note-bg:rgba(255,255,255,.44);
+      --note-border:rgba(15,138,112,.25);
+      --note-text:#4c605a;
+      --shine:.72;
+    }}
+    @media (prefers-color-scheme:dark){{
+      :root{{
+        --bg:#0b1210;
+        --bg-2:#14201c;
+        --glass:rgba(23,34,31,.66);
+        --glass-strong:rgba(31,45,41,.76);
+        --glass-fallback:#18211d;
+        --text:#ecf2ee;
+        --muted:#a7b5ae;
+        --line:rgba(220,255,244,.18);
+        --line-soft:rgba(220,255,244,.10);
+        --accent:#47c7a7;
+        --accent-2:#f0a75e;
+        --accent-soft:rgba(71,199,167,.13);
+        --warm:rgba(240,167,94,.13);
+        --grid-line:rgba(71,199,167,.105);
+        --panel-shadow:0 2px 1px rgba(255,255,255,.06), 0 16px 34px rgba(0,0,0,.42), 0 42px 88px rgba(0,0,0,.52), inset 1px 1px 0 rgba(255,255,255,.18), inset -1px -1px 0 rgba(0,0,0,.50), inset 0 18px 34px rgba(255,255,255,.045);
+        --panel-hover-shadow:0 2px 1px rgba(255,255,255,.08), 0 20px 40px rgba(0,0,0,.48), 0 52px 96px rgba(0,0,0,.58), inset 1px 1px 0 rgba(255,255,255,.22), inset -1px -1px 0 rgba(0,0,0,.54), inset 0 20px 38px rgba(255,255,255,.06);
+        --edge-shadow:rgba(0,0,0,.46);
+        --input-bg:rgba(9,15,13,.52);
+        --portal-border:rgba(240,167,94,.42);
+        --form-error-border:#8c463a;
+        --form-error-bg:rgba(53,27,23,.78);
+        --form-error-text:#f6b4a9;
+        --footer:#87958e;
+        --note-bg:rgba(20,32,28,.58);
+        --note-border:rgba(71,199,167,.24);
+        --note-text:#bfd5cc;
+        --shine:.24;
+      }}
+    }}
     *{{box-sizing:border-box;margin:0;padding:0}}
     body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
-          background:#f0ece5;color:#1d2a2e;padding:14px;min-height:100vh}}
-    .page{{max-width:600px;margin:0 auto;display:flex;flex-direction:column;gap:12px}}
-    .logo{{max-height:40px;max-width:160px;object-fit:contain;display:block}}
+          background:
+            linear-gradient(135deg,var(--accent-soft) 0%,transparent 36%),
+            linear-gradient(315deg,var(--warm) 0%,transparent 40%),
+            linear-gradient(180deg,var(--bg) 0%,var(--bg-2) 100%);
+          background-attachment:fixed;color:var(--text);padding:clamp(10px,2.5vw,26px);min-height:100vh;overflow-x:hidden}}
+    body::before{{content:"";position:fixed;inset:0;pointer-events:none;
+          background-image:linear-gradient(var(--grid-line) 1px,transparent 1px),linear-gradient(90deg,var(--grid-line) 1px,transparent 1px);
+          background-size:56px 56px;mask-image:linear-gradient(180deg,rgba(0,0,0,.70),rgba(0,0,0,.18) 78%,transparent);
+          -webkit-mask-image:linear-gradient(180deg,rgba(0,0,0,.70),rgba(0,0,0,.18) 78%,transparent)}}
+    .page{{position:relative;width:min(100%,1680px);margin:0 auto;display:flex;flex-direction:column;gap:clamp(12px,1.6vw,20px)}}
+    .grid{{display:grid;grid-template-columns:1fr;gap:clamp(12px,1.6vw,20px);align-items:start}}
+    .logo{{max-height:56px;max-width:min(220px,52vw);object-fit:contain;display:block}}
+    .logo-left{{margin-right:auto}}
+    .logo-right{{margin-left:auto}}
+    .hero,.card,.security-note{{position:relative;overflow:hidden;background:var(--glass);
+           border:1px solid var(--line);border-radius:8px;box-shadow:var(--panel-shadow);
+           backdrop-filter:blur(18px) saturate(1.24);-webkit-backdrop-filter:blur(18px) saturate(1.24)}}
+    .hero::before,.card::before,.security-note::before{{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;
+           background:linear-gradient(145deg,rgba(255,255,255,.70),rgba(255,255,255,.16) 36%,rgba(255,255,255,0) 62%);
+           opacity:var(--shine)}}
+    .hero::after,.card::after,.security-note::after{{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;
+           background:linear-gradient(315deg,var(--edge-shadow),rgba(0,0,0,0) 34%),linear-gradient(180deg,rgba(255,255,255,.30),rgba(255,255,255,0) 18%);
+           mix-blend-mode:multiply;opacity:.74}}
+    .hero>*,
+    .card>*,
+    .security-note>*{{position:relative}}
+    @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){{
+      .hero,.card,.security-note{{background:var(--glass-fallback)}}
+    }}
+    @media (hover:hover){{
+      .card:hover{{transform:translateY(-2px);box-shadow:var(--panel-hover-shadow)}}
+    }}
     /* Hero */
-    .hero{{background:linear-gradient(140deg,#e2f4ef 0%,#fff8ed 100%);
-           border:1px solid #b8ddd3;border-radius:18px;padding:18px 20px}}
-    .hero-top{{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}}
-    .badge{{display:flex;align-items:center;background:#0f8a70;color:#fff;
-            font-size:16px;font-weight:800;letter-spacing:.08em;
-            padding:0 16px;border-radius:12px;height:40px;white-space:nowrap}}
-    .hero h1{{font-size:20px;font-weight:700;line-height:1.2;margin-bottom:4px;text-align:center}}
-    .hero p{{font-size:13px;color:#5e7077;text-align:center}}
+    .hero{{background:linear-gradient(145deg,var(--glass-strong),var(--glass));
+           padding:clamp(16px,3vw,26px)}}
+    .hero-top{{display:flex;align-items:center;justify-content:flex-end;gap:14px;margin-bottom:12px}}
+    .hero h1{{font-size:clamp(20px,3.6vw,34px);font-weight:700;line-height:1.15;margin-bottom:4px;text-align:center;overflow-wrap:anywhere}}
+    .hero p{{font-size:clamp(13px,1.9vw,15px);color:var(--muted);text-align:center}}
     /* Cards */
-    .card{{background:#fff;border:1px solid #ddd6cc;border-radius:14px;padding:14px 16px}}
-    .card h2{{font-size:14px;font-weight:600;margin-bottom:10px;color:#1d2a2e}}
+    .card{{padding:clamp(14px,2vw,20px);min-width:0;transition:transform .16s ease,box-shadow .16s ease}}
+    .card h2{{font-size:15px;font-weight:600;margin-bottom:10px;color:var(--text)}}
     /* Definition list */
-    dl{{display:grid;grid-template-columns:auto 1fr;gap:7px 14px;align-items:center}}
-    dt{{font-size:12px;color:#607079;white-space:nowrap}}
-    dd{{font-size:13px}}
-    .mono{{font-family:ui-monospace,"SFMono-Regular",Consolas,monospace;word-break:break-all}}
+    dl{{display:grid;grid-template-columns:minmax(96px,auto) minmax(0,1fr);gap:8px 14px;align-items:start}}
+    dt{{font-size:12px;color:var(--muted);white-space:nowrap}}
+    dd{{font-size:13px;min-width:0}}
+    .mono{{font-family:ui-monospace,"SFMono-Regular",Consolas,monospace;overflow-wrap:anywhere;word-break:break-word}}
     /* Copy row */
     .cr{{display:flex;align-items:center;gap:8px}}
-    .cbtn{{background:none;border:1px solid #ddd6cc;border-radius:7px;
-           padding:2px 9px;font-size:11px;cursor:pointer;color:#0f8a70;white-space:nowrap}}
-    .cbtn:active{{background:#e2f4ef}}
+    .cbtn{{background:var(--input-bg);border:1px solid var(--line);border-radius:7px;
+           padding:2px 9px;font-size:11px;cursor:pointer;color:var(--accent);white-space:nowrap}}
+    .cbtn:active{{background:var(--accent-soft)}}
     /* Tables */
-    table{{width:100%;border-collapse:collapse;font-size:13px}}
-    th{{text-align:left;font-size:11px;font-weight:600;color:#607079;
-        padding:0 0 7px;border-bottom:1px solid #ddd6cc}}
-    td{{padding:7px 0;border-bottom:1px solid #f0ebe4;vertical-align:middle}}
+    .table-wrap{{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}}
+    .data-table{{width:100%;border-collapse:collapse;font-size:13px}}
+    .data-table th{{text-align:left;font-size:11px;font-weight:600;color:var(--muted);
+        padding:0 0 7px;border-bottom:1px solid var(--line)}}
+    .data-table td{{padding:7px 0;border-bottom:1px solid var(--line-soft);vertical-align:middle}}
     tr:last-child td{{border-bottom:none}}
     .role{{font-size:11px;text-transform:uppercase;letter-spacing:.06em;
-           color:#607079;padding-right:10px;white-space:nowrap}}
-    .iname{{padding-right:10px;color:#3d5059}}
+           color:var(--muted);padding-right:10px;white-space:nowrap}}
+    .iname{{padding-right:10px;color:var(--muted)}}
+    .access-note{{font-size:12px;color:var(--muted);margin-bottom:8px;overflow-wrap:anywhere}}
+    .subtle{{color:var(--muted)}}
     /* Portal card */
-    .portal{{border-color:#f8d9b3}}
-    .portal h2 span{{color:#f28f3b;font-size:11px;font-weight:400;margin-left:6px}}
-    fieldset{{border:1px solid #ddd6cc;border-radius:10px;
-              padding:10px 12px;margin-top:8px;opacity:.6}}
-    legend{{font-size:11px;color:#607079;padding:0 5px}}
-    .fld{{display:flex;flex-direction:column;gap:7px}}
-    .fld label{{font-size:12px;color:#607079;display:flex;flex-direction:column;gap:3px}}
-    .fld input{{border:1px solid #ddd6cc;border-radius:7px;
-                padding:7px 10px;font-size:13px;background:#f9f7f5;width:100%}}
-    .sbtn{{background:#0f8a70;color:#fff;border:none;border-radius:9px;
-           padding:9px;font-size:14px;width:100%;margin-top:8px;opacity:.45;cursor:not-allowed}}
-    .footer{{text-align:center;font-size:11px;color:#8a979c;padding:2px 0 6px}}
-    a{{color:#0f8a70;text-decoration:none}}
+    .portal{{border-color:var(--portal-border)}}
+    .portal h2 span{{color:var(--accent-2);font-size:11px;font-weight:400;margin-left:6px}}
+    .portal-form{{display:flex;flex-direction:column;gap:12px;margin-top:8px}}
+    .form-error{{border:1px solid var(--form-error-border);background:var(--form-error-bg);color:var(--form-error-text);
+                 padding:10px 12px;border-radius:8px;font-size:12px;line-height:1.45}}
+    .fld{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}
+    .fld label{{font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:3px}}
+    .fld input{{border:1px solid var(--line);border-radius:7px;
+                padding:7px 10px;font-size:13px;background:var(--input-bg);color:var(--text);width:100%;
+                box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
+    .fld input:focus-visible{{outline:2px solid rgba(15,138,112,.24);outline-offset:1px;border-color:var(--accent)}}
+    .portal-options{{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}}
+    .remember{{display:flex;align-items:flex-start;gap:10px;font-size:12px;color:var(--muted);line-height:1.45}}
+    .remember input{{margin-top:2px;accent-color:var(--accent);inline-size:16px;block-size:16px;flex:0 0 auto}}
+    .portal-help{{font-size:12px;color:var(--muted);line-height:1.55}}
+    .sbtn{{background:var(--glass-strong);color:var(--text);border:1px solid var(--line);border-radius:8px;
+           padding:11px 16px;font-size:14px;width:100%;cursor:pointer;font-weight:700;
+           box-shadow:0 1px 0 rgba(255,255,255,.44),0 10px 20px rgba(29,42,46,.13),0 22px 42px rgba(15,138,112,.14),
+                      inset 1px 1px 0 rgba(255,255,255,.72),inset -1px -1px 0 rgba(29,42,46,.14);
+           transition:background-color .14s ease,border-color .14s ease,box-shadow .14s ease,transform .14s ease,color .14s ease}}
+    .sbtn:hover{{background:var(--accent-soft);border-color:var(--accent);color:var(--text);
+           transform:translateY(-1px);
+           box-shadow:0 1px 0 rgba(255,255,255,.50),0 14px 24px rgba(29,42,46,.16),0 28px 54px rgba(15,138,112,.20),
+                      inset 1px 1px 0 rgba(255,255,255,.78),inset -1px -1px 0 rgba(29,42,46,.16)}}
+    .sbtn:active{{transform:translateY(1px);
+           box-shadow:inset 0 2px 8px rgba(29,42,46,.18),0 4px 12px rgba(29,42,46,.12)}}
+    .sbtn:focus-visible{{outline:2px solid rgba(15,138,112,.34);outline-offset:2px;border-color:var(--accent)}}
+    .security-note{{border-color:var(--note-border);background:var(--note-bg);color:var(--note-text);
+                    padding:12px 14px;font-size:12px;line-height:1.55}}
+    .security-note strong{{color:var(--text)}}
+    .security-note[hidden]{{display:none}}
+    .footer{{text-align:center;font-size:11px;color:var(--footer);padding:2px 0 6px;line-height:1.5}}
+    a{{color:var(--accent);text-decoration:none}}
+    @media (min-width:860px){{
+      .grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}
+      .hero{{grid-column:1 / -1}}
+      .remote-card,.network-card{{grid-column:1 / -1}}
+    }}
+    @media (min-width:1320px){{
+      .grid{{grid-template-columns:repeat(12,minmax(0,1fr))}}
+      .hero{{grid-column:1 / -1}}
+      .wifi-card{{grid-column:span 4}}
+      .remote-card{{grid-column:span 8}}
+      .network-card{{grid-column:span 8}}
+      .portal{{grid-column:span 4}}
+    }}
+    @media (max-width:640px){{
+      body{{padding:10px}}
+      .page,.grid{{gap:10px}}
+            .hero-top{{
+                flex-direction:row;
+                align-items:center;
+                justify-content:space-between;
+                flex-wrap:nowrap;
+                gap:8px;
+            }}
+            .logo{{max-height:38px;max-width:calc(50vw - 24px)}}
+            .logo-left{{margin-right:0}}
+            .logo-right{{margin-left:0}}
+      .fld{{grid-template-columns:1fr}}
+            dl{{grid-template-columns:minmax(96px,auto) minmax(0,1fr);gap:6px 10px;align-items:center}}
+            dt{{white-space:nowrap}}
+            dd{{margin-bottom:0;min-width:0}}
+      .data-table thead{{display:none}}
+            .data-table,.data-table tbody,.data-table tr{{display:block;width:100%}}
+      .data-table tr{{padding:8px 0;border-bottom:1px solid var(--line-soft)}}
+            .data-table td{{display:flex;align-items:baseline;gap:6px;padding:3px 0;border-bottom:none;overflow-wrap:anywhere;word-break:break-word}}
+            .data-table td::before{{content:attr(data-label) ": ";display:inline-block;font-size:10px;font-weight:700;
+                letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin-bottom:0;white-space:nowrap;flex:0 0 auto}}
+      .role{{padding-right:0;white-space:normal}}
+    }}
   </style>
+{render_debug_style_css()}
 </head>
 <body>
 <div class="page">
 
+  <div class="grid">
   <div class="hero">
     <div class="hero-top">
-      <div class="badge">BMI30</div>
-      {logo_html}
+    {tagit_logo_html}
+    {am_logo_html}
     </div>
     <h1>{hostname}</h1>
     <p>IM Mark Detection System</p>
   </div>
 
-  <div class="card">
+  <div class="card wifi-card">
         <h2>Wi-Fi Network</h2>
     <dl>
             <dt>SSID</dt>
@@ -449,63 +1836,494 @@ def render_html_page(data: dict[str, Any]) -> bytes:
             <dt>Hotspot IP</dt>
       <dd class="mono">{hotspot_ip}</dd>
             <dt>Sync Mode</dt>
-            <dd class="mono">{sync_mode} <span style="color:#607079">({sync_src})</span></dd>
+            <dd class="mono">{sync_mode} <span class="subtle">({sync_src})</span></dd>
             <dt>Device Link</dt>
             <dd>{'online' if sync_ok else '---'}</dd>
     </dl>
   </div>
 
-  <div class="card">
+  <div class="card remote-card">
         <h2>Remote Access</h2>
-    <table>
-            <tr><th>Method</th><th>Address / command</th></tr>
-      <tr>
-        <td>SSH</td>
-        <td class="mono">ssh {ssh_user}@{hotspot_ip}</td>
-      </tr>
-      <tr>
-        <td>RDP</td>
-        <td class="mono">{hotspot_ip}:{rdp_port}</td>
-      </tr>
-      <tr>
-                <td>Web</td>
-        <td><a href="http://{hotspot_ip}/">http://{hotspot_ip}/</a></td>
-      </tr>
-    </table>
+        <p class="access-note">Current access path: {access_role} via {access_ip}</p>
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr><th>Method</th><th>Address / command</th></tr>
+        </thead>
+        <tbody>
+          {remote_rows}
+        </tbody>
+      </table>
+    </div>
   </div>
 
-  <div class="card">
+  <div class="card network-card">
         <h2>Device Network Addresses</h2>
-    <table>
-            <tr><th>Type</th><th>Interface</th><th>IP Address</th></tr>
-      {iface_table}
-    </table>
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr><th>Type</th><th>Interface</th><th>IP Address</th></tr>
+        </thead>
+        <tbody>
+          {iface_table}
+        </tbody>
+      </table>
+    </div>
   </div>
 
   <div class="card portal">
-        <h2>Management Portal <span>(coming soon)</span></h2>
-    <p style="font-size:13px;color:#607079;margin-bottom:2px">
-            Authentication for advanced device management features.
+        <h2>Management Portal <span>(preview)</span></h2>
+    <p class="access-note" style="margin-bottom:2px">
+            Sign in to open the next management screen.
     </p>
-    <fieldset disabled>
-            <legend>Sign in</legend>
+    <form class="portal-form" method="post" action="/portal-login" novalidate>
+      {auth_error_html}
       <div class="fld">
-                <label>Username<input type="text" placeholder="admin"></label>
-                <label>Password<input type="password" placeholder="••••••••"></label>
+                <label>Username<input name="username" type="text" value="{entered_username}" placeholder="admin" autocomplete="username" aria-required="true"></label>
+                <label>Password<input name="password" type="password" placeholder="admin" autocomplete="current-password" aria-required="true"></label>
       </div>
-            <button class="sbtn" disabled>Sign In</button>
-    </fieldset>
+      <div class="portal-options">
+        <label class="remember"><input name="remember" type="checkbox" value="1"{remember_checked_attr}>Remember this browser for 7 days</label>
+      </div>
+      <p class="portal-help">The device does not store your password here. When enabled, it keeps a signed login cookie that expires automatically after 7 days.</p>
+            <button class="sbtn" type="submit">Sign In</button>
+    </form>
+  </div>
   </div>
 
-  <div style="text-align:center;padding:4px 0 2px">
-    <a href="/portal-done" style="display:inline-block;background:#0f8a70;color:#fff;text-decoration:none;
-       border-radius:10px;padding:10px 32px;font-size:14px;font-weight:600;">Continue</a>
-  </div>
+    <div id="security-note" class="security-note" hidden>
+      <strong>Local device page.</strong> Your browser may show "Not secure" because this hotspot page is running over HTTP.
+      The warning disappears only after HTTPS with a trusted certificate is configured for the device.
+    </div>
 
     <p class="footer">Updated: {generated} · auto-refresh {REFRESH_S}&#x202f;s
         &nbsp;·&nbsp; <a href="/api/status">JSON API</a></p>
 
 </div>
+{render_debug_panel()}
+{render_debug_panel_script()}
+<script>
+  var securityNote = document.getElementById('security-note');
+  if (securityNote && window.location.protocol !== 'https:') {{
+    securityNote.hidden = false;
+  }}
+  var portalForm = document.querySelector('.portal-form');
+  if (portalForm) {{
+    var usernameInput = portalForm.querySelector('input[name="username"]');
+    var passwordInput = portalForm.querySelector('input[name="password"]');
+    var showPortalError = function (message) {{
+      var error = portalForm.querySelector('.form-error');
+      if (!error) {{
+        error = document.createElement('p');
+        error.className = 'form-error';
+        error.setAttribute('role', 'alert');
+        portalForm.insertBefore(error, portalForm.firstElementChild);
+      }}
+      error.textContent = message;
+    }};
+    var clearPortalError = function () {{
+      var error = portalForm.querySelector('.form-error');
+      if (error) {{
+        error.remove();
+      }}
+    }};
+    portalForm.addEventListener('submit', function (event) {{
+      var usernameMissing = usernameInput && usernameInput.value.trim() === '';
+      var passwordMissing = passwordInput && passwordInput.value === '';
+      if (!usernameMissing && !passwordMissing) {{
+        return;
+      }}
+      event.preventDefault();
+      if (usernameMissing && passwordMissing) {{
+        showPortalError('Please enter username and password.');
+        usernameInput.focus();
+      }} else if (usernameMissing) {{
+        showPortalError('Please enter username.');
+        usernameInput.focus();
+      }} else {{
+        showPortalError('Please enter password.');
+        passwordInput.focus();
+      }}
+    }});
+    [usernameInput, passwordInput].forEach(function (input) {{
+      if (input) {{
+        input.addEventListener('input', clearPortalError);
+      }}
+    }});
+  }}
+  window.setTimeout(function () {{
+    var inputs = Array.prototype.slice.call(document.querySelectorAll('.portal-form input[type="text"], .portal-form input[type="password"]'));
+    var hasFocus = inputs.some(function (input) {{ return input === document.activeElement; }});
+    var hasValue = inputs.some(function (input) {{ return input.value.trim() !== ''; }});
+    var debugOpen = document.documentElement.dataset.debugOpen === 'true';
+    if (!debugOpen && !hasFocus && !hasValue) {{
+      window.location.reload();
+    }}
+  }}, {REFRESH_S * 1000});
+</script>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_portal_page(hostname: str, session_username: str = "", session_role: str = "user", notice: str = "", notice_kind: str = "ok") -> bytes:
+    title = html.escape(hostname)
+    signed_in_as = html.escape(session_username)
+    access_label = "Engineering access" if session_role == "engineer" else "User access"
+    cfg = load_dc_config()
+    notice_html = ""
+    if notice:
+        cls = "notice notice-error" if notice_kind == "error" else "notice"
+        notice_html = f'<p class="{cls}" role="status">{html.escape(notice)}</p>'
+    mode_options = "\n".join(
+        f'<label class="mode-option" title="{html.escape(desc)}"><input type="radio" name="mode" value="{name}" {"checked" if cfg["mode"] == name else ""}><span>{label}</span></label>'
+        for name, label, desc in (
+            ("WORK", "Work", "Slow continuous DC learning for long unattended operation."),
+            ("DETECT", "Detect", "Medium tracking during detection; host settings define how it ramps faster over time."),
+            ("BOOT_FAST", "Boot-fast", "Fast DC adaptation after a host-controlled forced reboot, then firmware returns to Work."),
+            ("FREEZE", "Freeze", "Keep subtracting the stored DC value but stop learning new DC."),
+        )
+    )
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+{render_style_bootstrap()}
+  <link rel="icon" href="{with_rev('/favicon.ico')}" sizes="any">
+  <link rel="icon" href="{with_rev('/favicon.png')}" type="image/png">
+  <title>BMI30 - Management Portal</title>
+  <style>
+    :root{{
+      color-scheme:light dark;
+      --bg:#eef4f1;
+      --bg-2:#d7e3de;
+      --panel:rgba(255,255,255,.62);
+      --panel-fallback:#f8fbf9;
+      --text:#17252a;
+      --muted:#5d6e74;
+      --accent:#0f8a70;
+      --accent-2:#f28f3b;
+      --accent-soft:rgba(15,138,112,.16);
+      --warm:rgba(242,143,59,.14);
+      --grid-line:rgba(15,138,112,.075);
+      --line:rgba(255,255,255,.68);
+      --panel-shadow:0 2px 1px rgba(255,255,255,.36), 0 16px 34px rgba(29,42,46,.16), 0 40px 84px rgba(29,42,46,.20), inset 1px 1px 0 rgba(255,255,255,.86), inset -1px -1px 0 rgba(60,82,86,.16), inset 0 18px 34px rgba(255,255,255,.22);
+      --edge-shadow:rgba(31,48,52,.18);
+      --note-bg:rgba(255,255,255,.44);
+      --note-border:rgba(15,138,112,.25);
+      --note-text:#4c605a;
+      --shine:.72;
+    }}
+    @media (prefers-color-scheme:dark){{
+      :root{{
+        --bg:#0b1210;
+        --bg-2:#14201c;
+        --panel:rgba(23,34,31,.68);
+        --panel-fallback:#18211d;
+        --text:#ecf2ee;
+        --muted:#a7b5ae;
+        --accent:#47c7a7;
+        --accent-2:#f0a75e;
+        --accent-soft:rgba(71,199,167,.13);
+        --warm:rgba(240,167,94,.13);
+        --grid-line:rgba(71,199,167,.105);
+        --line:rgba(220,255,244,.18);
+        --panel-shadow:0 2px 1px rgba(255,255,255,.06), 0 18px 38px rgba(0,0,0,.44), 0 48px 96px rgba(0,0,0,.56), inset 1px 1px 0 rgba(255,255,255,.18), inset -1px -1px 0 rgba(0,0,0,.50), inset 0 18px 34px rgba(255,255,255,.045);
+        --edge-shadow:rgba(0,0,0,.46);
+        --note-bg:rgba(20,32,28,.58);
+        --note-border:rgba(71,199,167,.24);
+        --note-text:#bfd5cc;
+        --shine:.24;
+      }}
+    }}
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{min-height:100vh;padding:clamp(18px,3vw,30px);display:grid;place-items:center;
+          background:
+            linear-gradient(135deg,var(--accent-soft) 0%,transparent 36%),
+            linear-gradient(315deg,var(--warm) 0%,transparent 40%),
+            linear-gradient(180deg,var(--bg) 0%,var(--bg-2) 100%);
+          background-attachment:fixed;
+          color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;overflow-x:hidden}}
+    body::before{{content:"";position:fixed;inset:0;pointer-events:none;
+          background-image:linear-gradient(var(--grid-line) 1px,transparent 1px),linear-gradient(90deg,var(--grid-line) 1px,transparent 1px);
+          background-size:56px 56px;mask-image:linear-gradient(180deg,rgba(0,0,0,.70),rgba(0,0,0,.18) 78%,transparent);
+          -webkit-mask-image:linear-gradient(180deg,rgba(0,0,0,.70),rgba(0,0,0,.18) 78%,transparent)}}
+    .panel{{position:relative;overflow:visible;width:min(100%,1180px);background:var(--panel);
+            border:1px solid var(--line);border-radius:8px;padding:clamp(22px,4vw,42px);
+            box-shadow:var(--panel-shadow);backdrop-filter:blur(18px) saturate(1.24);
+            -webkit-backdrop-filter:blur(18px) saturate(1.24)}}
+    .panel::before{{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;
+            background:linear-gradient(145deg,rgba(255,255,255,.70),rgba(255,255,255,.16) 36%,rgba(255,255,255,0) 62%);
+            opacity:var(--shine)}}
+    .panel::after{{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;
+            background:linear-gradient(315deg,var(--edge-shadow),rgba(0,0,0,0) 34%),linear-gradient(180deg,rgba(255,255,255,.30),rgba(255,255,255,0) 18%);
+            mix-blend-mode:multiply;opacity:.74}}
+    .panel>*{{position:relative}}
+    @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){{
+      .panel{{background:var(--panel-fallback)}}
+    }}
+    .eyebrow{{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);margin-bottom:12px}}
+    h1{{font-size:clamp(28px,5vw,44px);line-height:1.08;margin-bottom:14px}}
+    h2{{font-size:20px;line-height:1.25;margin-bottom:10px}}
+    h3{{font-size:15px;line-height:1.25;margin-bottom:8px}}
+    p{{font-size:16px;line-height:1.6;color:var(--muted);max-width:34rem}}
+    .session-tag{{display:inline-flex;align-items:center;gap:8px;margin:0 0 14px;padding:8px 12px;border-radius:999px;
+                  background:var(--accent-soft);color:var(--text);font-size:12px;font-weight:600}}
+    .host{{display:inline-block;margin-top:8px;font-family:ui-monospace,"SFMono-Regular",Consolas,monospace;color:var(--text)}}
+    .portal-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:22px}}
+    .portal-title{{min-width:240px}}
+    .portal-shell{{display:grid;grid-template-columns:minmax(190px,240px) minmax(0,1fr);gap:20px;align-items:start}}
+    .portal-menu{{display:grid;gap:8px;position:sticky;top:18px}}
+    .menu-btn{{width:100%;min-height:44px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg);
+               color:var(--text);font:inherit;font-weight:700;text-align:left;padding:10px 12px;cursor:pointer;
+               display:flex;align-items:center;gap:10px;transition:background-color .14s ease,border-color .14s ease,transform .14s ease}}
+    .menu-btn:hover{{background:var(--accent-soft);border-color:var(--accent)}}
+    .menu-btn[aria-selected="true"]{{background:var(--accent-soft);border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}}
+    .menu-index{{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;
+                 background:var(--panel);border:1px solid var(--line);font-size:12px;color:var(--accent);flex:0 0 auto}}
+    .portal-content{{min-width:0}}
+    .portal-panel{{display:none}}
+    .portal-panel.is-active{{display:block}}
+    .summary-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:18px}}
+    .summary-item{{border-top:1px solid var(--line);padding-top:12px}}
+    .metric{{display:flex;align-items:baseline;justify-content:space-between;gap:12px;border-top:1px solid var(--line);
+             padding:11px 0;color:var(--text)}}
+    .metric span{{font-size:13px;color:var(--muted)}}
+    .metric strong{{font-size:14px;text-align:right}}
+    .security-note{{display:none;margin-top:18px;border:1px solid var(--note-border);background:var(--note-bg);
+                    color:var(--note-text);border-radius:8px;padding:12px 14px;font-size:12px;line-height:1.55;
+                    box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
+    .security-note strong{{color:var(--text)}}
+    .config-form{{display:grid;gap:18px;margin-top:18px}}
+    .section{{border-top:1px solid var(--line);padding-top:18px}}
+    .section h2{{font-size:17px;line-height:1.25;margin-bottom:10px}}
+    .mode-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}}
+    .mode-option{{display:flex;align-items:center;justify-content:center;min-height:48px;border:1px solid var(--line);
+                  border-radius:8px;background:var(--note-bg);cursor:pointer;font-weight:700;color:var(--text)}}
+    .mode-option input{{position:absolute;opacity:0;pointer-events:none}}
+    .mode-option:has(input:checked){{border-color:var(--accent);background:var(--accent-soft);box-shadow:inset 0 0 0 1px var(--accent)}}
+    .fields{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}
+    .field{{display:grid;gap:6px}}
+    .field span{{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:700;color:var(--text)}}
+    .field input{{width:100%;min-height:42px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg);
+                  color:var(--text);font:inherit;padding:9px 11px;box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
+    .field small{{font-size:12px;line-height:1.45;color:var(--muted)}}
+    .help{{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;
+           border:1px solid var(--line);color:var(--accent);font-size:12px;font-weight:800;background:var(--panel)}}
+    .notice{{margin-top:16px;border:1px solid var(--note-border);background:var(--note-bg);color:var(--note-text);
+             border-radius:8px;padding:11px 13px;font-size:13px;line-height:1.45;max-width:none}}
+    .notice-error{{border-color:var(--form-error-border);background:var(--form-error-bg);color:var(--form-error-text)}}
+    .actions{{display:flex;flex-wrap:wrap;gap:12px;margin-top:24px}}
+    .actions-inline{{margin-top:0}}
+    button.link{{font:inherit;cursor:pointer}}
+    .link{{display:inline-flex;align-items:center;justify-content:center;padding:11px 18px;
+           border-radius:8px;background:var(--panel);color:var(--text);text-decoration:none;font-weight:700;
+           border:1px solid var(--line);
+           box-shadow:0 1px 0 rgba(255,255,255,.42),0 12px 24px rgba(29,42,46,.14),0 24px 48px rgba(15,138,112,.14),
+                      inset 1px 1px 0 rgba(255,255,255,.66),inset -1px -1px 0 rgba(29,42,46,.14);
+           transition:background-color .14s ease,border-color .14s ease,box-shadow .14s ease,transform .14s ease,color .14s ease}}
+    .link:hover{{background:var(--accent-soft);border-color:var(--accent);transform:translateY(-1px);
+           box-shadow:0 1px 0 rgba(255,255,255,.48),0 16px 28px rgba(29,42,46,.16),0 30px 58px rgba(15,138,112,.20),
+                      inset 1px 1px 0 rgba(255,255,255,.72),inset -1px -1px 0 rgba(29,42,46,.16)}}
+    .link:active{{transform:translateY(1px);box-shadow:inset 0 2px 8px rgba(29,42,46,.18),0 4px 12px rgba(29,42,46,.12)}}
+    .link:focus-visible{{outline:2px solid rgba(15,138,112,.34);outline-offset:2px;border-color:var(--accent)}}
+    .link-secondary{{background:transparent;color:var(--accent);border:1px solid var(--line);
+           box-shadow:inset 0 1px 0 rgba(255,255,255,.16)}}
+    .link-secondary:hover{{background:var(--accent-soft);border-color:var(--accent);
+           box-shadow:0 1px 0 rgba(255,255,255,.38),0 10px 20px rgba(29,42,46,.12),
+                      inset 1px 1px 0 rgba(255,255,255,.48),inset -1px -1px 0 rgba(29,42,46,.12)}}
+    @media (max-width:860px){{
+      body{{place-items:start center}}
+      .portal-shell{{grid-template-columns:1fr}}
+      .portal-menu{{position:sticky;top:0;z-index:20;display:flex;overflow-x:auto;padding:8px 0 10px;
+                    margin:0 calc(clamp(22px,4vw,42px) * -1) 6px;
+                    padding-left:clamp(22px,4vw,42px);padding-right:clamp(22px,4vw,42px);
+                    scroll-snap-type:x proximity;background:var(--panel);
+                    border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+                    box-shadow:0 10px 22px rgba(29,42,46,.12);
+                    backdrop-filter:blur(18px) saturate(1.18);-webkit-backdrop-filter:blur(18px) saturate(1.18)}}
+      .menu-btn{{width:auto;min-width:178px;flex:0 0 auto;scroll-snap-align:start;white-space:normal}}
+      .summary-grid{{grid-template-columns:1fr}}
+      .mode-grid,.fields{{grid-template-columns:1fr}}
+    }}
+  </style>
+{render_debug_style_css()}
+</head>
+<body>
+  <main class="panel">
+    <div class="portal-head">
+      <div class="portal-title">
+        <p class="eyebrow">BMI30 Management Portal</p>
+        <h1>Device Control</h1>
+        <p><span class="host">Device: {title}</span></p>
+      </div>
+      <p class="session-tag">Signed in as {signed_in_as or "authorized user"} · {access_label}</p>
+    </div>
+    {notice_html}
+    <div class="portal-shell">
+      <nav class="portal-menu" aria-label="Management sections">
+        <button class="menu-btn" type="button" data-panel="antenna" aria-selected="true"><span class="menu-index">1</span>Antenna Status</button>
+        <button class="menu-btn" type="button" data-panel="detection" aria-selected="false"><span class="menu-index">2</span>Tag Detection</button>
+        <button class="menu-btn" type="button" data-panel="operation" aria-selected="false"><span class="menu-index">3</span>Operating Mode</button>
+        <button class="menu-btn" type="button" data-panel="group" aria-selected="false"><span class="menu-index">4</span>Group Mode</button>
+        <button class="menu-btn" type="button" data-panel="dc" aria-selected="false"><span class="menu-index">5</span>DC Compensation</button>
+        <button class="menu-btn" type="button" data-panel="privacy" aria-selected="false"><span class="menu-index">6</span>Privacy</button>
+        <button class="menu-btn" type="button" data-panel="statistics" aria-selected="false"><span class="menu-index">7</span>Statistics</button>
+        <button class="menu-btn" type="button" data-panel="about" aria-selected="false"><span class="menu-index">8</span>About Device</button>
+      </nav>
+      <div class="portal-content">
+        <section class="portal-panel is-active" id="panel-antenna">
+          <h2>Antenna Status</h2>
+          <p>Live antenna, noise, signal, temperature, and firmware sensor values will be shown here.</p>
+          <div class="summary-grid">
+            <div class="summary-item"><h3>Signal</h3><div class="metric"><span>Level</span><strong>---</strong></div><div class="metric"><span>Noise</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Sensors</h3><div class="metric"><span>Temperature</span><strong>---</strong></div><div class="metric"><span>Optic active</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Device</h3><div class="metric"><span>Stream</span><strong>---</strong></div><div class="metric"><span>DC mode</span><strong>{html.escape(str(cfg['mode']))}</strong></div></div>
+          </div>
+        </section>
+        <section class="portal-panel" id="panel-detection">
+          <h2>Tag Detection</h2>
+          <p>Detection algorithm, thresholds, filtering, and tag type selection will be configured here.</p>
+          <div class="summary-grid">
+            <div class="summary-item"><h3>Algorithm</h3><div class="metric"><span>Selected</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Tag Type</h3><div class="metric"><span>Current</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Thresholds</h3><div class="metric"><span>Mode</span><strong>---</strong></div></div>
+          </div>
+        </section>
+        <section class="portal-panel" id="panel-operation">
+          <h2>Operating Mode</h2>
+          <p>Radar connection, transmitter schedule, and runtime behavior will be configured here.</p>
+          <div class="summary-grid">
+            <div class="summary-item"><h3>Radar</h3><div class="metric"><span>Connection</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Transmission</h3><div class="metric"><span>Work time</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Profile</h3><div class="metric"><span>Active</span><strong>---</strong></div></div>
+          </div>
+        </section>
+        <section class="portal-panel" id="panel-group">
+          <h2>Group Mode</h2>
+          <p>Master/slave behavior and synchronized group operation will be configured here.</p>
+          <div class="summary-grid">
+            <div class="summary-item"><h3>Role</h3><div class="metric"><span>Mode</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Sync</h3><div class="metric"><span>Status</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Peers</h3><div class="metric"><span>Count</span><strong>---</strong></div></div>
+          </div>
+        </section>
+        <section class="portal-panel" id="panel-dc">
+          <h2>DC Compensation</h2>
+          <p>Configure firmware DC subtraction and adaptation speeds.</p>
+          <form class="config-form" method="post" action="/portal-dc-config">
+            <div class="section">
+              <h3>Mode</h3>
+              <div class="mode-grid">{mode_options}</div>
+            </div>
+            <div class="section">
+              <h3>Adaptation timing</h3>
+              <div class="fields">
+                <label class="field">
+                  <span>Work settle time, seconds <b class="help" title="Slow permanent DC tracking. Recommended default is 900 seconds for long operation.">?</b></span>
+                  <input name="work_settle_s" type="number" min="1" max="86400" step="1" value="{cfg['work_settle_s']:g}">
+                </label>
+                <label class="field">
+                  <span>Detect initial settle time, seconds <b class="help" title="Starting Detect adaptation speed. Larger values adapt more slowly at the beginning of detection.">?</b></span>
+                  <input name="detect_initial_settle_s" type="number" min="0.1" max="86400" step="0.1" value="{cfg['detect_initial_settle_s']:g}">
+                </label>
+                <label class="field">
+                  <span>Detect final settle time, seconds <b class="help" title="Final Detect adaptation speed after the ramp. Smaller values adapt faster.">?</b></span>
+                  <input name="detect_final_settle_s" type="number" min="0.1" max="86400" step="0.1" value="{cfg['detect_final_settle_s']:g}">
+                </label>
+                <label class="field">
+                  <span>Detect ramp time, seconds <b class="help" title="How long the host should take to move from initial Detect speed to final Detect speed. Use 0 for immediate final speed.">?</b></span>
+                  <input name="detect_ramp_s" type="number" min="0" max="86400" step="1" value="{cfg['detect_ramp_s']:g}">
+                </label>
+                <label class="field">
+                  <span>Boot-fast settle time, seconds <b class="help" title="Fast DC learning speed used after a host-controlled forced reboot. Recommended default is 5 seconds.">?</b></span>
+                  <input name="fast_settle_s" type="number" min="0.1" max="3600" step="0.1" value="{cfg['fast_settle_s']:g}">
+                </label>
+                <label class="field">
+                  <span>Boot-fast duration, seconds <b class="help" title="How long firmware stays in BOOT_FAST before automatically switching to WORK. Recommended default is 30 seconds.">?</b></span>
+                  <input name="fast_duration_s" type="number" min="0" max="86400" step="1" value="{cfg['fast_duration_s']:g}">
+                </label>
+              </div>
+              <p class="notice">Detect ramp values are saved for the host. The immediate firmware command uses the Detect initial settle time as the current detect_settle_s.</p>
+            </div>
+            <div class="actions actions-inline">
+              <button class="link" type="submit" name="apply" value="1">Save and Apply to Device</button>
+              <button class="link link-secondary" type="submit" name="apply" value="0">Save Only</button>
+            </div>
+          </form>
+        </section>
+        <section class="portal-panel" id="panel-privacy">
+          <h2>Privacy</h2>
+          <p>Login credentials and allowed communication channels will be configured here.</p>
+          <div class="summary-grid">
+            <div class="summary-item"><h3>Portal</h3><div class="metric"><span>Login</span><strong>{signed_in_as or "authorized"}</strong></div></div>
+            <div class="summary-item"><h3>Channels</h3><div class="metric"><span>Allowed</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Remote Access</h3><div class="metric"><span>Status</span><strong>---</strong></div></div>
+          </div>
+        </section>
+        <section class="portal-panel" id="panel-statistics">
+          <h2>Statistics</h2>
+          <p>Runtime counters, detection history, communication quality, and service statistics will be shown here.</p>
+          <div class="summary-grid">
+            <div class="summary-item"><h3>Runtime</h3><div class="metric"><span>Uptime</span><strong>---</strong></div><div class="metric"><span>Frames</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Detection</h3><div class="metric"><span>Events</span><strong>---</strong></div><div class="metric"><span>Last event</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Communication</h3><div class="metric"><span>Errors</span><strong>---</strong></div><div class="metric"><span>Restarts</span><strong>---</strong></div></div>
+          </div>
+        </section>
+        <section class="portal-panel" id="panel-about">
+          <h2>About Device</h2>
+          <p>Device identity, firmware version, host software version, serial number, and hardware information will be shown here.</p>
+          <div class="summary-grid">
+            <div class="summary-item"><h3>Identity</h3><div class="metric"><span>Hostname</span><strong>{title}</strong></div><div class="metric"><span>Serial</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Firmware</h3><div class="metric"><span>Version</span><strong>---</strong></div><div class="metric"><span>Build</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Host</h3><div class="metric"><span>Software</span><strong>BMI30 Portal</strong></div><div class="metric"><span>Role</span><strong>{access_label}</strong></div></div>
+          </div>
+        </section>
+        <p id="portal-security-note" class="security-note">
+          <strong>Local device page.</strong> Your browser may show "Not secure" here until HTTPS with a trusted certificate is configured.
+        </p>
+        <div class="actions">
+          <a class="link" href="/portal-logout">Sign Out</a>
+          <a class="link link-secondary" href="/login">Connection Info</a>
+        </div>
+      </div>
+    </div>
+  </main>
+  {render_debug_panel()}
+  {render_debug_panel_script()}
+  <script>
+    var menuButtons = Array.prototype.slice.call(document.querySelectorAll('.menu-btn'));
+    var panels = Array.prototype.slice.call(document.querySelectorAll('.portal-panel'));
+    function setActivePanel(name, updateHash) {{
+      var found = panels.some(function (panel) {{ return panel.id === 'panel-' + name; }});
+      if (!found) {{ name = 'antenna'; }}
+      menuButtons.forEach(function (button) {{
+        var active = button.dataset.panel === name;
+        button.setAttribute('aria-selected', active ? 'true' : 'false');
+        if (active && updateHash) {{
+          try {{ button.scrollIntoView({{block:'nearest', inline:'center', behavior:'smooth'}}); }} catch (error) {{}}
+        }}
+      }});
+      panels.forEach(function (panel) {{
+        panel.classList.toggle('is-active', panel.id === 'panel-' + name);
+      }});
+      if (updateHash) {{
+        try {{ history.replaceState(null, '', '#' + name); }} catch (error) {{}}
+      }}
+    }}
+    menuButtons.forEach(function (button) {{
+      button.addEventListener('click', function () {{
+        setActivePanel(button.dataset.panel || 'antenna', true);
+      }});
+    }});
+    setActivePanel((window.location.hash || '#antenna').slice(1), false);
+    var portalSecurityNote = document.getElementById('portal-security-note');
+    if (portalSecurityNote && window.location.protocol !== 'https:') {{
+      portalSecurityNote.style.display = 'block';
+    }}
+  </script>
 </body>
 </html>
 """
@@ -518,18 +2336,135 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         return
 
+    def _is_tls(self) -> bool:
+        return isinstance(self.request, ssl.SSLSocket)
+
+    def _preferred_scheme(self) -> str:
+        if self._is_tls() or (is_https_enabled() and FORCE_HTTPS):
+            return "https"
+        return "http"
+
+    def _absolute_url(self, path: str, scheme: str = "http") -> str:
+        local_ip = ""
+        try:
+            local_ip = self.connection.getsockname()[0]
+        except Exception:
+            local_ip = ""
+
+        if not local_ip or local_ip == "0.0.0.0":
+            local_ip = HOTSPOT_IP
+
+        port = HTTPS_PORT if scheme == "https" else PORT
+        needs_port = (scheme == "https" and port != 443) or (scheme == "http" and port != 80)
+        suffix = f":{port}" if needs_port else ""
+        return f"{scheme}://{local_ip}{suffix}{path}"
+
+    def _read_post_form(self) -> dict[str, str]:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = 0
+        raw = self.rfile.read(max(content_length, 0))
+        parsed = parse_qs(raw.decode("utf-8", errors="replace"), keep_blank_values=True)
+        return {key: values[0] if values else "" for key, values in parsed.items()}
+
+    def _read_cookie(self, name: str) -> str:
+        raw_cookie = self.headers.get("Cookie", "")
+        if not raw_cookie:
+            return ""
+
+        jar = SimpleCookie()
+        try:
+            jar.load(raw_cookie)
+        except Exception:
+            return ""
+
+        morsel = jar.get(name)
+        return morsel.value if morsel is not None else ""
+
+    def _get_portal_session(self) -> dict[str, Any] | None:
+        session = parse_portal_session_token(self._read_cookie(PORTAL_SESSION_COOKIE))
+        if session is None:
+            return None
+        if int(session["exp"]) <= int(time.time()):
+            return None
+        return session
+
+    def _send_redirect(
+        self,
+        location: str,
+        *,
+        status: HTTPStatus = HTTPStatus.FOUND,
+        set_cookie: str | None = None,
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Location", location)
+        if set_cookie:
+            self.send_header("Set-Cookie", set_cookie)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
     def _handle_request(self, send_body: bool) -> None:
         path = self.path.split("?", 1)[0]
+        preferred_ip = extract_request_host_ip(self.headers.get("Host", ""))
 
-        # Android CNA: пользователь нажал "Continue" → отдаём 204, браузер закрывается
+        # Legacy Android CNA endpoint: return 204 so the popup can close cleanly.
         if path == "/portal-done":
             self.send_response(HTTPStatus.NO_CONTENT)
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
 
-        if path == "/logo":
-            logo = load_logo_bytes(detect_logo_path())
+        if path == "/favicon.ico":
+            icon = load_logo_bytes(detect_logo_path(FAVICON_ICO_CANDIDATES))
+            if icon is None:
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.end_headers()
+                return
+            payload, ctype = icon
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(payload)
+            return
+
+        if path == "/favicon.png":
+            icon = load_logo_bytes(detect_logo_path(FAVICON_PNG_CANDIDATES))
+            if icon is None:
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.end_headers()
+                return
+            payload, ctype = icon
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(payload)
+            return
+
+        if path == "/logo-tagit":
+            logo = load_logo_bytes(detect_logo_path(TAGIT_LOGO_CANDIDATES))
+            if logo is None:
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.end_headers()
+                return
+            payload, ctype = logo
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(payload)
+            return
+
+        if path in {"/logo-am", "/logo"}:
+            logo = load_logo_bytes(detect_logo_path(AM_LOGO_CANDIDATES))
             if logo is None:
                 self.send_response(HTTPStatus.NOT_FOUND)
                 self.end_headers()
@@ -546,7 +2481,7 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
         # JSON API
         if path == "/api/status":
-            data = collect_remote_access_targets()
+            data = collect_remote_access_targets(preferred_ip=preferred_ip)
             payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -556,13 +2491,62 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
                 self.wfile.write(payload)
             return
 
+        if path == "/portal-logout":
+            self._send_redirect(
+                self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
+                status=HTTPStatus.SEE_OTHER,
+                set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
+            )
+            return
+
+        if path == "/portal":
+            session = self._get_portal_session()
+            if session is None:
+                self._send_redirect(
+                    self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
+                    set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
+                )
+                return
+            data = collect_remote_access_targets(preferred_ip=preferred_ip)
+            query = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            notice = ""
+            notice_kind = "ok"
+            if query.get("saved", [""])[0] == "1":
+                notice = "DC configuration saved."
+            if query.get("applied", [""])[0] == "1":
+                notice = "DC configuration saved and sent to the device."
+            if query.get("error", [""])[0] == "1":
+                notice = "DC configuration saved, but the device did not accept the live apply. Check USB connection and try again."
+                notice_kind = "error"
+            payload = render_portal_page(
+                data["hostname"],
+                session_username=str(session.get("u", "")),
+                session_role=str(session.get("r", "user")),
+                notice=notice,
+                notice_kind=notice_kind,
+            )
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(payload)
+            return
+
         # Connectivity-probe.
-        # Для iOS/macOS надёжнее отдать HTML напрямую на probe URL,
-        # чем редиректить на другой адрес. Аналогично это корректно работает
-        # и для Android/Windows/Linux: ответ отличается от ожидаемого "internet ok",
-        # поэтому ОС помечает сеть как captive portal и показывает страницу входа.
+        # Android/Chrome OS надёжнее открывают captive portal после 302 redirect
+        # на страницу логина. Для Apple/Windows/Linux оставляем HTML прямо на probe URL.
+        if path in ANDROID_PROBE_PATHS:
+            login_url = self._absolute_url(with_rev("/login"))
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", login_url)
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.end_headers()
+            return
+
         if path in PROBE_PATHS:
-            data = collect_remote_access_targets()
+            data = collect_remote_access_targets(preferred_ip=preferred_ip)
             payload = render_html_page(data)
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -575,7 +2559,13 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
         # Информационная страница
         if path in INFO_PATHS:
-            data = collect_remote_access_targets()
+            if is_https_enabled() and FORCE_HTTPS and not self._is_tls():
+                self.send_response(HTTPStatus.FOUND)
+                self.send_header("Location", self._absolute_url(path, scheme="https"))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            data = collect_remote_access_targets(preferred_ip=preferred_ip)
             payload = render_html_page(data)
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -587,10 +2577,7 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             return
 
         # Всё остальное — редирект на страницу входа
-        self.send_response(HTTPStatus.FOUND)
-        self.send_header("Location", LOGIN_URL)
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
+        self._send_redirect(self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()))
 
     def do_GET(self) -> None:
         self._handle_request(send_body=True)
@@ -598,10 +2585,125 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self._handle_request(send_body=False)
 
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path == "/portal-dc-config":
+            session = self._get_portal_session()
+            if session is None:
+                self._send_redirect(
+                    self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
+                    status=HTTPStatus.SEE_OTHER,
+                    set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
+                )
+                return
+
+            form = self._read_post_form()
+            cfg = dc_config_from_form(form)
+            try:
+                save_dc_config(cfg)
+            except Exception:
+                payload = render_portal_page(
+                    collect_remote_access_targets(preferred_ip=extract_request_host_ip(self.headers.get("Host", "")))["hostname"],
+                    session_username=str(session.get("u", "")),
+                    session_role=str(session.get("r", "user")),
+                    notice="Unable to save DC configuration.",
+                    notice_kind="error",
+                )
+                self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
+            apply_now = form.get("apply", "1").strip().lower() not in {"0", "false", "off", "no"}
+            if apply_now:
+                ok, _message = apply_dc_config_to_device(cfg)
+                suffix = "?applied=1#dc" if ok else "?error=1#dc"
+            else:
+                suffix = "?saved=1#dc"
+            self._send_redirect(
+                self._absolute_url(f"/portal{suffix}", scheme=self._preferred_scheme()),
+                status=HTTPStatus.SEE_OTHER,
+            )
+            return
+
+        if path != "/portal-login":
+            self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+            self.send_header("Allow", "GET, HEAD, POST")
+            self.end_headers()
+            return
+
+        if is_https_enabled() and FORCE_HTTPS and not self._is_tls():
+            self._send_redirect(
+                self._absolute_url(with_rev("/login"), scheme="https"),
+                status=HTTPStatus.SEE_OTHER,
+            )
+            return
+
+        preferred_ip = extract_request_host_ip(self.headers.get("Host", ""))
+        form = self._read_post_form()
+        username = form.get("username", "").strip()
+        password = form.get("password", "")
+        remember_session = form.get("remember", "").strip().lower() not in {"", "0", "false", "off", "no"}
+
+        auth_result = authenticate_portal_credentials(username, password)
+        if auth_result is not None:
+            expires_at = int(time.time()) + PORTAL_SESSION_TTL_S
+            session_cookie = build_portal_session_cookie(
+                create_portal_session_token(
+                    auth_result["username"],
+                    expires_at,
+                    role=auth_result["role"],
+                ),
+                remember=remember_session,
+                secure=self._is_tls(),
+            )
+            self._send_redirect(
+                self._absolute_url("/portal", scheme=self._preferred_scheme()),
+                status=HTTPStatus.SEE_OTHER,
+                set_cookie=session_cookie,
+            )
+            return
+
+        data = collect_remote_access_targets(preferred_ip=preferred_ip)
+        payload = render_html_page(
+            data,
+            auth_error="Invalid username or password.",
+            entered_username=username,
+            remember_session=remember_session,
+        )
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
 
 def main() -> None:
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), HotspotInfoHandler)
-    server.serve_forever()
+    global HTTPS_RUNTIME_ENABLED
+
+    http_server = ThreadingHTTPServer(("0.0.0.0", PORT), HotspotInfoHandler)
+
+    https_server: ThreadingHTTPServer | None = None
+    if ENABLE_HTTPS and HTTPS_PORT != PORT and os.path.isfile(TLS_CERT_PATH) and os.path.isfile(TLS_KEY_PATH):
+        try:
+            https_server = ThreadingHTTPServer(("0.0.0.0", HTTPS_PORT), HotspotInfoHandler)
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.load_cert_chain(certfile=TLS_CERT_PATH, keyfile=TLS_KEY_PATH)
+            https_server.socket = ssl_ctx.wrap_socket(https_server.socket, server_side=True)
+            HTTPS_RUNTIME_ENABLED = True
+        except Exception as exc:
+            HTTPS_RUNTIME_ENABLED = False
+            print(f"[WARN] HTTPS disabled: {exc}")
+
+    if https_server is not None:
+        th = threading.Thread(target=https_server.serve_forever, daemon=True)
+        th.start()
+
+    http_server.serve_forever()
 
 
 if __name__ == "__main__":
