@@ -133,6 +133,10 @@ DEFAULT_DC_CONFIG: dict[str, Any] = {
 # PDF документация
 PDF_CACHE_DIR = pathlib.Path(os.getenv("BMI30_PDF_CACHE_DIR", "/var/cache/bmi30")).expanduser()
 PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    os.chmod(PDF_CACHE_DIR, 0o777)
+except Exception:
+    pass
 PDF_UPDATE_INTERVAL_S = max(3600, int(os.getenv("BMI30_PDF_UPDATE_INTERVAL_S", str(24 * 3600))))  # 24 часа по умолчанию
 
 PORTAL_DOCUMENTS: dict[str, dict[str, str]] = {
