@@ -2097,7 +2097,6 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     doc_order = ["operation", "safety", "network"]
     doc_tabs_parts: list[str] = []
     doc_pages_parts: list[str] = []
-    doc_download_parts: list[str] = []
     for idx, doc_id in enumerate(doc_order):
         doc = PORTAL_DOCUMENTS[doc_id]
         active = idx == 0
@@ -2114,12 +2113,10 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             f'<pre class="doc-text">{html.escape(doc["content"])}</pre>'
             f'</article>'
         )
-        doc_download_parts.append(
-            f'<a class="link link-secondary" href="/portal-doc-download?doc={doc_id}">Download {html.escape(doc["title"])} (TXT)</a>'
-        )
     doc_tabs = "\n".join(doc_tabs_parts)
     doc_pages = "\n".join(doc_pages_parts)
-    doc_downloads = "\n".join(doc_download_parts)
+    first_doc = doc_order[0]
+    first_doc_title = html.escape(PORTAL_DOCUMENTS[first_doc]["title"])
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -2325,7 +2322,8 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     .doc-page .subtle{{margin-bottom:10px}}
     .doc-text{{margin:0;white-space:pre-wrap;line-height:1.5;font-family:ui-monospace,"SFMono-Regular",Consolas,monospace;
                font-size:12px;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px}}
-    .doc-downloads{{margin-top:12px}}
+    .doc-downloads{{margin-top:12px;align-items:center}}
+    .doc-downloads .subtle{{margin-right:2px}}
     @media (max-width:860px){{
       body{{place-items:start center}}
       .portal-shell{{grid-template-columns:1fr}}
@@ -2471,7 +2469,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
         </section>
         <section class="portal-panel" id="panel-documentation">
           <h2>Documentation</h2>
-          <p>Read operation instructions and service notes directly in the portal. Use tabs for reading and separate buttons for downloads.</p>
+          <p>Read operation instructions and service notes directly in the portal. Select a tab to choose which document is published for download.</p>
           <div class="doc-tabs" role="tablist" aria-label="Documentation tabs">
             {doc_tabs}
           </div>
@@ -2479,7 +2477,9 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             {doc_pages}
           </div>
           <div class="actions actions-inline doc-downloads">
-            {doc_downloads}
+            <span class="subtle">Selected for download:</span>
+            <strong id="doc-selected-title">{first_doc_title}</strong>
+            <a id="doc-download-link" class="link link-secondary" href="/portal-doc-download?doc={first_doc}">Download Selected Document (TXT)</a>
           </div>
         </section>
         <section class="portal-panel" id="panel-about">
@@ -2545,6 +2545,15 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       docPages.forEach(function (page) {{
         page.classList.toggle('is-active', page.dataset.docPage === name);
       }});
+      var downloadLink = document.getElementById('doc-download-link');
+      var selectedTitle = document.getElementById('doc-selected-title');
+      if (downloadLink) {{
+        downloadLink.setAttribute('href', '/portal-doc-download?doc=' + encodeURIComponent(name));
+      }}
+      if (selectedTitle) {{
+        var activeTab = docTabs.find(function (tab) {{ return tab.dataset.docTab === name; }});
+        selectedTitle.textContent = activeTab ? activeTab.textContent : name;
+      }}
     }}
     docTabs.forEach(function (tab) {{
       tab.addEventListener('click', function () {{
