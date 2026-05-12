@@ -2099,6 +2099,48 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       --note-text:#4c605a;
       --shine:.72;
     }}
+    html[data-theme-mode="light"]{{
+      color-scheme:light;
+      --bg:#eef4f1;
+      --bg-2:#d7e3de;
+      --panel:rgba(255,255,255,.62);
+      --panel-fallback:#f8fbf9;
+      --text:#17252a;
+      --muted:#5d6e74;
+      --accent:#0f8a70;
+      --accent-2:#f28f3b;
+      --accent-soft:rgba(15,138,112,.16);
+      --warm:rgba(242,143,59,.14);
+      --grid-line:rgba(15,138,112,.075);
+      --line:rgba(255,255,255,.68);
+      --panel-shadow:0 2px 1px rgba(255,255,255,.36), 0 16px 34px rgba(29,42,46,.16), 0 40px 84px rgba(29,42,46,.20), inset 1px 1px 0 rgba(255,255,255,.86), inset -1px -1px 0 rgba(60,82,86,.16), inset 0 18px 34px rgba(255,255,255,.22);
+      --edge-shadow:rgba(31,48,52,.18);
+      --note-bg:rgba(255,255,255,.44);
+      --note-border:rgba(15,138,112,.25);
+      --note-text:#4c605a;
+      --shine:.72;
+    }}
+    html[data-theme-mode="dark"]{{
+      color-scheme:dark;
+      --bg:#0b1210;
+      --bg-2:#14201c;
+      --panel:rgba(23,34,31,.68);
+      --panel-fallback:#18211d;
+      --text:#ecf2ee;
+      --muted:#a7b5ae;
+      --accent:#47c7a7;
+      --accent-2:#f0a75e;
+      --accent-soft:rgba(71,199,167,.13);
+      --warm:rgba(240,167,94,.13);
+      --grid-line:rgba(71,199,167,.105);
+      --line:rgba(220,255,244,.18);
+      --panel-shadow:0 2px 1px rgba(255,255,255,.06), 0 18px 38px rgba(0,0,0,.44), 0 48px 96px rgba(0,0,0,.56), inset 1px 1px 0 rgba(255,255,255,.18), inset -1px -1px 0 rgba(0,0,0,.50), inset 0 18px 34px rgba(255,255,255,.045);
+      --edge-shadow:rgba(0,0,0,.46);
+      --note-bg:rgba(20,32,28,.58);
+      --note-border:rgba(71,199,167,.24);
+      --note-text:#bfd5cc;
+      --shine:.24;
+    }}
     @media (prefers-color-scheme:dark){{
       :root{{
         --bg:#0b1210;
