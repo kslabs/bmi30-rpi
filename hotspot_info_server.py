@@ -177,64 +177,66 @@ def with_rev(path: str) -> str:
     return f"{path}{sep}v={PAGE_REV}"
 
 
+def _fetch_google_doc_pdf_bytes(google_doc_id: str, timeout: int = 30) -> bytes | None:
+    if not google_doc_id or not google_doc_id.strip():
+        return None
+    try:
+        export_url = f"https://docs.google.com/document/d/{google_doc_id}/export?format=pdf"
+        with urlopen(export_url, timeout=timeout) as response:
+            pdf_data = response.read()
+        if not pdf_data.startswith(b"%PDF"):
+            return None
+        return pdf_data
+    except Exception:
+        return None
+
+
+def _read_cached_pdf(cache_path: pathlib.Path) -> bytes | None:
+    try:
+        if cache_path.exists():
+            return cache_path.read_bytes()
+    except Exception:
+        return None
+    return None
+
+
 def download_google_doc_pdf(google_doc_id: str, cache_path: pathlib.Path) -> bool:
     """Скачивает PDF с Google Docs и сохраняет в кэш. Возвращает True если успешно."""
-    if not google_doc_id or not google_doc_id.strip():
+    pdf_data = _fetch_google_doc_pdf_bytes(google_doc_id, timeout=30)
+    if pdf_data is None:
         return False
-    
     try:
-        # Google Docs экспорт URL
-        export_url = f"https://docs.google.com/document/d/{google_doc_id}/export?format=pdf"
-        
-        # Загружаем PDF
-        with urlopen(export_url, timeout=30) as response:
-            pdf_data = response.read()
-        
-        # Проверяем что это действительно PDF
-        if not pdf_data.startswith(b"%PDF"):
-            return False
-        
-        # Сохраняем в кэш
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_bytes(pdf_data)
         return True
-    except Exception as e:
-        # Логируем ошибку но не падаем
+    except Exception:
         return False
 
 
-def get_pdf_data(doc_id: str) -> bytes | None:
-    """Получает PDF данные. Пытается загрузить если нет в кэше или устарело."""
+def get_pdf_data(doc_id: str, prefer_cache: bool = True) -> bytes | None:
+    """Получает PDF данные. По умолчанию сразу отдает кэш, а сеть используется только при отсутствии кэша."""
     if not doc_id:
         return None
-    
+
     cache_path = PDF_CACHE_DIR / f"{doc_id}.pdf"
-    
-    # Проверяем кэш
-    if cache_path.exists():
-        # Если кэш свежее чем UPDATE_INTERVAL, используем его
-        mtime = cache_path.stat().st_mtime
-        age_s = time.time() - mtime
-        if age_s < PDF_UPDATE_INTERVAL_S:
-            try:
-                return cache_path.read_bytes()
-            except Exception:
-                pass
-    
-    # Пытаемся загрузить новую версию
+
+    if prefer_cache:
+        cached = _read_cached_pdf(cache_path)
+        if cached is not None:
+            return cached
+
     if download_google_doc_pdf(doc_id, cache_path):
-        try:
-            return cache_path.read_bytes()
-        except Exception:
-            pass
-    
-    # Если загрузка не удалась, используем старый кэш если есть
-    if cache_path.exists():
-        try:
-            return cache_path.read_bytes()
-        except Exception:
-            pass
-    
+        downloaded = _read_cached_pdf(cache_path)
+        if downloaded is not None:
+            return downloaded
+
+    if not prefer_cache:
+        return None
+
+    fallback = _read_cached_pdf(cache_path)
+    if fallback is not None:
+        return fallback
+
     return None
 
 
@@ -2189,6 +2191,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             f'        <span class="pdf-page-total">/—</span>'
             f'      </div>'
             f'      <button class="pdf-btn" data-action="next-page" title="Next page">Next →</button>'
+          f'      <button class="pdf-update-btn" data-action="apply-update" data-doc="{doc_id}" hidden>Доступна новая версия</button>'
             f'    </div>'
             f'    <div class="pdf-pages">'
             f'      <canvas class="pdf-canvas" data-doc="{doc_id}"></canvas>'
@@ -2444,6 +2447,13 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     .pdf-btn:hover{{background:var(--accent);color:var(--bg);transform:translateY(-1px)}}
     .pdf-btn:active{{transform:translateY(0);box-shadow:inset 0 1px 3px rgba(0,0,0,0.2)}}
     .pdf-btn:disabled{{opacity:0.5;cursor:not-allowed;transform:none}}
+    .pdf-update-btn{{padding:8px 12px;min-height:38px;border-radius:999px;border:1px solid var(--accent);
+             background:color-mix(in srgb, var(--accent-soft) 78%, transparent);color:var(--accent);
+             font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap;
+             transition:opacity .16s ease,transform .16s ease,background .16s ease}}
+    .pdf-update-btn:hover{{background:var(--accent-soft);transform:translateY(-1px)}}
+    .pdf-update-btn[hidden]{{display:none !important}}
+    .pdf-update-btn.is-loading{{opacity:.7;cursor:wait}}
     .pdf-page-nav{{display:flex;align-items:center;gap:6px;justify-content:center}}
     .pdf-page-input{{width:60px;min-height:38px;padding:6px 8px;border:1px solid var(--line);border-radius:4px;
                      background:var(--panel);color:var(--text);font-size:12px;text-align:center}}
@@ -2742,7 +2752,8 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             totalPages: 0,
             rendering: false,
             canvas: null,
-            ctx: null
+            ctx: null,
+            lastCheckTs: 0
           }};
         }}
         
@@ -2768,6 +2779,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
         var prevBtn = viewer.querySelector('[data-action="prev-page"]');
         var nextBtn = viewer.querySelector('[data-action="next-page"]');
         var pageInput = viewer.querySelector('.pdf-page-input');
+        var updateBtn = viewer.querySelector('[data-action="apply-update"]');
         
         if (prevBtn) {{
           prevBtn.addEventListener('click', function() {{ 
@@ -2795,6 +2807,12 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             updatePageDisplay(docId);
           }});
         }}
+
+        if (updateBtn) {{
+          updateBtn.addEventListener('click', function() {{
+            refreshPdfFromServer(docId, updateBtn);
+          }});
+        }}
       }}
       
       function loadPdf(docId) {{
@@ -2817,9 +2835,64 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             }}
             
             renderPage(docId, 1);
+            maybeCheckPdfUpdate(docId);
           }})
           .catch(function(err) {{
             console.error('PDF load error:', err);
+          }});
+      }}
+
+      function maybeCheckPdfUpdate(docId) {{
+        var state = pdfStates[docId];
+        if (!state) {{ return; }}
+        var now = Date.now();
+        if (now - state.lastCheckTs < 120000) {{ return; }}
+        state.lastCheckTs = now;
+
+        fetch('/portal-pdf-update-check?doc=' + encodeURIComponent(docId))
+          .then(function(response) {{
+            if (!response.ok) throw new Error('update-check failed');
+            return response.json();
+          }})
+          .then(function(data) {{
+            var viewer = document.querySelector('[data-pdf-id="' + docId + '"]');
+            if (!viewer) {{ return; }}
+            var btn = viewer.querySelector('[data-action="apply-update"]');
+            if (!btn) {{ return; }}
+            if (data && data.updateAvailable) {{
+              btn.hidden = false;
+            }} else {{
+              btn.hidden = true;
+            }}
+          }})
+          .catch(function() {{}});
+      }}
+
+      function refreshPdfFromServer(docId, button) {{
+        if (!button) {{ return; }}
+        button.classList.add('is-loading');
+        button.disabled = true;
+        var oldText = button.textContent;
+        button.textContent = 'Обновление...';
+
+        fetch('/portal-pdf-refresh?doc=' + encodeURIComponent(docId))
+          .then(function(response) {{
+            if (!response.ok) throw new Error('refresh failed');
+            return response.json();
+          }})
+          .then(function(data) {{
+            button.hidden = true;
+            loadPdf(docId);
+          }})
+          .catch(function() {{
+            button.textContent = 'Ошибка обновления';
+            window.setTimeout(function() {{
+              button.textContent = oldText;
+            }}, 1800);
+          }})
+          .finally(function() {{
+            button.classList.remove('is-loading');
+            button.disabled = false;
           }});
       }}
       
@@ -2953,6 +3026,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             var viewer = document.querySelector('[data-pdf-id="' + docId + '"]');
             if (viewer && viewer.closest('.doc-page.is-active')) {{
               updatePageDisplay(docId);
+              maybeCheckPdfUpdate(docId);
             }}
             syncFloatingControls();
           }}, 50);
@@ -3249,6 +3323,121 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             if send_body:
                 self.wfile.write(pdf_data)
             return
+
+        if path == "/portal-pdf-update-check":
+            session = self._get_portal_session()
+            if session is None:
+                self.send_response(HTTPStatus.UNAUTHORIZED)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(b'{"error":"not authorized"}')
+                return
+
+            query = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            doc_key = query.get("doc", [""])[0].strip().lower()
+            doc = PORTAL_DOCUMENTS.get(doc_key)
+            if doc is None:
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(b'{"error":"doc not found"}')
+                return
+
+            google_doc_id = doc.get("google_doc_id", "").strip()
+            cache_path = PDF_CACHE_DIR / f"{google_doc_id}.pdf"
+            cached = _read_cached_pdf(cache_path)
+
+            if cached is None:
+                payload = json.dumps({"updateAvailable": True, "hasCache": False}, ensure_ascii=False).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(payload)
+                return
+
+            remote = _fetch_google_doc_pdf_bytes(google_doc_id, timeout=12)
+            update_available = False
+            online = remote is not None
+            if remote is not None:
+                update_available = hashlib.sha256(remote).digest() != hashlib.sha256(cached).digest()
+
+            payload = json.dumps(
+                {"updateAvailable": update_available, "hasCache": True, "online": online},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(payload)
+            return
+
+        if path == "/portal-pdf-refresh":
+            session = self._get_portal_session()
+            if session is None:
+                self.send_response(HTTPStatus.UNAUTHORIZED)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(b'{"error":"not authorized"}')
+                return
+
+            query = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            doc_key = query.get("doc", [""])[0].strip().lower()
+            doc = PORTAL_DOCUMENTS.get(doc_key)
+            if doc is None:
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(b'{"error":"doc not found"}')
+                return
+
+            google_doc_id = doc.get("google_doc_id", "").strip()
+            cache_path = PDF_CACHE_DIR / f"{google_doc_id}.pdf"
+            previous = _read_cached_pdf(cache_path)
+            remote = _fetch_google_doc_pdf_bytes(google_doc_id, timeout=20)
+            if remote is None:
+                self.send_response(HTTPStatus.BAD_GATEWAY)
+                payload = json.dumps({"ok": False, "error": "remote unavailable"}, ensure_ascii=False).encode("utf-8")
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(payload)
+                return
+
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_bytes(remote)
+                changed = previous is None or hashlib.sha256(previous).digest() != hashlib.sha256(remote).digest()
+                payload = json.dumps({"ok": True, "updated": changed}, ensure_ascii=False).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(payload)
+                return
+            except Exception:
+                self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+                payload = json.dumps({"ok": False, "error": "cache write failed"}, ensure_ascii=False).encode("utf-8")
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(payload)
+                return
 
         if path == "/portal-doc-download":
             session = self._get_portal_session()
