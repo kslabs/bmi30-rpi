@@ -2909,6 +2909,14 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
         var topPx = parseInt(topPxRaw, 10);
         if (!Number.isFinite(topPx)) {{ topPx = 8; }}
 
+        var uiStyle = (document.documentElement.getAttribute('data-ui-style') || '').toLowerCase();
+        var enableFixedFallback = uiStyle === 'neumorph';
+
+        if (!enableFixedFallback) {{
+          clearFloatingControls(null);
+          return;
+        }}
+
         var pageRect = activePage.getBoundingClientRect();
         var viewerRect = controls.parentElement.getBoundingClientRect();
         // Use viewer top instead of controls rect so fixed controls can return to normal on upward scroll.
