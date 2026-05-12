@@ -2414,24 +2414,29 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     .doc-downloads .subtle{{margin-right:2px}}
     @media (max-width:860px){{
       body{{place-items:start center}}
+      .panel{{padding:10px 8px}}
       .portal-shell{{grid-template-columns:1fr}}
       .portal-menu{{position:sticky;top:0;z-index:20;display:flex;overflow-x:auto;padding:8px 0 10px;
-                    margin:0 calc(clamp(22px,4vw,42px) * -1) 6px;
-                    padding-left:clamp(22px,4vw,42px);padding-right:clamp(22px,4vw,42px);
+                    margin:0 -8px 6px;
+                    padding-left:8px;padding-right:8px;
                     scroll-snap-type:x proximity;background:var(--panel);
                     border-top:1px solid var(--line);border-bottom:1px solid var(--line);
                     box-shadow:var(--panel-shadow);
                     backdrop-filter:blur(18px) saturate(1.18);-webkit-backdrop-filter:blur(18px) saturate(1.18)}}
       .menu-btn{{width:auto;min-width:178px;flex:0 0 auto;scroll-snap-align:start;white-space:normal}}
       .doc-tab{{width:auto;min-width:180px;flex:0 0 auto;margin-right:-6px}}
-      .doc-reader{{border-radius:0 8px 8px 8px}}
+      .doc-reader{{border-radius:0 8px 8px 8px;padding:6px 4px}}
+      .pdf-controls{{flex-wrap:wrap;gap:6px;padding:6px 8px}}
+      .pdf-page-nav{{flex:0 0 auto;order:0}}
+      .pdf-actions{{flex:0 0 auto;order:1;gap:4px}}
+      .pdf-pages{{min-height:200px;padding:4px;margin-top:4px;border-radius:4px}}
       html[data-ui-style="neumorph"] .menu-btn{{box-shadow:4px 4px 8px var(--neumo-lo),-4px -4px 8px var(--neumo-hi)}}
       html[data-ui-style="neumorph"] .menu-btn:hover{{box-shadow:5px 5px 10px var(--neumo-lo),-5px -5px 10px var(--neumo-hi)}}
       html[data-ui-style="neumorph"] .menu-btn[aria-selected="true"]{{box-shadow:inset 4px 4px 8px var(--neumo-lo),inset -4px -4px 8px var(--neumo-hi)}}
       .summary-grid{{grid-template-columns:1fr}}
       .mode-grid,.fields{{grid-template-columns:1fr}}
+      .scroll-top-btn{{right:12px;bottom:12px}}
     }}
-    /* PDF Viewer Styles */
     .pdf-viewer{{display:block;position:relative}}
         .pdf-controls{{display:flex;align-items:center;justify-content:space-between;gap:10px;
           position:-webkit-sticky;position:sticky;top:var(--pdf-controls-top,10px);z-index:32;
@@ -2482,13 +2487,6 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     @keyframes pageFlip{{
       from{{opacity:0;transform:rotateX(-10deg)}}
       to{{opacity:1;transform:rotateX(0deg)}}
-    }}
-    @media (max-width:860px){{
-      .pdf-controls{{flex-direction:column;align-items:stretch}}
-      .pdf-btn{{width:100%;text-align:center}}
-      .pdf-page-nav{{justify-content:center;margin:8px 0}}
-      .pdf-pages{{min-height:300px}}
-      .scroll-top-btn{{right:12px;bottom:12px}}
     }}
   </style>
 {render_debug_style_css()}
