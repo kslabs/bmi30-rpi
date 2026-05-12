@@ -13,6 +13,7 @@ import json
 import mimetypes
 import os
 import pathlib
+import re
 import ssl
 import socket
 import subprocess
@@ -22,7 +23,7 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 from urllib.request import urlopen
 
 
@@ -31,6 +32,7 @@ HTTPS_PORT   = int(os.getenv("BMI30_HOTSPOT_INFO_HTTPS_PORT", "443"))
 REFRESH_S    = max(10, int(os.getenv("BMI30_HOTSPOT_INFO_REFRESH_S", "30")))
 HOTSPOT_IP   = os.getenv("BMI30_HOTSPOT_IP",   "10.42.0.1")
 HOTSPOT_CONN = os.getenv("BMI30_HOTSPOT_CONN",  "BMI30-Hotspot")
+WIFI_STA_IFACE = os.getenv("BMI30_WIFI_STA_IFACE", "wlan0")
 SSH_USER     = os.getenv("BMI30_SSH_USER",      "techaid")
 SSH_PORT     = int(os.getenv("BMI30_SSH_PORT",  "22"))
 RDP_PORT     = int(os.getenv("BMI30_RDP_PORT",  "3389"))
@@ -43,10 +45,25 @@ PORTAL_PASSWORD = os.getenv("BMI30_PORTAL_PASSWORD", "admin")
 PORTAL_ENGINEER_USERNAME = os.getenv("BMI30_PORTAL_ENGINEER_USERNAME", "").strip()
 PORTAL_ENGINEER_PASSWORD = os.getenv("BMI30_PORTAL_ENGINEER_PASSWORD", "")
 PORTAL_ENGINEER_PASSWORD_HASH = os.getenv("BMI30_PORTAL_ENGINEER_PASSWORD_HASH", "").strip()
+DEFAULT_ENGINEER_USERNAME = os.getenv("BMI30_DEFAULT_ENGINEER_USERNAME", "TechAid")
+DEFAULT_ENGINEER_PASSWORD_HASH = os.getenv(
+    "BMI30_DEFAULT_ENGINEER_PASSWORD_HASH",
+    "pbkdf2_sha256$390000$Ym1pMzAtZW5naW5lZXItdjE$f8kv-1dqQTiWk756wJgI-4KID-gHYR5Meji3kYpgIV4",
+)
 PORTAL_SESSION_COOKIE = "bmi30_portal_session"
 PORTAL_SESSION_TTL_S = max(60, int(os.getenv("BMI30_PORTAL_SESSION_TTL_S", str(7 * 24 * 60 * 60))))
 PORTAL_PASSWORD_HASH_ITERATIONS = max(100_000, int(os.getenv("BMI30_PORTAL_PASSWORD_HASH_ITERATIONS", "390000")))
-CONFIG_JSON = os.getenv("BMI30_CONFIG_JSON", os.path.join(os.path.dirname(__file__), "host", "bmi30_config.json"))
+_CONFIG_JSON_ENV = os.getenv("BMI30_CONFIG_JSON", "").strip()
+if _CONFIG_JSON_ENV:
+    CONFIG_JSON = _CONFIG_JSON_ENV
+else:
+    _CONFIG_JSON_CANDIDATES = [
+        "/etc/bmi30/portal_config.json",
+        "/usr/local/bin/host/bmi30_config.json",
+        os.path.join(os.path.dirname(__file__), "host", "bmi30_config.json"),
+    ]
+    _CONFIG_JSON_FALLBACK = _CONFIG_JSON_CANDIDATES[0] if getattr(os, "geteuid", lambda: 0)() == 0 else _CONFIG_JSON_CANDIDATES[-1]
+    CONFIG_JSON = next((path for path in _CONFIG_JSON_CANDIDATES if os.path.isfile(path)), _CONFIG_JSON_FALLBACK)
 DEVICE_SYNC_CACHE_S = max(1, int(os.getenv("BMI30_DEVICE_SYNC_CACHE_S", "3")))
 SYNC_STATUS_OFFSET_S = os.getenv("BMI30_SYNC_STATUS_OFFSET", "").strip()
 PAGE_REV = os.getenv("BMI30_PAGE_REV", str(int(os.path.getmtime(__file__))))
@@ -108,6 +125,9 @@ _SYNC_CACHE: dict[str, Any] = {
     "value": "---",
     "source": "device",
 }
+
+_PORTAL_CLIENTS: dict[str, float] = {}
+PORTAL_CLIENT_TTL_S = 15.0
 
 HTTPS_RUNTIME_ENABLED = False
 
@@ -252,6 +272,60 @@ def _load_machine_id() -> bytes:
     return b""
 
 
+def _load_config_json_direct() -> dict[str, Any]:
+    try:
+        with open(CONFIG_JSON, "r", encoding="utf-8") as f:
+            payload = json.load(f) or {}
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def load_portal_auth_config() -> dict[str, str]:
+    raw = _load_config_json_direct().get("portal_auth")
+    source = raw if isinstance(raw, dict) else {}
+    username = str(source.get("username") or PORTAL_USERNAME).strip() or PORTAL_USERNAME
+    password_hash = str(source.get("password_hash") or "").strip()
+    return {
+        "username": username,
+        "password_hash": password_hash,
+    }
+
+
+def load_engineer_auth_config() -> dict[str, Any]:
+    raw = _load_config_json_direct().get("engineer_auth")
+    source = raw if isinstance(raw, dict) else {}
+    env_enabled = bool(PORTAL_ENGINEER_USERNAME and (PORTAL_ENGINEER_PASSWORD_HASH or PORTAL_ENGINEER_PASSWORD))
+    username = str(source.get("username") or PORTAL_ENGINEER_USERNAME or DEFAULT_ENGINEER_USERNAME).strip() or DEFAULT_ENGINEER_USERNAME
+    password_hash = str(source.get("password_hash") or PORTAL_ENGINEER_PASSWORD_HASH or "").strip()
+    enabled = bool(source.get("enabled", env_enabled))
+    return {
+        "enabled": enabled,
+        "username": username,
+        "password_hash": password_hash,
+        "env_password": PORTAL_ENGINEER_PASSWORD if PORTAL_ENGINEER_USERNAME and username == PORTAL_ENGINEER_USERNAME else "",
+    }
+
+
+def get_portal_username() -> str:
+    return load_portal_auth_config()["username"]
+
+
+def portal_auth_revision(role: str = "user") -> str:
+    digest = hashlib.sha256()
+    digest.update(b"bmi30-portal-auth-revision")
+    if role == "engineer":
+        auth = load_engineer_auth_config()
+        digest.update(str(auth["enabled"]).encode("utf-8", errors="ignore"))
+        digest.update(str(auth["username"]).encode("utf-8", errors="ignore"))
+        digest.update(str(auth["password_hash"] or auth["env_password"]).encode("utf-8", errors="ignore"))
+    else:
+        auth = load_portal_auth_config()
+        digest.update(auth["username"].encode("utf-8", errors="ignore"))
+        digest.update((auth["password_hash"] or f"plain:{PORTAL_PASSWORD}").encode("utf-8", errors="ignore"))
+    return digest.hexdigest()[:24]
+
+
 def _build_portal_session_secret() -> bytes:
     configured_secret = os.getenv("BMI30_PORTAL_SESSION_SECRET", "").strip()
     if configured_secret:
@@ -260,11 +334,13 @@ def _build_portal_session_secret() -> bytes:
     digest = hashlib.sha256()
     digest.update(b"bmi30-portal-session")
     digest.update(_load_machine_id() or os.urandom(32))
-    digest.update(PORTAL_USERNAME.encode("utf-8", errors="ignore"))
-    digest.update(PORTAL_PASSWORD.encode("utf-8", errors="ignore"))
-    digest.update(PORTAL_ENGINEER_USERNAME.encode("utf-8", errors="ignore"))
-    digest.update(PORTAL_ENGINEER_PASSWORD.encode("utf-8", errors="ignore"))
-    digest.update(PORTAL_ENGINEER_PASSWORD_HASH.encode("utf-8", errors="ignore"))
+    auth = load_portal_auth_config()
+    digest.update(auth["username"].encode("utf-8", errors="ignore"))
+    digest.update((auth["password_hash"] or PORTAL_PASSWORD).encode("utf-8", errors="ignore"))
+    engineer_auth = load_engineer_auth_config()
+    digest.update(str(engineer_auth["enabled"]).encode("utf-8", errors="ignore"))
+    digest.update(str(engineer_auth["username"]).encode("utf-8", errors="ignore"))
+    digest.update(str(engineer_auth["password_hash"] or engineer_auth["env_password"]).encode("utf-8", errors="ignore"))
     return digest.digest()
 
 
@@ -318,25 +394,47 @@ def verify_portal_password_hash(password: str, stored_hash: str) -> bool:
     return hmac.compare_digest(candidate_digest, expected_digest)
 
 
+def verify_portal_user_password(username: str, password: str) -> bool:
+    auth = load_portal_auth_config()
+    if not constant_time_equals(username, auth["username"]):
+        return False
+    if auth["password_hash"]:
+        return verify_portal_password_hash(password, auth["password_hash"])
+    return constant_time_equals(password, PORTAL_PASSWORD)
+
+
+def verify_engineer_password(username: str, password: str) -> bool:
+    auth = load_engineer_auth_config()
+    if not auth["enabled"] or not constant_time_equals(username, str(auth["username"])):
+        return False
+    if auth["password_hash"]:
+        return verify_portal_password_hash(password, str(auth["password_hash"]))
+    if auth["env_password"]:
+        return constant_time_equals(password, str(auth["env_password"]))
+    return False
+
+
 def is_engineer_account_enabled() -> bool:
-    return bool(PORTAL_ENGINEER_USERNAME and (PORTAL_ENGINEER_PASSWORD_HASH or PORTAL_ENGINEER_PASSWORD))
+    auth = load_engineer_auth_config()
+    return bool(auth["enabled"] and (auth["password_hash"] or auth["env_password"]))
 
 
 def authenticate_portal_credentials(username: str, password: str) -> dict[str, str] | None:
-    if constant_time_equals(username, PORTAL_USERNAME) and constant_time_equals(password, PORTAL_PASSWORD):
-        return {"username": PORTAL_USERNAME, "role": "user"}
+    if verify_portal_user_password(username, password):
+        return {"username": get_portal_username(), "role": "user"}
 
-    if is_engineer_account_enabled() and constant_time_equals(username, PORTAL_ENGINEER_USERNAME):
-        if PORTAL_ENGINEER_PASSWORD_HASH and verify_portal_password_hash(password, PORTAL_ENGINEER_PASSWORD_HASH):
-            return {"username": PORTAL_ENGINEER_USERNAME, "role": "engineer"}
-        if PORTAL_ENGINEER_PASSWORD and constant_time_equals(password, PORTAL_ENGINEER_PASSWORD):
-            return {"username": PORTAL_ENGINEER_USERNAME, "role": "engineer"}
+    if verify_engineer_password(username, password):
+        return {"username": str(load_engineer_auth_config()["username"]), "role": "engineer"}
 
     return None
 
 
 def create_portal_session_token(username: str, expires_at: int, role: str = "user") -> str:
-    payload = json.dumps({"u": username, "exp": expires_at, "r": role}, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    payload = json.dumps(
+        {"u": username, "exp": expires_at, "r": role, "v": portal_auth_revision(role)},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
     payload_b64 = _b64url_encode(payload)
     signature = hmac.new(PORTAL_SESSION_SECRET, payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
     return f"{payload_b64}.{signature}"
@@ -363,17 +461,20 @@ def parse_portal_session_token(token: str) -> dict[str, Any] | None:
         username = str(payload.get("u", ""))
         expires_at = int(payload.get("exp", 0))
         role = str(payload.get("r", "user"))
+        revision = str(payload.get("v", ""))
     except (TypeError, ValueError):
         return None
 
     if role == "user":
-        expected_username = PORTAL_USERNAME
+        expected_username = get_portal_username()
     elif role == "engineer" and is_engineer_account_enabled():
-        expected_username = PORTAL_ENGINEER_USERNAME
+        expected_username = str(load_engineer_auth_config()["username"])
     else:
         return None
 
     if username != expected_username or expires_at <= 0:
+        return None
+    if revision != portal_auth_revision(role):
         return None
 
     return {"u": username, "exp": expires_at, "r": role}
@@ -419,6 +520,29 @@ def run_command(*args: str) -> str:
     return proc.stdout.strip()
 
 
+def _now_monotonic() -> float:
+    return time.monotonic()
+
+
+def remember_portal_client(address: str) -> None:
+    address = (address or "").strip()
+    if not address:
+        return
+    now = _now_monotonic()
+    _PORTAL_CLIENTS[address] = now
+    for key, seen_at in list(_PORTAL_CLIENTS.items()):
+        if now - seen_at > PORTAL_CLIENT_TTL_S:
+            _PORTAL_CLIENTS.pop(key, None)
+
+
+def count_portal_clients() -> int:
+    now = _now_monotonic()
+    for key, seen_at in list(_PORTAL_CLIENTS.items()):
+        if now - seen_at > PORTAL_CLIENT_TTL_S:
+            _PORTAL_CLIENTS.pop(key, None)
+    return len(_PORTAL_CLIENTS)
+
+
 def _load_config_json() -> dict[str, Any]:
     try:
         with open(CONFIG_JSON, "r", encoding="utf-8") as f:
@@ -435,6 +559,10 @@ def _save_config_json(payload: dict[str, Any]) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
+    try:
+        os.chmod(tmp_path, 0o640)
+    except Exception:
+        pass
     os.replace(tmp_path, CONFIG_JSON)
 
 
@@ -471,6 +599,116 @@ def save_dc_config(cfg: dict[str, Any]) -> None:
     payload = _load_config_json()
     payload["dc_config"] = _normalize_dc_config(cfg)
     payload["dc_config_updated_at"] = int(time.time())
+    _save_config_json(payload)
+
+
+def save_portal_credentials(username: str, password: str) -> None:
+    username = username.strip()
+    if not username or len(username) > 64:
+        raise ValueError("Username must be 1-64 characters long.")
+    if len(password) < 8:
+        raise ValueError("Password must contain at least 8 characters.")
+    payload = _load_config_json()
+    payload["portal_auth"] = {
+        "username": username,
+        "password_hash": hash_portal_password(password),
+        "updated_at": int(time.time()),
+    }
+    _save_config_json(payload)
+
+
+def save_engineer_credentials(enabled: bool, username: str, password: str = "") -> None:
+    username = username.strip() or DEFAULT_ENGINEER_USERNAME
+    if len(username) > 64:
+        raise ValueError("Engineer login must be 1-64 characters long.")
+    payload = _load_config_json()
+    existing_raw = payload.get("engineer_auth")
+    existing = existing_raw if isinstance(existing_raw, dict) else {}
+    password_hash = str(existing.get("password_hash") or "").strip()
+    if enabled:
+        if password:
+            if len(password) < 8:
+                raise ValueError("Engineer password must contain at least 8 characters.")
+            password_hash = hash_portal_password(password)
+        elif not password_hash:
+            password_hash = DEFAULT_ENGINEER_PASSWORD_HASH
+    payload["engineer_auth"] = {
+        "enabled": bool(enabled),
+        "username": username,
+        "password_hash": password_hash,
+        "updated_at": int(time.time()),
+    }
+    _save_config_json(payload)
+
+
+def load_remote_desktop_config() -> dict[str, Any]:
+    raw = _load_config_json_direct().get("remote_desktop")
+    source = raw if isinstance(raw, dict) else {}
+    username = str(source.get("username") or SSH_USER).strip() or SSH_USER
+    return {
+        "username": username,
+        "password_saved": bool(source.get("password_saved")),
+        "updated_at": int(source.get("updated_at") or 0),
+    }
+
+
+def save_remote_desktop_metadata(username: str, password_changed: bool) -> None:
+    payload = _load_config_json()
+    previous_raw = payload.get("remote_desktop")
+    previous = previous_raw if isinstance(previous_raw, dict) else {}
+    payload["remote_desktop"] = {
+        "username": username,
+        "password_saved": bool(password_changed or previous.get("password_saved")),
+        "secret_store": "system user password and x11vnc rfbauth",
+        "updated_at": int(time.time()),
+    }
+    _save_config_json(payload)
+
+
+CHANNEL_KEYS = {"hotspot", "wifi", "ethernet", "remote"}
+
+
+def load_channel_permissions() -> dict[str, bool]:
+    raw = _load_config_json_direct().get("channel_permissions")
+    source = raw if isinstance(raw, dict) else {}
+    return {key: bool(source.get(key, True)) for key in CHANNEL_KEYS}
+
+
+def save_channel_permission(channel: str, enabled: bool) -> None:
+    if channel not in CHANNEL_KEYS:
+        raise ValueError("Unknown communication channel.")
+    payload = _load_config_json()
+    raw = payload.get("channel_permissions")
+    permissions = raw if isinstance(raw, dict) else {}
+    permissions[channel] = bool(enabled)
+    permissions["updated_at"] = int(time.time())
+    payload["channel_permissions"] = permissions
+    _save_config_json(payload)
+
+
+def save_hotspot_access_metadata(ssid: str, password_changed: bool) -> None:
+    payload = _load_config_json()
+    previous = payload.get("hotspot_access")
+    previous_saved = bool(previous.get("password_saved")) if isinstance(previous, dict) else False
+    payload["hotspot_access"] = {
+        "ssid": ssid,
+        "password_saved": bool(password_changed or previous_saved),
+        "secret_store": "NetworkManager",
+        "updated_at": int(time.time()),
+    }
+    _save_config_json(payload)
+
+
+def save_wifi_internet_metadata(ssid: str, connected: bool, message: str = "") -> None:
+    payload = _load_config_json()
+    payload["wifi_internet"] = {
+        "ssid": ssid,
+        "password_saved": True,
+        "secret_store": "NetworkManager",
+        "last_apply_ok": bool(connected),
+        "last_message": message[:240],
+        "updated_at": int(time.time()),
+    }
     _save_config_json(payload)
 
 
@@ -1531,6 +1769,77 @@ def render_debug_panel_script() -> str:
 </script>"""
 
 
+def _nmcli_unescape(value: str) -> str:
+    result: list[str] = []
+    escaped = False
+    for ch in value:
+        if escaped:
+            result.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        else:
+            result.append(ch)
+    if escaped:
+        result.append("\\")
+    return "".join(result)
+
+
+def _split_nmcli_terse_line(line: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for ch in line:
+        if escaped:
+            current.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == ":":
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    if escaped:
+        current.append("\\")
+    parts.append("".join(current))
+    return parts
+
+
+def _run_nmcli_result(*args: str, timeout: float = 12.0) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            ("nmcli", *args),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        return False, str(exc)
+    output = (proc.stdout or proc.stderr or "").strip()
+    return proc.returncode == 0, output
+
+
+def _is_hotspot_connection(connection_id: str, device: str = "") -> bool:
+    lowered_device = device.lower()
+    if lowered_device == "wlan0ap":
+        return True
+    mode = run_command("nmcli", "-g", "802-11-wireless.mode", "connection", "show", connection_id).strip().lower()
+    ipv4_method = run_command("nmcli", "-g", "ipv4.method", "connection", "show", connection_id).strip().lower()
+    iface = run_command("nmcli", "-g", "connection.interface-name", "connection", "show", connection_id).strip().lower()
+    conn_ssid = run_command("nmcli", "-g", "802-11-wireless.ssid", "connection", "show", connection_id).strip()
+    lowered_name = connection_id.lower()
+    return (
+        mode == "ap"
+        or ipv4_method == "shared"
+        or iface == "wlan0ap"
+        or lowered_name.startswith("hotspot")
+        or conn_ssid.startswith("BMI30-")
+        or conn_ssid.startswith("BMI30.")
+    )
+
+
 def detect_hotspot_connection() -> dict[str, Any]:
     info: dict[str, Any] = {
         "ssid": "",
@@ -1539,18 +1848,443 @@ def detect_hotspot_connection() -> dict[str, Any]:
     }
     output = run_command("nmcli", "-t", "-f", "DEVICE,NAME,UUID,TYPE", "connection", "show", "--active")
     for line in output.splitlines():
-        parts = line.split(":")
+        parts = _split_nmcli_terse_line(line)
         if len(parts) < 4:
             continue
         device, name, _uuid, conn_type = parts[:4]
-        if device == "wlan0ap" or conn_type in {"wifi", "802-11-wireless"}:
+        if conn_type in {"wifi", "802-11-wireless"} and _is_hotspot_connection(name, device):
             info["interface"] = device or "wlan0ap"
             info["connection_id"] = name
             info["ssid"] = run_command("nmcli", "-g", "802-11-wireless.ssid", "connection", "show", name)
             if not info["ssid"]:
                 info["ssid"] = name
             break
+    if not info["connection_id"]:
+        output = run_command("nmcli", "-t", "-f", "NAME,UUID,TYPE", "connection", "show")
+        for line in output.splitlines():
+            parts = _split_nmcli_terse_line(line)
+            if len(parts) < 3:
+                continue
+            name, _uuid, conn_type = parts[:3]
+            if conn_type in {"wifi", "802-11-wireless"} and _is_hotspot_connection(name):
+                info["connection_id"] = name
+                info["ssid"] = run_command("nmcli", "-g", "802-11-wireless.ssid", "connection", "show", name) or name
+                info["interface"] = run_command("nmcli", "-g", "connection.interface-name", "connection", "show", name) or "wlan0ap"
+                break
     return info
+
+
+def scan_visible_wifi_networks() -> list[dict[str, str]]:
+    ok, output = _run_nmcli_result(
+        "-t",
+        "-f",
+        "SSID,SECURITY,SIGNAL,IN-USE",
+        "dev",
+        "wifi",
+        "list",
+        "--rescan",
+        "yes",
+        timeout=10.0,
+    )
+    if not ok:
+        return []
+
+    by_ssid: dict[str, dict[str, str]] = {}
+    for line in output.splitlines():
+        parts = _split_nmcli_terse_line(line)
+        if len(parts) < 4:
+            continue
+        ssid, security, signal, in_use = (_nmcli_unescape(part).strip() for part in parts[:4])
+        if not ssid:
+            continue
+        existing = by_ssid.get(ssid)
+        if existing is None or int(signal or "0") > int(existing.get("signal") or "0"):
+            by_ssid[ssid] = {
+                "ssid": ssid,
+                "security": security or "open",
+                "signal": signal or "0",
+                "in_use": "yes" if in_use == "*" else "",
+            }
+    return sorted(by_ssid.values(), key=lambda item: (item.get("in_use") != "yes", -int(item.get("signal") or "0"), item["ssid"].lower()))
+
+
+def _reactivate_hotspot_connection(old_connection_id: str, new_connection_id: str) -> None:
+    time.sleep(1.5)
+    _run_nmcli_result("connection", "down", old_connection_id, timeout=8.0)
+    up_ok, _message = _run_nmcli_result("connection", "up", new_connection_id, timeout=20.0)
+    if not up_ok and old_connection_id != new_connection_id:
+        _run_nmcli_result("connection", "up", old_connection_id, timeout=20.0)
+
+
+def apply_hotspot_access_settings(ssid: str, password: str = "") -> tuple[bool, str]:
+    ssid = ssid.strip()
+    if not ssid or len(ssid.encode("utf-8")) > 32:
+        return False, "HotSpot SSID must be 1-32 bytes long."
+    if password and not (8 <= len(password) <= 63):
+        return False, "HotSpot password must contain 8-63 characters."
+
+    hotspot = detect_hotspot_connection()
+    connection_id = hotspot.get("connection_id") or HOTSPOT_CONN
+    ok, message = _run_nmcli_result("connection", "show", connection_id, timeout=6.0)
+    if not ok:
+        return False, message or "HotSpot connection profile was not found."
+
+    args = [
+        "connection",
+        "modify",
+        connection_id,
+        "connection.id",
+        ssid,
+        "802-11-wireless.ssid",
+        ssid,
+        "802-11-wireless.mode",
+        "ap",
+        "ipv4.method",
+        "shared",
+        "wifi-sec.key-mgmt",
+        "wpa-psk",
+        "connection.autoconnect",
+        "yes",
+    ]
+    if password:
+        args.extend(["wifi-sec.psk", password])
+    ok, message = _run_nmcli_result(*args, timeout=12.0)
+    if not ok:
+        return False, message or "NetworkManager rejected HotSpot settings."
+
+    run_command("nmcli", "connection", "reload")
+    save_hotspot_access_metadata(ssid, bool(password))
+    threading.Thread(target=_reactivate_hotspot_connection, args=(connection_id, ssid), daemon=True).start()
+    return True, "HotSpot settings saved. The access point will restart in a moment."
+
+
+def connect_wifi_internet(ssid: str, password: str = "") -> tuple[bool, str]:
+    ssid = ssid.strip()
+    if not ssid:
+        return False, "Select or type a Wi-Fi network name."
+    if len(ssid.encode("utf-8")) > 32:
+        return False, "Wi-Fi SSID must be 1-32 bytes long."
+
+    args = ["dev", "wifi", "connect", ssid, "ifname", WIFI_STA_IFACE]
+    if password:
+        args.extend(["password", password])
+    ok, message = _run_nmcli_result(*args, timeout=35.0)
+    save_wifi_internet_metadata(ssid, ok, message)
+    if not ok:
+        return False, message or "Unable to connect to Wi-Fi."
+    return True, message or "Wi-Fi connection saved."
+
+
+def _active_connection_for_device(device: str) -> str:
+    output = run_command("nmcli", "-t", "-f", "DEVICE,CONNECTION", "dev", "status")
+    for line in output.splitlines():
+        parts = _split_nmcli_terse_line(line)
+        if len(parts) >= 2 and parts[0] == device:
+            return _nmcli_unescape(parts[1]).strip()
+    return ""
+
+
+def _ethernet_connection_names() -> list[str]:
+    output = run_command("nmcli", "-t", "-f", "NAME,TYPE", "connection", "show")
+    names: list[str] = []
+    for line in output.splitlines():
+        parts = _split_nmcli_terse_line(line)
+        if len(parts) >= 2 and parts[1] in {"802-3-ethernet", "ethernet"}:
+            names.append(_nmcli_unescape(parts[0]).strip())
+    return [name for name in names if name]
+
+
+def _systemctl(*args: str, timeout: float = 20.0) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            ("systemctl", *args),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        return False, str(exc)
+    return proc.returncode == 0, (proc.stdout or proc.stderr or "").strip()
+
+
+def apply_channel_permission(channel: str, enabled: bool) -> tuple[bool, str]:
+    if channel not in CHANNEL_KEYS:
+        return False, "Unknown communication channel."
+
+    save_channel_permission(channel, enabled)
+
+    if channel == "hotspot":
+        hotspot = detect_hotspot_connection()
+        connection_id = hotspot.get("connection_id") or HOTSPOT_CONN
+        if enabled:
+            _systemctl("enable", "bmi30-hotspot.service", timeout=12.0)
+            ok, message = _systemctl("restart", "bmi30-hotspot.service", timeout=25.0)
+            if not ok:
+                _run_nmcli_result("connection", "up", connection_id, timeout=20.0)
+            return True, message or "HotSpot enabled."
+        _systemctl("stop", "bmi30-hotspot.service", timeout=15.0)
+        _systemctl("disable", "bmi30-hotspot.service", timeout=12.0)
+        if connection_id:
+            _run_nmcli_result("connection", "down", connection_id, timeout=12.0)
+        return True, "HotSpot disabled."
+
+    if channel == "wifi":
+        active_connection = _active_connection_for_device(WIFI_STA_IFACE)
+        if enabled:
+            saved_raw = _load_config_json().get("wifi_internet")
+            saved = saved_raw if isinstance(saved_raw, dict) else {}
+            saved_ssid = str(saved.get("ssid") or "").strip()
+            if saved_ssid:
+                _run_nmcli_result("connection", "modify", saved_ssid, "connection.autoconnect", "yes", timeout=8.0)
+                _run_nmcli_result("connection", "up", saved_ssid, timeout=25.0)
+            else:
+                _run_nmcli_result("device", "connect", WIFI_STA_IFACE, timeout=20.0)
+            return True, "Internet Wi-Fi enabled."
+        if active_connection:
+            _run_nmcli_result("connection", "modify", active_connection, "connection.autoconnect", "no", timeout=8.0)
+        _run_nmcli_result("device", "disconnect", WIFI_STA_IFACE, timeout=15.0)
+        return True, "Internet Wi-Fi disabled."
+
+    if channel == "ethernet":
+        ethernet_names = _ethernet_connection_names()
+        for name in ethernet_names:
+            _run_nmcli_result("connection", "modify", name, "connection.autoconnect", "yes" if enabled else "no", timeout=8.0)
+            if enabled:
+                _run_nmcli_result("connection", "up", name, timeout=12.0)
+            else:
+                _run_nmcli_result("connection", "down", name, timeout=8.0)
+        return True, "Ethernet enabled." if enabled else "Ethernet disabled."
+
+    if channel == "remote":
+        units = ("xrdp-sesman.service", "xrdp.service", "bmi30-x11vnc.service")
+        if enabled:
+            for unit in units:
+                _systemctl("enable", unit, timeout=10.0)
+            for unit in units:
+                _systemctl("restart", unit, timeout=20.0)
+            return True, "RDP/VNC enabled."
+        for unit in reversed(units):
+            _systemctl("stop", unit, timeout=15.0)
+            _systemctl("disable", unit, timeout=10.0)
+        return True, "RDP/VNC disabled."
+
+    return False, "Unknown communication channel."
+
+
+def count_hotspot_clients(interface: str = "wlan0ap") -> int:
+    output = run_command("iw", "dev", interface or "wlan0ap", "station", "dump")
+    return sum(1 for line in output.splitlines() if line.startswith("Station "))
+
+
+def is_wifi_internet_connected(interface: str = WIFI_STA_IFACE) -> bool:
+    return bool(detect_wifi_internet_connection(interface).get("connected"))
+
+
+def detect_wifi_internet_connection(interface: str = WIFI_STA_IFACE) -> dict[str, Any]:
+    output = run_command("nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "dev", "status")
+    for line in output.splitlines():
+        parts = _split_nmcli_terse_line(line)
+        if len(parts) >= 4 and parts[0] == interface and parts[1] == "wifi":
+            connected = parts[2].lower() == "connected"
+            connection = _nmcli_unescape(parts[3]).strip()
+            ssid = run_command("nmcli", "-g", "802-11-wireless.ssid", "connection", "show", connection) if connection else ""
+            return {
+                "connected": connected,
+                "ssid": ssid or connection,
+                "connection": connection,
+            }
+    return {"connected": False, "ssid": "", "connection": ""}
+
+
+def _ethernet_has_carrier(device: str) -> bool:
+    if not device or device == "lo" or device.startswith(("veth", "br-", "docker", "virbr")):
+        return False
+    carrier_path = f"/sys/class/net/{device}/carrier"
+    try:
+        with open(carrier_path, "r", encoding="utf-8") as f:
+            return f.read().strip() == "1"
+    except Exception:
+        return False
+
+
+def count_ethernet_connections() -> int:
+    output = run_command("nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "dev", "status")
+    count = 0
+    for line in output.splitlines():
+        parts = _split_nmcli_terse_line(line)
+        if len(parts) >= 3 and parts[1] == "ethernet" and parts[2].lower() == "connected" and _ethernet_has_carrier(parts[0]):
+            count += 1
+    return count
+
+
+def _host_part(endpoint: str) -> str:
+    endpoint = endpoint.strip()
+    if endpoint.startswith("[") and "]" in endpoint:
+        return endpoint[1:endpoint.index("]")].split("%", 1)[0]
+    if ":" in endpoint:
+        return endpoint.rsplit(":", 1)[0].split("%", 1)[0]
+    return endpoint.split("%", 1)[0]
+
+
+def _port_part(endpoint: str) -> str:
+    endpoint = endpoint.strip()
+    if endpoint.startswith("[") and "]:" in endpoint:
+        return endpoint.rsplit("]:", 1)[-1]
+    if ":" in endpoint:
+        return endpoint.rsplit(":", 1)[-1]
+    return ""
+
+
+def _is_loopback_host(host: str) -> bool:
+    host = host.strip("[]")
+    return host in {"127.0.0.1", "::1", "localhost"} or host.startswith("127.")
+
+
+def count_remote_desktop_connections() -> int:
+    ports = {str(RDP_PORT), "5901"}
+    output = run_command("ss", "-Htn", "state", "established")
+    clients: set[str] = set()
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local = parts[2]
+        peer = parts[3]
+        local_port = _port_part(local)
+        peer_host = _host_part(peer)
+        if local_port in ports and peer_host and not _is_loopback_host(peer_host):
+            clients.add(peer_host)
+    return len(clients)
+
+
+def _valid_linux_username(username: str) -> bool:
+    return bool(re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", username))
+
+
+def _user_exists(username: str) -> bool:
+    return bool(run_command("getent", "passwd", username))
+
+
+def _groups_for_new_remote_user() -> list[str]:
+    groups = run_command("id", "-nG", SSH_USER).split()
+    skip = {SSH_USER, "root"}
+    return [group for group in groups if group and group not in skip]
+
+
+def _ensure_remote_user(username: str, password: str) -> tuple[bool, str]:
+    if _user_exists(username):
+        return True, ""
+    if not password:
+        return False, "Password is required when creating a new remote desktop login."
+    groups = ",".join(_groups_for_new_remote_user())
+    args = ["useradd", "-m", "-s", "/bin/bash"]
+    if groups:
+        args.extend(["-G", groups])
+    args.append(username)
+    try:
+        proc = subprocess.run(args, check=False, capture_output=True, text=True, timeout=12.0)
+    except Exception as exc:
+        return False, str(exc)
+    if proc.returncode != 0:
+        return False, (proc.stderr or proc.stdout or "Unable to create remote desktop user.").strip()
+    return True, ""
+
+
+def _set_system_user_password(username: str, password: str) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            ["chpasswd"],
+            input=f"{username}:{password}\n",
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=12.0,
+        )
+    except Exception as exc:
+        return False, str(exc)
+    if proc.returncode != 0:
+        return False, (proc.stderr or proc.stdout or "Unable to set system password.").strip()
+    return True, ""
+
+
+def _store_x11vnc_password(password: str) -> tuple[bool, str]:
+    secret_path = "/etc/bmi30/x11vnc.pass"
+    os.makedirs(os.path.dirname(secret_path), exist_ok=True)
+    try:
+        proc = subprocess.run(
+            ["x11vnc", "-storepasswd", password, secret_path],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=12.0,
+        )
+    except Exception as exc:
+        return False, str(exc)
+    if proc.returncode != 0:
+        return False, (proc.stderr or proc.stdout or "Unable to store VNC password.").strip()
+    try:
+        os.chmod(secret_path, 0o600)
+    except Exception:
+        pass
+    return True, ""
+
+
+def _ensure_x11vnc_rfbauth() -> None:
+    service_path = "/etc/systemd/system/bmi30-x11vnc.service"
+    secret_path = "/etc/bmi30/x11vnc.pass"
+    try:
+        with open(service_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return
+    if "-rfbauth" in content:
+        return
+    lines = []
+    changed = False
+    for line in content.splitlines():
+        if line.startswith("ExecStart=") and "x11vnc" in line:
+            if " -rfbport " in line:
+                line = line.replace(" -rfbport ", f" -rfbauth {secret_path} -rfbport ", 1)
+            else:
+                line = f"{line} -rfbauth {secret_path}"
+            changed = True
+        lines.append(line)
+    if not changed:
+        return
+    backup_path = f"{service_path}.bak.{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    try:
+        with open(backup_path, "w", encoding="utf-8") as f:
+            f.write(content)
+            if not content.endswith("\n"):
+                f.write("\n")
+        with open(service_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        return
+    subprocess.run(["systemctl", "daemon-reload"], check=False, capture_output=True, text=True, timeout=10.0)
+
+
+def apply_remote_desktop_credentials(username: str, password: str = "") -> tuple[bool, str]:
+    username = username.strip()
+    if not _valid_linux_username(username):
+        return False, "Remote desktop login must be a valid Linux username: lowercase letters, digits, _ or -."
+    if password and len(password) < 8:
+        return False, "Remote desktop password must contain at least 8 characters."
+    ok, message = _ensure_remote_user(username, password)
+    if not ok:
+        return False, message
+    if password:
+        ok, message = _set_system_user_password(username, password)
+        if not ok:
+            return False, message
+        ok, message = _store_x11vnc_password(password)
+        if not ok:
+            return False, message
+        _ensure_x11vnc_rfbauth()
+        subprocess.run(["systemctl", "restart", "bmi30-x11vnc.service"], check=False, capture_output=True, text=True, timeout=15.0)
+    save_remote_desktop_metadata(username, bool(password))
+    return True, "Remote desktop credentials saved."
 
 
 def collect_ipv4_interfaces() -> list[dict[str, str]]:
@@ -1675,6 +2409,14 @@ def collect_remote_access_targets(preferred_ip: str | None = None) -> dict[str, 
             "interface": access_iface,
             "web_url": format_web_url(access_ip, web_scheme),
         },
+        "connections": {
+            "portal": count_portal_clients(),
+            "hotspot": count_hotspot_clients(hotspot.get("interface") or "wlan0ap"),
+            "wifi": 1 if is_wifi_internet_connected(WIFI_STA_IFACE) else 0,
+            "ethernet": count_ethernet_connections(),
+            "remote": count_remote_desktop_connections(),
+        },
+        "channels": load_channel_permissions(),
         "sync_mode": sync_mode,
         "logos": {
             "tagit": {
@@ -2150,11 +2892,132 @@ def render_html_page(
     return body.encode("utf-8")
 
 
+def _read_rpi_temperatures() -> list[tuple[str, float]]:
+    """Read all available temperature sensors on Raspberry Pi.
+
+    Returns list of (label, celsius) tuples, deduplicated by sensor type.
+    """
+    results: list[tuple[str, float]] = []
+    seen_types: set[str] = set()
+
+    # 1. Thermal zones (/sys/class/thermal/thermal_zone*)
+    import glob as _glob
+    for zone_path in sorted(_glob.glob("/sys/class/thermal/thermal_zone*")):
+        try:
+            zone_type = open(f"{zone_path}/type").read().strip()
+            raw = int(open(f"{zone_path}/temp").read().strip())
+        except Exception:
+            continue
+        if zone_type in seen_types:
+            continue
+        seen_types.add(zone_type)
+        label_map = {
+            "cpu-thermal": "CPU",
+            "gpu-thermal": "GPU",
+            "soc-thermal": "SoC",
+        }
+        label = label_map.get(zone_type, zone_type)
+        results.append((label, raw / 1000.0))
+
+    # 2. hwmon sensors not already covered by thermal zones
+    hwmon_label_map = {
+        "rp1_adc": "RP1",
+        "rp1_temp": "RP1",
+        "bcm2835_thermal": "SoC",
+        "cpu_thermal": "CPU",
+    }
+    for hwmon_path in sorted(_glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            hwmon_name = open(f"{hwmon_path}/name").read().strip()
+        except Exception:
+            continue
+        if hwmon_name not in hwmon_label_map:
+            continue
+        label = hwmon_label_map[hwmon_name]
+        # skip if already added (same label)
+        if any(l == label for l, _ in results):
+            continue
+        for temp_file in sorted(_glob.glob(f"{hwmon_path}/temp*_input")):
+            try:
+                raw = int(open(temp_file).read().strip())
+                results.append((label, raw / 1000.0))
+                break
+            except Exception:
+                continue
+
+    # 3. GPU temperature via vcgencmd (if not already present)
+    if not any(l == "GPU" for l, _ in results):
+        try:
+            import subprocess as _subprocess
+            out = _subprocess.check_output(
+                ["vcgencmd", "measure_temp"],
+                timeout=2, stderr=_subprocess.DEVNULL
+            ).decode()
+            # output: "temp=52.1'C"
+            val_str = out.strip().removeprefix("temp=").removesuffix("'C")
+            results.append(("GPU", float(val_str)))
+        except Exception:
+            pass
+
+    return results
+
+
 def render_portal_page(hostname: str, session_username: str = "", session_role: str = "user", notice: str = "", notice_kind: str = "ok") -> bytes:
     title = html.escape(hostname)
     signed_in_as = html.escape(session_username)
     access_label = "Engineering access" if session_role == "engineer" else "User access"
     cfg = load_dc_config()
+    portal_auth = load_portal_auth_config()
+    portal_username = html.escape(portal_auth["username"])
+    hotspot_cfg = detect_hotspot_connection()
+    hotspot_ssid = html.escape(hotspot_cfg.get("ssid") or hotspot_cfg.get("connection_id") or "BMI30-Hotspot")
+    hotspot_profile = html.escape(hotspot_cfg.get("connection_id") or "NetworkManager")
+    config_payload = _load_config_json()
+    wifi_meta_raw = config_payload.get("wifi_internet")
+    wifi_meta = wifi_meta_raw if isinstance(wifi_meta_raw, dict) else {}
+    wifi_active = detect_wifi_internet_connection(WIFI_STA_IFACE)
+    wifi_saved_ssid = html.escape(str(wifi_active.get("ssid") or wifi_meta.get("ssid") or ""))
+    wifi_last_status = "Connected / saved" if wifi_meta.get("last_apply_ok") else ("Saved, last connect failed" if wifi_meta else "Not configured")
+    wifi_last_status_html = html.escape(wifi_last_status)
+    privacy_counts = {
+        "portal": count_portal_clients(),
+        "hotspot": count_hotspot_clients(hotspot_cfg.get("interface") or "wlan0ap"),
+        "wifi": 1 if wifi_active.get("connected") else 0,
+        "ethernet": count_ethernet_connections(),
+        "remote": count_remote_desktop_connections(),
+    }
+    channel_permissions = load_channel_permissions()
+    channel_checked = {key: " checked" if channel_permissions.get(key, True) else "" for key in CHANNEL_KEYS}
+    engineer_auth = load_engineer_auth_config()
+    engineer_enabled = bool(engineer_auth["enabled"] and (engineer_auth["password_hash"] or engineer_auth["env_password"]))
+    engineer_username = html.escape(str(engineer_auth["username"]) or DEFAULT_ENGINEER_USERNAME)
+    engineer_checked = " checked" if engineer_enabled else ""
+    # Temperature sensors
+    _temps = _read_rpi_temperatures()
+    if _temps:
+        temp_metrics = "".join(
+            f'<div class="metric"><span>{html.escape(lbl)}</span>'
+            f'<strong data-sensor="rpi-{lbl.lower()}">{temp:.1f}\u00b0C</strong></div>'
+            for lbl, temp in _temps
+        )
+        # placeholder for STM32 temperature (populated via JS when available)
+        temp_metrics += '<div class="metric"><span>STM32</span><strong data-sensor="stm32-temp">---</strong></div>'
+    else:
+        temp_metrics = ('<div class="metric"><span>Temperature</span><strong data-sensor="rpi-cpu">N/A</strong></div>'
+                        '<div class="metric"><span>STM32</span><strong data-sensor="stm32-temp">---</strong></div>')
+    remote_desktop = load_remote_desktop_config()
+    remote_username = html.escape(str(remote_desktop["username"]))
+    remote_password_state = "Saved" if remote_desktop.get("password_saved") else "Current system password"
+    remote_password_state_html = html.escape(remote_password_state)
+    networks = scan_visible_wifi_networks()
+    wifi_options_parts = ['<option value="">Choose visible network...</option>']
+    for item in networks:
+        ssid_value = html.escape(item["ssid"], quote=True)
+        marker = " (connected)" if item.get("in_use") == "yes" else ""
+        label = html.escape(f'{item["ssid"]} - {item.get("signal", "0")}% - {item.get("security", "open")}{marker}')
+        selected = " selected" if item["ssid"] == wifi_meta.get("ssid") else ""
+        wifi_options_parts.append(f'<option value="{ssid_value}"{selected}>{label}</option>')
+    wifi_options = "\n".join(wifi_options_parts)
     notice_html = ""
     if notice:
         cls = "notice notice-error" if notice_kind == "error" else "notice"
@@ -2334,6 +3197,10 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     p{{font-size:16px;line-height:1.6;color:var(--muted);max-width:34rem}}
     .session-tag{{display:inline-flex;align-items:center;gap:8px;margin:0 0 14px;padding:8px 12px;border-radius:999px;
                   background:var(--accent-soft);color:var(--text);font-size:12px;font-weight:600}}
+    .session-block{{display:grid;justify-items:end;align-content:start;gap:8px;max-width:min(540px,100%)}}
+    .session-notice-slot{{width:min(540px,100%);min-height:0}}
+    .session-notice-slot .notice{{margin:0}}
+    .session-notice-slot .notice-error{{margin:0}}
     .host{{display:inline-block;margin-top:8px;font-family:ui-monospace,"SFMono-Regular",Consolas,monospace;color:var(--text)}}
     .portal-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:22px}}
     .portal-title{{min-width:240px}}
@@ -2355,6 +3222,24 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
              padding:11px 0;color:var(--text)}}
     .metric span{{font-size:13px;color:var(--muted)}}
     .metric strong{{font-size:14px;text-align:right}}
+    #panel-antenna .summary-grid{{gap:18px}}
+    #panel-antenna .summary-item{{
+      padding:12px 14px;
+      position:relative;
+      border:1px solid var(--line);
+      border-radius:12px;
+      background:color-mix(in srgb, var(--panel) 84%, white 16%);
+      box-shadow:0 10px 24px rgba(0,0,0,.08), inset 0 1px 0 rgba(255,255,255,.22);
+    }}
+    html[data-theme-mode="dark"] #panel-antenna .summary-item{{
+      background:color-mix(in srgb, var(--panel) 90%, black 10%);
+      box-shadow:0 8px 22px rgba(0,0,0,.36), inset 0 1px 0 rgba(255,255,255,.06);
+    }}
+    #panel-antenna .summary-item + .summary-item::before{{content:none}}
+    #panel-antenna .summary-item h3{{margin-bottom:8px}}
+    #panel-antenna .metric{{padding:7px 0;gap:18px}}
+    #panel-antenna .metric span{{font-size:12px;line-height:1.2}}
+    #panel-antenna .metric strong{{font-size:14px;line-height:1.2;min-width:78px;text-align:right}}
     .security-note{{display:none;margin-top:18px;border:1px solid var(--note-border);background:var(--note-bg);
                     color:var(--note-text);border-radius:8px;padding:12px 14px;font-size:12px;line-height:1.55;
                     box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
@@ -2370,9 +3255,45 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     .fields{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}
     .field{{display:grid;gap:6px}}
     .field span{{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:700;color:var(--text)}}
-    .field input{{width:100%;min-height:42px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg);
+    .field input,.field select{{width:100%;min-height:42px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg);
                   color:var(--text);font:inherit;padding:9px 11px;box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
+    .field select{{appearance:auto}}
     .field small{{font-size:12px;line-height:1.45;color:var(--muted)}}
+    .privacy-status-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:0 0 14px}}
+    .privacy-status{{border:1px solid var(--line);border-radius:8px;background:var(--note-bg);padding:11px 12px;
+                     box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
+    .privacy-status h3{{margin:0 0 8px;font-size:14px;display:flex;align-items:center;justify-content:space-between;gap:8px}}
+    .status-head{{display:flex;align-items:center;justify-content:flex-start;gap:8px;margin:0 0 8px}}
+    .status-head h3{{margin:0;flex:1 1 auto}}
+    .channel-permission{{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex:0 0 auto}}
+    .channel-permission input{{width:16px;height:16px;margin:0;accent-color:var(--accent);cursor:pointer}}
+    .privacy-status .metric{{padding:7px 0}}
+    .privacy-status .metric:first-of-type{{border-top:none}}
+    .privacy-status h3 strong[data-connection-count]{{font-size:20px;color:var(--accent);line-height:1}}
+    .privacy-forms{{display:grid;gap:14px;margin-top:14px}}
+    .privacy-form{{display:grid;gap:10px;border-top:1px solid var(--line);padding-top:14px}}
+    .privacy-title-row{{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:24px}}
+    .privacy-form h3{{margin-bottom:0}}
+    .privacy-toggle{{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;color:var(--muted);cursor:pointer}}
+    .privacy-toggle input{{width:16px;height:16px;accent-color:var(--accent)}}
+    .privacy-fields{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;align-items:end}}
+    .privacy-fields .field input,.privacy-fields .field select{{min-height:40px}}
+    .privacy-action{{align-self:end}}
+    .privacy-action .actions{{margin-top:0}}
+    .privacy-action .link{{width:100%;min-height:40px;padding:9px 12px}}
+    .privacy-title-actions{{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}}
+    .privacy-title-actions .link{{min-height:32px;padding:6px 10px;font-size:12px}}
+    .privacy-note{{margin-top:0}}
+    .modal-backdrop{{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:18px;
+                     background:rgba(0,0,0,.38);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}}
+    .modal-backdrop[hidden]{{display:none}}
+    .modal-panel{{width:min(100%,520px);border:1px solid var(--line);border-radius:8px;background:var(--panel);
+                  box-shadow:var(--panel-shadow);padding:18px;display:grid;gap:12px;
+                  backdrop-filter:blur(18px) saturate(1.18);-webkit-backdrop-filter:blur(18px) saturate(1.18)}}
+    .modal-head{{display:flex;align-items:center;justify-content:space-between;gap:10px}}
+    .modal-head h3{{margin:0}}
+    .modal-close{{width:34px;height:34px;border-radius:8px;border:1px solid var(--line);background:var(--note-bg);
+                  color:var(--text);font:inherit;font-weight:800;cursor:pointer}}
     .help{{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;
            border:1px solid var(--line);color:var(--accent);font-size:12px;font-weight:800;background:var(--panel)}}
     .notice{{margin-top:16px;border:1px solid var(--note-border);background:var(--note-bg);color:var(--note-text);
@@ -2437,6 +3358,19 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       html[data-ui-style="neumorph"] .menu-btn[aria-selected="true"]{{box-shadow:inset 4px 4px 8px var(--neumo-lo),inset -4px -4px 8px var(--neumo-hi)}}
       .summary-grid{{grid-template-columns:1fr}}
       .mode-grid,.fields{{grid-template-columns:1fr}}
+      .privacy-status-grid{{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}}
+      .privacy-status{{padding:8px 7px}}
+      .privacy-status h3{{font-size:12px}}
+      .privacy-status .metric{{display:grid;gap:2px;padding:5px 0}}
+      .privacy-status .metric span{{font-size:11px}}
+      .privacy-status .metric strong{{font-size:12px;text-align:left}}
+      .privacy-status h3 strong[data-connection-count]{{font-size:18px}}
+      .privacy-fields{{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}}
+      .privacy-fields .field span{{font-size:12px}}
+      .privacy-action .link{{min-height:40px;padding:8px 10px}}
+      .privacy-title-row{{align-items:flex-start}}
+      .privacy-title-actions{{gap:6px}}
+      .privacy-title-actions .link{{min-height:30px;padding:5px 8px;font-size:11px}}
       .scroll-top-btn{{right:8px;bottom:8px}}
     }}
     .pdf-viewer{{display:block;position:relative}}
@@ -2503,35 +3437,33 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
         <h1>Device Control</h1>
         <p><span class="host">Device: {title}</span></p>
       </div>
-      <p class="session-tag">Signed in as {signed_in_as or "authorized user"} · {access_label}</p>
+      <div class="session-block">
+        <p class="session-tag">Signed in as {signed_in_as or "authorized user"} · {access_label}</p>
+        <div class="session-notice-slot">{notice_html}</div>
+      </div>
     </div>
-    {notice_html}
     <div class="portal-shell">
       <nav class="portal-menu" aria-label="Management sections">
-        <button class="menu-btn" type="button" data-panel="antenna" aria-selected="true"><span class="menu-index">1</span>Antenna Status</button>
-        <button class="menu-btn" type="button" data-panel="detection" aria-selected="false"><span class="menu-index">2</span>Tag Detection</button>
-        <button class="menu-btn" type="button" data-panel="operation" aria-selected="false"><span class="menu-index">3</span>Operating Mode</button>
-        <button class="menu-btn" type="button" data-panel="group" aria-selected="false"><span class="menu-index">4</span>Group Mode</button>
-        <button class="menu-btn" type="button" data-panel="dc" aria-selected="false"><span class="menu-index">5</span>DC Compensation</button>
-        <button class="menu-btn" type="button" data-panel="privacy" aria-selected="false"><span class="menu-index">6</span>Privacy</button>
-        <button class="menu-btn" type="button" data-panel="statistics" aria-selected="false"><span class="menu-index">7</span>Statistics</button>
+        <button class="menu-btn" type="button" data-panel="antenna" aria-selected="true" title="Displays current antenna parameters: signal level, noise, temperature readings, and sensor data."><span class="menu-index">1</span>Antenna Status</button>
+        <button class="menu-btn" type="button" data-panel="detection" aria-selected="false" title="Shows detection algorithm, thresholds, filtering settings, and tag type selection."><span class="menu-index">2</span>Tag Detection</button>
+        <button class="menu-btn" type="button" data-panel="operation" aria-selected="false" title="Shows radar connection state, transmitter schedule, and runtime behavior settings."><span class="menu-index">3</span>Operating Mode</button>
+        <button class="menu-btn" type="button" data-panel="group" aria-selected="false" title="Shows master/slave role, synchronization status, and group operation settings."><span class="menu-index">4</span>Group Mode</button>
+        <button class="menu-btn" type="button" data-panel="dc" aria-selected="false" title="Configures firmware DC subtraction mode and adaptation timing."><span class="menu-index">5</span>DC Compensation</button>
+        <button class="menu-btn" type="button" data-panel="privacy" aria-selected="false" title="Change portal credentials, HotSpot access, and Wi-Fi internet connection."><span class="menu-index">6</span>Privacy</button>
+        <button class="menu-btn" type="button" data-panel="statistics" aria-selected="false" title="Shows runtime counters, detection history, communication quality, and service statistics."><span class="menu-index">7</span>Statistics</button>
         <button class="menu-btn" type="button" data-panel="documentation" aria-selected="false"><span class="menu-index">8</span>Documentation</button>
-        <button class="menu-btn" type="button" data-panel="about" aria-selected="false"><span class="menu-index">9</span>About Device</button>
+        <button class="menu-btn" type="button" data-panel="about" aria-selected="false" title="Shows device identity, firmware version, host software version, serial number, and hardware info."><span class="menu-index">9</span>About Device</button>
         <a class="menu-btn" href="/portal-logout" aria-label="Sign Out"><span class="menu-index" aria-hidden="true">&#x21AA;</span>Sign Out</a>
       </nav>
       <div class="portal-content">
         <section class="portal-panel is-active" id="panel-antenna">
-          <h2>Antenna Status</h2>
-          <p>Live antenna, noise, signal, temperature, and firmware sensor values will be shown here.</p>
           <div class="summary-grid">
             <div class="summary-item"><h3>Signal</h3><div class="metric"><span>Level</span><strong>---</strong></div><div class="metric"><span>Noise</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Sensors</h3><div class="metric"><span>Temperature</span><strong>---</strong></div><div class="metric"><span>Optic active</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Sensors</h3>{temp_metrics}<div class="metric"><span>Optic active</span><strong>---</strong></div></div>
             <div class="summary-item"><h3>Device</h3><div class="metric"><span>Stream</span><strong>---</strong></div><div class="metric"><span>DC mode</span><strong>{html.escape(str(cfg['mode']))}</strong></div></div>
           </div>
         </section>
         <section class="portal-panel" id="panel-detection">
-          <h2>Tag Detection</h2>
-          <p>Detection algorithm, thresholds, filtering, and tag type selection will be configured here.</p>
           <div class="summary-grid">
             <div class="summary-item"><h3>Algorithm</h3><div class="metric"><span>Selected</span><strong>---</strong></div></div>
             <div class="summary-item"><h3>Tag Type</h3><div class="metric"><span>Current</span><strong>---</strong></div></div>
@@ -2539,8 +3471,6 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
           </div>
         </section>
         <section class="portal-panel" id="panel-operation">
-          <h2>Operating Mode</h2>
-          <p>Radar connection, transmitter schedule, and runtime behavior will be configured here.</p>
           <div class="summary-grid">
             <div class="summary-item"><h3>Radar</h3><div class="metric"><span>Connection</span><strong>---</strong></div></div>
             <div class="summary-item"><h3>Transmission</h3><div class="metric"><span>Work time</span><strong>---</strong></div></div>
@@ -2548,8 +3478,6 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
           </div>
         </section>
         <section class="portal-panel" id="panel-group">
-          <h2>Group Mode</h2>
-          <p>Master/slave behavior and synchronized group operation will be configured here.</p>
           <div class="summary-grid">
             <div class="summary-item"><h3>Role</h3><div class="metric"><span>Mode</span><strong>---</strong></div></div>
             <div class="summary-item"><h3>Sync</h3><div class="metric"><span>Status</span><strong>---</strong></div></div>
@@ -2557,8 +3485,6 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
           </div>
         </section>
         <section class="portal-panel" id="panel-dc">
-          <h2>DC Compensation</h2>
-          <p>Configure firmware DC subtraction and adaptation speeds.</p>
           <form class="config-form" method="post" action="/portal-dc-config">
             <div class="section">
               <h3>Mode</h3>
@@ -2601,17 +3527,188 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
           </form>
         </section>
         <section class="portal-panel" id="panel-privacy">
-          <h2>Privacy</h2>
-          <p>Login credentials and allowed communication channels will be configured here.</p>
-          <div class="summary-grid">
-            <div class="summary-item"><h3>Portal</h3><div class="metric"><span>Login</span><strong>{signed_in_as or "authorized"}</strong></div></div>
-            <div class="summary-item"><h3>Channels</h3><div class="metric"><span>Allowed</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Remote Access</h3><div class="metric"><span>Status</span><strong>---</strong></div></div>
+          <div class="privacy-status-grid">
+            <div class="privacy-status">
+              <h3>Portal <strong data-connection-count="portal">{privacy_counts["portal"]}</strong></h3>
+              <div class="metric"><span>Login</span><strong>{portal_username}</strong></div>
+            </div>
+            <div class="privacy-status">
+              <div class="status-head">
+                <form method="post" action="/portal-channel-config" class="channel-permission" title="Allow HotSpot access">
+                  <input type="hidden" name="channel" value="hotspot">
+                  <input type="hidden" name="enabled" value="0">
+                  <input type="checkbox" name="enabled" value="1"{channel_checked["hotspot"]} onchange="this.form.submit()">
+                </form>
+                <h3>HotSpot <strong data-connection-count="hotspot">{privacy_counts["hotspot"]}</strong></h3>
+              </div>
+              <div class="metric"><span>SSID</span><strong>{hotspot_ssid}</strong></div>
+            </div>
+            <div class="privacy-status">
+              <div class="status-head">
+                <form method="post" action="/portal-channel-config" class="channel-permission" title="Allow Internet Wi-Fi">
+                  <input type="hidden" name="channel" value="wifi">
+                  <input type="hidden" name="enabled" value="0">
+                  <input type="checkbox" name="enabled" value="1"{channel_checked["wifi"]} onchange="this.form.submit()">
+                </form>
+                <h3>Internet WiFi <strong data-connection-count="wifi">{privacy_counts["wifi"]}</strong></h3>
+              </div>
+              <div class="metric"><span>SSID</span><strong>{wifi_saved_ssid or "---"}</strong></div>
+            </div>
+            <div class="privacy-status">
+              <div class="status-head">
+                <form method="post" action="/portal-channel-config" class="channel-permission" title="Allow Ethernet access">
+                  <input type="hidden" name="channel" value="ethernet">
+                  <input type="hidden" name="enabled" value="0">
+                  <input type="checkbox" name="enabled" value="1"{channel_checked["ethernet"]} onchange="this.form.submit()">
+                </form>
+                <h3>Ethernet <strong data-connection-count="ethernet">{privacy_counts["ethernet"]}</strong></h3>
+              </div>
+              <div class="metric"><span>Wired</span><strong>LAN</strong></div>
+            </div>
+            <div class="privacy-status">
+              <div class="status-head">
+                <form method="post" action="/portal-channel-config" class="channel-permission" title="Allow RDP/VNC remote desktop">
+                  <input type="hidden" name="channel" value="remote">
+                  <input type="hidden" name="enabled" value="0">
+                  <input type="checkbox" name="enabled" value="1"{channel_checked["remote"]} onchange="this.form.submit()">
+                </form>
+                <h3>RDP/VNC <strong data-connection-count="remote">{privacy_counts["remote"]}</strong></h3>
+              </div>
+              <div class="metric"><span>Login</span><strong>{remote_username}</strong></div>
+            </div>
+          </div>
+          <div class="privacy-forms">
+          <form class="privacy-form" method="post" action="/portal-account-config" autocomplete="off">
+              <div class="privacy-title-row">
+                <h3>Portal Login</h3>
+                <label class="privacy-toggle" title="Enable and edit optional BMI30 portal engineer login. This is separate from RDP/VNC desktop access.">
+                  <input id="engineer-toggle" type="checkbox"{engineer_checked}>
+                  <span>Engineer portal</span>
+                </label>
+              </div>
+              <div class="privacy-fields">
+                <label class="field">
+                  <span>New login</span>
+                  <input name="username" type="text" autocomplete="username" maxlength="64" value="{portal_username}">
+                </label>
+                <label class="field">
+                  <span>Current password</span>
+                  <input name="current_password" type="password" autocomplete="current-password" required>
+                </label>
+                <label class="field">
+                  <span>New password</span>
+                  <input name="new_password" type="password" autocomplete="new-password" minlength="8" required>
+                </label>
+                <label class="field">
+                  <span>Repeat new password</span>
+                  <input name="confirm_password" type="password" autocomplete="new-password" minlength="8" required>
+                </label>
+                <div class="privacy-action">
+                  <div class="actions actions-inline">
+                    <button class="link" type="submit">Save Portal Login</button>
+                  </div>
+                </div>
+              </div>
+          </form>
+          <form class="privacy-form" method="post" action="/portal-remote-config" autocomplete="off">
+              <div class="privacy-title-row">
+                <h3>Remote Desktop RDP/VNC Login</h3>
+                <div class="privacy-title-actions">
+                  <button class="link" type="submit">Save Desktop Login</button>
+                </div>
+              </div>
+              <div class="privacy-fields">
+                <label class="field">
+                  <span>Remote login</span>
+                  <input name="username" type="text" autocomplete="username" maxlength="32" value="{remote_username}" required>
+                </label>
+                <label class="field">
+                  <span>New RDP/VNC password</span>
+                  <input name="password" type="password" autocomplete="new-password" minlength="8" placeholder="Leave empty to keep current">
+                </label>
+                <label class="field">
+                  <span>Repeat RDP/VNC password</span>
+                  <input name="confirm_password" type="password" autocomplete="new-password" minlength="8" placeholder="{remote_password_state_html}">
+                </label>
+              </div>
+          </form>
+          <form class="privacy-form" method="post" action="/portal-hotspot-config" autocomplete="off">
+              <div class="privacy-title-row">
+                <h3>HotSpot Wi-Fi Access</h3>
+                <div class="privacy-title-actions">
+                  <button class="link" type="submit">Save HotSpot Access</button>
+                </div>
+              </div>
+              <div class="privacy-fields">
+                <label class="field">
+                  <span>HotSpot network name</span>
+                  <input name="ssid" type="text" maxlength="32" value="{hotspot_ssid}" required>
+                </label>
+                <label class="field">
+                  <span>New HotSpot password</span>
+                  <input name="password" type="password" autocomplete="new-password" minlength="8" maxlength="63" placeholder="Leave empty to keep current password">
+                </label>
+                <label class="field">
+                  <span>Repeat HotSpot password</span>
+                  <input name="confirm_password" type="password" autocomplete="new-password" minlength="8" maxlength="63" placeholder="Only needed when changing password">
+                </label>
+              </div>
+              <p class="notice privacy-note">Applying HotSpot changes restarts the access point. Wi-Fi clients may need to reconnect with the new name or password.</p>
+          </form>
+          <form class="privacy-form" method="post" action="/portal-wifi-config" autocomplete="off">
+              <div class="privacy-title-row">
+                <h3>Wi-Fi Internet Access</h3>
+                <div class="privacy-title-actions">
+                  <a class="link link-secondary" href="/portal#privacy">Refresh Networks</a>
+                  <button class="link" type="submit">Connect and Save Wi-Fi</button>
+                </div>
+              </div>
+              <div class="privacy-fields">
+                <label class="field">
+                  <span>Visible networks</span>
+                  <select name="visible_ssid">
+                    {wifi_options}
+                  </select>
+                </label>
+                <label class="field">
+                  <span>Manual network name</span>
+                  <input name="ssid" type="text" maxlength="32" placeholder="Use if the network is hidden">
+                </label>
+                <label class="field">
+                  <span>Wi-Fi password</span>
+                  <input name="password" type="password" autocomplete="new-password" placeholder="Required for protected networks">
+                </label>
+              </div>
+          </form>
           </div>
         </section>
+        <div id="engineer-modal" class="modal-backdrop" hidden>
+          <form class="modal-panel" method="post" action="/portal-engineer-config" autocomplete="off" role="dialog" aria-modal="true" aria-labelledby="engineer-modal-title">
+            <div class="modal-head">
+              <h3 id="engineer-modal-title">BMI30 Portal Engineer Login</h3>
+              <button class="modal-close" type="button" data-modal-close aria-label="Close">x</button>
+            </div>
+            <div class="fields">
+              <label class="field">
+                <span>Portal engineer login</span>
+                <input name="username" type="text" autocomplete="username" maxlength="64" value="{engineer_username or html.escape(DEFAULT_ENGINEER_USERNAME)}">
+              </label>
+              <label class="field">
+                <span>Portal engineer password</span>
+                <input name="password" type="password" autocomplete="new-password" minlength="8" placeholder="Leave empty to keep configured password">
+              </label>
+              <label class="field">
+                <span>Repeat portal engineer password</span>
+                <input name="confirm_password" type="password" autocomplete="new-password" minlength="8" placeholder="Leave empty to keep current">
+              </label>
+            </div>
+            <div class="actions actions-inline">
+              <button class="link" type="submit" name="enabled" value="1">Save Portal Engineer</button>
+              <button class="link link-secondary" type="submit" name="enabled" value="0">Disable Portal Engineer</button>
+            </div>
+          </form>
+        </div>
         <section class="portal-panel" id="panel-statistics">
-          <h2>Statistics</h2>
-          <p>Runtime counters, detection history, communication quality, and service statistics will be shown here.</p>
           <div class="summary-grid">
             <div class="summary-item"><h3>Runtime</h3><div class="metric"><span>Uptime</span><strong>---</strong></div><div class="metric"><span>Frames</span><strong>---</strong></div></div>
             <div class="summary-item"><h3>Detection</h3><div class="metric"><span>Events</span><strong>---</strong></div><div class="metric"><span>Last event</span><strong>---</strong></div></div>
@@ -2628,8 +3725,6 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
 
         </section>
         <section class="portal-panel" id="panel-about">
-          <h2>About Device</h2>
-          <p>Device identity, firmware version, host software version, serial number, and hardware information will be shown here.</p>
           <div class="summary-grid">
             <div class="summary-item"><h3>Identity</h3><div class="metric"><span>Hostname</span><strong>{title}</strong></div><div class="metric"><span>Serial</span><strong>---</strong></div></div>
             <div class="summary-item"><h3>Firmware</h3><div class="metric"><span>Version</span><strong>---</strong></div><div class="metric"><span>Build</span><strong>---</strong></div></div>
@@ -2728,6 +3823,98 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       window.addEventListener('scroll', updateScrollTopButton, {{ passive: true }});
       updateScrollTopButton();
     }}
+    var connectionCountEls = Array.prototype.slice.call(document.querySelectorAll('[data-connection-count]'));
+    function updateConnectionCounts() {{
+      if (!connectionCountEls.length) {{ return; }}
+      fetch('/api/status?v=' + Date.now(), {{ cache: 'no-store' }})
+        .then(function (response) {{
+          if (!response.ok) {{ throw new Error('status failed'); }}
+          return response.json();
+        }})
+        .then(function (data) {{
+          var counts = data && data.connections ? data.connections : {{}};
+          connectionCountEls.forEach(function (el) {{
+            var key = el.getAttribute('data-connection-count') || '';
+            if (Object.prototype.hasOwnProperty.call(counts, key)) {{
+              el.textContent = String(counts[key]);
+            }}
+          }});
+        }})
+        .catch(function () {{}});
+    }}
+    updateConnectionCounts();
+    window.setInterval(updateConnectionCounts, 5000);
+    // --- Sensor polling (panel-antenna only) ---
+    var _activePanel = (window.location.hash || '#antenna').slice(1);
+    var _sensorEls = {{}};
+    document.querySelectorAll('[data-sensor]').forEach(function (el) {{
+      _sensorEls[el.getAttribute('data-sensor')] = el;
+    }});
+    function _updateSensorEl(key, value) {{
+      var el = _sensorEls[key];
+      if (!el) {{ return; }}
+      el.textContent = (value !== null && value !== undefined) ? value.toFixed(1) + '\u00b0C' : '---';
+    }}
+    function _pollSensors() {{
+      if (_activePanel !== 'antenna') {{ return; }}
+      fetch('/api/sensors?v=' + Date.now(), {{ cache: 'no-store' }})
+        .then(function (r) {{ return r.ok ? r.json() : null; }})
+        .then(function (data) {{
+          if (!data) {{ return; }}
+          var rpi = data.rpi || {{}};
+          Object.keys(rpi).forEach(function (k) {{ _updateSensorEl('rpi-' + k, rpi[k]); }});
+          if (data.stm32 !== null && data.stm32 !== undefined) {{
+            _updateSensorEl('stm32-temp', data.stm32);
+          }}
+        }})
+        .catch(function () {{}});
+    }}
+    _pollSensors();
+    window.setInterval(_pollSensors, 5000);
+    // patch setActivePanel to track current panel
+    var _origSetActivePanel = setActivePanel;
+    setActivePanel = function (name, updateHash) {{
+      _activePanel = name;
+      _origSetActivePanel(name, updateHash);
+    }};
+    var engineerToggle = document.getElementById('engineer-toggle');
+    var engineerModal = document.getElementById('engineer-modal');
+    var engineerClose = engineerModal ? engineerModal.querySelector('[data-modal-close]') : null;
+    function openEngineerModal() {{
+      if (!engineerModal) {{ return; }}
+      engineerModal.hidden = false;
+      var firstInput = engineerModal.querySelector('input[name="username"]');
+      if (firstInput) {{ firstInput.focus(); }}
+    }}
+    function closeEngineerModal() {{
+      if (!engineerModal) {{ return; }}
+      engineerModal.hidden = true;
+      if (engineerToggle && !engineerToggle.defaultChecked) {{
+        engineerToggle.checked = false;
+      }}
+    }}
+    if (engineerToggle) {{
+      engineerToggle.addEventListener('change', function () {{
+        if (engineerToggle.checked) {{
+          openEngineerModal();
+        }}
+      }});
+    }}
+    if (engineerClose) {{
+      engineerClose.addEventListener('click', closeEngineerModal);
+    }}
+    if (engineerModal) {{
+      engineerModal.addEventListener('click', function (event) {{
+        if (event.target === engineerModal) {{
+          closeEngineerModal();
+        }}
+      }});
+    }}
+    document.addEventListener('keydown', function (event) {{
+      if (event.key === 'Escape' && engineerModal && !engineerModal.hidden) {{
+        closeEngineerModal();
+      }}
+    }});
   </script>
   <script>
     // PDF Viewer initialization
@@ -3112,7 +4299,8 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             content_length = 0
         raw = self.rfile.read(max(content_length, 0))
         parsed = parse_qs(raw.decode("utf-8", errors="replace"), keep_blank_values=True)
-        return {key: values[0] if values else "" for key, values in parsed.items()}
+        # Checkbox + hidden fallback fields submit duplicate keys; use the last value.
+        return {key: values[-1] if values else "" for key, values in parsed.items()}
 
     def _read_cookie(self, name: str) -> str:
         raw_cookie = self.headers.get("Cookie", "")
@@ -3149,6 +4337,15 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie", set_cookie)
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
+
+    def _redirect_portal_privacy_error(self, message: str) -> None:
+        self._send_redirect(
+            self._absolute_url(
+                f"/portal?privacy_error=1&message={quote(message[:240])}#privacy",
+                scheme=self._preferred_scheme(),
+            ),
+            status=HTTPStatus.SEE_OTHER,
+        )
 
     def _handle_request(self, send_body: bool) -> None:
         path = self.path.split("?", 1)[0]
@@ -3227,10 +4424,32 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
         # JSON API
         if path == "/api/status":
+            if self._get_portal_session() is not None:
+                remember_portal_client(self.client_address[0] if self.client_address else "")
             data = collect_remote_access_targets(preferred_ip=preferred_ip)
             payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(payload)
+            return
+
+        if path == "/api/sensors":
+            session = self._get_portal_session()
+            if session is None:
+                self.send_response(HTTPStatus.FORBIDDEN)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            rpi_temps = _read_rpi_temperatures()
+            rpi_data = {lbl.lower(): round(t, 1) for lbl, t in rpi_temps}
+            sensors_data: dict = {"rpi": rpi_data, "stm32": None}
+            payload = json.dumps(sensors_data, ensure_ascii=False).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             if send_body:
@@ -3253,6 +4472,7 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
                     set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
                 )
                 return
+            remember_portal_client(self.client_address[0] if self.client_address else "")
             data = collect_remote_access_targets(preferred_ip=preferred_ip)
             query = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
             notice = ""
@@ -3263,6 +4483,21 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
                 notice = "DC configuration saved and sent to the device."
             if query.get("error", [""])[0] == "1":
                 notice = "DC configuration saved, but the device did not accept the live apply. Check USB connection and try again."
+                notice_kind = "error"
+            if query.get("account", [""])[0] == "1":
+                notice = "Portal login and password saved."
+            if query.get("hotspot", [""])[0] == "1":
+                notice = "HotSpot Wi-Fi access settings saved."
+            if query.get("wifi", [""])[0] == "1":
+                notice = "Wi-Fi internet access saved."
+            if query.get("engineer", [""])[0] == "1":
+                notice = "BMI30 portal engineer login saved."
+            if query.get("remote", [""])[0] == "1":
+                notice = "Remote desktop RDP/VNC login saved."
+            if query.get("channel", [""])[0] == "1":
+                notice = "Communication channel permission saved."
+            if query.get("privacy_error", [""])[0] == "1":
+                notice = query.get("message", ["Unable to save privacy settings."])[0][:240]
                 notice_kind = "error"
             payload = render_portal_page(
                 data["hostname"],
@@ -3541,6 +4776,188 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path == "/portal-account-config":
+            session = self._get_portal_session()
+            if session is None:
+                self._send_redirect(
+                    self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
+                    status=HTTPStatus.SEE_OTHER,
+                    set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
+                )
+                return
+
+            form = self._read_post_form()
+            current_username = get_portal_username()
+            current_password = form.get("current_password", "")
+            new_username = form.get("username", "").strip()
+            new_password = form.get("new_password", "")
+            confirm_password = form.get("confirm_password", "")
+
+            if not verify_portal_user_password(current_username, current_password):
+                self._redirect_portal_privacy_error("Current portal password is incorrect.")
+                return
+            if new_password != confirm_password:
+                self._redirect_portal_privacy_error("New portal passwords do not match.")
+                return
+            try:
+                save_portal_credentials(new_username, new_password)
+            except ValueError as exc:
+                self._redirect_portal_privacy_error(str(exc))
+                return
+            except Exception:
+                self._redirect_portal_privacy_error("Unable to save portal credentials.")
+                return
+
+            expires_at = int(time.time()) + PORTAL_SESSION_TTL_S
+            session_cookie = build_portal_session_cookie(
+                create_portal_session_token(new_username, expires_at, role="user"),
+                remember=True,
+                secure=self._is_tls(),
+            )
+            self._send_redirect(
+                self._absolute_url("/portal?account=1#privacy", scheme=self._preferred_scheme()),
+                status=HTTPStatus.SEE_OTHER,
+                set_cookie=session_cookie,
+            )
+            return
+
+        if path == "/portal-engineer-config":
+            session = self._get_portal_session()
+            if session is None:
+                self._send_redirect(
+                    self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
+                    status=HTTPStatus.SEE_OTHER,
+                    set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
+                )
+                return
+
+            form = self._read_post_form()
+            enabled = form.get("enabled", "1").strip() not in {"0", "false", "off", "no"}
+            username = form.get("username", "").strip() or DEFAULT_ENGINEER_USERNAME
+            password = form.get("password", "")
+            confirm_password = form.get("confirm_password", "")
+            if password or confirm_password:
+                if password != confirm_password:
+                    self._redirect_portal_privacy_error("Portal engineer passwords do not match.")
+                    return
+            try:
+                save_engineer_credentials(enabled, username, password)
+            except ValueError as exc:
+                self._redirect_portal_privacy_error(str(exc))
+                return
+            except Exception:
+                self._redirect_portal_privacy_error("Unable to save engineer credentials.")
+                return
+            self._send_redirect(
+                self._absolute_url("/portal?engineer=1#privacy", scheme=self._preferred_scheme()),
+                status=HTTPStatus.SEE_OTHER,
+            )
+            return
+
+        if path == "/portal-channel-config":
+            session = self._get_portal_session()
+            if session is None:
+                self._send_redirect(
+                    self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
+                    status=HTTPStatus.SEE_OTHER,
+                    set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
+                )
+                return
+
+            form = self._read_post_form()
+            channel = form.get("channel", "").strip().lower()
+            enabled = form.get("enabled", "0").strip() in {"1", "true", "on", "yes"}
+            ok, message = apply_channel_permission(channel, enabled)
+            if not ok:
+                self._redirect_portal_privacy_error(message)
+                return
+            self._send_redirect(
+                self._absolute_url("/portal?channel=1#privacy", scheme=self._preferred_scheme()),
+                status=HTTPStatus.SEE_OTHER,
+            )
+            return
+
+        if path == "/portal-remote-config":
+            session = self._get_portal_session()
+            if session is None:
+                self._send_redirect(
+                    self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
+                    status=HTTPStatus.SEE_OTHER,
+                    set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
+                )
+                return
+
+            form = self._read_post_form()
+            username = form.get("username", "").strip()
+            password = form.get("password", "")
+            confirm_password = form.get("confirm_password", "")
+            if password or confirm_password:
+                if password != confirm_password:
+                    self._redirect_portal_privacy_error("RDP/VNC passwords do not match.")
+                    return
+            ok, message = apply_remote_desktop_credentials(username, password)
+            if not ok:
+                self._redirect_portal_privacy_error(message)
+                return
+            self._send_redirect(
+                self._absolute_url("/portal?remote=1#privacy", scheme=self._preferred_scheme()),
+                status=HTTPStatus.SEE_OTHER,
+            )
+            return
+
+        if path == "/portal-hotspot-config":
+            session = self._get_portal_session()
+            if session is None:
+                self._send_redirect(
+                    self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
+                    status=HTTPStatus.SEE_OTHER,
+                    set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
+                )
+                return
+
+            form = self._read_post_form()
+            ssid = form.get("ssid", "").strip()
+            password = form.get("password", "")
+            confirm_password = form.get("confirm_password", "")
+            if password or confirm_password:
+                if password != confirm_password:
+                    self._redirect_portal_privacy_error("HotSpot passwords do not match.")
+                    return
+            ok, message = apply_hotspot_access_settings(ssid, password)
+            if not ok:
+                self._redirect_portal_privacy_error(message)
+                return
+            self._send_redirect(
+                self._absolute_url("/portal?hotspot=1#privacy", scheme=self._preferred_scheme()),
+                status=HTTPStatus.SEE_OTHER,
+            )
+            return
+
+        if path == "/portal-wifi-config":
+            session = self._get_portal_session()
+            if session is None:
+                self._send_redirect(
+                    self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
+                    status=HTTPStatus.SEE_OTHER,
+                    set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
+                )
+                return
+
+            form = self._read_post_form()
+            selected_ssid = form.get("visible_ssid", "").strip()
+            manual_ssid = form.get("ssid", "").strip()
+            ssid = manual_ssid or selected_ssid
+            password = form.get("password", "")
+            ok, message = connect_wifi_internet(ssid, password)
+            if not ok:
+                self._redirect_portal_privacy_error(message)
+                return
+            self._send_redirect(
+                self._absolute_url("/portal?wifi=1#privacy", scheme=self._preferred_scheme()),
+                status=HTTPStatus.SEE_OTHER,
+            )
+            return
+
         if path == "/portal-dc-config":
             session = self._get_portal_session()
             if session is None:
