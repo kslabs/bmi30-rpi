@@ -2502,7 +2502,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
         <button class="menu-btn" type="button" data-panel="statistics" aria-selected="false"><span class="menu-index">7</span>Statistics</button>
         <button class="menu-btn" type="button" data-panel="documentation" aria-selected="false"><span class="menu-index">8</span>Documentation</button>
         <button class="menu-btn" type="button" data-panel="about" aria-selected="false"><span class="menu-index">9</span>About Device</button>
-        <a class="menu-btn" href="/portal-logout" aria-label="Sign Out">Sign Out</a>
+        <a class="menu-btn" href="/portal-logout" aria-label="Sign Out"><span class="menu-index" aria-hidden="true">&#x23FB;</span>Sign Out</a>
       </nav>
       <div class="portal-content">
         <section class="portal-panel is-active" id="panel-antenna">
