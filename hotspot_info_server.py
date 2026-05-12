@@ -553,7 +553,7 @@ def render_style_bootstrap() -> str:
           theme = 'auto';
         }
         var style = localStorage.getItem('bmi30.portal.style') || 'crystal';
-        if (style !== 'glass' && style !== 'crystal' && style !== 'neumorph') {
+        if (style !== 'glass' && style !== 'crystal' && style !== 'warm' && style !== 'neumorph') {
           style = 'crystal';
         }
         var effectiveTheme = theme;
@@ -565,7 +565,8 @@ def render_style_bootstrap() -> str:
         document.documentElement.dataset.uiStyle = style;
       } catch (error) {
         document.documentElement.dataset.themePref = 'auto';
-        document.documentElement.dataset.themeMode = 'dark';
+        var effectiveTheme = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+        document.documentElement.dataset.themeMode = effectiveTheme;
         document.documentElement.dataset.uiStyle = 'crystal';
       }
     }());
@@ -2224,9 +2225,12 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
                     padding-left:clamp(22px,4vw,42px);padding-right:clamp(22px,4vw,42px);
                     scroll-snap-type:x proximity;background:var(--panel);
                     border-top:1px solid var(--line);border-bottom:1px solid var(--line);
-                    box-shadow:0 10px 22px rgba(29,42,46,.12);
+                    box-shadow:var(--panel-shadow);
                     backdrop-filter:blur(18px) saturate(1.18);-webkit-backdrop-filter:blur(18px) saturate(1.18)}}
       .menu-btn{{width:auto;min-width:178px;flex:0 0 auto;scroll-snap-align:start;white-space:normal}}
+      html[data-ui-style="neumorph"] .menu-btn{{box-shadow:4px 4px 8px var(--neumo-lo),-4px -4px 8px var(--neumo-hi)}}
+      html[data-ui-style="neumorph"] .menu-btn:hover{{box-shadow:5px 5px 10px var(--neumo-lo),-5px -5px 10px var(--neumo-hi)}}
+      html[data-ui-style="neumorph"] .menu-btn[aria-selected="true"]{{box-shadow:inset 4px 4px 8px var(--neumo-lo),inset -4px -4px 8px var(--neumo-hi)}}
       .summary-grid{{grid-template-columns:1fr}}
       .mode-grid,.fields{{grid-template-columns:1fr}}
     }}
