@@ -2909,10 +2909,10 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
         var topPx = parseInt(topPxRaw, 10);
         if (!Number.isFinite(topPx)) {{ topPx = 8; }}
 
-        var controlsRect = controls.getBoundingClientRect();
         var pageRect = activePage.getBoundingClientRect();
         var viewerRect = controls.parentElement.getBoundingClientRect();
-        var shouldFix = controlsRect.top <= topPx && pageRect.bottom > (topPx + controls.offsetHeight + 10);
+        // Use viewer top instead of controls rect so fixed controls can return to normal on upward scroll.
+        var shouldFix = viewerRect.top <= topPx && pageRect.bottom > (topPx + controls.offsetHeight + 10);
         var spacer = controls.parentElement.querySelector('.pdf-controls-spacer');
 
         if (shouldFix) {{
