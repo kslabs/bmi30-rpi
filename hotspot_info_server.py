@@ -2427,8 +2427,8 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     }}
     /* PDF Viewer Styles */
     .pdf-viewer{{display:flex;flex-direction:column;gap:10px;height:100%;position:relative}}
-    .pdf-controls{{display:flex;align-items:center;justify-content:space-between;gap:10px;
-            position:sticky;top:8px;z-index:6;
+        .pdf-controls{{display:flex;align-items:center;justify-content:space-between;gap:10px;
+          position:sticky;top:10px;z-index:12;
             padding:8px 10px;background:color-mix(in srgb, var(--panel) 62%, transparent);
             border:1px solid color-mix(in srgb, var(--line) 70%, transparent);border-radius:8px;
             backdrop-filter:blur(8px) saturate(1.06);-webkit-backdrop-filter:blur(8px) saturate(1.06);
@@ -2445,20 +2445,31 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
                      background:var(--panel);color:var(--text);font-size:12px;text-align:center}}
     .pdf-page-input:focus-visible{{outline:2px solid rgba(15,138,112,.24);border-color:var(--accent)}}
     .pdf-page-total{{font-size:12px;color:var(--muted);min-width:40px;text-align:left}}
-    .pdf-pages{{flex:1;display:flex;justify-content:center;align-items:flex-start;overflow:auto;
+        .pdf-pages{{flex:1;display:flex;justify-content:center;align-items:flex-start;overflow:visible;
                 background:var(--panel);border:1px solid var(--line);border-radius:8px;
-          padding:10px;min-height:400px;max-height:min(74vh,860px)}}
+          padding:10px;min-height:400px}}
     .pdf-canvas{{max-width:100%;max-height:100%;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,0.15);
                  animation:pageFlip 0.3s ease-out}}
+        .scroll-top-btn{{position:fixed;right:16px;bottom:18px;z-index:40;
+             width:44px;height:44px;border-radius:999px;border:1px solid var(--line);
+             background:color-mix(in srgb, var(--panel) 62%, transparent);
+             color:var(--text);font-size:20px;line-height:1;cursor:pointer;
+             backdrop-filter:blur(8px) saturate(1.08);-webkit-backdrop-filter:blur(8px) saturate(1.08);
+             box-shadow:0 8px 18px rgba(0,0,0,.16);
+             opacity:0;pointer-events:none;transform:translateY(8px);
+             transition:opacity .18s ease,transform .18s ease,background .16s ease}}
+        .scroll-top-btn.is-visible{{opacity:.92;pointer-events:auto;transform:translateY(0)}}
+        .scroll-top-btn:hover{{opacity:1;background:color-mix(in srgb, var(--accent-soft) 74%, transparent)}}
     @keyframes pageFlip{{
       from{{opacity:0;transform:rotateX(-10deg)}}
       to{{opacity:1;transform:rotateX(0deg)}}
     }}
     @media (max-width:860px){{
-      .pdf-controls{{flex-direction:column;align-items:stretch;top:6px}}
+      .pdf-controls{{flex-direction:column;align-items:stretch;top:8px}}
       .pdf-btn{{width:100%;text-align:center}}
       .pdf-page-nav{{justify-content:center;margin:8px 0}}
       .pdf-pages{{min-height:300px}}
+      .scroll-top-btn{{right:12px;bottom:12px}}
     }}
   </style>
 {render_debug_style_css()}
@@ -2616,6 +2627,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       </div>
     </div>
   </main>
+  <button id="scroll-top-btn" class="scroll-top-btn" type="button" aria-label="Scroll to top">↑</button>
   {render_debug_panel()}
   {render_debug_panel_script()}
   <script>
@@ -2677,6 +2689,19 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     }});
     if (docTabs.length) {{
       setDocPage(docTabs[0].dataset.docTab || 'operation');
+    }}
+    var scrollTopBtn = document.getElementById('scroll-top-btn');
+    function updateScrollTopButton() {{
+      if (!scrollTopBtn) {{ return; }}
+      var show = window.scrollY > 420;
+      scrollTopBtn.classList.toggle('is-visible', show);
+    }}
+    if (scrollTopBtn) {{
+      scrollTopBtn.addEventListener('click', function () {{
+        window.scrollTo({{ top: 0, behavior: 'smooth' }});
+      }});
+      window.addEventListener('scroll', updateScrollTopButton, {{ passive: true }});
+      updateScrollTopButton();
     }}
   </script>
   <script>
