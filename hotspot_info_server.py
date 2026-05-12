@@ -2427,8 +2427,8 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     }}
     /* PDF Viewer Styles */
     .pdf-viewer{{display:flex;flex-direction:column;gap:10px;height:100%;position:relative}}
-        .pdf-controls{{display:flex;align-items:center;justify-content:space-between;gap:10px;
-          position:sticky;top:10px;z-index:12;
+            .pdf-controls{{display:flex;align-items:center;justify-content:space-between;gap:10px;
+              position:sticky;top:var(--pdf-controls-top,10px);z-index:32;
             padding:8px 10px;background:color-mix(in srgb, var(--panel) 62%, transparent);
             border:1px solid color-mix(in srgb, var(--line) 70%, transparent);border-radius:8px;
             backdrop-filter:blur(8px) saturate(1.06);-webkit-backdrop-filter:blur(8px) saturate(1.06);
@@ -2465,7 +2465,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       to{{opacity:1;transform:rotateX(0deg)}}
     }}
     @media (max-width:860px){{
-      .pdf-controls{{flex-direction:column;align-items:stretch;top:8px}}
+      .pdf-controls{{flex-direction:column;align-items:stretch}}
       .pdf-btn{{width:100%;text-align:center}}
       .pdf-page-nav{{justify-content:center;margin:8px 0}}
       .pdf-pages{{min-height:300px}}
@@ -2690,6 +2690,27 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     if (docTabs.length) {{
       setDocPage(docTabs[0].dataset.docTab || 'operation');
     }}
+    function updatePdfControlsOffset() {{
+      var controls = Array.prototype.slice.call(document.querySelectorAll('.pdf-controls'));
+      if (!controls.length) {{ return; }}
+      var topPx = 10;
+      var menu = document.querySelector('.portal-menu');
+      if (menu) {{
+        var menuStyle = window.getComputedStyle(menu);
+        if (menuStyle.position === 'sticky') {{
+          var rect = menu.getBoundingClientRect();
+          if (rect.bottom > 0 && rect.top < window.innerHeight) {{
+            topPx = Math.max(10, Math.round(rect.bottom + 8));
+          }}
+        }}
+      }}
+      controls.forEach(function (el) {{
+        el.style.setProperty('--pdf-controls-top', String(topPx) + 'px');
+      }});
+    }}
+    window.addEventListener('resize', updatePdfControlsOffset);
+    window.addEventListener('scroll', updatePdfControlsOffset, {{ passive: true }});
+    updatePdfControlsOffset();
     var scrollTopBtn = document.getElementById('scroll-top-btn');
     function updateScrollTopButton() {{
       if (!scrollTopBtn) {{ return; }}
