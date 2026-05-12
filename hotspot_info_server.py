@@ -1290,6 +1290,10 @@ def render_debug_style_css() -> str:
       html[data-ui-style="warm"][data-theme-mode="auto"] .debug-option[aria-pressed="true"]{opacity:1;color:#fbbf24!important;border-color:#fbbf24!important;background:rgba(251,191,36,.22)!important;transform:translateY(-2px);box-shadow:0 0 0 2px #fbbf24,0 8px 20px rgba(251,191,36,.35)!important}
       html[data-ui-style="warm"][data-theme-mode="auto"] .menu-btn[aria-selected="true"]{color:#fbbf24;border-color:rgba(251,191,36,.55);background:linear-gradient(135deg,rgba(245,158,11,.22),rgba(251,191,36,.10) 60%,rgba(245,158,11,.18));box-shadow:0 0 0 1px rgba(251,191,36,.50),inset 0 3px 8px rgba(180,83,9,.38),inset 0 1px 3px rgba(0,0,0,.32);transform:translateY(1px)}
     }
+    html[data-ui-style="crystal"][data-theme-mode="light"] .debug-option{opacity:.95}
+    html[data-ui-style="crystal"][data-theme-mode="light"] .debug-option[aria-pressed="true"]{opacity:1;color:#0f766e!important;border-color:#0f766e!important;background:rgba(15,118,110,.16)!important;transform:translateY(-1px);box-shadow:inset 1px 1px 0 rgba(255,255,255,.34),0 4px 12px rgba(15,138,112,.13)!important}
+    html[data-ui-style="warm"][data-theme-mode="light"] .debug-option{opacity:.95}
+    html[data-ui-style="warm"][data-theme-mode="light"] .debug-option[aria-pressed="true"]{opacity:1;color:#b45309!important;border-color:#b45309!important;background:rgba(180,83,9,.14)!important;transform:translateY(-1px);box-shadow:inset 1px 1px 0 rgba(255,255,255,.34),0 4px 12px rgba(180,83,9,.11)!important}
     .debug-note{font-size:12px;line-height:1.5;color:var(--muted)}
     @media (max-width:640px){
       .debug-tab{top:auto;bottom:18px;writing-mode:horizontal-tb;border-right:1px solid var(--line);border-radius:8px 0 0 8px}
