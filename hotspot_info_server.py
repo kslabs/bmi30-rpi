@@ -8,9 +8,11 @@ import hashlib
 import html
 import hmac
 import ipaddress
+import io
 import json
 import mimetypes
 import os
+import pathlib
 import ssl
 import socket
 import subprocess
@@ -21,6 +23,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs
+from urllib.request import urlopen
 
 
 PORT         = int(os.getenv("BMI30_HOTSPOT_INFO_PORT",      "80"))
@@ -127,25 +130,29 @@ DEFAULT_DC_CONFIG: dict[str, Any] = {
     "fast_duration_s": 30.0,
 }
 
+# PDF документация
+PDF_CACHE_DIR = pathlib.Path(os.getenv("BMI30_PDF_CACHE_DIR", "/var/cache/bmi30")).expanduser()
+PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+PDF_UPDATE_INTERVAL_S = max(3600, int(os.getenv("BMI30_PDF_UPDATE_INTERVAL_S", str(24 * 3600))))  # 24 часа по умолчанию
+
 PORTAL_DOCUMENTS: dict[str, dict[str, str]] = {
   "operation": {
     "title": "Operation Guide",
     "summary": "Daily startup, checks, and shutdown sequence for BMI30.",
-    "filename": "BMI30_Operation_Guide.txt",
-    "content": """BMI30 Operation Guide\n\n1. Startup\n- Power on the host and BMI30 reader.\n- Wait until the portal is reachable.\n- Open /portal and verify Antenna Status values are updating.\n\n2. Detection Run\n- Open Tag Detection and confirm expected tag profile.\n- Open Operating Mode and check runtime profile.\n- Keep DC mode in WORK or DETECT depending on scenario.\n\n3. During Operation\n- Monitor Noise, Signal, and Temperature trends.\n- If live apply fails, verify USB connection and retry from DC Compensation panel.\n- Record abnormal spikes in Statistics section.\n\n4. Shutdown\n- Stop active test sequence from host tools.\n- Save required configuration changes.\n- Power down the reader only after host process is stopped.\n""",
+    "filename": "BMI30_Operation_Guide.pdf",
+    "google_doc_id": "171lmgMctV8HfeChDzagbyibgGt0PfuEm3h6Lj2V1djo",
   },
   "safety": {
     "title": "Safety and Service Notes",
     "summary": "Safety checklist and service handling recommendations.",
-    "filename": "BMI30_Safety_and_Service_Notes.txt",
-    "content": """BMI30 Safety and Service Notes\n\n1. Electrical Safety\n- Use only approved power supplies and USB cables.\n- Do not connect/disconnect cables under unstable power conditions.\n\n2. Environment\n- Keep the unit dry and protected from condensation.\n- Avoid direct heat sources and strong vibration.\n\n3. Service\n- Before firmware or host updates, make a backup of configuration files.\n- After updates, run quick validation (antenna stream, detection, DC apply).\n\n4. Incident Handling\n- If service does not start, check systemd status and journal logs.\n- If USB link is unstable, inspect connectors and restart host service.
-""",
+    "filename": "BMI30_Safety_and_Service_Notes.pdf",
+    "google_doc_id": "171lmgMctV8HfeChDzagbyibgGt0PfuEm3h6Lj2V1djo",
   },
   "network": {
     "title": "Network and Remote Access",
     "summary": "Hotspot, portal access, and remote support checklist.",
-    "filename": "BMI30_Network_and_Remote_Access.txt",
-    "content": """BMI30 Network and Remote Access\n\n1. Hotspot Access\n- Connect to BMI30 hotspot SSID.\n- Open the captive portal or navigate to /login manually.\n\n2. Portal Login\n- Use the configured user account for standard settings.\n- Use engineer account only for advanced service actions.\n\n3. HTTPS\n- Configure certificate and key paths for trusted browser access.\n- Enable HTTPS and optionally force HTTPS redirects in environment variables.\n\n4. Remote Support\n- Verify SSH and RDP target addresses from status page.\n- Share only approved credentials and rotate them periodically.\n""",
+    "filename": "BMI30_Network_and_Remote_Access.pdf",
+    "google_doc_id": "171lmgMctV8HfeChDzagbyibgGt0PfuEm3h6Lj2V1djo",
   },
 }
 
@@ -164,6 +171,67 @@ def format_web_url(ip: str, scheme: str) -> str:
 def with_rev(path: str) -> str:
     sep = "&" if "?" in path else "?"
     return f"{path}{sep}v={PAGE_REV}"
+
+
+def download_google_doc_pdf(google_doc_id: str, cache_path: pathlib.Path) -> bool:
+    """Скачивает PDF с Google Docs и сохраняет в кэш. Возвращает True если успешно."""
+    if not google_doc_id or not google_doc_id.strip():
+        return False
+    
+    try:
+        # Google Docs экспорт URL
+        export_url = f"https://docs.google.com/document/d/{google_doc_id}/export?format=pdf"
+        
+        # Загружаем PDF
+        with urlopen(export_url, timeout=30) as response:
+            pdf_data = response.read()
+        
+        # Проверяем что это действительно PDF
+        if not pdf_data.startswith(b"%PDF"):
+            return False
+        
+        # Сохраняем в кэш
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(pdf_data)
+        return True
+    except Exception as e:
+        # Логируем ошибку но не падаем
+        return False
+
+
+def get_pdf_data(doc_id: str) -> bytes | None:
+    """Получает PDF данные. Пытается загрузить если нет в кэше или устарело."""
+    if not doc_id:
+        return None
+    
+    cache_path = PDF_CACHE_DIR / f"{doc_id}.pdf"
+    
+    # Проверяем кэш
+    if cache_path.exists():
+        # Если кэш свежее чем UPDATE_INTERVAL, используем его
+        mtime = cache_path.stat().st_mtime
+        age_s = time.time() - mtime
+        if age_s < PDF_UPDATE_INTERVAL_S:
+            try:
+                return cache_path.read_bytes()
+            except Exception:
+                pass
+    
+    # Пытаемся загрузить новую версию
+    if download_google_doc_pdf(doc_id, cache_path):
+        try:
+            return cache_path.read_bytes()
+        except Exception:
+            pass
+    
+    # Если загрузка не удалась, используем старый кэш если есть
+    if cache_path.exists():
+        try:
+            return cache_path.read_bytes()
+        except Exception:
+            pass
+    
+    return None
 
 
 def _load_machine_id() -> bytes:
@@ -2106,9 +2174,22 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
         doc_tabs_parts.append(
             f'<button class="{tab_class}" type="button" data-doc-tab="{doc_id}" aria-selected="{tab_selected}">{html.escape(doc["title"])}</button>'
         )
+        # PDF viewer HTML для каждого документа
         doc_pages_parts.append(
             f'<article class="{page_class}" data-doc-page="{doc_id}">'
-            f'<pre class="doc-text">{html.escape(doc["content"])}</pre>'
+            f'  <div class="pdf-viewer" data-pdf-id="{doc_id}">'
+            f'    <div class="pdf-controls">'
+            f'      <button class="pdf-btn" data-action="prev-page" title="Previous page">← Prev</button>'
+            f'      <div class="pdf-page-nav">'
+            f'        <input type="number" class="pdf-page-input" min="1" value="1" data-doc="{doc_id}">'
+            f'        <span class="pdf-page-total">/—</span>'
+            f'      </div>'
+            f'      <button class="pdf-btn" data-action="next-page" title="Next page">Next →</button>'
+            f'    </div>'
+            f'    <div class="pdf-pages">'
+            f'      <canvas class="pdf-canvas" data-doc="{doc_id}"></canvas>'
+            f'    </div>'
+            f'  </div>'
             f'</article>'
         )
     doc_tabs = "\n".join(doc_tabs_parts)
@@ -2340,8 +2421,41 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       .summary-grid{{grid-template-columns:1fr}}
       .mode-grid,.fields{{grid-template-columns:1fr}}
     }}
+    /* PDF Viewer Styles */
+    .pdf-viewer{{display:flex;flex-direction:column;gap:12px;height:100%}}
+    .pdf-controls{{display:flex;align-items:center;justify-content:space-between;gap:10px;
+                    padding:10px;background:var(--input-bg);border:1px solid var(--line);border-radius:6px;
+                    flex-wrap:wrap}}
+    .pdf-btn{{padding:6px 12px;background:var(--accent-soft);border:1px solid var(--accent);color:var(--accent);
+              border-radius:5px;cursor:pointer;font-size:13px;font-weight:500;transition:all 0.2s ease;
+              white-space:nowrap}}
+    .pdf-btn:hover{{background:var(--accent);color:var(--bg);transform:translateY(-1px)}}
+    .pdf-btn:active{{transform:translateY(0);box-shadow:inset 0 1px 3px rgba(0,0,0,0.2)}}
+    .pdf-btn:disabled{{opacity:0.5;cursor:not-allowed;transform:none}}
+    .pdf-page-nav{{display:flex;align-items:center;gap:4px;justify-content:center}}
+    .pdf-page-input{{width:50px;padding:4px 6px;border:1px solid var(--line);border-radius:4px;
+                     background:var(--panel);color:var(--text);font-size:12px;text-align:center}}
+    .pdf-page-input:focus-visible{{outline:2px solid rgba(15,138,112,.24);border-color:var(--accent)}}
+    .pdf-page-total{{font-size:12px;color:var(--muted);min-width:40px;text-align:left}}
+    .pdf-pages{{flex:1;display:flex;justify-content:center;align-items:flex-start;overflow:auto;
+                background:var(--panel);border:1px solid var(--line);border-radius:8px;
+                padding:10px;min-height:400px}}
+    .pdf-canvas{{max-width:100%;max-height:100%;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,0.15);
+                 animation:pageFlip 0.3s ease-out}}
+    @keyframes pageFlip{{
+      from{{opacity:0;transform:rotateX(-10deg)}}
+      to{{opacity:1;transform:rotateX(0deg)}}
+    }}
+    @media (max-width:860px){{
+      .pdf-controls{{flex-direction:column;align-items:stretch}}
+      .pdf-btn{{width:100%;text-align:center}}
+      .pdf-page-nav{{justify-content:center;margin:8px 0}}
+      .pdf-pages{{min-height:300px}}
+    }}
   </style>
 {render_debug_style_css()}
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.js"></script>
+  <script>pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.js';</script>
 </head>
 <body>
   <main class="panel">
@@ -2557,10 +2671,191 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       setDocPage(docTabs[0].dataset.docTab || 'operation');
     }}
   </script>
+  <script>
+    // PDF Viewer initialization
+    (function() {{
+      var pdfStates = {{}};
+      var docOrder = ['operation', 'safety', 'network'];
+      
+      // Инициализация для каждого документа
+      function initPdfViewer(docId) {{
+        if (!pdfStates[docId]) {{
+          pdfStates[docId] = {{
+            pdf: null,
+            currentPage: 1,
+            totalPages: 0,
+            rendering: false,
+            canvas: null,
+            ctx: null
+          }};
+        }}
+        
+        var state = pdfStates[docId];
+        var viewer = document.querySelector('[data-pdf-id="' + docId + '"]');
+        if (!viewer) return;
+        
+        state.canvas = viewer.querySelector('.pdf-canvas');
+        if (!state.canvas) return;
+        
+        state.ctx = state.canvas.getContext('2d');
+        
+        // Загружаем PDF
+        loadPdf(docId);
+        
+        // Инициализируем контролы
+        var prevBtn = viewer.querySelector('[data-action="prev-page"]');
+        var nextBtn = viewer.querySelector('[data-action="next-page"]');
+        var pageInput = viewer.querySelector('.pdf-page-input');
+        
+        if (prevBtn) {{
+          prevBtn.addEventListener('click', function() {{ 
+            if (state.currentPage > 1) {{
+              state.currentPage--;
+              updatePageDisplay(docId);
+            }}
+          }});
+        }}
+        
+        if (nextBtn) {{
+          nextBtn.addEventListener('click', function() {{ 
+            if (state.currentPage < state.totalPages) {{
+              state.currentPage++;
+              updatePageDisplay(docId);
+            }}
+          }});
+        }}
+        
+        if (pageInput) {{
+          pageInput.addEventListener('change', function() {{
+            var page = parseInt(pageInput.value) || 1;
+            page = Math.max(1, Math.min(page, state.totalPages));
+            state.currentPage = page;
+            updatePageDisplay(docId);
+          }});
+        }}
+      }}
+      
+      function loadPdf(docId) {{
+        fetch('/portal-pdf?doc=' + encodeURIComponent(docId))
+          .then(function(response) {{ 
+            if (!response.ok) throw new Error('PDF not found');
+            return response.arrayBuffer();
+          }})
+          .then(function(arrayBuffer) {{
+            return pdfjsLib.getDocument({{data: arrayBuffer}}).promise;
+          }})
+          .then(function(pdf) {{
+            pdfStates[docId].pdf = pdf;
+            pdfStates[docId].totalPages = pdf.numPages;
+            
+            var viewer = document.querySelector('[data-pdf-id="' + docId + '"]');
+            var total = viewer.querySelector('.pdf-page-total');
+            if (total) {{
+              total.textContent = '/' + pdf.numPages;
+            }}
+            
+            renderPage(docId, 1);
+          }})
+          .catch(function(err) {{
+            console.error('PDF load error:', err);
+          }});
+      }}
+      
+      function renderPage(docId, pageNum) {{
+        var state = pdfStates[docId];
+        if (!state.pdf || pageNum < 1 || pageNum > state.totalPages) return;
+        
+        state.rendering = true;
+        state.pdf.getPage(pageNum).then(function(page) {{
+          var viewport = page.getViewport({{scale: 2}});
+          state.canvas.width = viewport.width;
+          state.canvas.height = viewport.height;
+          
+          var renderCtx = {{
+            canvasContext: state.ctx,
+            viewport: viewport
+          }};
+          
+          page.render(renderCtx).promise.then(function() {{
+            state.rendering = false;
+          }}).catch(function() {{
+            state.rendering = false;
+          }});
+        }});
+      }}
+      
+      function updatePageDisplay(docId) {{
+        var state = pdfStates[docId];
+        var viewer = document.querySelector('[data-pdf-id="' + docId + '"]');
+        var pageInput = viewer.querySelector('.pdf-page-input');
+        
+        if (pageInput) {{
+          pageInput.value = state.currentPage;
+        }}
+        
+        var prevBtn = viewer.querySelector('[data-action="prev-page"]');
+        var nextBtn = viewer.querySelector('[data-action="next-page"]');
+        
+        if (prevBtn) {{
+          prevBtn.disabled = state.currentPage <= 1;
+        }}
+        if (nextBtn) {{
+          nextBtn.disabled = state.currentPage >= state.totalPages;
+        }}
+        
+        renderPage(docId, state.currentPage);
+      }}
+      
+      // Инициализируем все документы
+      docOrder.forEach(function(docId) {{
+        initPdfViewer(docId);
+      }});
+      
+      // Переинициализируем при смене вкладки
+      var docTabs = Array.prototype.slice.call(document.querySelectorAll('.doc-tab'));
+      docTabs.forEach(function(tab) {{
+        tab.addEventListener('click', function() {{
+          var docId = tab.dataset.docTab;
+          window.setTimeout(function() {{
+            var viewer = document.querySelector('[data-pdf-id="' + docId + '"]');
+            if (viewer && viewer.closest('.doc-page.is-active')) {{
+              updatePageDisplay(docId);
+            }}
+          }}, 50);
+        }});
+      }});
+    }})();
+  </script>
 </body>
 </html>
 """
     return body.encode("utf-8")
+
+
+# Глобальная переменная для отслеживания последнего обновления PDF
+_pdf_last_update_ts: dict[str, float] = {}
+
+
+def update_pdf_documents_background() -> None:
+    """Фоновое обновление PDF документов с Google Docs."""
+    while True:
+        try:
+            time.sleep(PDF_UPDATE_INTERVAL_S)
+            
+            # Обновляем каждый документ
+            for doc_id, doc_info in PORTAL_DOCUMENTS.items():
+                google_doc_id = doc_info.get("google_doc_id", "").strip()
+                if not google_doc_id:
+                    continue
+                
+                cache_path = PDF_CACHE_DIR / f"{google_doc_id}.pdf"
+                try:
+                    download_google_doc_pdf(google_doc_id, cache_path)
+                    _pdf_last_update_ts[doc_id] = time.time()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 class HotspotInfoHandler(BaseHTTPRequestHandler):
@@ -2767,6 +3062,50 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
                 self.wfile.write(payload)
             return
 
+        # PDF для портала
+        if path == "/portal-pdf":
+            session = self._get_portal_session()
+            if session is None:
+                self.send_response(HTTPStatus.UNAUTHORIZED)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(b"Not authorized")
+                return
+            query = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            doc_key = query.get("doc", [""])[0].strip().lower()
+            doc = PORTAL_DOCUMENTS.get(doc_key)
+            if doc is None:
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(b"PDF not found")
+                return
+            
+            google_doc_id = doc.get("google_doc_id", "").strip()
+            if not google_doc_id:
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.end_headers()
+                return
+            
+            pdf_data = get_pdf_data(google_doc_id)
+            if pdf_data is None:
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(b"PDF temporarily unavailable")
+                return
+            
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Cache-Control", "max-age=3600, public")
+            self.send_header("Content-Length", str(len(pdf_data)))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(pdf_data)
+            return
+
         if path == "/portal-doc-download":
             session = self._get_portal_session()
             if session is None:
@@ -2786,15 +3125,34 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
                 if send_body:
                     self.wfile.write(b"Documentation file not found.")
                 return
-            payload = doc["content"].encode("utf-8")
+            
+            # Теперь скачиваем PDF вместо текста
+            google_doc_id = doc.get("google_doc_id", "").strip()
+            if not google_doc_id:
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(b"PDF not configured")
+                return
+            
+            pdf_data = get_pdf_data(google_doc_id)
+            if pdf_data is None:
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(b"PDF temporarily unavailable")
+                return
+            
             self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Type", "application/pdf")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Disposition", f'attachment; filename="{doc["filename"]}"')
-            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Length", str(len(pdf_data)))
             self.end_headers()
             if send_body:
-                self.wfile.write(payload)
+                self.wfile.write(pdf_data)
             return
 
         # Connectivity-probe.
@@ -2947,6 +3305,10 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     global HTTPS_RUNTIME_ENABLED
+
+    # Запускаем фоновый процесс обновления PDF документов
+    pdf_update_thread = threading.Thread(target=update_pdf_documents_background, daemon=True)
+    pdf_update_thread.start()
 
     http_server = ThreadingHTTPServer(("0.0.0.0", PORT), HotspotInfoHandler)
 
