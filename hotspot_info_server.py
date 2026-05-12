@@ -2191,7 +2191,11 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             f'        <span class="pdf-page-total">/—</span>'
             f'      </div>'
             f'      <button class="pdf-btn" data-action="next-page" title="Next page">Next →</button>'
-          f'      <button class="pdf-update-btn" data-action="apply-update" data-doc="{doc_id}" hidden>Доступна новая версия</button>'
+            f'      <div class="pdf-actions">'
+            f'        <a class="pdf-btn pdf-dl-btn" href="/portal-doc-download?doc={doc_id}">↓ PDF</a>'
+            f'        <button class="pdf-update-btn" data-action="apply-update" data-doc="{doc_id}" hidden>↑ Обновить</button>'
+            f'        <span class="pdf-check-status" data-doc-status="{doc_id}"></span>'
+            f'      </div>'
             f'    </div>'
             f'    <div class="pdf-pages">'
             f'      <canvas class="pdf-canvas" data-doc="{doc_id}"></canvas>'
@@ -2202,7 +2206,6 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     doc_tabs = "\n".join(doc_tabs_parts)
     doc_pages = "\n".join(doc_pages_parts)
     first_doc = doc_order[0]
-    first_doc_title = html.escape(PORTAL_DOCUMENTS[first_doc]["title"])
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -2441,21 +2444,23 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     .pdf-controls-spacer{{display:none;height:0}}
     .pdf-controls-spacer.is-visible{{display:block}}
     .pdf-controls.is-fixed{{position:fixed;z-index:48;top:var(--pdf-controls-top,10px)}}
-    .pdf-btn{{padding:10px 14px;min-height:42px;background:color-mix(in srgb, var(--accent-soft) 72%, transparent);border:1px solid var(--accent);color:var(--accent);
-              border-radius:5px;cursor:pointer;font-size:13px;font-weight:500;transition:all 0.2s ease;
-              white-space:nowrap}}
+    .pdf-btn{{padding:4px 10px;min-height:28px;background:color-mix(in srgb, var(--accent-soft) 72%, transparent);border:1px solid var(--accent);color:var(--accent);
+              border-radius:5px;cursor:pointer;font-size:12px;font-weight:500;transition:all 0.2s ease;
+              white-space:nowrap;text-decoration:none;display:inline-flex;align-items:center}}
     .pdf-btn:hover{{background:var(--accent);color:var(--bg);transform:translateY(-1px)}}
     .pdf-btn:active{{transform:translateY(0);box-shadow:inset 0 1px 3px rgba(0,0,0,0.2)}}
     .pdf-btn:disabled{{opacity:0.5;cursor:not-allowed;transform:none}}
-    .pdf-update-btn{{padding:8px 12px;min-height:38px;border-radius:999px;border:1px solid var(--accent);
+    .pdf-actions{{display:flex;align-items:center;gap:6px;flex-shrink:0}}
+    .pdf-update-btn{{padding:4px 10px;min-height:28px;border-radius:999px;border:1px solid var(--accent);
              background:color-mix(in srgb, var(--accent-soft) 78%, transparent);color:var(--accent);
              font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap;
              transition:opacity .16s ease,transform .16s ease,background .16s ease}}
     .pdf-update-btn:hover{{background:var(--accent-soft);transform:translateY(-1px)}}
     .pdf-update-btn[hidden]{{display:none !important}}
     .pdf-update-btn.is-loading{{opacity:.7;cursor:wait}}
+    .pdf-check-status{{font-size:11px;color:var(--muted);white-space:nowrap;opacity:.75}}
     .pdf-page-nav{{display:flex;align-items:center;gap:6px;justify-content:center}}
-    .pdf-page-input{{width:60px;min-height:38px;padding:6px 8px;border:1px solid var(--line);border-radius:4px;
+    .pdf-page-input{{width:52px;min-height:28px;padding:3px 6px;border:1px solid var(--line);border-radius:4px;
                      background:var(--panel);color:var(--text);font-size:12px;text-align:center}}
     .pdf-page-input:focus-visible{{outline:2px solid rgba(15,138,112,.24);border-color:var(--accent)}}
     .pdf-page-total{{font-size:12px;color:var(--muted);min-width:40px;text-align:left}}
@@ -2620,11 +2625,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
           <div class="doc-reader">
             {doc_pages}
           </div>
-          <div class="actions actions-inline doc-downloads">
-            <span class="subtle">Selected for download:</span>
-            <strong id="doc-selected-title">{first_doc_title}</strong>
-            <a id="doc-download-link" class="link link-secondary" href="/portal-doc-download?doc={first_doc}">Download Selected Document (TXT)</a>
-          </div>
+
         </section>
         <section class="portal-panel" id="panel-about">
           <h2>About Device</h2>
@@ -2683,15 +2684,6 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       docPages.forEach(function (page) {{
         page.classList.toggle('is-active', page.dataset.docPage === name);
       }});
-      var downloadLink = document.getElementById('doc-download-link');
-      var selectedTitle = document.getElementById('doc-selected-title');
-      if (downloadLink) {{
-        downloadLink.setAttribute('href', '/portal-doc-download?doc=' + encodeURIComponent(name));
-      }}
-      if (selectedTitle) {{
-        var activeTab = docTabs.find(function (tab) {{ return tab.dataset.docTab === name; }});
-        selectedTitle.textContent = activeTab ? activeTab.textContent : name;
-      }}
     }}
     docTabs.forEach(function (tab) {{
       tab.addEventListener('click', function () {{
@@ -2858,14 +2850,22 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             var viewer = document.querySelector('[data-pdf-id="' + docId + '"]');
             if (!viewer) {{ return; }}
             var btn = viewer.querySelector('[data-action="apply-update"]');
-            if (!btn) {{ return; }}
-            if (data && data.updateAvailable) {{
-              btn.hidden = false;
-            }} else {{
-              btn.hidden = true;
+            var statusEl = document.querySelector('[data-doc-status="' + docId + '"]');
+            if (btn) {{
+              btn.hidden = !(data && data.updateAvailable);
+            }}
+            if (statusEl) {{
+              if (data && !data.online) {{
+                statusEl.textContent = 'Нет интернета';
+              }} else {{
+                statusEl.textContent = 'Проверено только что';
+              }}
             }}
           }})
-          .catch(function() {{}});
+          .catch(function() {{
+            var statusEl = document.querySelector('[data-doc-status="' + docId + '"]');
+            if (statusEl) {{ statusEl.textContent = 'Ошибка проверки'; }}
+          }});
       }}
 
       function refreshPdfFromServer(docId, button) {{
