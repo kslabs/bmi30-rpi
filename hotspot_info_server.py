@@ -2426,24 +2426,28 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       .mode-grid,.fields{{grid-template-columns:1fr}}
     }}
     /* PDF Viewer Styles */
-    .pdf-viewer{{display:flex;flex-direction:column;gap:12px;height:100%}}
+    .pdf-viewer{{display:flex;flex-direction:column;gap:10px;height:100%;position:relative}}
     .pdf-controls{{display:flex;align-items:center;justify-content:space-between;gap:10px;
-                    padding:10px;background:var(--input-bg);border:1px solid var(--line);border-radius:6px;
-                    flex-wrap:wrap}}
-    .pdf-btn{{padding:6px 12px;background:var(--accent-soft);border:1px solid var(--accent);color:var(--accent);
+            position:sticky;top:8px;z-index:6;
+            padding:8px 10px;background:color-mix(in srgb, var(--panel) 62%, transparent);
+            border:1px solid color-mix(in srgb, var(--line) 70%, transparent);border-radius:8px;
+            backdrop-filter:blur(8px) saturate(1.06);-webkit-backdrop-filter:blur(8px) saturate(1.06);
+            box-shadow:0 6px 16px rgba(0,0,0,.12);
+            flex-wrap:wrap}}
+    .pdf-btn{{padding:10px 14px;min-height:42px;background:color-mix(in srgb, var(--accent-soft) 72%, transparent);border:1px solid var(--accent);color:var(--accent);
               border-radius:5px;cursor:pointer;font-size:13px;font-weight:500;transition:all 0.2s ease;
               white-space:nowrap}}
     .pdf-btn:hover{{background:var(--accent);color:var(--bg);transform:translateY(-1px)}}
     .pdf-btn:active{{transform:translateY(0);box-shadow:inset 0 1px 3px rgba(0,0,0,0.2)}}
     .pdf-btn:disabled{{opacity:0.5;cursor:not-allowed;transform:none}}
-    .pdf-page-nav{{display:flex;align-items:center;gap:4px;justify-content:center}}
-    .pdf-page-input{{width:50px;padding:4px 6px;border:1px solid var(--line);border-radius:4px;
+    .pdf-page-nav{{display:flex;align-items:center;gap:6px;justify-content:center}}
+    .pdf-page-input{{width:60px;min-height:38px;padding:6px 8px;border:1px solid var(--line);border-radius:4px;
                      background:var(--panel);color:var(--text);font-size:12px;text-align:center}}
     .pdf-page-input:focus-visible{{outline:2px solid rgba(15,138,112,.24);border-color:var(--accent)}}
     .pdf-page-total{{font-size:12px;color:var(--muted);min-width:40px;text-align:left}}
     .pdf-pages{{flex:1;display:flex;justify-content:center;align-items:flex-start;overflow:auto;
                 background:var(--panel);border:1px solid var(--line);border-radius:8px;
-                padding:10px;min-height:400px}}
+          padding:10px;min-height:400px;max-height:min(74vh,860px)}}
     .pdf-canvas{{max-width:100%;max-height:100%;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,0.15);
                  animation:pageFlip 0.3s ease-out}}
     @keyframes pageFlip{{
@@ -2451,7 +2455,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       to{{opacity:1;transform:rotateX(0deg)}}
     }}
     @media (max-width:860px){{
-      .pdf-controls{{flex-direction:column;align-items:stretch}}
+      .pdf-controls{{flex-direction:column;align-items:stretch;top:6px}}
       .pdf-btn{{width:100%;text-align:center}}
       .pdf-page-nav{{justify-content:center;margin:8px 0}}
       .pdf-pages{{min-height:300px}}
