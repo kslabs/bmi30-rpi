@@ -2413,29 +2413,31 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     .doc-downloads{{margin-top:12px;align-items:center}}
     .doc-downloads .subtle{{margin-right:2px}}
     @media (max-width:860px){{
-      body{{place-items:start center}}
-      .panel{{padding:10px 8px}}
-      .portal-shell{{grid-template-columns:1fr}}
-      .portal-menu{{position:sticky;top:0;z-index:20;display:flex;overflow-x:auto;padding:8px 0 10px;
-                    margin:0 -8px 6px;
-                    padding-left:8px;padding-right:8px;
+      body{{place-items:start center;padding:0}}
+      .panel{{padding:6px 2px;border-radius:0;border-left:none;border-right:none;width:100%;box-shadow:none}}
+      .portal-head{{margin-bottom:10px;padding:0 6px}}
+      .portal-shell{{grid-template-columns:1fr;gap:6px}}
+      .portal-menu{{position:sticky;top:0;z-index:20;display:flex;overflow-x:auto;padding:6px 0 8px;
+                    margin:0 -2px 4px;
+                    padding-left:6px;padding-right:6px;
                     scroll-snap-type:x proximity;background:var(--panel);
                     border-top:1px solid var(--line);border-bottom:1px solid var(--line);
                     box-shadow:var(--panel-shadow);
                     backdrop-filter:blur(18px) saturate(1.18);-webkit-backdrop-filter:blur(18px) saturate(1.18)}}
       .menu-btn{{width:auto;min-width:178px;flex:0 0 auto;scroll-snap-align:start;white-space:normal}}
-      .doc-tab{{width:auto;min-width:180px;flex:0 0 auto;margin-right:-6px}}
-      .doc-reader{{border-radius:0 8px 8px 8px;padding:6px 4px}}
-      .pdf-controls{{flex-wrap:wrap;gap:6px;padding:6px 8px}}
+      .doc-tabs{{padding:0 2px}}
+      .doc-tab{{width:auto;min-width:160px;flex:0 0 auto;margin-right:-6px}}
+      .doc-reader{{border-radius:0 6px 6px 6px;padding:4px 2px}}
+      .pdf-controls{{flex-wrap:wrap;gap:5px;padding:5px 6px}}
       .pdf-page-nav{{flex:0 0 auto;order:0}}
       .pdf-actions{{flex:0 0 auto;order:1;gap:4px}}
-      .pdf-pages{{min-height:200px;padding:4px;margin-top:4px;border-radius:4px}}
+      .pdf-pages{{min-height:160px;padding:2px;margin-top:3px;border-radius:3px}}
       html[data-ui-style="neumorph"] .menu-btn{{box-shadow:4px 4px 8px var(--neumo-lo),-4px -4px 8px var(--neumo-hi)}}
       html[data-ui-style="neumorph"] .menu-btn:hover{{box-shadow:5px 5px 10px var(--neumo-lo),-5px -5px 10px var(--neumo-hi)}}
       html[data-ui-style="neumorph"] .menu-btn[aria-selected="true"]{{box-shadow:inset 4px 4px 8px var(--neumo-lo),inset -4px -4px 8px var(--neumo-hi)}}
       .summary-grid{{grid-template-columns:1fr}}
       .mode-grid,.fields{{grid-template-columns:1fr}}
-      .scroll-top-btn{{right:12px;bottom:12px}}
+      .scroll-top-btn{{right:8px;bottom:8px}}
     }}
     .pdf-viewer{{display:block;position:relative}}
         .pdf-controls{{display:flex;align-items:center;justify-content:space-between;gap:10px;
