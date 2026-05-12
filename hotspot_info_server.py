@@ -2487,9 +2487,6 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             <div class="summary-item"><h3>Host</h3><div class="metric"><span>Software</span><strong>BMI30 Portal</strong></div><div class="metric"><span>Role</span><strong>{access_label}</strong></div></div>
           </div>
         </section>
-        <p id="portal-security-note" class="security-note">
-          <strong>Local device page.</strong> Your browser may show "Not secure" here until HTTPS with a trusted certificate is configured.
-        </p>
         <div class="actions">
           <a class="link" href="/portal-logout">Sign Out</a>
           <a class="link link-secondary" href="/login">Connection Info</a>
@@ -2558,10 +2555,6 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     }});
     if (docTabs.length) {{
       setDocPage(docTabs[0].dataset.docTab || 'operation');
-    }}
-    var portalSecurityNote = document.getElementById('portal-security-note');
-    if (portalSecurityNote && window.location.protocol !== 'https:') {{
-      portalSecurityNote.style.display = 'block';
     }}
   </script>
 </body>
