@@ -726,10 +726,11 @@ def render_debug_style_css() -> str:
     html[data-ui-style="crystal"] .menu-btn[aria-selected="true"],
     html[data-ui-style="crystal"] .mode-option:has(input:checked),
     html[data-ui-style="crystal"] .debug-option[aria-pressed="true"]{
-      background:linear-gradient(135deg,rgba(15,118,110,.12),rgba(15,118,110,.06) 60%);
-      border-color:rgba(15,118,110,.35);
+      background:linear-gradient(135deg,rgba(15,118,110,.18),rgba(15,118,110,.10) 60%);
+      border-color:rgba(15,118,110,.42);
       color:var(--text);
-      box-shadow:0 0 0 1px rgba(15,118,110,.35),0 4px 12px rgba(15,118,110,.12),inset 0 1px 1px rgba(255,255,255,.80),inset 0 -8px 16px rgba(15,118,110,.06);
+      transform:translateY(1px);
+      box-shadow:0 0 0 1px rgba(15,118,110,.42),inset 0 3px 8px rgba(15,118,110,.18),inset 0 1px 3px rgba(0,0,0,.08);
     }
     html[data-ui-style="crystal"] .sbtn{
       background:linear-gradient(135deg,rgba(255,255,255,.70),rgba(255,255,255,.40) 60%,rgba(255,255,255,.62)),linear-gradient(180deg,#0f766e 0%,#0d6b63 100%);
@@ -813,10 +814,10 @@ def render_debug_style_css() -> str:
     }
     html[data-ui-style="crystal"][data-theme-mode="dark"] .menu-btn[aria-selected="true"]{
       color:#38bdf8;
-      border-color:#38bdf8;
-      background:linear-gradient(135deg,rgba(56,189,248,.28),rgba(14,165,233,.14) 60%,rgba(56,189,248,.20));
-      box-shadow:0 0 0 2px rgba(56,189,248,.70),0 8px 20px rgba(14,116,144,.40),inset 0 1px 1px rgba(186,230,253,.22);
-      transform:translateY(-1px);
+      border-color:rgba(56,189,248,.55);
+      background:linear-gradient(135deg,rgba(14,165,233,.20),rgba(56,189,248,.10) 60%,rgba(14,165,233,.16));
+      box-shadow:0 0 0 1px rgba(56,189,248,.50),inset 0 3px 8px rgba(14,116,144,.40),inset 0 1px 3px rgba(0,0,0,.30);
+      transform:translateY(1px);
     }
     html[data-ui-style="crystal"][data-theme-mode="dark"] .sbtn{
       background:linear-gradient(135deg,rgba(226,232,240,.15),rgba(226,232,240,.05) 60%,rgba(226,232,240,.10)),linear-gradient(180deg,#14b8a6 0%,#0d9488 100%);
@@ -981,6 +982,7 @@ def render_debug_style_css() -> str:
       color:var(--accent-2);
       background:var(--panel);
       border:0;
+      transform:translateY(1px);
       box-shadow:inset 6px 6px 12px var(--neumo-lo),inset -6px -6px 12px var(--neumo-hi);
     }
     html[data-ui-style="neumorph"] .fld input,
@@ -1137,10 +1139,11 @@ def render_debug_style_css() -> str:
     html[data-ui-style="warm"] .menu-btn[aria-selected="true"],
     html[data-ui-style="warm"] .mode-option:has(input:checked),
     html[data-ui-style="warm"] .debug-option[aria-pressed="true"]{
-      background:linear-gradient(135deg,rgba(180,83,9,.12),rgba(180,83,9,.06) 60%);
-      border-color:rgba(180,83,9,.32);
+      background:linear-gradient(135deg,rgba(180,83,9,.18),rgba(180,83,9,.10) 60%);
+      border-color:rgba(180,83,9,.40);
       color:var(--text);
-      box-shadow:0 0 0 1px rgba(180,83,9,.32),0 4px 12px rgba(180,83,9,.10),inset 0 1px 1px rgba(255,250,247,.80),inset 0 -8px 16px rgba(180,83,9,.05);
+      transform:translateY(1px);
+      box-shadow:0 0 0 1px rgba(180,83,9,.40),inset 0 3px 8px rgba(180,83,9,.18),inset 0 1px 3px rgba(61,40,23,.10);
     }
     html[data-ui-style="warm"] .sbtn{
       background:linear-gradient(135deg,rgba(255,250,247,.76),rgba(255,250,247,.46) 60%,rgba(255,250,247,.68)),linear-gradient(180deg,#b45309 0%,#a16207 100%);
@@ -1224,10 +1227,10 @@ def render_debug_style_css() -> str:
     }
     html[data-ui-style="warm"][data-theme-mode="dark"] .menu-btn[aria-selected="true"]{
       color:#fbbf24;
-      border-color:#fbbf24;
-      background:linear-gradient(135deg,rgba(251,191,36,.30),rgba(245,158,11,.16) 60%,rgba(251,191,36,.22));
-      box-shadow:0 0 0 2px rgba(251,191,36,.68),0 8px 20px rgba(180,83,9,.44),inset 0 1px 1px rgba(254,240,138,.20);
-      transform:translateY(-1px);
+      border-color:rgba(251,191,36,.55);
+      background:linear-gradient(135deg,rgba(245,158,11,.22),rgba(251,191,36,.10) 60%,rgba(245,158,11,.18));
+      box-shadow:0 0 0 1px rgba(251,191,36,.50),inset 0 3px 8px rgba(180,83,9,.38),inset 0 1px 3px rgba(0,0,0,.32);
+      transform:translateY(1px);
     }
     html[data-ui-style="warm"][data-theme-mode="dark"] .sbtn{
       background:linear-gradient(135deg,rgba(243,237,228,.12),rgba(243,237,228,.04) 60%,rgba(243,237,228,.08)),linear-gradient(180deg,#fbbf24 0%,#f59e0b 100%);
@@ -1281,10 +1284,10 @@ def render_debug_style_css() -> str:
     @media (prefers-color-scheme:dark){
       html[data-ui-style="crystal"][data-theme-mode="auto"] .debug-option{opacity:.55}
       html[data-ui-style="crystal"][data-theme-mode="auto"] .debug-option[aria-pressed="true"]{opacity:1;color:#38bdf8!important;border-color:#38bdf8!important;background:rgba(56,189,248,.22)!important;transform:translateY(-2px);box-shadow:0 0 0 2px #38bdf8,0 8px 20px rgba(56,189,248,.35)!important}
-      html[data-ui-style="crystal"][data-theme-mode="auto"] .menu-btn[aria-selected="true"]{color:#38bdf8;border-color:#38bdf8;background:linear-gradient(135deg,rgba(56,189,248,.28),rgba(14,165,233,.14) 60%,rgba(56,189,248,.20));box-shadow:0 0 0 2px rgba(56,189,248,.70),0 8px 20px rgba(14,116,144,.40),inset 0 1px 1px rgba(186,230,253,.22);transform:translateY(-1px)}
+      html[data-ui-style="crystal"][data-theme-mode="auto"] .menu-btn[aria-selected="true"]{color:#38bdf8;border-color:rgba(56,189,248,.55);background:linear-gradient(135deg,rgba(14,165,233,.20),rgba(56,189,248,.10) 60%,rgba(14,165,233,.16));box-shadow:0 0 0 1px rgba(56,189,248,.50),inset 0 3px 8px rgba(14,116,144,.40),inset 0 1px 3px rgba(0,0,0,.30);transform:translateY(1px)}
       html[data-ui-style="warm"][data-theme-mode="auto"] .debug-option{opacity:.55}
       html[data-ui-style="warm"][data-theme-mode="auto"] .debug-option[aria-pressed="true"]{opacity:1;color:#fbbf24!important;border-color:#fbbf24!important;background:rgba(251,191,36,.22)!important;transform:translateY(-2px);box-shadow:0 0 0 2px #fbbf24,0 8px 20px rgba(251,191,36,.35)!important}
-      html[data-ui-style="warm"][data-theme-mode="auto"] .menu-btn[aria-selected="true"]{color:#fbbf24;border-color:#fbbf24;background:linear-gradient(135deg,rgba(251,191,36,.30),rgba(245,158,11,.16) 60%,rgba(251,191,36,.22));box-shadow:0 0 0 2px rgba(251,191,36,.68),0 8px 20px rgba(180,83,9,.44),inset 0 1px 1px rgba(254,240,138,.20);transform:translateY(-1px)}
+      html[data-ui-style="warm"][data-theme-mode="auto"] .menu-btn[aria-selected="true"]{color:#fbbf24;border-color:rgba(251,191,36,.55);background:linear-gradient(135deg,rgba(245,158,11,.22),rgba(251,191,36,.10) 60%,rgba(245,158,11,.18));box-shadow:0 0 0 1px rgba(251,191,36,.50),inset 0 3px 8px rgba(180,83,9,.38),inset 0 1px 3px rgba(0,0,0,.32);transform:translateY(1px)}
     }
     .debug-note{font-size:12px;line-height:1.5;color:var(--muted)}
     @media (max-width:640px){
@@ -2159,7 +2162,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
                color:var(--text);font:inherit;font-weight:700;text-align:left;padding:10px 12px;cursor:pointer;
                display:flex;align-items:center;gap:10px;transition:background-color .14s ease,border-color .14s ease,transform .14s ease}}
     .menu-btn:hover{{background:var(--accent-soft);border-color:var(--accent)}}
-    .menu-btn[aria-selected="true"]{{background:var(--accent-soft);border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}}
+    .menu-btn[aria-selected="true"]{{background:var(--accent-soft);border-color:var(--accent);transform:translateY(1px);box-shadow:inset 0 2px 6px rgba(0,0,0,.12),inset 0 0 0 1px var(--accent)}}
     .menu-index{{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;
                  background:var(--panel);border:1px solid var(--line);font-size:12px;color:var(--accent);flex:0 0 auto}}
     .portal-content{{min-width:0}}
