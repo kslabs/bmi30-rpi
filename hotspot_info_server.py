@@ -2693,14 +2693,15 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     function updatePdfControlsOffset() {{
       var controls = Array.prototype.slice.call(document.querySelectorAll('.pdf-controls'));
       if (!controls.length) {{ return; }}
-      var topPx = 10;
+      var topPx = 8;
       var menu = document.querySelector('.portal-menu');
-      if (menu) {{
+      var isMobileMenu = window.matchMedia('(max-width: 860px)').matches;
+      if (menu && isMobileMenu) {{
         var menuStyle = window.getComputedStyle(menu);
         if (menuStyle.position === 'sticky') {{
           var rect = menu.getBoundingClientRect();
           if (rect.bottom > 0 && rect.top < window.innerHeight) {{
-            topPx = Math.max(10, Math.round(rect.bottom + 8));
+            topPx = Math.max(8, Math.round(rect.bottom + 6));
           }}
         }}
       }}
