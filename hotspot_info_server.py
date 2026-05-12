@@ -2502,6 +2502,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
         <button class="menu-btn" type="button" data-panel="statistics" aria-selected="false"><span class="menu-index">7</span>Statistics</button>
         <button class="menu-btn" type="button" data-panel="documentation" aria-selected="false"><span class="menu-index">8</span>Documentation</button>
         <button class="menu-btn" type="button" data-panel="about" aria-selected="false"><span class="menu-index">9</span>About Device</button>
+        <a class="menu-btn" href="/portal-logout" aria-label="Sign Out">Sign Out</a>
       </nav>
       <div class="portal-content">
         <section class="portal-panel is-active" id="panel-antenna">
@@ -2624,10 +2625,6 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             <div class="summary-item"><h3>Host</h3><div class="metric"><span>Software</span><strong>BMI30 Portal</strong></div><div class="metric"><span>Role</span><strong>{access_label}</strong></div></div>
           </div>
         </section>
-        <div class="actions">
-          <a class="link" href="/portal-logout">Sign Out</a>
-          <a class="link link-secondary" href="/login">Connection Info</a>
-        </div>
       </div>
     </div>
   </main>
@@ -2635,7 +2632,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
   {render_debug_panel()}
   {render_debug_panel_script()}
   <script>
-    var menuButtons = Array.prototype.slice.call(document.querySelectorAll('.menu-btn'));
+    var menuButtons = Array.prototype.slice.call(document.querySelectorAll('.menu-btn[data-panel]'));
     var panels = Array.prototype.slice.call(document.querySelectorAll('.portal-panel'));
     function setActivePanel(name, updateHash) {{
       var found = panels.some(function (panel) {{ return panel.id === 'panel-' + name; }});
