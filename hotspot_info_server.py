@@ -127,6 +127,28 @@ DEFAULT_DC_CONFIG: dict[str, Any] = {
     "fast_duration_s": 30.0,
 }
 
+PORTAL_DOCUMENTS: dict[str, dict[str, str]] = {
+  "operation": {
+    "title": "Operation Guide",
+    "summary": "Daily startup, checks, and shutdown sequence for BMI30.",
+    "filename": "BMI30_Operation_Guide.txt",
+    "content": """BMI30 Operation Guide\n\n1. Startup\n- Power on the host and BMI30 reader.\n- Wait until the portal is reachable.\n- Open /portal and verify Antenna Status values are updating.\n\n2. Detection Run\n- Open Tag Detection and confirm expected tag profile.\n- Open Operating Mode and check runtime profile.\n- Keep DC mode in WORK or DETECT depending on scenario.\n\n3. During Operation\n- Monitor Noise, Signal, and Temperature trends.\n- If live apply fails, verify USB connection and retry from DC Compensation panel.\n- Record abnormal spikes in Statistics section.\n\n4. Shutdown\n- Stop active test sequence from host tools.\n- Save required configuration changes.\n- Power down the reader only after host process is stopped.\n""",
+  },
+  "safety": {
+    "title": "Safety and Service Notes",
+    "summary": "Safety checklist and service handling recommendations.",
+    "filename": "BMI30_Safety_and_Service_Notes.txt",
+    "content": """BMI30 Safety and Service Notes\n\n1. Electrical Safety\n- Use only approved power supplies and USB cables.\n- Do not connect/disconnect cables under unstable power conditions.\n\n2. Environment\n- Keep the unit dry and protected from condensation.\n- Avoid direct heat sources and strong vibration.\n\n3. Service\n- Before firmware or host updates, make a backup of configuration files.\n- After updates, run quick validation (antenna stream, detection, DC apply).\n\n4. Incident Handling\n- If service does not start, check systemd status and journal logs.\n- If USB link is unstable, inspect connectors and restart host service.
+""",
+  },
+  "network": {
+    "title": "Network and Remote Access",
+    "summary": "Hotspot, portal access, and remote support checklist.",
+    "filename": "BMI30_Network_and_Remote_Access.txt",
+    "content": """BMI30 Network and Remote Access\n\n1. Hotspot Access\n- Connect to BMI30 hotspot SSID.\n- Open the captive portal or navigate to /login manually.\n\n2. Portal Login\n- Use the configured user account for standard settings.\n- Use engineer account only for advanced service actions.\n\n3. HTTPS\n- Configure certificate and key paths for trusted browser access.\n- Enable HTTPS and optionally force HTTPS redirects in environment variables.\n\n4. Remote Support\n- Verify SSH and RDP target addresses from status page.\n- Share only approved credentials and rotate them periodically.\n""",
+  },
+}
+
 
 def is_https_enabled() -> bool:
     return HTTPS_RUNTIME_ENABLED
@@ -2072,6 +2094,32 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             ("FREEZE", "Freeze", "Keep subtracting the stored DC value but stop learning new DC."),
         )
     )
+    doc_order = ["operation", "safety", "network"]
+    doc_tabs_parts: list[str] = []
+    doc_pages_parts: list[str] = []
+    doc_download_parts: list[str] = []
+    for idx, doc_id in enumerate(doc_order):
+        doc = PORTAL_DOCUMENTS[doc_id]
+        active = idx == 0
+        tab_class = "doc-tab is-active" if active else "doc-tab"
+        page_class = "doc-page is-active" if active else "doc-page"
+        tab_selected = "true" if active else "false"
+        doc_tabs_parts.append(
+            f'<button class="{tab_class}" type="button" data-doc-tab="{doc_id}" aria-selected="{tab_selected}">{html.escape(doc["title"])}</button>'
+        )
+        doc_pages_parts.append(
+            f'<article class="{page_class}" data-doc-page="{doc_id}">'
+            f'<h3>{html.escape(doc["title"])}</h3>'
+            f'<p class="subtle">{html.escape(doc["summary"])}</p>'
+            f'<pre class="doc-text">{html.escape(doc["content"])}</pre>'
+            f'</article>'
+        )
+        doc_download_parts.append(
+            f'<a class="link link-secondary" href="/portal-doc-download?doc={doc_id}">Download {html.escape(doc["title"])} (TXT)</a>'
+        )
+    doc_tabs = "\n".join(doc_tabs_parts)
+    doc_pages = "\n".join(doc_pages_parts)
+    doc_downloads = "\n".join(doc_download_parts)
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -2263,6 +2311,21 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     .link-secondary:hover{{background:var(--accent-soft);border-color:var(--accent);
            box-shadow:0 1px 0 rgba(255,255,255,.38),0 10px 20px rgba(29,42,46,.12),
                       inset 1px 1px 0 rgba(255,255,255,.48),inset -1px -1px 0 rgba(29,42,46,.12)}}
+    .doc-tabs{{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}}
+    .doc-tab{{min-height:38px;padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg);
+              color:var(--text);font:inherit;font-weight:700;cursor:pointer;
+              transition:background-color .14s ease,border-color .14s ease,transform .14s ease,box-shadow .14s ease}}
+    .doc-tab:hover{{background:var(--accent-soft);border-color:var(--accent);transform:translateY(-1px)}}
+    .doc-tab[aria-selected="true"],.doc-tab.is-active{{background:var(--accent-soft);border-color:var(--accent);transform:translateY(1px);
+              box-shadow:inset 0 2px 6px rgba(0,0,0,.12),inset 0 0 0 1px var(--accent)}}
+    .doc-reader{{margin-top:12px;padding:14px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg)}}
+    .doc-page{{display:none}}
+    .doc-page.is-active{{display:block}}
+    .doc-page h3{{margin-bottom:6px}}
+    .doc-page .subtle{{margin-bottom:10px}}
+    .doc-text{{margin:0;white-space:pre-wrap;line-height:1.5;font-family:ui-monospace,"SFMono-Regular",Consolas,monospace;
+               font-size:12px;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px}}
+    .doc-downloads{{margin-top:12px}}
     @media (max-width:860px){{
       body{{place-items:start center}}
       .portal-shell{{grid-template-columns:1fr}}
@@ -2274,6 +2337,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
                     box-shadow:var(--panel-shadow);
                     backdrop-filter:blur(18px) saturate(1.18);-webkit-backdrop-filter:blur(18px) saturate(1.18)}}
       .menu-btn{{width:auto;min-width:178px;flex:0 0 auto;scroll-snap-align:start;white-space:normal}}
+      .doc-tab{{width:auto;min-width:180px;flex:0 0 auto}}
       html[data-ui-style="neumorph"] .menu-btn{{box-shadow:4px 4px 8px var(--neumo-lo),-4px -4px 8px var(--neumo-hi)}}
       html[data-ui-style="neumorph"] .menu-btn:hover{{box-shadow:5px 5px 10px var(--neumo-lo),-5px -5px 10px var(--neumo-hi)}}
       html[data-ui-style="neumorph"] .menu-btn[aria-selected="true"]{{box-shadow:inset 4px 4px 8px var(--neumo-lo),inset -4px -4px 8px var(--neumo-hi)}}
@@ -2303,7 +2367,8 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
         <button class="menu-btn" type="button" data-panel="dc" aria-selected="false"><span class="menu-index">5</span>DC Compensation</button>
         <button class="menu-btn" type="button" data-panel="privacy" aria-selected="false"><span class="menu-index">6</span>Privacy</button>
         <button class="menu-btn" type="button" data-panel="statistics" aria-selected="false"><span class="menu-index">7</span>Statistics</button>
-        <button class="menu-btn" type="button" data-panel="about" aria-selected="false"><span class="menu-index">8</span>About Device</button>
+        <button class="menu-btn" type="button" data-panel="documentation" aria-selected="false"><span class="menu-index">8</span>Documentation</button>
+        <button class="menu-btn" type="button" data-panel="about" aria-selected="false"><span class="menu-index">9</span>About Device</button>
       </nav>
       <div class="portal-content">
         <section class="portal-panel is-active" id="panel-antenna">
@@ -2404,6 +2469,19 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             <div class="summary-item"><h3>Communication</h3><div class="metric"><span>Errors</span><strong>---</strong></div><div class="metric"><span>Restarts</span><strong>---</strong></div></div>
           </div>
         </section>
+        <section class="portal-panel" id="panel-documentation">
+          <h2>Documentation</h2>
+          <p>Read operation instructions and service notes directly in the portal. Use tabs for reading and separate buttons for downloads.</p>
+          <div class="doc-tabs" role="tablist" aria-label="Documentation tabs">
+            {doc_tabs}
+          </div>
+          <div class="doc-reader">
+            {doc_pages}
+          </div>
+          <div class="actions actions-inline doc-downloads">
+            {doc_downloads}
+          </div>
+        </section>
         <section class="portal-panel" id="panel-about">
           <h2>About Device</h2>
           <p>Device identity, firmware version, host software version, serial number, and hardware information will be shown here.</p>
@@ -2451,6 +2529,31 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       }});
     }});
     setActivePanel((window.location.hash || '#antenna').slice(1), false);
+    var docTabs = Array.prototype.slice.call(document.querySelectorAll('.doc-tab'));
+    var docPages = Array.prototype.slice.call(document.querySelectorAll('.doc-page'));
+    function setDocPage(name) {{
+      if (!docTabs.length || !docPages.length) {{ return; }}
+      var found = docPages.some(function (page) {{ return page.dataset.docPage === name; }});
+      if (!found) {{
+        name = docPages[0].dataset.docPage || 'operation';
+      }}
+      docTabs.forEach(function (tab) {{
+        var active = tab.dataset.docTab === name;
+        tab.setAttribute('aria-selected', active ? 'true' : 'false');
+        tab.classList.toggle('is-active', active);
+      }});
+      docPages.forEach(function (page) {{
+        page.classList.toggle('is-active', page.dataset.docPage === name);
+      }});
+    }}
+    docTabs.forEach(function (tab) {{
+      tab.addEventListener('click', function () {{
+        setDocPage(tab.dataset.docTab || 'operation');
+      }});
+    }});
+    if (docTabs.length) {{
+      setDocPage(docTabs[0].dataset.docTab || 'operation');
+    }}
     var portalSecurityNote = document.getElementById('portal-security-note');
     if (portalSecurityNote && window.location.protocol !== 'https:') {{
       portalSecurityNote.style.display = 'block';
@@ -2660,6 +2763,36 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(payload)
+            return
+
+        if path == "/portal-doc-download":
+            session = self._get_portal_session()
+            if session is None:
+                self._send_redirect(
+                    self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
+                    set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
+                )
+                return
+            query = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            doc_key = query.get("doc", [""])[0].strip().lower()
+            doc = PORTAL_DOCUMENTS.get(doc_key)
+            if doc is None:
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(b"Documentation file not found.")
+                return
+            payload = doc["content"].encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Disposition", f'attachment; filename="{doc["filename"]}"')
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             if send_body:
