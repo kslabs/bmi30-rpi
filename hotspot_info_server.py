@@ -146,7 +146,7 @@ PORTAL_DOCUMENTS: dict[str, dict[str, str]] = {
     "title": "Safety and Service Notes",
     "summary": "Safety checklist and service handling recommendations.",
     "filename": "BMI30_Safety_and_Service_Notes.pdf",
-    "google_doc_id": "171lmgMctV8HfeChDzagbyibgGt0PfuEm3h6Lj2V1djo",
+    "google_doc_id": "1ifvh_uU8Vc-1ntcj0QViccQ5mQg9ujBqG8F5Ir_tw_E",
   },
   "network": {
     "title": "Network and Remote Access",
