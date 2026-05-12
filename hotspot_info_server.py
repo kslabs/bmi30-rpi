@@ -2108,8 +2108,6 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
         )
         doc_pages_parts.append(
             f'<article class="{page_class}" data-doc-page="{doc_id}">'
-            f'<h3>{html.escape(doc["title"])}</h3>'
-            f'<p class="subtle">{html.escape(doc["summary"])}</p>'
             f'<pre class="doc-text">{html.escape(doc["content"])}</pre>'
             f'</article>'
         )
@@ -2308,18 +2306,17 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     .link-secondary:hover{{background:var(--accent-soft);border-color:var(--accent);
            box-shadow:0 1px 0 rgba(255,255,255,.38),0 10px 20px rgba(29,42,46,.12),
                       inset 1px 1px 0 rgba(255,255,255,.48),inset -1px -1px 0 rgba(29,42,46,.12)}}
-    .doc-tabs{{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}}
-    .doc-tab{{min-height:38px;padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg);
-              color:var(--text);font:inherit;font-weight:700;cursor:pointer;
-              transition:background-color .14s ease,border-color .14s ease,transform .14s ease,box-shadow .14s ease}}
-    .doc-tab:hover{{background:var(--accent-soft);border-color:var(--accent);transform:translateY(-1px)}}
-    .doc-tab[aria-selected="true"],.doc-tab.is-active{{background:var(--accent-soft);border-color:var(--accent);transform:translateY(1px);
-              box-shadow:inset 0 2px 6px rgba(0,0,0,.12),inset 0 0 0 1px var(--accent)}}
-    .doc-reader{{margin-top:12px;padding:14px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg)}}
+    .doc-tabs{{display:flex;align-items:flex-end;gap:0;margin:0 0 -1px;padding:0 10px;overflow-x:auto;overflow-y:visible;position:relative;z-index:2}}
+    .doc-tab{{min-height:40px;padding:10px 16px;border:1px solid var(--line);border-bottom:none;border-radius:12px 12px 0 0;
+          background:linear-gradient(180deg,var(--note-bg),rgba(0,0,0,0));color:var(--text);font:inherit;font-weight:700;
+          cursor:pointer;position:relative;top:1px;margin-right:-8px;z-index:1;
+          transition:background-color .14s ease,border-color .14s ease,transform .14s ease,box-shadow .14s ease}}
+    .doc-tab:hover{{background:var(--accent-soft);border-color:var(--accent);z-index:2;transform:translateY(-1px)}}
+    .doc-tab[aria-selected="true"],.doc-tab.is-active{{top:0;background:var(--panel);border-color:var(--accent);
+          box-shadow:0 -1px 0 rgba(255,255,255,.28),0 6px 14px rgba(0,0,0,.12);z-index:4;transform:none}}
+    .doc-reader{{margin-top:0;padding:14px;border:1px solid var(--line);border-radius:0 10px 10px 10px;background:var(--note-bg);position:relative;z-index:1}}
     .doc-page{{display:none}}
     .doc-page.is-active{{display:block}}
-    .doc-page h3{{margin-bottom:6px}}
-    .doc-page .subtle{{margin-bottom:10px}}
     .doc-text{{margin:0;white-space:pre-wrap;line-height:1.5;font-family:ui-monospace,"SFMono-Regular",Consolas,monospace;
                font-size:12px;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px}}
     .doc-downloads{{margin-top:12px;align-items:center}}
@@ -2335,7 +2332,8 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
                     box-shadow:var(--panel-shadow);
                     backdrop-filter:blur(18px) saturate(1.18);-webkit-backdrop-filter:blur(18px) saturate(1.18)}}
       .menu-btn{{width:auto;min-width:178px;flex:0 0 auto;scroll-snap-align:start;white-space:normal}}
-      .doc-tab{{width:auto;min-width:180px;flex:0 0 auto}}
+      .doc-tab{{width:auto;min-width:180px;flex:0 0 auto;margin-right:-6px}}
+      .doc-reader{{border-radius:0 8px 8px 8px}}
       html[data-ui-style="neumorph"] .menu-btn{{box-shadow:4px 4px 8px var(--neumo-lo),-4px -4px 8px var(--neumo-hi)}}
       html[data-ui-style="neumorph"] .menu-btn:hover{{box-shadow:5px 5px 10px var(--neumo-lo),-5px -5px 10px var(--neumo-hi)}}
       html[data-ui-style="neumorph"] .menu-btn[aria-selected="true"]{{box-shadow:inset 4px 4px 8px var(--neumo-lo),inset -4px -4px 8px var(--neumo-hi)}}
@@ -2468,8 +2466,6 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
           </div>
         </section>
         <section class="portal-panel" id="panel-documentation">
-          <h2>Documentation</h2>
-          <p>Read operation instructions and service notes directly in the portal. Select a tab to choose which document is published for download.</p>
           <div class="doc-tabs" role="tablist" aria-label="Documentation tabs">
             {doc_tabs}
           </div>
