@@ -2426,14 +2426,18 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       .mode-grid,.fields{{grid-template-columns:1fr}}
     }}
     /* PDF Viewer Styles */
-    .pdf-viewer{{display:flex;flex-direction:column;gap:10px;height:100%;position:relative}}
-            .pdf-controls{{display:flex;align-items:center;justify-content:space-between;gap:10px;
-              position:sticky;top:var(--pdf-controls-top,10px);z-index:32;
+    .pdf-viewer{{display:block;position:relative}}
+        .pdf-controls{{display:flex;align-items:center;justify-content:space-between;gap:10px;
+          position:-webkit-sticky;position:sticky;top:var(--pdf-controls-top,10px);z-index:32;
+            width:100%;align-self:flex-start;
             padding:8px 10px;background:color-mix(in srgb, var(--panel) 62%, transparent);
             border:1px solid color-mix(in srgb, var(--line) 70%, transparent);border-radius:8px;
             backdrop-filter:blur(8px) saturate(1.06);-webkit-backdrop-filter:blur(8px) saturate(1.06);
             box-shadow:0 6px 16px rgba(0,0,0,.12);
             flex-wrap:wrap}}
+    .pdf-controls-spacer{{display:none;height:0}}
+    .pdf-controls-spacer.is-visible{{display:block}}
+    .pdf-controls.is-fixed{{position:fixed;z-index:48;top:var(--pdf-controls-top,10px)}}
     .pdf-btn{{padding:10px 14px;min-height:42px;background:color-mix(in srgb, var(--accent-soft) 72%, transparent);border:1px solid var(--accent);color:var(--accent);
               border-radius:5px;cursor:pointer;font-size:13px;font-weight:500;transition:all 0.2s ease;
               white-space:nowrap}}
@@ -2445,9 +2449,9 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
                      background:var(--panel);color:var(--text);font-size:12px;text-align:center}}
     .pdf-page-input:focus-visible{{outline:2px solid rgba(15,138,112,.24);border-color:var(--accent)}}
     .pdf-page-total{{font-size:12px;color:var(--muted);min-width:40px;text-align:left}}
-        .pdf-pages{{flex:1;display:flex;justify-content:center;align-items:flex-start;overflow:visible;
+        .pdf-pages{{display:flex;justify-content:center;align-items:flex-start;overflow:visible;
                 background:var(--panel);border:1px solid var(--line);border-radius:8px;
-          padding:10px;min-height:400px}}
+          padding:10px;min-height:400px;margin-top:8px}}
     .pdf-canvas{{max-width:100%;max-height:100%;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,0.15);
                  animation:pageFlip 0.3s ease-out}}
         .scroll-top-btn{{position:fixed;right:16px;bottom:18px;z-index:40;
@@ -2758,6 +2762,12 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
         loadPdf(docId);
         
         // Инициализируем контролы
+        var controls = viewer.querySelector('.pdf-controls');
+        if (controls && !viewer.querySelector('.pdf-controls-spacer')) {{
+          var spacer = document.createElement('div');
+          spacer.className = 'pdf-controls-spacer';
+          controls.parentNode.insertBefore(spacer, controls);
+        }}
         var prevBtn = viewer.querySelector('[data-action="prev-page"]');
         var nextBtn = viewer.querySelector('[data-action="next-page"]');
         var pageInput = viewer.querySelector('.pdf-page-input');
@@ -2860,6 +2870,69 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
         
         renderPage(docId, state.currentPage);
       }}
+
+      function clearFloatingControls(exceptEl) {{
+        var controlsList = Array.prototype.slice.call(document.querySelectorAll('.pdf-controls'));
+        controlsList.forEach(function (controls) {{
+          if (exceptEl && controls === exceptEl) {{ return; }}
+          controls.classList.remove('is-fixed');
+          controls.style.left = '';
+          controls.style.width = '';
+          var spacer = controls.parentElement ? controls.parentElement.querySelector('.pdf-controls-spacer') : null;
+          if (spacer) {{
+            spacer.classList.remove('is-visible');
+            spacer.style.height = '0px';
+          }}
+        }});
+      }}
+
+      function syncFloatingControls() {{
+        var panel = document.getElementById('panel-documentation');
+        if (!panel || !panel.classList.contains('is-active')) {{
+          clearFloatingControls(null);
+          return;
+        }}
+        var activePage = panel.querySelector('.doc-page.is-active');
+        if (!activePage) {{
+          clearFloatingControls(null);
+          return;
+        }}
+        var controls = activePage.querySelector('.pdf-controls');
+        if (!controls) {{
+          clearFloatingControls(null);
+          return;
+        }}
+
+        clearFloatingControls(controls);
+
+        var topPxRaw = getComputedStyle(controls).getPropertyValue('--pdf-controls-top').trim();
+        var topPx = parseInt(topPxRaw, 10);
+        if (!Number.isFinite(topPx)) {{ topPx = 8; }}
+
+        var controlsRect = controls.getBoundingClientRect();
+        var pageRect = activePage.getBoundingClientRect();
+        var viewerRect = controls.parentElement.getBoundingClientRect();
+        var shouldFix = controlsRect.top <= topPx && pageRect.bottom > (topPx + controls.offsetHeight + 10);
+        var spacer = controls.parentElement.querySelector('.pdf-controls-spacer');
+
+        if (shouldFix) {{
+          controls.classList.add('is-fixed');
+          controls.style.left = Math.round(viewerRect.left) + 'px';
+          controls.style.width = Math.round(viewerRect.width) + 'px';
+          if (spacer) {{
+            spacer.classList.add('is-visible');
+            spacer.style.height = Math.round(controls.offsetHeight + 8) + 'px';
+          }}
+        }} else {{
+          controls.classList.remove('is-fixed');
+          controls.style.left = '';
+          controls.style.width = '';
+          if (spacer) {{
+            spacer.classList.remove('is-visible');
+            spacer.style.height = '0px';
+          }}
+        }}
+      }}
       
       // Инициализируем все документы
       docOrder.forEach(function(docId) {{
@@ -2876,9 +2949,20 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             if (viewer && viewer.closest('.doc-page.is-active')) {{
               updatePageDisplay(docId);
             }}
+            syncFloatingControls();
           }}, 50);
         }});
       }});
+
+      var menuBtns = Array.prototype.slice.call(document.querySelectorAll('.menu-btn'));
+      menuBtns.forEach(function(btn) {{
+        btn.addEventListener('click', function() {{
+          window.setTimeout(syncFloatingControls, 60);
+        }});
+      }});
+      window.addEventListener('scroll', syncFloatingControls, {{ passive: true }});
+      window.addEventListener('resize', syncFloatingControls);
+      window.setTimeout(syncFloatingControls, 120);
     }})();
   </script>
 </body>
