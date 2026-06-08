@@ -50,17 +50,21 @@ backup_file() {
 
 detect_serial() {
     local serial=""
+    local source=""
 
     if [[ -r /proc/device-tree/serial-number ]]; then
         serial="$(tr -d '\000\r\n ' < /proc/device-tree/serial-number || true)"
+        [[ -n "$serial" ]] && source="/proc/device-tree/serial-number"
     fi
 
     if [[ -z "$serial" && -r /sys/firmware/devicetree/base/serial-number ]]; then
         serial="$(tr -d '\000\r\n ' < /sys/firmware/devicetree/base/serial-number || true)"
+        [[ -n "$serial" ]] && source="/sys/firmware/devicetree/base/serial-number"
     fi
 
     if [[ -z "$serial" && -r /proc/cpuinfo ]]; then
         serial="$(awk -F: '/^Serial/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo || true)"
+        [[ -n "$serial" ]] && source="/proc/cpuinfo"
     fi
 
     serial="$(printf '%s' "$serial" | tr -cd '0-9A-Fa-f')"
@@ -69,6 +73,7 @@ detect_serial() {
         exit 1
     fi
 
+    printf '[INFO] Источник серийного номера: %s\n' "${source:-unknown}" >&2
     printf '%s' "${serial^^}"
 }
 
@@ -372,7 +377,7 @@ new_section = [
     'name=BMI30 Shared Desktop (:0)',
     'lib=libvnc.so',
     'ip=127.0.0.1',
-    'port=5900',
+    'port=5901',
     'username=na',
     'password=ask',
     end_marker,
@@ -489,7 +494,7 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /tmp/.X11-unix/X0 ] && ex
 ExecStartPre=/usr/local/bin/bmi30-force-display-mode.sh
 ExecStartPre=/bin/sh -c 'DISPLAY=:0 XAUTHORITY=/var/run/lightdm/root/:0 /usr/bin/setxkbmap -model pc105 -layout us,ru -variant , -option "" -option grp:ctrl_shift_toggle,grp_led:scroll 2>/dev/null || true'
 # One x11vnc client at a time: avoids accumulating parallel XRDP->VNC bridges that overload Xorg.
-ExecStart=/usr/bin/x11vnc -display :0 -auth guess -forever -nevershared -rfbport 5900 -localhost -noxdamage -norepeat -xkb -nomodtweak -clear_keys -clear_all -skip_keycodes 64,108,133,134,205,206,207 -o /var/log/bmi30-x11vnc.log
+ExecStart=/usr/bin/x11vnc -display :0 -auth guess -forever -nevershared -rfbport 5901 -localhost -noxdamage -norepeat -xkb -nomodtweak -clear_keys -clear_all -skip_keycodes 64,108,133,134,205,206,207 -o /var/log/bmi30-x11vnc.log
 Restart=always
 RestartSec=2
 
@@ -1655,13 +1660,9 @@ detect_serial() {
         serial="$(awk -F': ' '/^Serial/ {print $2; exit}' /proc/cpuinfo | tr -d ' \t\n' || true)"
     fi
 
-    if [[ -z "$serial" && -r /etc/machine-id ]]; then
-        serial="$(tr -d ' \t\n' < /etc/machine-id || true)"
-    fi
-
     serial="$(printf '%s' "$serial" | tr -cd '0-9A-Fa-f')"
-    if [[ -z "$serial" ]]; then
-        echo "Unable to determine serial" >&2
+    if [[ -z "$serial" || ${#serial} -lt 12 ]]; then
+        echo "Unable to determine Raspberry Pi hardware serial" >&2
         exit 1
     fi
 
@@ -1810,6 +1811,43 @@ EOF
     HOTSPOT_PORTAL_UPDATED=1
 }
 
+install_refresh_network_identity_service() {
+    local script_dir refresh_src refresh_dst service_path
+
+    script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+    refresh_src="$script_dir/utilities/refresh_network_identity.sh"
+    refresh_dst="/usr/local/sbin/bmi30-refresh-network-identity.sh"
+    service_path="/etc/systemd/system/bmi30-refresh-network-identity.service"
+
+    if [[ ! -f "$refresh_src" ]]; then
+        log WARN "Не найден $refresh_src, постоянная автокоррекция сетевой идентичности не будет установлена"
+        return
+    fi
+
+    log INFO "Устанавливаю постоянную автокоррекцию сетевой идентичности на каждом старте"
+    backup_file "$refresh_dst"
+    install -m 755 "$refresh_src" "$refresh_dst"
+
+    backup_file "$service_path"
+    cat > "$service_path" <<'EOF'
+[Unit]
+Description=Refresh BMI30 network identity on every boot
+After=local-fs.target NetworkManager.service
+Wants=NetworkManager.service
+ConditionPathExists=/usr/local/sbin/bmi30-refresh-network-identity.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bmi30-refresh-network-identity.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable bmi30-refresh-network-identity.service >/dev/null 2>&1 || true
+}
+
 configure_firewall() {
     if ! command -v ufw >/dev/null 2>&1; then
         return
@@ -1831,6 +1869,10 @@ configure_firewall() {
 restart_services() {
     log INFO "Перезапускаю сетевые службы"
     systemctl daemon-reload || true
+
+    if systemctl list-unit-files NetworkManager.service >/dev/null 2>&1; then
+        systemctl reload NetworkManager >/dev/null 2>&1 || systemctl restart NetworkManager >/dev/null 2>&1 || true
+    fi
 
     for service in avahi-daemon smbd nmbd wsdd snmpd lldpd xrdp bmi30-x11vnc bmi30-hotspot-info; do
         if systemctl list-unit-files "${service}.service" >/dev/null 2>&1; then
@@ -1905,6 +1947,7 @@ main() {
     configure_wifi_name "$display_name"
     configure_bmi30_hotspot_service
     configure_hotspot_info_page
+    install_refresh_network_identity_service
     configure_headless_display
     configure_workspace_restore
     configure_rdp_session

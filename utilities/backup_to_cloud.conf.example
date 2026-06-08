@@ -1,0 +1,27 @@
+# Example config for utilities/backup_to_cloud.sh.
+# Copy to utilities/backup_to_cloud.conf and edit for this device.
+
+# What to archive.
+SOURCE_DIR="/home/techaid/Documents"
+
+# Where local archives are stored.
+BACKUP_ROOT="/home/techaid/Documents/backups"
+
+# Cloud upload via rclone. Leave empty for local-only backup.
+REMOTE_TARGET="gdrive:"
+
+# Optional Google Drive folder ID.
+REMOTE_FOLDER_ID="1q7nYpi-rXyjx5XOgZ_G0rfQ2xyrLh-BC"
+
+# Local archive retention.
+LOCAL_RETENTION_DAYS="30"
+
+# Per-user systemd timer schedules.
+PUBLISH_ON_CALENDAR="*-*-* 22:00:00"
+UPDATE_ON_CALENDAR="*-*-* 23:00:00"
+
+# Cloud marker that points every device to the newest archive.
+REMOTE_LATEST_FILE="bmi30_latest.env"
+
+# Create a local snapshot before applying an update from cloud.
+PRE_UPDATE_SNAPSHOT="1"

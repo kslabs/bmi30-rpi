@@ -1,0 +1,12 @@
+[Unit]
+Description=BMI30 one-time USB to eMMC migration
+After=multi-user.target
+ConditionPathExists=/home/techaid/Documents/.bmi30_migrate_usb_to_emmc_once
+
+[Service]
+Type=oneshot
+ExecStart=/home/techaid/Documents/utilities/migrate_to_emmc_once_after_reboot.sh
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

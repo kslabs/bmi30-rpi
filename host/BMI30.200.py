@@ -3,10 +3,29 @@
 from __future__ import annotations
 import os
 import sys, time, json, os as _os_alias, struct
+import importlib
 import threading
 import datetime
 import zlib
 from collections import deque
+
+# Realtime alarm defaults. These are process-environment defaults, so direct
+# `python3 ...` runs behave like the launcher unless the user overrides them.
+for _env_key, _env_val in {
+	"BMI30_BEEP_REALTIME": "1",
+	"BMI30_DETECT_IN_READER": "1",
+	"BMI30_BEEP_HOLD_ENABLE": "0",
+	"BMI30_BEEP_HOLD_DELAY": "0.0",
+	"BMI30_DETECT_LOSS_SEC": "0.0",
+	"BMI30_DETECT_COOLDOWN": "0.05",
+	"BMI30_BEEP_SWEEP": "0",
+	"BMI30_BEEP_INFO_TONE": "0.10",
+	"BMI30_BEEP_INFO_GAP": "0.0",
+	"BMI30_BEEP_CHANNEL_GAP": "0.0",
+	"BMI30_BEEP_REPEAT_GAP": "0.05",
+}.items():
+	os.environ.setdefault(_env_key, _env_val)
+
 # Qt env: avoid GTK theme/plugin conflicts on RPi (Bookworm)
 # Choose backend safely:
 # - if user set QT_QPA_PLATFORM explicitly, respect it
@@ -46,6 +65,10 @@ except Exception:
 	CMD_SET_TIM2_ENABLE = 0x1E
 	CMD_SET_TX_ENABLE = 0x33
 
+# Short bulk status request: device replies with [0x31, err, step].
+# This shares the numeric opcode with vendor SET_ALT on EP0 but uses the bulk path.
+CMD_GET_ERR_STEP = 0x31
+
 # Optional: device-side DC adaptation toggle (not present in older usb_stream.py)
 try:
 	from usb_vendor.usb_stream import CMD_SET_DC_ADAPT  # type: ignore
@@ -64,14 +87,22 @@ except Exception:
 	except Exception:
 		CMD_CALIB_DC_FAST = 0x1E
 
-# Optional: sync mode (master/slave/off)
-try:
-	from usb_vendor.usb_stream import CMD_SET_SYNC_MODE  # type: ignore
-except Exception:
+def _import_gpio_module(module_name: str):
+	"""Import GPIO-related module, falling back to system dist-packages from venv."""
 	try:
-		CMD_SET_SYNC_MODE = int(os.getenv("BMI30_CMD_SET_SYNC_MODE", "0x1D"), 0)
+		return importlib.import_module(module_name)
 	except Exception:
-		CMD_SET_SYNC_MODE = 0x1D
+		pass
+	for extra_path in (
+		"/usr/lib/python3/dist-packages",
+		f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages",
+	):
+		try:
+			if os.path.isdir(extra_path) and extra_path not in sys.path:
+				sys.path.append(extra_path)
+		except Exception:
+			pass
+	return importlib.import_module(module_name)
 
 
 class PwmBeeper:
@@ -97,6 +128,10 @@ class PwmBeeper:
 		self._continuous_on = False
 		self._last_freq = 0
 		self._pattern_token = 0
+		self._repeat_loop_active = False
+		self._repeat_loop_sequences = None
+		self._repeat_loop_gap = 0.0
+		self._repeat_loop_stop_requested = False
 		self._init_backend()
 
 	def status(self) -> str:
@@ -122,7 +157,7 @@ class PwmBeeper:
 			return
 		# Try pigpio first
 		try:
-			import pigpio  # type: ignore
+			pigpio = _import_gpio_module('pigpio')  # type: ignore
 			pi = pigpio.pi()
 			if getattr(pi, 'connected', False):
 				self._backend = 'pigpio'
@@ -135,7 +170,7 @@ class PwmBeeper:
 			pass
 		# Try lgpio (recommended on Pi5 / modern distros)
 		try:
-			import lgpio  # type: ignore
+			lgpio = _import_gpio_module('lgpio')  # type: ignore
 			chip = 0
 			try:
 				chip = int(os.getenv('BMI30_GPIOCHIP', '0') or 0)
@@ -157,7 +192,7 @@ class PwmBeeper:
 			self._lg_h = None
 		# Fallback: RPi.GPIO software PWM
 		try:
-			import RPi.GPIO as GPIO  # type: ignore
+			GPIO = _import_gpio_module('RPi.GPIO')  # type: ignore
 			GPIO.setwarnings(False)
 			GPIO.setmode(GPIO.BCM)
 			GPIO.setup(self.gpio_pin, GPIO.OUT, initial=GPIO.LOW)  # Явно LOW при инициализации
@@ -237,6 +272,9 @@ class PwmBeeper:
 			if freq <= 0:
 				# Invalidate pending pattern threads and stop immediately.
 				self._pattern_token = int(getattr(self, '_pattern_token', 0)) + 1
+				self._repeat_loop_active = False
+				self._repeat_loop_sequences = None
+				self._repeat_loop_stop_requested = False
 				self._continuous_on = False
 				self._last_freq = 0
 				self._stop()
@@ -244,6 +282,10 @@ class PwmBeeper:
 			# avoid needless reprogramming
 			if self._continuous_on and self._last_freq == int(freq):
 				return
+			self._pattern_token = int(getattr(self, '_pattern_token', 0)) + 1
+			self._repeat_loop_active = False
+			self._repeat_loop_sequences = None
+			self._repeat_loop_stop_requested = False
 			self._continuous_on = True
 			self._last_freq = int(freq)
 			self._start(float(freq))
@@ -254,49 +296,182 @@ class PwmBeeper:
 			return
 		with self._lock:
 			self._pattern_token = int(getattr(self, '_pattern_token', 0)) + 1
+			self._repeat_loop_active = False
+			self._repeat_loop_sequences = None
+			self._repeat_loop_stop_requested = False
 			self._continuous_on = False
 			self._last_freq = 0
 			self._stop()
 
-	def play_pattern(self, f1: float, f2: float, t_on1: float = 0.150, t_gap: float = 0.050, t_on2: float = 0.150):
-		"""Play: ON(f1) -> OFF -> ON(f2). Non-blocking for callers (spawns a daemon thread)."""
+	def _clean_sequence(self, segments):
+		clean = []
+		try:
+			for freq_hz, seconds in list(segments or []):
+				dur = max(0.0, float(seconds))
+				if dur <= 0.0:
+					continue
+				if freq_hz is None:
+					clean.append((None, dur))
+				else:
+					freq = float(freq_hz)
+					if freq <= 0.0:
+						clean.append((None, dur))
+					else:
+						clean.append((freq, dur))
+		except Exception:
+			clean = []
+		return tuple(clean)
+
+	def play_sequence(self, segments):
+		"""Play a non-blocking latest-wins sequence of (freq_hz, seconds)."""
 		if not self._enabled or self._backend is None:
 			return
-		# If continuous mode is active, do not interrupt it with patterns.
-		try:
-			if bool(getattr(self, '_continuous_on', False)):
-				return
-		except Exception:
-			pass
-		# Invalidate older pattern requests; only latest should continue.
+		clean = self._clean_sequence(segments)
+		if not clean:
+			return
 		with self._lock:
 			self._pattern_token = int(getattr(self, '_pattern_token', 0)) + 1
 			token = int(self._pattern_token)
+			self._repeat_loop_active = False
+			self._repeat_loop_sequences = None
+			self._repeat_loop_stop_requested = False
+			self._continuous_on = False
+			self._last_freq = 0
+
+		def _sleep_or_cancel(seconds: float) -> bool:
+			end_t = time.time() + max(0.0, float(seconds))
+			while time.time() < end_t:
+				with self._lock:
+					if int(getattr(self, '_pattern_token', 0)) != token or bool(getattr(self, '_continuous_on', False)):
+						return False
+				time.sleep(min(0.02, max(0.0, end_t - time.time())))
+			return True
 
 		def _run():
-			with self._lock:
-				try:
-					if int(getattr(self, '_pattern_token', 0)) != int(token):
+			try:
+				for freq_hz, seconds in clean:
+					with self._lock:
+						if int(getattr(self, '_pattern_token', 0)) != int(token) or bool(getattr(self, '_continuous_on', False)):
+							return
+						if freq_hz is None:
+							self._last_freq = 0
+							self._stop()
+						else:
+							self._last_freq = int(max(1, float(freq_hz)))
+							self._start(float(freq_hz))
+					if not _sleep_or_cancel(seconds):
 						return
-					self._start(f1)
-					time.sleep(max(0.0, float(t_on1)))
-					if int(getattr(self, '_pattern_token', 0)) != int(token):
+			finally:
+				with self._lock:
+					if int(getattr(self, '_pattern_token', 0)) == int(token) and not bool(getattr(self, '_continuous_on', False)):
+						self._last_freq = 0
 						self._stop()
-						return
-					self._stop()
-					time.sleep(max(0.0, float(t_gap)))
-					if int(getattr(self, '_pattern_token', 0)) != int(token):
-						self._stop()
-						return
-					self._start(f2)
-					time.sleep(max(0.0, float(t_on2)))
-					if int(getattr(self, '_pattern_token', 0)) != int(token):
-						self._stop()
-						return
-				finally:
-					self._stop()
 
 		threading.Thread(target=_run, daemon=True).start()
+
+	def play_repeating_sequences(self, sequences, repeat_gap_s: float = 0.0):
+		"""Repeat one or more sequences until stop_now()/set_continuous()/play_sequence()."""
+		if not self._enabled or self._backend is None:
+			return
+		clean_sequences = []
+		try:
+			for seq in list(sequences or []):
+				clean = self._clean_sequence(seq)
+				if clean:
+					clean_sequences.append(clean)
+		except Exception:
+			clean_sequences = []
+		if not clean_sequences:
+			return
+		try:
+			gap = max(0.0, float(repeat_gap_s))
+		except Exception:
+			gap = 0.0
+
+		with self._lock:
+			self._repeat_loop_sequences = tuple(clean_sequences)
+			self._repeat_loop_gap = gap
+			self._repeat_loop_stop_requested = False
+			self._continuous_on = False
+			if bool(getattr(self, '_repeat_loop_active', False)):
+				return
+			self._pattern_token = int(getattr(self, '_pattern_token', 0)) + 1
+			token = int(self._pattern_token)
+			self._repeat_loop_active = True
+			self._last_freq = 0
+
+		def _sleep_or_cancel(seconds: float) -> bool:
+			end_t = time.time() + max(0.0, float(seconds))
+			while time.time() < end_t:
+				with self._lock:
+					if int(getattr(self, '_pattern_token', 0)) != token or bool(getattr(self, '_continuous_on', False)):
+						return False
+				time.sleep(min(0.01, max(0.0, end_t - time.time())))
+			return True
+
+		def _run():
+			seq_index = 0
+			try:
+				while True:
+					with self._lock:
+						if int(getattr(self, '_pattern_token', 0)) != token or bool(getattr(self, '_continuous_on', False)):
+							return
+						sequences_now = tuple(getattr(self, '_repeat_loop_sequences', None) or ())
+						gap_now = float(getattr(self, '_repeat_loop_gap', 0.0) or 0.0)
+					if not sequences_now:
+						return
+					sequence = sequences_now[seq_index % len(sequences_now)]
+					seq_index += 1
+					for freq_hz, seconds in sequence:
+						with self._lock:
+							if int(getattr(self, '_pattern_token', 0)) != token or bool(getattr(self, '_continuous_on', False)):
+								return
+							if freq_hz is None:
+								self._last_freq = 0
+								self._stop()
+							else:
+								self._last_freq = int(max(1, float(freq_hz)))
+								self._start(float(freq_hz))
+						if not _sleep_or_cancel(seconds):
+							return
+					with self._lock:
+						if int(getattr(self, '_pattern_token', 0)) != token or bool(getattr(self, '_continuous_on', False)):
+							return
+						stop_requested = bool(getattr(self, '_repeat_loop_stop_requested', False))
+						self._last_freq = 0
+						self._stop()
+						if stop_requested:
+							return
+					if gap_now > 0.0 and not _sleep_or_cancel(gap_now):
+						return
+			finally:
+				with self._lock:
+					if int(getattr(self, '_pattern_token', 0)) == token:
+						self._repeat_loop_active = False
+						self._repeat_loop_sequences = None
+						self._repeat_loop_stop_requested = False
+						self._last_freq = 0
+						self._stop()
+
+		threading.Thread(target=_run, daemon=True).start()
+
+	def stop_repeating_after_current_sequence(self) -> bool:
+		"""Stop a repeating sequence after the current two-tone phrase finishes."""
+		if not self._enabled or self._backend is None:
+			return False
+		with self._lock:
+			if not bool(getattr(self, '_repeat_loop_active', False)):
+				return False
+			self._repeat_loop_stop_requested = True
+			return True
+
+	def play_repeating_sequence(self, segments, repeat_gap_s: float = 0.0):
+		"""Repeat a single sequence until explicitly stopped."""
+		self.play_repeating_sequences((segments,), repeat_gap_s=repeat_gap_s)
+
+	def play_pattern(self, f1: float, f2: float, t_on1: float = 0.150, t_gap: float = 0.050, t_on2: float = 0.150):
+		"""Play: ON(f1) -> OFF -> ON(f2). Latest call cancels older patterns."""
+		self.play_sequence(((f1, t_on1), (None, t_gap), (f2, t_on2)))
 
 # Qt/pyqtgraph bootstrap: enforce PyQt5 first to keep binding consistent
 PG_IMPORT_ERR = None
@@ -558,6 +733,17 @@ class ScopeWindow:
 		self.debug = _env_bool("BMI30_DEBUG", False)
 		self.xcorr_debug = _env_bool("BMI30_XCORR_DEBUG", self.debug)
 		self.reader_debug = _env_bool("BMI30_READER_DEBUG", self.debug)
+		# Core-first policy: USB receive and detection must not depend on GUI redraw.
+		self.gui_enabled = _env_bool("BMI30_GUI_ENABLE", True)
+		self.gui_render_enabled = bool(self.gui_enabled and _env_bool("BMI30_GUI_RENDER", True))
+		self.detect_in_reader = _env_bool("BMI30_DETECT_IN_READER", True)
+		try:
+			self.gui_render_min_interval = float(os.getenv("BMI30_GUI_RENDER_MIN_INTERVAL", "0.0" if self.gui_render_enabled else "0.25"))
+		except Exception:
+			self.gui_render_min_interval = 0.0 if self.gui_render_enabled else 0.25
+		if self.gui_render_min_interval < 0.0:
+			self.gui_render_min_interval = 0.0
+		self._last_view_update_t = 0.0
 		# Легенда: по умолчанию компактная (без "мусора"); подробная — только по флагу.
 		self.legend_verbose = _env_bool("BMI30_LEGEND_VERBOSE", self.debug)
 		# Загружаем сохранённое состояние GUI (best-effort)
@@ -594,7 +780,8 @@ class ScopeWindow:
 		# True  -> авто-масштаб/центрированный продукт (текущая логика)
 		# False -> фиксированная шкала 0..65535 для просмотра слабых сигналов
 		self.xcorr_norm_enabled = _cfg_bool(self._ui_state.get('xcorr_norm_enabled', None), False)
-		# ADC commutation mode: 0=оба, 1=только ADC1, 2=только ADC2
+		# Host-side detector source selector: 0=оба, 1=только ADC1, 2=только ADC2.
+		# На работу/синхронизацию STM32 не влияет.
 		try:
 			self.adc_comm_mode = int(self._ui_state.get('adc_comm_mode', os.getenv("BMI30_ADC_COMM_MODE", "0")))
 		except Exception:
@@ -623,6 +810,17 @@ class ScopeWindow:
 		except Exception:
 			pass
 		self._last_full_status: str = ""
+		self._stm32_sync_mode: str = "---"
+		self._stm32_sync_source: str = "device"
+		self._stm32_sync_ok: bool = False
+		self._stm32_sync_last_poll_t: float = 0.0
+		self._err_step_last_req_t: float = 0.0
+		try:
+			self._err_step_req_interval_s = float(os.getenv("BMI30_ERR_STEP_POLL_SEC", "0.5"))
+		except Exception:
+			self._err_step_req_interval_s = 0.5
+		if self._err_step_req_interval_s < 0.1:
+			self._err_step_req_interval_s = 0.1
 		# legend_lbl остаётся основным статусным лейблом; цветные метки 1/0
 		# отображаются в заголовках каждого графика (локально), поэтому
 		# не создаём глобальный mapping-widget в легенде.
@@ -852,9 +1050,10 @@ class ScopeWindow:
 		self._beep_force_mode = 0
 		self._update_pwm_btn_style()
 		self.btn_pwm.clicked.connect(self._on_toggle_force_pwm)
-		# Кнопка коммутации ADC (1/2/оба)
+		# Кнопка выбора источника детекции на хосте (ADC1/ADC2/оба).
+		# Это локальный фильтр детекции и не команда синхронизации для STM32.
 		self.btn_sync = QtWidgets.QPushButton("")
-		self.btn_sync.setToolTip("ADC: 1/2/1+2")
+		self.btn_sync.setToolTip("DET source: ADC1 / ADC2 / ADC1+ADC2")
 		try:
 			self.btn_sync.setFixedSize(32, 21)
 		except Exception:
@@ -882,10 +1081,14 @@ class ScopeWindow:
 			self._btn_sync_s = None
 		self.btn_sync.clicked.connect(self._cycle_sync_mode)
 		self._update_sync_btn_style()
-		# Кнопка передачи (TIM2 enable)
+		# Кнопка передачи Tx200
 		self.tim2_enabled = _cfg_bool(self._ui_state.get('tim2_enabled', None), str(os.getenv("BMI30_TIM2_ENABLE", "1")).lower() not in ("0", "false", "no"))
-		self.btn_tim2 = QtWidgets.QPushButton("TX")
-		self.btn_tim2.setToolTip("Передача TIM2: ВКЛ/ВЫКЛ")
+		self.tim2_applied = False
+		self.tim2_pending = False
+		self._tim2_request_seq = 0
+		self._tim2_result_queue: queue.Queue = queue.Queue()  # worker Tx200 -> GUI
+		self.btn_tim2 = QtWidgets.QPushButton("Tx200")
+		self.btn_tim2.setToolTip("Передача Tx200: ВКЛ/ВЫКЛ")
 		self.btn_tim2.setCheckable(True)
 		try:
 			self.btn_tim2.setChecked(bool(self.tim2_enabled))
@@ -1087,6 +1290,18 @@ class ScopeWindow:
 		self.data0_odd = np.zeros(self.max_samples, dtype=np.int32)
 		self.data1_even = self.data1
 		self.data1_odd = np.zeros(self.max_samples, dtype=np.int32)
+		# Sliding detector buffers: previous packet + current packet, updated every packet.
+		self.det0_even = np.zeros(self.max_samples, dtype=np.int32)
+		self.det0_odd = np.zeros(self.max_samples, dtype=np.int32)
+		self.det1_even = np.zeros(self.max_samples, dtype=np.int32)
+		self.det1_odd = np.zeros(self.max_samples, dtype=np.int32)
+		self._det_prev0 = None
+		self._det_prev1 = None
+		self._det_prev_par0 = None
+		self._det_prev_par1 = None
+		self._det_slide_valid0 = False
+		self._det_slide_valid1 = False
+		self._det_button6_active = False
 		# phase diagnostics (even/odd should be same magnitude, opposite phase)
 		self.seq0_even = None
 		self.seq0_odd = None
@@ -1140,6 +1355,33 @@ class ScopeWindow:
 			self.dc_adapt_modes = set()
 		# DC компенсация встроена в устройство — не загружаем локальные офсеты
 		# (раньше вызывали self._load_dc_offset())
+		# Host only supervises device-side DC adaptation: while STM32 adapts,
+		# compare first and last quarters of the first 200 samples and freeze
+		# STM32 DC adaptation as soon as they match.
+		try:
+			self.dc_quarter_window = int(os.getenv('BMI30_DC_QUARTER_WINDOW', '200'))
+		except Exception:
+			self.dc_quarter_window = 200
+		if self.dc_quarter_window < 4:
+			self.dc_quarter_window = 200
+		try:
+			self.dc_quarter_tol = float(os.getenv('BMI30_DC_QUARTER_TOL', '1.0'))
+		except Exception:
+			self.dc_quarter_tol = 1.0
+		if (not np.isfinite(self.dc_quarter_tol)) or self.dc_quarter_tol < 0.0:
+			self.dc_quarter_tol = 1.0
+		try:
+			self.dc_quarter_stable_frames = int(os.getenv('BMI30_DC_QUARTER_STABLE_FRAMES', '1'))
+		except Exception:
+			self.dc_quarter_stable_frames = 1
+		if self.dc_quarter_stable_frames < 1:
+			self.dc_quarter_stable_frames = 1
+		self._dc_quarter_active = False
+		self._dc_quarter_done = False
+		self._dc_quarter_frames = 0
+		self._dc_quarter_ok_frames = 0
+		self._dc_quarter_last = None
+		self._dc_quarter_last_report_t = 0.0
 		
 		# How to split packets into two phases (even/odd).
 		# Firmware may encode phase in seq LSB, timestamp LSB, or reserved fields.
@@ -1211,6 +1453,11 @@ class ScopeWindow:
 		self._usb_err_count = 0
 		self._usb_err_last_t = 0.0
 		self._usb_err_need_hw_reset = False
+		self._usb_err_need_power_cycle = False
+		self._link_recovery_attempts = 0
+		self._link_recovery_soft_reset_done = False
+		self._link_recovery_disconnect_planned = False
+		self._link_recovery_pending_action = 'reconnect'
 		# One-time hardware reset on startup (optional)
 		self._hw_reset_on_start_done = False
 		# Flag set by reader when new data copied; polled in GUI tick to trigger xcorr compute
@@ -1453,6 +1700,20 @@ class ScopeWindow:
 		self.last_diag_t = 0.0
 		# отслеживание общего приёма данных (по транспорту), чтобы не ругаться на "остановку" при отсутствии пар
 		self._last_rx_seen = 0.0
+		# Автоиндикация на устройстве: RPi реально получает рабочие кадры.
+		self.host_rx_indicator_enabled = _env_bool("BMI30_HOST_RX_INDICATOR", True)
+		try:
+			self.host_rx_indicator_timeout_s = float(os.getenv("BMI30_HOST_RX_INDICATOR_TIMEOUT", "1.0"))
+		except Exception:
+			self.host_rx_indicator_timeout_s = 1.0
+		if self.host_rx_indicator_timeout_s < 0.1:
+			self.host_rx_indicator_timeout_s = 0.1
+		try:
+			self.host_rx_indicator_cmd = int(os.getenv("BMI30_HOST_RX_INDICATOR_CMD", "0x33"), 0)
+		except Exception:
+			self.host_rx_indicator_cmd = 0x33
+		self._host_rx_indicator_state = False
+		self._host_rx_indicator_last_send_t = 0.0
 		# Предыдущие transport rx-счётчики (для вычисления реального Afps/Bfps в GUI)
 		self._rx_cnt_a_prev = None
 		self._rx_cnt_b_prev = None
@@ -1605,6 +1866,15 @@ class ScopeWindow:
 		except Exception:
 			gpio_pin = 12
 		self._beeper = PwmBeeper(gpio_pin=gpio_pin)
+		# Стартовый сигнал — короткий двойной «пип» при успешной инициализации beeper
+		try:
+			_beep_st = str(self._beeper.status())
+			print(f"[beeper] инициализирован: {_beep_st}", flush=True)
+			if _beep_st not in ('none', 'OFF', 'unknown'):
+				# Два коротких тона: 1800 Гц → 2600 Гц (подтверждение запуска)
+				self._beeper.play_pattern(1800.0, 2600.0, t_on1=0.10, t_gap=0.05, t_on2=0.10)
+		except Exception:
+			pass
 		# Optional continuous PWM output (useful for measuring "variable signal" on the pin)
 		# Modes: pattern (default), continuous, sweep
 		try:
@@ -1613,6 +1883,7 @@ class ScopeWindow:
 				self._beep_mode = 'pattern'
 		except Exception:
 			self._beep_mode = 'pattern'
+		self._beep_realtime_enabled = _env_bool('BMI30_BEEP_REALTIME', True)
 		# Explicit sweep mode (guaranteed variable PWM frequency on GPIO12 for scope/debug)
 		try:
 			self._beep_sweep_enabled = _env_bool('BMI30_BEEP_SWEEP', False) or (self._beep_mode == 'sweep')
@@ -1675,15 +1946,16 @@ class ScopeWindow:
 		except Exception:
 			pass
 		try:
-			# Slightly longer default to avoid rapid re-trigger; does not block unfreeze while frozen.
-			self._det_cooldown_s = float(os.getenv("BMI30_DETECT_COOLDOWN", "1.0"))
+			_default_cooldown_s = "0.05" if bool(getattr(self, '_beep_realtime_enabled', True)) else "1.0"
+			self._det_cooldown_s = float(os.getenv("BMI30_DETECT_COOLDOWN", _default_cooldown_s))
 		except Exception:
-			self._det_cooldown_s = 1.0
+			self._det_cooldown_s = 0.05 if bool(getattr(self, '_beep_realtime_enabled', True)) else 1.0
 		try:
 			# Faster default unfreeze once signal is lost.
-			self._det_loss_s = float(os.getenv("BMI30_DETECT_LOSS_SEC", "1.0"))
+			_default_loss_s = "0.0" if bool(getattr(self, '_beep_realtime_enabled', True)) else "1.0"
+			self._det_loss_s = float(os.getenv("BMI30_DETECT_LOSS_SEC", _default_loss_s))
 		except Exception:
-			self._det_loss_s = 1.0
+			self._det_loss_s = 0.0 if bool(getattr(self, '_beep_realtime_enabled', True)) else 1.0
 		try:
 			# Slightly stricter loss criterion => быстрее считаться "потерянным".
 			self._det_loss_ratio = float(os.getenv("BMI30_DETECT_LOSS_RATIO", "1.4"))
@@ -1705,14 +1977,15 @@ class ScopeWindow:
 			self._beep_adc0_min, self._beep_adc0_max = 1000.0, 3000.0
 			self._beep_adc1_min, self._beep_adc1_max = 2000.0, 4000.0
 		# Optional: keep PWM running while detection HOLD is active.
-		# This is OFF by default to avoid changing behavior unexpectedly.
-		self._beep_hold_enabled = _env_bool('BMI30_BEEP_HOLD_ENABLE', False)
+		# In realtime mode this is ON: detection owns PWM state directly.
+		self._beep_hold_enabled = _env_bool('BMI30_BEEP_HOLD_ENABLE', bool(getattr(self, '_beep_realtime_enabled', True)))
 		try:
-			self._beep_hold_delay_s = float(os.getenv('BMI30_BEEP_HOLD_DELAY', '0.40'))
+			_default_hold_delay = '0.0' if bool(getattr(self, '_beep_realtime_enabled', True)) else '0.40'
+			self._beep_hold_delay_s = float(os.getenv('BMI30_BEEP_HOLD_DELAY', _default_hold_delay))
 			if (not np.isfinite(self._beep_hold_delay_s)) or self._beep_hold_delay_s < 0.0:
-				self._beep_hold_delay_s = 0.40
+				self._beep_hold_delay_s = 0.0 if bool(getattr(self, '_beep_realtime_enabled', True)) else 0.40
 		except Exception:
-			self._beep_hold_delay_s = 0.40
+			self._beep_hold_delay_s = 0.0 if bool(getattr(self, '_beep_realtime_enabled', True)) else 0.40
 		self._beep_hold_active = False
 		self._beep_hold_freq = 0.0
 		self._beep_hold_after_t = 0.0
@@ -1789,6 +2062,14 @@ class ScopeWindow:
 		# stream (ленивый запуск)
 		self.stream = None
 		self._connecting = False
+		self._connect_started_t = 0.0
+		self._connect_attempt_id = 0
+		self._connect_timeout_count = 0
+		try:
+			self.connect_timeout_s = float(os.getenv("BMI30_CONNECT_TIMEOUT_S", "6.0"))
+		except Exception:
+			self.connect_timeout_s = 6.0
+		self._connect_result_queue: queue.Queue = queue.Queue()  # фоновый поток → GUI
 		self.usb_retry_timer = QtCore.QTimer()
 		self.usb_retry_timer.setInterval(1500)
 		self.usb_retry_timer.timeout.connect(self._try_connect)
@@ -1798,11 +2079,12 @@ class ScopeWindow:
 		# timer
 		self.timer = QtWidgets.QApplication.instance().thread()  # dummy keep
 		self.qtimer = QtCore.QTimer()
-		# Настраиваемая частота GUI: BMI30_GUI_FPS (по умолчанию 16 FPS для снижения нагрузки)
+		# Настраиваемая частота GUI: BMI30_GUI_FPS.
+		# Если отрисовка отключена, тикаем редко: только для reconnect/status/capture housekeeping.
 		try:
-			gui_fps = int(os.getenv("BMI30_GUI_FPS", "16"))
+			gui_fps = int(os.getenv("BMI30_GUI_FPS", "16" if self.gui_render_enabled else "4"))
 		except Exception:
-			gui_fps = 16
+			gui_fps = 16 if self.gui_render_enabled else 4
 		interval = max(10, int(1000 / gui_fps))  # минимум 10мс
 		self.qtimer.setInterval(interval)
 		self.qtimer.timeout.connect(self._tick)
@@ -1824,15 +2106,20 @@ class ScopeWindow:
 		# авто-сброс STM32 при пропаже потока
 		self.auto_reset_on_stall = str(os.getenv("BMI30_AUTO_RESET_ON_STALL", "1")).lower() not in ("0","false","no")
 		try:
-			self.stall_reset_after = float(os.getenv("BMI30_STALL_RESET_AFTER", "15"))
+			self.stall_reset_after = float(os.getenv("BMI30_STALL_RESET_AFTER", "2.0"))
 		except Exception:
-			self.stall_reset_after = 15.0
+			self.stall_reset_after = 2.0
 		try:
-			self.stall_reset_cooldown = float(os.getenv("BMI30_STALL_RESET_COOLDOWN", "30"))
+			self.stall_reset_cooldown = float(os.getenv("BMI30_STALL_RESET_COOLDOWN", "10.0"))
 		except Exception:
-			self.stall_reset_cooldown = 30.0
+			self.stall_reset_cooldown = 10.0
 		self._stall_reset_last_t = 0.0
 		self._stall_reset_inflight = False
+		self._stream_fault_kind = "ok"
+		self._stream_fault_msg = ""
+		self._stream_fault_probe_t = 0.0
+		self._stream_fault_probe_ok = None
+		self._stream_fault_probe_msg = ""
 		# Флаг: поток остановлен пользователем (не выполнять автопинки)
 		self._stream_user_stopped = False
 		# нижняя панель: слева слайдеры, справа цифровые кнопки
@@ -1874,10 +2161,26 @@ class ScopeWindow:
 		self.num_group = QtWidgets.QButtonGroup()
 		self.num_group.setExclusive(True)
 		self.num_buttons = []
+		self.num_button_tooltips = {
+			0: "Выключить графическое отображение",
+			1: "Полный сигнал верхней части антенны",
+			2: "Полный сигнал нижней части антенны",
+			3: "Отображение полного сигнала с верхней и нижней частей антенны",
+			4: "Отображение необработанного рабочего участка верхней и нижней частей антенны",
+			5: "Отображение обработанного рабочего участка верхней и нижней частей антенны",
+			6: "Детекция метки верхней и нижней частей антенны отдельно в 1D",
+			7: "Детекция метки верхней и нижней частей антенны в 1D с корреляцией между частями антенны",
+			8: "Детекция метки верхней и нижней частей антенны в 3D с корреляцией между частями антенны",
+			9: "Сканирование дроном и отображение графической диаграммы детектирования",
+		}
 		btns_layout = QtWidgets.QHBoxLayout()
-		for i in range(8):
+		for i in range(10):
 			b = QtWidgets.QToolButton()
 			b.setText(str(i))
+			try:
+				b.setToolTip(self.num_button_tooltips.get(i, str(i)))
+			except Exception:
+				pass
 			b.setCheckable(True)
 			b.setAutoExclusive(True)
 			b.setFixedSize(42, 42)
@@ -1897,10 +2200,12 @@ class ScopeWindow:
 		# без stretch — слайдеры тянутся до кнопок
 		bottom.addLayout(btns_layout)
 		# apply saved selection
-		if self.sel_saved and 1 <= self.sel_saved <= 7:
+		if self.sel_saved and 1 <= self.sel_saved <= 6:
 			self.num_buttons[self.sel_saved].setChecked(True)
+			self._last_allowed_num_idx = int(self.sel_saved)
 		else:
 			self.num_buttons[0].setChecked(True)
+			self._last_allowed_num_idx = 0
 		self.num_group.idClicked.connect(self._num_clicked)
 		# Дополнительный обработчик для специальных режимов (например кнопка 6 — корреляция)
 		self.num_group.idClicked.connect(self._on_num_clicked_extra)
@@ -1972,23 +2277,79 @@ class ScopeWindow:
 			if port is None:
 				print("[RESET] CDC порт не найден, пропускаем SOFT_RESET")
 				return
-			with serial.Serial(port, 115200, timeout=1) as ser:
+			with serial.Serial(port, 115200, timeout=0.2, write_timeout=0.2) as ser:
 				ser.write(bytes([CMD_SOFT_RESET]))
 				time.sleep(0.1)
 				print("[RESET] SOFT_RESET sent via CDC")
 		except Exception as e:
 			print(f"[RESET] SOFT_RESET via CDC failed: {e}")
 
-	def _hardware_reset_device(self) -> bool:
+	def _release_hw_reset_line(self) -> bool:
+		"""Best-effort release of HW reset pin to Hi-Z/input state."""
+		try:
+			gpio_pin = int(os.getenv("BMI30_HW_RESET_GPIO", "17"))
+		except Exception:
+			gpio_pin = 17
+		if gpio_pin <= 0:
+			return False
+		# Try pigpio first
+		try:
+			import pigpio  # type: ignore
+			pi = pigpio.pi()
+			if getattr(pi, 'connected', False):
+				try:
+					pi.set_mode(gpio_pin, pigpio.INPUT)
+					pi.set_pull_up_down(gpio_pin, pigpio.PUD_OFF)
+				except Exception:
+					pass
+				try:
+					pi.stop()
+				except Exception:
+					pass
+				print(f"[HW-RESET] release line gpio=BCM{gpio_pin} backend=pigpio", flush=True)
+				return True
+		except Exception:
+			pass
+		# Try lgpio
+		try:
+			import lgpio  # type: ignore
+			chip = lgpio.gpiochip_open(0)
+			try:
+				lgpio.gpio_claim_input(chip, gpio_pin)
+			except Exception:
+				pass
+			try:
+				lgpio.gpiochip_close(chip)
+			except Exception:
+				pass
+			print(f"[HW-RESET] release line gpio=BCM{gpio_pin} backend=lgpio", flush=True)
+			return True
+		except Exception:
+			pass
+		# Fallback: RPi.GPIO
+		try:
+			import RPi.GPIO as GPIO  # type: ignore
+			GPIO.setwarnings(False)
+			GPIO.setmode(GPIO.BCM)
+			GPIO.setup(gpio_pin, GPIO.IN, pull_up_down=GPIO.PUD_OFF)
+			GPIO.cleanup(gpio_pin)
+			print(f"[HW-RESET] release line gpio=BCM{gpio_pin} backend=RPi.GPIO", flush=True)
+			return True
+		except Exception:
+			pass
+		print(f"[HW-RESET] release line gpio=BCM{gpio_pin} failed: no gpio backend", flush=True)
+		return False
+
+	def _hardware_reset_device(self, update_ui: bool = True) -> bool:
 		"""Аппаратный сброс через GPIO (open-collector): краткий LOW, затем Hi-Z."""
 		try:
 			gpio_pin = int(os.getenv("BMI30_HW_RESET_GPIO", "17"))
 		except Exception:
 			gpio_pin = 17
 		try:
-			pulse_ms = int(os.getenv("BMI30_HW_RESET_PULSE_MS", "100"))
+			pulse_ms = int(os.getenv("BMI30_HW_RESET_PULSE_MS", "1000"))
 		except Exception:
-			pulse_ms = 100
+			pulse_ms = 1000
 		try:
 			wait_s = float(os.getenv("BMI30_HW_RESET_WAIT_S", "3.0"))
 		except Exception:
@@ -2000,20 +2361,48 @@ class ScopeWindow:
 		if wait_s < 0:
 			wait_s = 0.0
 		try:
-			self._set_status(f"Аппаратный сброс GPIO{gpio_pin}…", hold_sec=1.5)
+			print(f"[HW-RESET] request gpio=BCM{gpio_pin} pulse_ms={pulse_ms} wait_s={wait_s}", flush=True)
 		except Exception:
 			pass
+		if update_ui:
+			try:
+				self._set_status(f"Аппаратный сброс GPIO{gpio_pin}…", hold_sec=1.5)
+			except Exception:
+				pass
 		# Try pigpio first
 		try:
 			import pigpio  # type: ignore
 			pi = pigpio.pi()
 			if getattr(pi, 'connected', False):
+				try:
+					print("[HW-RESET] backend=pigpio", flush=True)
+				except Exception:
+					pass
+				# Читаем начальный уровень (вход без подтяжки)
+				try:
+					pi.set_mode(gpio_pin, pigpio.INPUT)
+					pi.set_pull_up_down(gpio_pin, pigpio.PUD_OFF)
+					initial_level = pi.read(gpio_pin)
+					print(f"[HW-RESET] gpio=BCM{gpio_pin} initial_level={initial_level}", flush=True)
+				except Exception as _e:
+					print(f"[HW-RESET] initial_level read error: {_e}", flush=True)
 				pi.set_mode(gpio_pin, pigpio.OUTPUT)
 				pi.write(gpio_pin, 0)
 				time.sleep(max(0.01, pulse_ms / 1000.0))
 				pi.set_mode(gpio_pin, pigpio.INPUT)  # Hi-Z
+				pi.set_pull_up_down(gpio_pin, pigpio.PUD_OFF)
+				# Читаем уровень после отпускания
+				try:
+					post_level = pi.read(gpio_pin)
+					print(f"[HW-RESET] gpio=BCM{gpio_pin} post_reset_level={post_level}", flush=True)
+				except Exception as _e:
+					print(f"[HW-RESET] post_reset_level read error: {_e}", flush=True)
 				pi.stop()
 				time.sleep(wait_s)
+				try:
+					print("[HW-RESET] done backend=pigpio", flush=True)
+				except Exception:
+					pass
 				return True
 		except Exception:
 			pass
@@ -2021,27 +2410,157 @@ class ScopeWindow:
 		try:
 			import lgpio  # type: ignore
 			chip = lgpio.gpiochip_open(0)
+			try:
+				print("[HW-RESET] backend=lgpio", flush=True)
+			except Exception:
+				pass
+			# Читаем начальный уровень
+			try:
+				lgpio.gpio_claim_input(chip, gpio_pin)
+				initial_level = lgpio.gpio_read(chip, gpio_pin)
+				print(f"[HW-RESET] gpio=BCM{gpio_pin} initial_level={initial_level}", flush=True)
+			except Exception as _e:
+				print(f"[HW-RESET] initial_level read error: {_e}", flush=True)
 			lgpio.gpio_claim_output(chip, gpio_pin, 0)
 			time.sleep(max(0.01, pulse_ms / 1000.0))
 			lgpio.gpio_claim_input(chip, gpio_pin)
+			# Читаем уровень после отпускания
+			try:
+				post_level = lgpio.gpio_read(chip, gpio_pin)
+				print(f"[HW-RESET] gpio=BCM{gpio_pin} post_reset_level={post_level}", flush=True)
+			except Exception as _e:
+				print(f"[HW-RESET] post_reset_level read error: {_e}", flush=True)
 			lgpio.gpiochip_close(chip)
 			time.sleep(wait_s)
+			try:
+				print("[HW-RESET] done backend=lgpio", flush=True)
+			except Exception:
+				pass
 			return True
 		except Exception:
 			pass
 		# Fallback: RPi.GPIO
 		try:
 			import RPi.GPIO as GPIO  # type: ignore
+			try:
+				print("[HW-RESET] backend=RPi.GPIO", flush=True)
+			except Exception:
+				pass
 			GPIO.setwarnings(False)
 			GPIO.setmode(GPIO.BCM)
+			# Читаем начальный уровень
+			try:
+				GPIO.setup(gpio_pin, GPIO.IN, pull_up_down=GPIO.PUD_OFF)
+				initial_level = GPIO.input(gpio_pin)
+				print(f"[HW-RESET] gpio=BCM{gpio_pin} initial_level={initial_level}", flush=True)
+			except Exception as _e:
+				print(f"[HW-RESET] initial_level read error: {_e}", flush=True)
 			GPIO.setup(gpio_pin, GPIO.OUT, initial=GPIO.LOW)
 			time.sleep(max(0.01, pulse_ms / 1000.0))
 			GPIO.setup(gpio_pin, GPIO.IN, pull_up_down=GPIO.PUD_OFF)
+			# Читаем уровень после отпускания
+			try:
+				post_level = GPIO.input(gpio_pin)
+				print(f"[HW-RESET] gpio=BCM{gpio_pin} post_reset_level={post_level}", flush=True)
+			except Exception as _e:
+				print(f"[HW-RESET] post_reset_level read error: {_e}", flush=True)
 			GPIO.cleanup(gpio_pin)
 			time.sleep(wait_s)
+			try:
+				print("[HW-RESET] done backend=RPi.GPIO", flush=True)
+			except Exception:
+				pass
 			return True
 		except Exception:
+			try:
+				print("[HW-RESET] failed: no gpio backend available", flush=True)
+			except Exception:
+				pass
 			return False
+
+	def _probe_device_status_ep0(self, force: bool = False):
+		"""Best-effort probe: отвечает ли устройство на GET_STATUS по EP0."""
+		now = time.time()
+		try:
+			last_t = float(getattr(self, '_stream_fault_probe_t', 0.0) or 0.0)
+		except Exception:
+			last_t = 0.0
+		if (not force) and last_t > 0.0 and (now - last_t) < 0.5:
+			return getattr(self, '_stream_fault_probe_ok', None), str(getattr(self, '_stream_fault_probe_msg', '') or '')
+		ok = None
+		msg = ""
+		try:
+			st = getattr(self, 'stream', None)
+			dev = getattr(st, 'dev', None) if st is not None else None
+			if dev is None:
+				ok, msg = (None, "dev отсутствует")
+			else:
+				data = dev.ctrl_transfer(0xC0, CMD_GET_STATUS, 0, 0, 64, timeout=250)
+				blen = len(data) if data is not None else 0
+				if blen >= 4 and bytes(data[:4]) == b'STAT':
+					ver = int(data[4]) if blen >= 5 else 0
+					cur_samples = int.from_bytes(bytes(data[6:8]), 'little') if blen >= 8 else 0
+					frame_bytes = int.from_bytes(bytes(data[8:10]), 'little') if blen >= 10 else 0
+					ok = True
+					msg = f"STAT v{ver} cur_samples={cur_samples} frame_bytes={frame_bytes}"
+				else:
+					ok = False
+					msg = f"GET_STATUS len={blen}"
+		except Exception as e:
+			ok = False
+			msg = str(e)
+		self._stream_fault_probe_t = now
+		self._stream_fault_probe_ok = ok
+		self._stream_fault_probe_msg = msg
+		return ok, msg
+
+	def _classify_stream_fault(self, now_t: float | None = None):
+		"""Разделить проблемы USB RX, потери стереопар и реального залипания потока."""
+		if now_t is None:
+			now_t = time.time()
+		if self.stream is None:
+			return ("stream_off", "Поток остановлен")
+		try:
+			if bool(getattr(self.stream, 'disconnected', False)):
+				return ("usb_disconnected", "RPi/USB: устройство исчезло или переоткрылось")
+		except Exception:
+			pass
+		try:
+			stop_after = float(getattr(self, 'stop_warn_after', 5.0) or 5.0)
+		except Exception:
+			stop_after = 5.0
+		try:
+			rx_t = float(getattr(self.stream, 'last_rx_t', 0.0) or 0.0)
+		except Exception:
+			rx_t = 0.0
+		try:
+			frame_t = float(getattr(self, 'last_frame_t', 0.0) or 0.0)
+		except Exception:
+			frame_t = 0.0
+		has_frames = bool(getattr(self, 'base_buf_len', None) is not None)
+		idle_rx = (float(now_t) - rx_t) if rx_t > 0.0 else float('inf')
+		idle_frame = (float(now_t) - frame_t) if frame_t > 0.0 else float('inf')
+		if idle_rx <= stop_after:
+			if has_frames and idle_frame > stop_after:
+				return ("pairing_stall", "USB RX жив, но нет новых стереопар")
+			if not has_frames:
+				return ("waiting_frames", "USB RX жив, но рабочих кадров еще нет")
+			return ("ok", "Поток жив")
+		ep0_ok, ep0_msg = self._probe_device_status_ep0(force=False)
+		if ep0_ok is True:
+			return ("stm32_stream_stall", f"STM32 отвечает на EP0, но bulk поток молчит ({ep0_msg})")
+		if ep0_ok is False:
+			return ("rpi_usb_fault", f"RPi/USB не получает даже EP0 ({ep0_msg})")
+		return ("no_rx_unknown", "Нет USB приёма, причина не определена")
+
+	def _update_stream_fault_state(self, now_t: float | None = None):
+		try:
+			kind, msg = self._classify_stream_fault(now_t=now_t)
+		except Exception as e:
+			kind, msg = ("fault_unknown", f"Диагностика потока недоступна: {e}")
+		self._stream_fault_kind = str(kind)
+		self._stream_fault_msg = str(msg)
+		return kind, msg
 
 	def _init_det_gpio(self):
 		"""Инициализировать GPIO для индикации срабатывания ADC1/ADC2."""
@@ -2354,6 +2873,16 @@ class ScopeWindow:
 				self.data0_odd[:] = 0
 				self.data1_even[:] = 0
 				self.data1_odd[:] = 0
+				self.det0_even[:] = 0
+				self.det0_odd[:] = 0
+				self.det1_even[:] = 0
+				self.det1_odd[:] = 0
+				self._det_prev0 = None
+				self._det_prev1 = None
+				self._det_prev_par0 = None
+				self._det_prev_par1 = None
+				self._det_slide_valid0 = False
+				self._det_slide_valid1 = False
 			except Exception:
 				pass
 			if getattr(self, 'phase_trace', False):
@@ -2430,6 +2959,35 @@ class ScopeWindow:
 			# on error, return safe defaults
 			N = int(len(even)) if hasattr(even, '__len__') else 0
 			return 0, 0.0, np.zeros(2 * N - 1, dtype=np.float64), np.zeros(N, dtype=np.float64)
+
+	def _det_product_from_pair(self, even: np.ndarray, odd: np.ndarray, shift: int = 0) -> np.ndarray:
+		"""Build detector product from one sliding even/odd packet pair."""
+		try:
+			N = min(int(len(even)), int(len(odd)))
+			if N <= 0:
+				return np.zeros(0, dtype=np.float64)
+			even_s = np.asarray(even[:N], dtype=np.int64) - 32767
+			odd_inv = -(np.asarray(odd[:N], dtype=np.int64) - 32767)
+			prod = np.zeros(N, dtype=np.float64)
+			try:
+				shift = int(shift)
+			except Exception:
+				shift = 0
+			if shift >= 0:
+				end = N - min(shift, N)
+				if end > 0:
+					prod[:end] = even_s[:end].astype(np.float64) * odd_inv[shift:shift + end].astype(np.float64)
+			else:
+				start = min(-shift, N)
+				if start < N:
+					prod[start:] = even_s[start:].astype(np.float64) * odd_inv[:N - start].astype(np.float64)
+			return prod
+		except Exception:
+			try:
+				N = int(len(even)) if hasattr(even, '__len__') else 0
+			except Exception:
+				N = 0
+			return np.zeros(max(0, N), dtype=np.float64)
 
 	def _find_optimal_phase_shift(self, even: np.ndarray, odd: np.ndarray, channel_name: str = ""):
 		"""Find optimal phase shift between even and inverted odd by iterating all shifts.
@@ -2604,7 +3162,11 @@ class ScopeWindow:
 	def _on_num_clicked_extra(self, idx: int):
 		"""Extra handler for numeric buttons — button 6 triggers cross-correlation display."""
 		try:
-			if int(idx) != 6:
+			idx = int(idx)
+			if idx in (7, 8, 9):
+				return
+			if idx != 6:
+				self._det_button6_active = False
 				return
 		except Exception:
 			return
@@ -2619,6 +3181,7 @@ class ScopeWindow:
 		# if button is checked -> start continuous recompute, else stop
 		try:
 			if self.num_buttons[6].isChecked():
+				self._det_button6_active = True
 				# immediate compute once, then start timer
 				# make correlation curves visible and compute
 				try:
@@ -2630,6 +3193,12 @@ class ScopeWindow:
 				self._corr_timer.start()
 				self._set_status('XCorr: continuous', hold_sec=1.0)
 			else:
+				self._det_button6_active = False
+				try:
+					self._beep_hold_stop()
+					self._set_det_gpio(False, False)
+				except Exception:
+					pass
 				if hasattr(self, '_corr_timer'):
 					self._corr_timer.stop()
 				# hide and clear corr plots
@@ -2941,6 +3510,95 @@ class ScopeWindow:
 		except Exception:
 			pass
 
+	def _dc_quarter_arm(self, enabled: bool, reason: str = ""):
+		"""Track host-side supervision of STM32 DC adaptation."""
+		try:
+			if bool(enabled):
+				self._dc_quarter_active = True
+				self._dc_quarter_done = False
+				self._dc_quarter_frames = 0
+				self._dc_quarter_ok_frames = 0
+				self._dc_quarter_last = None
+			else:
+				self._dc_quarter_active = False
+				self._dc_quarter_ok_frames = 0
+			if bool(getattr(self, 'reader_debug', False)):
+				state = "ON" if bool(enabled) else "OFF"
+				print(f"[DC_Q] supervise {state} {reason}".rstrip(), flush=True)
+		except Exception:
+			pass
+
+	def _dc_quarter_channel_stats(self, arr):
+		"""Return first/last quarter means for samples 0..199."""
+		try:
+			if arr is None:
+				return None
+			n = int(getattr(self, 'dc_quarter_window', 200) or 200)
+			if n < 4:
+				n = 200
+			if len(arr) < n:
+				return None
+			q = int(n // 4)
+			if q <= 0:
+				return None
+			a = np.asarray(arr[:n], dtype=np.float64)
+			first = float(np.mean(a[:q]))
+			last = float(np.mean(a[n - q:n]))
+			return (first, last, first - last)
+		except Exception:
+			return None
+
+	def _dc_quarter_autostop_check(self, ch0, ch1):
+		"""Stop STM32 DC adaptation when 0-49 and 150-199 levels match."""
+		try:
+			if not bool(getattr(self, '_dc_quarter_active', False)):
+				return
+			if bool(getattr(self, '_det_dc_frozen', False)):
+				return
+			tol = float(getattr(self, 'dc_quarter_tol', 1.0) or 1.0)
+			stable_need = int(getattr(self, 'dc_quarter_stable_frames', 1) or 1)
+			stats = []
+			try:
+				adc1_en, adc2_en = self._adc_enable_flags()
+			except Exception:
+				adc1_en, adc2_en = True, True
+			for name, arr, enabled in (("ADC1", ch0, adc1_en), ("ADC2", ch1, adc2_en)):
+				if not enabled:
+					continue
+				st = self._dc_quarter_channel_stats(arr)
+				if st is None:
+					return
+				stats.append((name, st[0], st[1], st[2]))
+			if not stats:
+				return
+			self._dc_quarter_frames = int(getattr(self, '_dc_quarter_frames', 0) or 0) + 1
+			self._dc_quarter_last = tuple(stats)
+			balanced = all(abs(diff) <= tol for _, _, _, diff in stats)
+			if balanced:
+				self._dc_quarter_ok_frames = int(getattr(self, '_dc_quarter_ok_frames', 0) or 0) + 1
+			else:
+				self._dc_quarter_ok_frames = 0
+			now = time.time()
+			if bool(getattr(self, 'reader_debug', False)) and (now - float(getattr(self, '_dc_quarter_last_report_t', 0.0) or 0.0)) >= 1.0:
+				self._dc_quarter_last_report_t = now
+				parts = [f"{name}:q1={first:.1f} q4={last:.1f} d={diff:+.1f}" for name, first, last, diff in stats]
+				print(f"[DC_Q] {' | '.join(parts)} tol={tol:.1f} ok={self._dc_quarter_ok_frames}/{stable_need}", flush=True)
+			if self._dc_quarter_ok_frames < stable_need:
+				return
+			# The device has reached the requested condition; freeze STM32 DC adaptation.
+			self._device_set_dc_adapt(False)
+			self._dc_quarter_done = True
+			self._dc_quarter_active = False
+			parts = [f"{name} d={diff:+.1f}" for name, _, _, diff in stats]
+			try:
+				self._set_status("DC: четверти выровнены, компенсация остановлена (" + ", ".join(parts) + ")", hold_sec=2.0)
+			except Exception:
+				pass
+			if bool(getattr(self, 'reader_debug', False)):
+				print(f"[DC_Q] balanced -> SET_DC_ADAPT 0 ({', '.join(parts)})", flush=True)
+		except Exception:
+			pass
+
 	def _device_set_dc_adapt(self, enabled: bool):
 		"""Toggle device-side DC adaptation if supported by firmware."""
 		try:
@@ -2948,6 +3606,7 @@ class ScopeWindow:
 				return
 			payload = b"\x01" if bool(enabled) else b"\x00"
 			self.stream.send_cmd(CMD_SET_DC_ADAPT, payload)
+			self._dc_quarter_arm(bool(enabled), "SET_DC_ADAPT")
 		except Exception:
 			pass
 
@@ -2962,6 +3621,7 @@ class ScopeWindow:
 			if f > 255:
 				f = 255
 			self.stream.send_cmd(CMD_CALIB_DC_FAST, bytes([f & 0xFF]))
+			self._dc_quarter_arm(True, f"CALIB_DC_FAST {f}")
 		except Exception:
 			pass
 
@@ -3038,6 +3698,8 @@ class ScopeWindow:
 					return
 			except Exception:
 				pass
+			if bool(getattr(self, '_beep_realtime_enabled', True)):
+				return
 			if not bool(getattr(self, '_beep_hold_enabled', False)):
 				return
 			# Do not interfere with explicit debug modes
@@ -3075,16 +3737,29 @@ class ScopeWindow:
 			self._beep_hold_active = False
 			self._beep_hold_freq = 0.0
 			self._beep_hold_after_t = 0.0
+			self._beep_info_busy_until = 0.0
 			# Do not stop PWM if user forced it ON from the GUI.
 			_force_mode = int(getattr(self, '_beep_force_mode', 0) or 0)
 			if _force_mode == -1:
 				try:
-					self._beeper.set_continuous(None)
+					stop_now = getattr(self._beeper, 'stop_now', None)
+					if callable(stop_now):
+						stop_now()
+					else:
+						self._beeper.set_continuous(None)
 				except Exception:
 					pass
 			elif not bool(getattr(self, '_beep_force_enabled', False)):
 				try:
-					self._beeper.set_continuous(None)
+					stop_after = getattr(self._beeper, 'stop_repeating_after_current_sequence', None)
+					if bool(getattr(self, '_beep_realtime_enabled', True)) and callable(stop_after) and stop_after():
+						pass
+					else:
+						stop_now = getattr(self._beeper, 'stop_now', None)
+						if callable(stop_now):
+							stop_now()
+						else:
+							self._beeper.set_continuous(None)
 				except Exception:
 					pass
 		except Exception:
@@ -3106,12 +3781,67 @@ class ScopeWindow:
 				f2_common = self._shift_to_beep_freq(shift0, 2000.0, 3000.0)
 				f2_0 = float(np.clip(f2_common, self._beep_adc0_min, self._beep_adc0_max))
 				f2_1 = float(np.clip(f2_common, self._beep_adc1_min, self._beep_adc1_max))
-			# Play patterns (sequential)
+			if bool(getattr(self, '_beep_realtime_enabled', True)):
+				try:
+					tone_s = float(os.getenv("BMI30_BEEP_INFO_TONE", "0.10"))
+					info_gap_s = float(os.getenv("BMI30_BEEP_INFO_GAP", "0.0"))
+					channel_gap_s = float(os.getenv("BMI30_BEEP_CHANNEL_GAP", "0.0"))
+					repeat_gap_s = float(os.getenv("BMI30_BEEP_REPEAT_GAP", "0.05"))
+				except Exception:
+					tone_s, info_gap_s, channel_gap_s, repeat_gap_s = 0.10, 0.0, 0.0, 0.05
+				tone_s = max(0.02, min(1.0, float(tone_s)))
+				info_gap_s = max(0.0, min(2.0, float(info_gap_s)))
+				channel_gap_s = max(0.0, min(2.0, float(channel_gap_s)))
+				repeat_gap_s = max(0.0, min(2.0, float(repeat_gap_s)))
+				sequences = []
+				def _make_pattern(base_freq: float, phase_freq: float):
+					seq = [(float(base_freq), tone_s)]
+					if info_gap_s > 0.0:
+						seq.append((None, info_gap_s))
+					seq.append((float(phase_freq), tone_s))
+					return tuple(seq)
+				if fired0:
+					sequences.append(_make_pattern(self._beep_adc0_base, f2_0))
+				if fired1:
+					sequences.append(_make_pattern(self._beep_adc1_base, f2_1))
+				play_repeating_sequences = getattr(self._beeper, 'play_repeating_sequences', None)
+				if callable(play_repeating_sequences):
+					play_repeating_sequences(sequences, repeat_gap_s=repeat_gap_s)
+					return
+				seq = []
+				for pattern in sequences:
+					if seq and channel_gap_s > 0.0:
+						seq.append((None, channel_gap_s))
+					seq.extend(pattern)
+				try:
+					now = time.time()
+					busy_until = float(getattr(self, '_beep_info_busy_until', 0.0) or 0.0)
+					if now < busy_until:
+						return
+					self._beep_info_busy_until = now + sum(float(seg[1]) for seg in seq) + repeat_gap_s
+				except Exception:
+					pass
+				play_sequence = getattr(self._beeper, 'play_sequence', None)
+				if callable(play_sequence):
+					play_sequence(seq)
+				elif fired0:
+					self._beeper.play_pattern(self._beep_adc0_base, f2_0, t_on1=tone_s, t_gap=info_gap_s, t_on2=tone_s)
+				elif fired1:
+					self._beeper.play_pattern(self._beep_adc1_base, f2_1, t_on1=tone_s, t_gap=info_gap_s, t_on2=tone_s)
+				return
+			if bool(getattr(self, '_beep_hold_enabled', False)):
+				if fired0 and fired1:
+					freq = float(f2_0 if abs(int(shift0)) >= abs(int(shift1)) else f2_1)
+				elif fired0:
+					freq = float(f2_0)
+				else:
+					freq = float(f2_1)
+				self._beeper.set_continuous(freq)
+				return
+			# Legacy pattern mode: play only one pattern to avoid queuing sound and blocking GUI.
 			if fired0:
 				self._beeper.play_pattern(self._beep_adc0_base, f2_0)
-				if fired1:
-					time.sleep(0.25)
-			if fired1:
+			elif fired1:
 				self._beeper.play_pattern(self._beep_adc1_base, f2_1)
 		except Exception:
 			pass
@@ -3514,44 +4244,52 @@ class ScopeWindow:
 			self._capture_post_countdown = 0
 
 	def _quick_detect(self):
-		"""Быстрое детектирование без полного вычисления корреляции.
-		
-		Вызывается немедленно при получении новых пакетов для минимизации задержки.
-		Вычисляет простое произведение even * (-odd) без оптимизации сдвига фазы.
-		"""
+		"""Fast detector path on sliding packet pairs: previous packet + current packet."""
 		try:
+			if not bool(getattr(self, '_det_button6_active', False)):
+				return
 			with self.data_lock:
 				N = int(self.base_buf_len) if getattr(self, 'base_buf_len', None) else int(getattr(self, 'view_len', self.max_samples))
 				N = max(1, min(N, self.max_samples))
 				if N <= 1:
 					return
-				# Копируем буферы
-				e0 = np.array(self.data0_even[:N], copy=True).astype(np.float64)
-				o0 = np.array(self.data0_odd[:N], copy=True).astype(np.float64)
-				e1 = np.array(self.data1_even[:N], copy=True).astype(np.float64)
-				o1 = np.array(self.data1_odd[:N], copy=True).astype(np.float64)
-			
-			# Центрируем сигналы (0..65535 -> -32767..+32768)
-			e0_c = e0 - 32767.0
-			o0_c = o0 - 32767.0
-			e1_c = e1 - 32767.0
-			o1_c = o1 - 32767.0
-			
-			# Инвертируем нечетные
-			o0_inv = -o0_c
-			o1_inv = -o1_c
-			
-			# Вычисляем произведение (без сдвига фазы для скорости)
-			prod0_center = e0_c * o0_inv
-			prod1_center = e1_c * o1_inv
-			
-			# Нормализуем к [-1..1]
+				valid0 = bool(getattr(self, '_det_slide_valid0', False))
+				valid1 = bool(getattr(self, '_det_slide_valid1', False))
+				if not (valid0 or valid1):
+					return
+				zero = np.zeros(N, dtype=np.int32)
+				if valid0:
+					e0 = np.array(self.det0_even[:N], copy=True)
+					o0 = np.array(self.det0_odd[:N], copy=True)
+				else:
+					e0 = zero.copy()
+					o0 = zero.copy()
+				if valid1:
+					e1 = np.array(self.det1_even[:N], copy=True)
+					o1 = np.array(self.det1_odd[:N], copy=True)
+				else:
+					e1 = zero.copy()
+					o1 = zero.copy()
+				try:
+					shift0 = int(getattr(self, '_phase_shift_adc0', 0) or 0)
+				except Exception:
+					shift0 = 0
+				try:
+					shift1 = int(getattr(self, '_phase_shift_adc1', 0) or 0)
+				except Exception:
+					shift1 = 0
+			prod0_center = self._det_product_from_pair(e0, o0, shift0)
+			prod1_center = self._det_product_from_pair(e1, o1, shift1)
 			denom = 32768.0 * 32768.0
 			prod0_norm = prod0_center / (denom + 1e-12)
 			prod1_norm = prod1_center / (denom + 1e-12)
-			
-			# Вызываем детектирование
-			self._update_signal_detection(prod0_norm, prod1_norm, 0, 0, source='norm')
+			src = str(getattr(self, '_det_source', 'prod') or 'prod').strip().lower()
+			if src in ('raw', 'product'):
+				src = 'prod'
+			if src == 'prod':
+				self._update_signal_detection(prod0_center, prod1_center, shift0, shift1, source='prod')
+			else:
+				self._update_signal_detection(prod0_norm, prod1_norm, shift0, shift1, source='norm')
 		except Exception:
 			pass
 
@@ -3568,6 +4306,8 @@ class ScopeWindow:
 		- detect/hold: +2 / -1
 		"""
 		if not bool(getattr(self, '_det_enabled', False)):
+			return
+		if not bool(getattr(self, '_det_button6_active', False)):
 			return
 		# Optional gate: when dependency is enabled and GPIO23=0, disable ONLY detection fire,
 		# but continue level/threshold computation for UI and adaptation.
@@ -4260,6 +5000,10 @@ class ScopeWindow:
 				self._prev_beep_state = False
 				self._det_hold0 = False
 				self._det_hold1 = False
+				self._det_exceed0 = 0
+				self._det_exceed1 = 0
+				self._det_start_consec0 = 0
+				self._det_start_consec1 = 0
 				try:
 					self._det_freeze_thr0 = 0
 					self._det_freeze_thr1 = 0
@@ -4766,6 +5510,32 @@ class ScopeWindow:
 
 	# --- numeric buttons persistence ---
 	def _num_clicked(self, idx: int):
+		try:
+			idx = int(idx)
+		except Exception:
+			idx = 0
+		if idx in (7, 8, 9):
+			try:
+				self._set_status("пока не реализовано", hold_sec=2.0)
+			except Exception:
+				pass
+			try:
+				restore_idx = int(getattr(self, '_last_allowed_num_idx', 0) or 0)
+			except Exception:
+				restore_idx = 0
+			try:
+				if restore_idx < 0 or restore_idx >= len(self.num_buttons) or restore_idx in (7, 8, 9):
+					restore_idx = 0
+				self.num_group.blockSignals(True)
+				self.num_buttons[restore_idx].setChecked(True)
+			except Exception:
+				pass
+			try:
+				self.num_group.blockSignals(False)
+			except Exception:
+				pass
+			return
+		self._last_allowed_num_idx = idx
 		# Сброс счетчиков статистики и разморозка при любом переключении режима
 		# ВАЖНО: адаптивные пороги НЕ сбрасываем - они продолжают работать
 		try:
@@ -4777,15 +5547,16 @@ class ScopeWindow:
 			self._beep_consecutive1 = 0
 			# Проверяем переход между режимами
 			last_idx = getattr(self, '_det_last_mode_idx', None)
-			going_to_detect = (idx >= 6)  # Переходим на кнопки 6+
-			coming_from_detect = (last_idx is not None and last_idx >= 6)  # Были на кнопках 6+
+			going_to_detect = (idx == 6)  # Детекция разрешена только на кнопке 6
+			coming_from_detect = (last_idx is not None and last_idx == 6)  # Были на кнопке 6
+			self._det_button6_active = bool(going_to_detect)
 			# Сохраняем текущий режим
 			self._det_last_mode_idx = idx
-			# Если уходим с кнопок 6+ - сохраняем пороги
+			# Если уходим с кнопки 6 - сохраняем пороги
 			if coming_from_detect and not going_to_detect:
 				self._det_saved_thr0 = self._det_thr0
 				self._det_saved_thr1 = self._det_thr1
-			# Если приходим на кнопки 6+ - восстанавливаем пороги и запускаем warmup
+			# Если приходим на кнопку 6 - восстанавливаем пороги и запускаем warmup
 			if going_to_detect:
 				# Восстанавливаем сохраненные пороги (если есть)
 				if hasattr(self, '_det_saved_thr0') and self._det_saved_thr0 > 0:
@@ -4814,12 +5585,17 @@ class ScopeWindow:
 					self._device_set_dc_adapt(True)
 				except Exception:
 					pass
+				try:
+					self._beep_hold_stop()
+					self._set_det_gpio(False, False)
+				except Exception:
+					pass
 		except Exception:
 			pass
-		# Enable heavy phase-shift search only in modes 6+ ("6 и более").
+		# Enable heavy phase-shift search only in mode 6.
 		# This flag is consumed by the USB reader thread.
 		try:
-			self._phase_search_enabled = bool(int(idx) >= 6)
+			self._phase_search_enabled = bool(int(idx) == 6)
 		except Exception:
 			self._phase_search_enabled = False
 		# Если поток не запущен — перезапускаем на любой кнопке кроме 0
@@ -4862,6 +5638,10 @@ class ScopeWindow:
 			self._set_status("XCorr: toggle (no stream mode change)", hold_sec=1.5)
 		elif self.stream is not None and idx not in (1, 2, 3, 4, 5):
 			try:
+				self._clear_host_rx_indicator(force=True)
+			except Exception:
+				pass
+			try:
 				self.stream.close()
 			except Exception:
 				pass
@@ -4875,6 +5655,16 @@ class ScopeWindow:
 			self.data1_even = self.data1
 			self.data0_odd = np.zeros(0, dtype=np.int16)
 			self.data1_odd = np.zeros(0, dtype=np.int16)
+			self.det0_even = np.zeros(0, dtype=np.int16)
+			self.det0_odd = np.zeros(0, dtype=np.int16)
+			self.det1_even = np.zeros(0, dtype=np.int16)
+			self.det1_odd = np.zeros(0, dtype=np.int16)
+			self._det_prev0 = None
+			self._det_prev1 = None
+			self._det_prev_par0 = None
+			self._det_prev_par1 = None
+			self._det_slide_valid0 = False
+			self._det_slide_valid1 = False
 			self.timestamps = np.zeros(0, dtype=np.float64)
 			self._last_sample_ts = None
 			self.view_len = 0
@@ -4901,8 +5691,8 @@ class ScopeWindow:
 			with open(os.path.join(os.path.dirname(__file__), 'bmi30_sel.json'), 'r', encoding='utf-8') as f:
 				obj = json.load(f)
 			val = int(obj.get('sel'))
-			# Валидация: максимум кнопка 5
-			if val > 5:
+			# Валидация: рабочие цифровые кнопки 0..6; 7..9 пока не реализованы.
+			if val < 0 or val > 6:
 				return 5
 			return val
 		except Exception:
@@ -5525,6 +6315,11 @@ class ScopeWindow:
 							if bool(getattr(self, 'reader_debug', False)):
 								print(f"[READER] Buffer size changed: {old_len} -> {self.base_buf_len} семплов, freq={self.freq_hz}Hz", flush=True)
 				
+				try:
+					self._dc_quarter_autostop_check(ch0, ch1)
+				except Exception:
+					pass
+
 				# Копируем данные в shared buffers (поддержка независимых каналов)
 				with self.data_lock:
 					current_time = time.time()
@@ -5547,6 +6342,28 @@ class ScopeWindow:
 						# Фильтр применяется только для отображения в _update_view()
 						tgt = self.data0_odd if par else self.data0_even
 						tgt[:len(ch0)] = ch0
+						# Detector uses a sliding phase pair: previous packet + current packet.
+						try:
+							prev = getattr(self, '_det_prev0', None)
+							prev_par = getattr(self, '_det_prev_par0', None)
+							n_det = min(len(ch0), self.max_samples)
+							if prev is not None and prev_par is not None and int(prev_par) != int(par):
+								prev_arr = np.asarray(prev[:n_det], dtype=np.int32)
+								cur_arr = np.asarray(ch0[:n_det], dtype=np.int32)
+								if int(par) == 0:
+									self.det0_even[:n_det] = cur_arr
+									self.det0_odd[:n_det] = prev_arr
+								else:
+									self.det0_even[:n_det] = prev_arr
+									self.det0_odd[:n_det] = cur_arr
+								if n_det < self.max_samples:
+									self.det0_even[n_det:] = 0
+									self.det0_odd[n_det:] = 0
+								self._det_slide_valid0 = True
+							self._det_prev0 = np.array(ch0[:n_det], copy=True)
+							self._det_prev_par0 = int(par)
+						except Exception:
+							pass
 						# mark that new data arrived and we should recompute xcorr (schedule outside lock)
 						self._need_xcorr = True
 						# Also trigger phase shift search in background worker (latest-only)
@@ -5580,8 +6397,9 @@ class ScopeWindow:
 							if ts is not None:
 								self._ts_a_even = ts
 						
-					# Флаг для немедленного детектирования
-					self._need_detect = True
+					# Если детектор не перенесён в reader thread, GUI подхватит флаг позже.
+					if not bool(getattr(self, 'detect_in_reader', True)):
+						self._need_detect = True
 					
 					if ch1 is not None:
 						try:
@@ -5600,6 +6418,28 @@ class ScopeWindow:
 						# Фильтр применяется только для отображения в _update_view()
 						tgt = self.data1_odd if par else self.data1_even
 						tgt[:len(ch1)] = ch1
+						# Detector uses a sliding phase pair: previous packet + current packet.
+						try:
+							prev = getattr(self, '_det_prev1', None)
+							prev_par = getattr(self, '_det_prev_par1', None)
+							n_det = min(len(ch1), self.max_samples)
+							if prev is not None and prev_par is not None and int(prev_par) != int(par):
+								prev_arr = np.asarray(prev[:n_det], dtype=np.int32)
+								cur_arr = np.asarray(ch1[:n_det], dtype=np.int32)
+								if int(par) == 0:
+									self.det1_even[:n_det] = cur_arr
+									self.det1_odd[:n_det] = prev_arr
+								else:
+									self.det1_even[:n_det] = prev_arr
+									self.det1_odd[:n_det] = cur_arr
+								if n_det < self.max_samples:
+									self.det1_even[n_det:] = 0
+									self.det1_odd[n_det:] = 0
+								self._det_slide_valid1 = True
+							self._det_prev1 = np.array(ch1[:n_det], copy=True)
+							self._det_prev_par1 = int(par)
+						except Exception:
+							pass
 						# mark that new data arrived and we should recompute xcorr (schedule outside lock)
 						self._need_xcorr = True
 						# Also trigger phase shift search in background worker (latest-only)
@@ -5633,8 +6473,9 @@ class ScopeWindow:
 							if ts is not None:
 								self._ts_b_even = ts
 						
-					# Флаг для немедленного детектирования
-					self._need_detect = True
+					# Если детектор не перенесён в reader thread, GUI подхватит флаг позже.
+					if not bool(getattr(self, 'detect_in_reader', True)):
+						self._need_detect = True
 					
 					# Сохранять DC offset в файл каждые 10 минут (при STREAM_MODE=1)
 					if getattr(self, 'stream_mode', 0) == 1 and (current_time - self.dc_last_save >= self.dc_save_interval):
@@ -5741,7 +6582,8 @@ class ScopeWindow:
 							self.timestamps[:len(ts)] = ts
 							if len(ts) < self.max_samples:
 								self.timestamps[len(ts):] = 0.0
-					self.last_frame_t = time.time()
+						self.last_frame_t = time.time()
+						self._mark_link_recovery_success()
 					# Обновим счетчики и проверим разрывы в режиме пар (если оба канала пришли одновременно)
 					if a is not None and b is not None:
 						if not getattr(self.stream, 'asm', None) or not getattr(self.stream.asm, 'independent', False):
@@ -5889,6 +6731,14 @@ class ScopeWindow:
 							s1 = 'ERR'
 						if bool(getattr(self, 'reader_debug', False)):
 							print(f"[READER] Received {self._reader_count} frames, ch0[0:5]={s0}, ch1[0:5]={s1}", flush=True)
+
+					# Core-first mode: run fast detection from reader thread,
+					# independent from GUI redraw cadence.
+					if bool(getattr(self, 'detect_in_reader', True)) and bool(getattr(self, '_det_button6_active', False)):
+						try:
+							self._quick_detect()
+						except Exception:
+							pass
 				
 			except Exception as e:
 				msg = str(e)
@@ -5933,6 +6783,113 @@ class ScopeWindow:
 			self._apply_det_gate_state()
 		except Exception:
 			pass
+
+		# --- Подтверждение Tx200 от устройства (из фонового worker) ---
+		while True:
+			try:
+				tim2_req_id, tim2_expected, tim2_ok = self._tim2_result_queue.get_nowait()
+			except queue.Empty:
+				break
+			if int(tim2_req_id) != int(getattr(self, '_tim2_request_seq', 0)):
+				continue
+			self.tim2_pending = False
+			if bool(tim2_ok):
+				self.tim2_applied = bool(tim2_expected)
+				self._set_status("Tx200: подтверждено устройством", hold_sec=1.2)
+			else:
+				self.tim2_applied = False
+				self._set_status("Tx200: устройство не подтвердило состояние", hold_sec=1.6)
+			self._update_tim2_btn_style()
+
+		# --- Обработка результата фонового потока подключения ---
+		try:
+			connect_result = self._connect_result_queue.get_nowait()
+			if isinstance(connect_result, tuple) and len(connect_result) == 4:
+				attempt_id, stream_result, err_result, recovery_used = connect_result
+			else:
+				attempt_id = int(getattr(self, '_connect_attempt_id', 0))
+				stream_result, err_result, recovery_used = connect_result
+		except queue.Empty:
+			attempt_id = None
+			stream_result = None
+			err_result = None
+			recovery_used = False
+
+		if stream_result is not None or err_result is not None:
+			if attempt_id is not None and int(attempt_id) != int(getattr(self, '_connect_attempt_id', 0)):
+				try:
+					if stream_result is not None:
+						stream_result.close()
+				except Exception:
+					pass
+				stream_result = None
+				err_result = None
+			else:
+				self._connecting = False
+				self._connect_started_t = 0.0
+				if stream_result is not None:
+					self.stream = stream_result
+					self._connect_timeout_count = 0
+					# успешное подключение — сбросим счётчики ошибок
+					try:
+						self._usb_connect_err_count = 0
+					except Exception:
+						pass
+					try:
+						self._det_reset_and_arm_warmup('connect')
+					except Exception:
+						pass
+					try:
+						self.last_port_info = self.stream.port_info
+					except Exception:
+						pass
+					if recovery_used and self.apply_init_sequence:
+						try:
+							self._run_init_sequence()
+						except Exception as e_init:
+							print(f"[initseq] failed: {e_init}")
+					if recovery_used:
+						try:
+							self._apply_saved_device_settings()
+						except Exception:
+							pass
+					else:
+						try:
+							self._poll_stm32_sync_mode(force=True)
+						except Exception:
+							pass
+					self._set_status("Устройство подключено, ожидание данных…", hold_sec=1.5)
+					self.connect_t = time.time()
+					self.last_frame_t = 0
+					self.no_data_warned = False
+					if not self.reader_running:
+						self.reader_running = True
+						self.reader_thread = threading.Thread(target=self._reader_thread_func, daemon=True)
+						self.reader_thread.start()
+						if bool(getattr(self, 'debug', False)):
+							print("[GUI] Reader thread started", flush=True)
+					self.usb_retry_timer.stop()
+				else:
+					# Ошибка подключения
+					e = err_result
+					print(f"[ERROR] Exception during connect: {e}", flush=True)
+					self._recover_link_after_loss(f"Ошибка подключения ({e})", current_stream_alive=False)
+
+		# Watchdog подключения: если инициализация зависла, эскалируем recovery.
+		if self.stream is None and bool(getattr(self, '_connecting', False)):
+			try:
+				cst = float(getattr(self, '_connect_started_t', 0.0) or 0.0)
+				timeout_s = float(self._link_recovery_wait_timeout_s())
+				if cst > 0.0 and timeout_s > 0.0 and (time.time() - cst) > timeout_s:
+					self._connecting = False
+					self._connect_started_t = 0.0
+					self._connect_attempt_id = int(getattr(self, '_connect_attempt_id', 0)) + 1
+					self._connect_timeout_count = int(getattr(self, '_connect_timeout_count', 0) or 0) + 1
+					self._recover_link_after_loss(f"Таймаут инициализации >{timeout_s:g}с", current_stream_alive=False)
+					return
+			except Exception:
+				pass
+
 		# Обработка статуса подключения
 		if self.stream is None:
 			self._last_sample_ts = None
@@ -5946,58 +6903,29 @@ class ScopeWindow:
 		# Проверка disconnected (но продолжаем отображать данные)
 		if self.stream is not None and getattr(self.stream, 'disconnected', False):
 			try:
+				self._clear_host_rx_indicator(stream=self.stream, force=True)
+			except Exception:
+				pass
+			try:
 				self.stream.close()
 			except Exception:
 				pass
 			self.stream = None
 			self._last_sample_ts = None
-			# Агрессивное восстановление: reset устройства, при повторах — power-cycle USB.
 			try:
-				need_hw = bool(getattr(self, '_usb_err_need_hw_reset', False))
+				planned = bool(getattr(self, '_link_recovery_disconnect_planned', False))
 			except Exception:
-				need_hw = False
-			try:
-				need_power = bool(getattr(self, '_usb_err_need_power_cycle', False))
-			except Exception:
-				need_power = False
-			now_rec = time.time()
-			try:
-				last_hw = float(getattr(self, '_usb_disc_last_hw_reset_t', 0.0) or 0.0)
-			except Exception:
-				last_hw = 0.0
-			try:
-				last_pw = float(getattr(self, '_usb_disc_last_power_t', 0.0) or 0.0)
-			except Exception:
-				last_pw = 0.0
-			# Всегда пытаемся аппаратный сброс при disconnect (с троттлингом)
-			if need_hw or (now_rec - last_hw) >= 5.0:
+				planned = False
+			self._link_recovery_disconnect_planned = False
+			if planned:
 				try:
-					self._usb_err_need_hw_reset = False
+					self._set_status("USB занят/отключён, переподключение…", hold_sec=2.0)
 				except Exception:
 					pass
-				try:
-					self._set_status("USB занят/отключён, аппаратный сброс…", hold_sec=2.0)
-				except Exception:
-					pass
-				try:
-					self._hardware_reset_device()
-					self._usb_disc_last_hw_reset_t = now_rec
-				except Exception:
-					pass
-			# Если reset не помогает/серия ошибок длинная — power-cycle порта
-			if need_power and (now_rec - last_pw) >= 15.0:
-				try:
-					self._usb_err_need_power_cycle = False
-				except Exception:
-					pass
-				try:
-					self._set_status("USB занят/отключён, перезапитка порта…", hold_sec=2.0)
-					self._power_cycle_usb_port()
-					self._usb_disc_last_power_t = now_rec
-				except Exception:
-					pass
-			self.usb_retry_timer.start()
-			self._activate_stream()
+				self.usb_retry_timer.start()
+				self._activate_stream()
+				return
+			self._recover_link_after_loss("USB занят/отключён", current_stream_alive=False)
 			return
 		
 		# Читаем данные из shared buffers с блокировкой (ВСЕГДА, даже если stream=None)
@@ -6252,13 +7180,18 @@ class ScopeWindow:
 					pass
 		# Runtime-легенда (стабильная): обновляем чаще, но с троттлингом и без прыжков высоты
 		try:
+			self._poll_err_step_status()
+		except Exception:
+			pass
+		try:
 			self._set_runtime_legend(_default_status)
 		except Exception:
 			pass
 
-		# Быстрое детектирование: выполняется сразу при получении новых пакетов (независимо от кнопки 6)
+		# Fallback-режим: если детектор не перенесён в reader thread,
+		# GUI может выполнять его по старому пути.
 		try:
-			if getattr(self, '_need_detect', False):
+			if (not bool(getattr(self, 'detect_in_reader', True))) and getattr(self, '_need_detect', False):
 				self._need_detect = False
 				try:
 					self._quick_detect()
@@ -6290,8 +7223,20 @@ class ScopeWindow:
 			pass
 		# предупреждение если нет данных
 		now2 = time.time()
+		try:
+			self._update_host_rx_indicator(now2)
+		except Exception:
+			pass
+		try:
+			fault_kind, fault_msg = self._update_stream_fault_state(now2)
+		except Exception:
+			fault_kind, fault_msg = ("fault_unknown", "")
+		try:
+			self._poll_stm32_sync_mode()
+		except Exception:
+			pass
 		if self.stream and self.base_buf_len is None and self.connect_t and (now2-self.connect_t)>2.0 and not self.no_data_warned:
-			# Не дёргаем устройство бесконечно; просто покажем диагностику и предложим ↻
+			# Показываем диагностику и сообщаем, что авто-восстановление уже запущено.
 			try:
 				if hasattr(self.stream, 'test_seen') and getattr(self.stream, 'test_seen', 0) > 0:
 					# Попробуем вытащить last_stat для отображения ключевых полей
@@ -6301,27 +7246,42 @@ class ScopeWindow:
 						ver = st[4]
 						cur_samples = int.from_bytes(st[6:8],'little')
 						frame_bytes = int.from_bytes(st[8:10],'little')
-						self._set_status(f"Есть TEST, но нет A/B. STAT v{ver} cur_samples={cur_samples} frame_bytes={frame_bytes}. Нажмите ↻ для ручного пинка.", hold_sec=2.0)
+						self._set_status(f"Есть TEST, но нет A/B. STAT v{ver} cur_samples={cur_samples} frame_bytes={frame_bytes}. Пробую восстановить автоматически; ↻ можно нажать вручную.", hold_sec=2.0)
 					else:
-						self._set_status("Есть TEST, но нет рабочих кадров A/B. Проверьте прошивку: фиксация размера и отправка ADC1/ADC2 после TEST. Нажмите ↻ для ручного пинка.", hold_sec=2.0)
+						self._set_status("Есть TEST, но нет рабочих кадров A/B. Проверьте прошивку: фиксация размера и отправка ADC1/ADC2 после TEST. Пробую восстановить автоматически; ↻ можно нажать вручную.", hold_sec=2.0)
 				else:
-					self._set_status("Нет данных (нет первых кадров). Нажмите ↻ для повторной попытки. " + self._instr, hold_sec=2.0)
+					self._set_status("Нет данных (нет первых кадров). Пробую восстановить автоматически. " + self._instr, hold_sec=2.0)
 			except Exception:
-				self._set_status("Нет данных (нет первых кадров). Нажмите ↻ для повторной попытки. " + self._instr, hold_sec=2.0)
+				self._set_status("Нет данных (нет первых кадров). Пробую восстановить автоматически. " + self._instr, hold_sec=2.0)
 			self.no_data_warned = True
-		# Авто-сброс STM32 если нет первых кадров слишком долго (независимо от флага no_data_warned).
-		# _maybe_auto_reset_on_stall сам управляет troттлингом (stall_reset_after / stall_reset_cooldown).
-		if self.stream and self.base_buf_len is None and self.connect_t and (now2 - self.connect_t) > 2.0 and not bool(getattr(self, '_stream_user_stopped', False)):
+		# Быстрый watchdog: восстанавливаем только если реально пропал bulk RX.
+		if self.stream and bool(getattr(self, 'auto_reset_on_stall', False)):
 			try:
-				self._maybe_auto_reset_on_stall("нет первых кадров", now2 - float(self.connect_t))
+				rx_t = float(getattr(self.stream, 'last_rx_t', 0.0) or 0.0)
+				idle_rx = (now2 - rx_t) if rx_t > 0 else 0.0
+				thr = float(getattr(self, 'stall_reset_after', 2.0) or 2.0)
+				try:
+					if int(getattr(self, '_link_recovery_attempts', 0) or 0) > 0:
+						thr = min(float(thr), float(self._link_recovery_wait_timeout_s()))
+				except Exception:
+					pass
+				if thr > 0 and idle_rx >= thr and str(fault_kind) not in ('ok', 'waiting_frames', 'pairing_stall'):
+					if str(fault_kind) == 'stm32_stream_stall':
+						reason = 'STM32 bulk молчит'
+					elif str(fault_kind) == 'rpi_usb_fault':
+						reason = 'RPi/USB fault'
+					else:
+						reason = 'нет приёма'
+					self._maybe_auto_reset_on_stall(reason, idle_rx)
 			except Exception:
 				pass
 		elif self.stream and (now2 - float(getattr(self.stream, 'last_rx_t', 0.0))) > self.stop_warn_after and (now2 - self.last_diag_t) > self.diag_interval:
 			# Совсем нет приёма данных (ни STAT, ни кадров)
+			fault_text = str(fault_msg or "Нет приёма данных. Причина не определена.")
 			if self.diag_to_console:
-				print(f"[diag] Нет приёма данных >{int(self.stop_warn_after)}с. Возможно устройство перестало слать.")
+				print(f"[diag] {fault_text}")
 			else:
-				self._set_status(f"Нет приёма данных >{int(self.stop_warn_after)}с. Возможно устройство перестало слать. " + self._instr, hold_sec=4.0)
+				self._set_status(f"{fault_text}. Пробую восстановить автоматически. " + self._instr, hold_sec=4.0)
 			self.last_diag_t = now2
 			# Авто-сброс STM32 при полном отсутствии трафика
 			try:
@@ -6332,16 +7292,12 @@ class ScopeWindow:
 				pass
 		elif self.stream and self.base_buf_len is not None and (now2 - self.last_frame_t) > self.stop_warn_after and (now2 - self.last_diag_t) > self.diag_interval:
 			# Приём идёт, но нет новых стереопар (например, рассинхрон A/B)
+			fault_text = str(fault_msg or "USB RX жив, но нет новых стереопар.")
 			if self.diag_to_console:
-				print(f"[diag] Нет новых стереопар >{int(self.stop_warn_after)}с (приём идёт). Проверьте A/B и seq. Нажмите ↻ для переподключения.")
+					print(f"[diag] {fault_text}")
 			else:
-				self._set_status(f"Нет новых стереопар >{int(self.stop_warn_after)}с (приём идёт). Проверьте A/B и seq. Нажмите ↻ для переподключения.", hold_sec=3.0)
+				self._set_status(f"{fault_text}. Проверьте A/B и seq; reset во время живого RX не выполняю.", hold_sec=3.0)
 			self.last_diag_t = now2
-			# Авто-сброс STM32 при зависшем потоке (нет новых кадров)
-			try:
-				self._maybe_auto_reset_on_stall("нет новых кадров", now2 - float(self.last_frame_t))
-			except Exception:
-				pass
 			# Попробуем мягко пнуть поток (без STOP), но не чаще чем раз в diag_interval
 			if (not bool(getattr(self, '_stream_user_stopped', False))) and self.auto_soft_kick and (now2 - self.last_soft_kick_t) > max(2.0, self.diag_interval):
 				try:
@@ -6395,8 +7351,17 @@ class ScopeWindow:
 			if bool(getattr(self, 'debug', False)):
 				print(f"[CAPTURE] Error in _tick: {e}", flush=True)
 		
-		# Обновить view после всех изменений данных
-		self._update_view()
+		# Обновить view после всех изменений данных.
+		# При клиентском запуске GUI может быть полностью отключён и не влияет на core path.
+		try:
+			if bool(getattr(self, 'gui_render_enabled', True)):
+				now_render = time.time()
+				min_interval = float(getattr(self, 'gui_render_min_interval', 0.0) or 0.0)
+				if min_interval <= 0.0 or (now_render - float(getattr(self, '_last_view_update_t', 0.0) or 0.0)) >= min_interval:
+					self._last_view_update_t = now_render
+					self._update_view()
+		except Exception:
+			pass
 
 	def _update_view(self):
 		"""Перерисовать окно по текущим параметрам (без чтения новых данных)."""
@@ -6410,45 +7375,49 @@ class ScopeWindow:
 		self.view_len = vlen
 		# Snapshot buffers under lock to avoid tearing/races (can look like swaps/in-phase).
 		with self.data_lock:
-			# copy and cast to float64 immediately to avoid unsigned-int wrap/overflow
-			seg0 = (self.data0_even if hasattr(self, 'data0_even') else self.data0)[self.view_start:self.view_start+vlen].copy().astype(np.float64)
-			seg1 = (self.data1_even if hasattr(self, 'data1_even') else self.data1)[self.view_start:self.view_start+vlen].copy().astype(np.float64)
-			seg0b = (self.data0_odd if hasattr(self, 'data0_odd') else np.zeros_like(seg0))[self.view_start:self.view_start+vlen].copy().astype(np.float64)
-			seg1b = (self.data1_odd if hasattr(self, 'data1_odd') else np.zeros_like(seg1))[self.view_start:self.view_start+vlen].copy().astype(np.float64)
-			# Если чет/нечет давно не обновлялись — не показываем старые данные
-			try:
-				# Stale zeroing only in LATEST mode to avoid odd/even disappearing in LOSSLESS/AVG
-				if int(getattr(self, 'stream_mode', 0)) == 0:
-					st = float(getattr(self, 'parity_stale_s', 0.2) or 0.2)
-					if st > 0:
-						nowv = time.time()
-						if (nowv - float(getattr(self, '_last_a_even_t', 0.0))) > st:
-							seg0[:] = 0
-						if (nowv - float(getattr(self, '_last_a_odd_t', 0.0))) > st:
-							seg0b[:] = 0
-						if (nowv - float(getattr(self, '_last_b_even_t', 0.0))) > st:
-							seg1[:] = 0
-						if (nowv - float(getattr(self, '_last_b_odd_t', 0.0))) > st:
-							seg1b[:] = 0
-			except Exception:
-				pass
-			# Validity markers: if we haven't received a phase yet, avoid hiding freshly-filled buffers.
-			v0e = (getattr(self, 'seq0_even', None) is not None)
-			v0o = (getattr(self, 'seq0_odd', None) is not None)
-			v1e = (getattr(self, 'seq1_even', None) is not None)
-			v1o = (getattr(self, 'seq1_odd', None) is not None)
-			# If seq flags are not yet set but data contain non-zero samples, treat them as valid to display
-			try:
-				if not v0e and np.any(seg0 != 0):
-					v0e = True
-				if not v0o and np.any(seg0b != 0):
-					v0o = True
-				if not v1e and np.any(seg1 != 0):
-					v1e = True
-				if not v1o and np.any(seg1b != 0):
-					v1o = True
-			except Exception:
-				pass
+			# Copy under lock quickly; cast outside lock so GUI disturbs reader less.
+			seg0 = (self.data0_even if hasattr(self, 'data0_even') else self.data0)[self.view_start:self.view_start+vlen].copy()
+			seg1 = (self.data1_even if hasattr(self, 'data1_even') else self.data1)[self.view_start:self.view_start+vlen].copy()
+			seg0b = (self.data0_odd if hasattr(self, 'data0_odd') else np.zeros_like(seg0))[self.view_start:self.view_start+vlen].copy()
+			seg1b = (self.data1_odd if hasattr(self, 'data1_odd') else np.zeros_like(seg1))[self.view_start:self.view_start+vlen].copy()
+		seg0 = seg0.astype(np.float64, copy=False)
+		seg1 = seg1.astype(np.float64, copy=False)
+		seg0b = seg0b.astype(np.float64, copy=False)
+		seg1b = seg1b.astype(np.float64, copy=False)
+		# Если чет/нечет давно не обновлялись — не показываем старые данные
+		try:
+			# Stale zeroing only in LATEST mode to avoid odd/even disappearing in LOSSLESS/AVG
+			if int(getattr(self, 'stream_mode', 0)) == 0:
+				st = float(getattr(self, 'parity_stale_s', 0.2) or 0.2)
+				if st > 0:
+					nowv = time.time()
+					if (nowv - float(getattr(self, '_last_a_even_t', 0.0))) > st:
+						seg0[:] = 0
+					if (nowv - float(getattr(self, '_last_a_odd_t', 0.0))) > st:
+						seg0b[:] = 0
+					if (nowv - float(getattr(self, '_last_b_even_t', 0.0))) > st:
+						seg1[:] = 0
+					if (nowv - float(getattr(self, '_last_b_odd_t', 0.0))) > st:
+						seg1b[:] = 0
+		except Exception:
+			pass
+		# Validity markers: if we haven't received a phase yet, avoid hiding freshly-filled buffers.
+		v0e = (getattr(self, 'seq0_even', None) is not None)
+		v0o = (getattr(self, 'seq0_odd', None) is not None)
+		v1e = (getattr(self, 'seq1_even', None) is not None)
+		v1o = (getattr(self, 'seq1_odd', None) is not None)
+		# If seq flags are not yet set but data contain non-zero samples, treat them as valid to display
+		try:
+			if not v0e and np.any(seg0 != 0):
+				v0e = True
+			if not v0o and np.any(seg0b != 0):
+				v0o = True
+			if not v1e and np.any(seg1 != 0):
+				v1e = True
+			if not v1o and np.any(seg1b != 0):
+				v1o = True
+		except Exception:
+			pass
 		
 		# Host-side DC removal disabled: device provides DC compensation.
 		# (No host-side per-sample DC subtraction.)
@@ -6726,7 +7695,14 @@ class ScopeWindow:
 			frozen = bool(getattr(self, '_det_dc_frozen', False))
 			arrow_up = '↑' if (frozen and h0_on) else ''
 			arrow_dn = '↓' if (frozen and h1_on) else ''
-			dcf = f"FROZEN{arrow_up}{arrow_dn}" if frozen else 'RUN'
+			if frozen:
+				dcf = f"FROZEN{arrow_up}{arrow_dn}"
+			elif bool(getattr(self, '_dc_quarter_active', False)):
+				dcf = 'ADAPT'
+			elif bool(getattr(self, '_dc_quarter_done', False)):
+				dcf = 'BAL'
+			else:
+				dcf = 'RUN'
 			try:
 				adc1_en, adc2_en = self._adc_enable_flags()
 			except Exception:
@@ -6756,7 +7732,9 @@ class ScopeWindow:
 			bg_adc2 = "#ff4d4d" if not adc2_en else ("#ffd84d" if (frozen and h1_on) else "#ffffff")
 			fg_adc1 = "#000000" if bg_adc1 == "#ffffff" else "#ffffff"
 			fg_adc2 = "#000000" if bg_adc2 == "#ffffff" else ("#000000" if bg_adc2 == "#ffd84d" else "#ffffff")
-			status_html = f"<div style='font-family:monospace; white-space:pre;'>{line1}</div>"
+			stm32_sync = self._stm32_sync_status_text()
+			err_step_txt = self._err_step_status_text()
+			status_html = f"<div style='font-family:monospace; white-space:pre;'>{line1} | {stm32_sync} | {err_step_txt}</div>"
 			line1_html = f"<div style='font-family:monospace; white-space:pre; background-color:{bg_adc1}; color:{fg_adc1};'>{line_adc1}</div>"
 			line2_html = f"<div style='font-family:monospace; white-space:pre; background-color:{bg_adc2}; color:{fg_adc2};'>{line_adc2}</div>"
 			if not verbose:
@@ -6796,7 +7774,8 @@ class ScopeWindow:
 			except Exception:
 				xc_on = False
 			xc_sum = str(getattr(self, '_xcorr_last_summary', 'XCORR: off'))
-			status_line = f"{line1} | BEEP:{beep_st}/{bm} {_sc_txt} | XCorrFPS:{float(getattr(self,'_xcorr_fps',0.0)):.1f} tick:{_tick_hz:.1f} | {xc_sum if xc_on else 'XCORR: off'}"
+			err_step_txt = self._err_step_status_text()
+			status_line = f"{line1} | {stm32_sync} | {err_step_txt} | BEEP:{beep_st}/{bm} {_sc_txt} | XCorrFPS:{float(getattr(self,'_xcorr_fps',0.0)):.1f} tick:{_tick_hz:.1f} | {xc_sum if xc_on else 'XCORR: off'}"
 			line_adc1_v = f"{prefix} | ADC1[{adc1_state}] amp={amp0:5d} pm={pm0:6.0f} xpk/thr={lvl0:5d}/{thr0:5d} {h0} sh={sh0:4d}"
 			line_adc2_v = f"{prefix} | ADC2[{adc2_state}] amp={amp1:5d} pm={pm1:6.0f} xpk/thr={lvl1:5d}/{thr1:5d} {h1} sh={sh1:4d}"
 			max_len_v = max(len(line_adc1_v), len(line_adc2_v))
@@ -7053,6 +8032,14 @@ class ScopeWindow:
 	def _manual_reconnect(self):
 		# Принудительно закрыть и заново начать поиск
 		try:
+			self._reset_link_recovery_state()
+		except Exception:
+			pass
+		try:
+			self._clear_host_rx_indicator(force=True)
+		except Exception:
+			pass
+		try:
 			if self.stream:
 				self.stream.close()
 		except Exception:
@@ -7078,6 +8065,105 @@ class ScopeWindow:
 			self._activate_stream()
 		else:
 			self._set_status("Поток остановлен", hold_sec=1.5)
+
+	def _reset_link_recovery_state(self):
+		self._link_recovery_attempts = 0
+		self._link_recovery_soft_reset_done = False
+		self._link_recovery_disconnect_planned = False
+		self._link_recovery_pending_action = 'reconnect'
+
+	def _link_recovery_wait_timeout_s(self):
+		"""Таймаут ожидания RX для текущего уровня восстановления."""
+		try:
+			attempts = int(getattr(self, '_link_recovery_attempts', 0) or 0)
+		except Exception:
+			attempts = 0
+		try:
+			action = str(getattr(self, '_link_recovery_pending_action', 'reconnect') or 'reconnect')
+		except Exception:
+			action = 'reconnect'
+		if attempts <= 0:
+			try:
+				return float(getattr(self, 'connect_timeout_s', 6.0) or 6.0)
+			except Exception:
+				return 6.0
+		if action == 'reconnect' or attempts == 1:
+			return 1.0
+		if action == 'software_reset' or attempts == 2:
+			return 2.0
+		try:
+			return max(2.0, float(getattr(self, 'connect_timeout_s', 6.0) or 6.0))
+		except Exception:
+			return 2.0
+
+	def _mark_link_recovery_success(self):
+		"""Сбрасывает эскалацию только после подтвержденного рабочего RX."""
+		try:
+			attempts = int(getattr(self, '_link_recovery_attempts', 0) or 0)
+		except Exception:
+			attempts = 0
+		if attempts <= 0:
+			return
+		self._reset_link_recovery_state()
+		try:
+			self._usb_err_need_hw_reset = False
+			self._usb_err_need_power_cycle = False
+		except Exception:
+			pass
+
+	def _next_link_recovery_action(self):
+		try:
+			attempts = int(getattr(self, '_link_recovery_attempts', 0) or 0)
+		except Exception:
+			attempts = 0
+		# Ровно три уровня: USB reconnect -> software reset -> hardware reset.
+		if attempts <= 0:
+			self._link_recovery_attempts = 1
+			self._link_recovery_pending_action = 'reconnect'
+			return ('reconnect', 1)
+		if attempts == 1:
+			self._link_recovery_attempts = 2
+			self._link_recovery_soft_reset_done = True
+			self._link_recovery_pending_action = 'software_reset'
+			return ('software_reset', 2)
+		self._link_recovery_attempts = 3
+		self._link_recovery_pending_action = 'hardware_reset'
+		return ('hardware_reset', 3)
+
+	def _recover_link_after_loss(self, reason: str, current_stream_alive: bool = False):
+		action, attempt_no = self._next_link_recovery_action()
+		try:
+			self._usb_err_need_hw_reset = False
+		except Exception:
+			pass
+		if action == 'reconnect':
+			msg = f"{reason}: уровень 1/3, переподключаю USB-поток…"
+		elif action == 'software_reset':
+			msg = f"{reason}: уровень 2/3, выполняю программный reset STM32…"
+		else:
+			msg = f"{reason}: уровень 3/3, выполняю аппаратный reset STM32…"
+			try:
+				self._usb_err_need_hw_reset = True
+			except Exception:
+				pass
+		try:
+			self._set_status(msg, hold_sec=2.0)
+		except Exception:
+			pass
+		if current_stream_alive and self.stream is not None:
+			try:
+				self._link_recovery_disconnect_planned = True
+			except Exception:
+				pass
+			try:
+				self.stream.disconnected = True
+			except Exception:
+				pass
+			return action
+		if not self.usb_retry_timer.isActive():
+			self.usb_retry_timer.start()
+		self._activate_stream()
+		return action
 
 	def _toggle_capture(self):
 		"""Переключение автозахвата осциллограмм."""
@@ -7662,47 +8748,24 @@ class ScopeWindow:
 			last_t = float(getattr(self, '_stall_reset_last_t', 0.0) or 0.0)
 			if cooldown > 0 and (now - last_t) < cooldown:
 				return
+			try:
+				fault_kind = str(getattr(self, '_stream_fault_kind', '') or '')
+			except Exception:
+				fault_kind = ''
+			# Если bulk RX жив, но застряло только спаривание/первые рабочие кадры,
+			# устройство не ресетим: это не "мертвый USB поток".
+			if fault_kind in ('ok', 'waiting_frames', 'pairing_stall'):
+				return
 			self._stall_reset_inflight = True
 			self._stall_reset_last_t = now
 			try:
-				self._set_status(f"Поток пропал ({reason}) — сброс STM32…", hold_sec=2.0)
+				self._set_status(f"Поток пропал ({reason}) — запускаю восстановление связи…", hold_sec=2.0)
 			except Exception:
 				pass
 
 			def _worker():
 				try:
-					# Попробуем SOFT_RESET через CDC (если доступен)
-					try:
-						self._send_soft_reset_via_cdc()
-					except Exception:
-						pass
-					# Попробуем DEEP_RESET по bulk (если доступен)
-					try:
-						if self.stream is not None and hasattr(self.stream, 'deep_reset'):
-							self.stream.deep_reset()
-							time.sleep(0.1)
-					except Exception:
-						pass
-					# Аппаратный reset (GPIO) или power-cycle USB
-					try:
-						ok = bool(self._hardware_reset_device())
-					except Exception:
-						ok = False
-					if not ok:
-						try:
-							self._power_cycle_usb_port()
-						except Exception:
-							pass
-					# Отметим как disconnected и запросим аппаратный reset по существующему пути
-					try:
-						self._usb_err_need_hw_reset = True
-					except Exception:
-						pass
-					try:
-						if self.stream is not None:
-							self.stream.disconnected = True
-					except Exception:
-						pass
+					self._recover_link_after_loss(f"Поток пропал ({reason})", current_stream_alive=True)
 				finally:
 					try:
 						self._stall_reset_inflight = False
@@ -7849,6 +8912,10 @@ class ScopeWindow:
 			if self.stream is not None:
 				# Закрыть текущий поток прежде чем дёргать питание
 				try:
+					self._clear_host_rx_indicator(stream=self.stream, force=True)
+				except Exception:
+					pass
+				try:
 					self.stream.close()
 				except Exception:
 					pass
@@ -7947,14 +9014,65 @@ class ScopeWindow:
 			self._set_status(f"Power-cycle ошибка: {e}", hold_sec=3.0)
 
 	def _try_connect(self, first=False):
+		"""GUI thread: запускает фоновый поток подключения, не блокируя Qt event loop."""
 		if self.num_group.checkedId() == 0:
 			return
 		if self._connecting or self.stream is not None:
 			return
+		self._connect_attempt_id = int(getattr(self, '_connect_attempt_id', 0)) + 1
+		attempt_id = int(self._connect_attempt_id)
 		self._connecting = True
+		self._connect_started_t = time.time()
 		msg_prefix = "Подключение" if not first else "Инициализация"
+		self._set_status(f"{msg_prefix} к устройству…", hold_sec=1.5)
+		t = threading.Thread(target=self._connect_worker_bg, args=(bool(first), attempt_id), daemon=True)
+		t.start()
+
+	def _connect_worker_bg(self, first: bool = False, attempt_id: int | None = None):
+		"""Фоновый поток: reset/CDC/USB connect без блокировки GUI."""
+		stream = None
+		err = None
+		recovery_used = False
+		if attempt_id is None:
+			attempt_id = int(getattr(self, '_connect_attempt_id', 0))
 		try:
-			self._set_status(f"{msg_prefix} к устройству…", hold_sec=1.5)
+			recovery_action = str(getattr(self, '_link_recovery_pending_action', 'reconnect') or 'reconnect')
+			need_hw_reset = bool(getattr(self, '_usb_err_need_hw_reset', False)) or (recovery_action == 'hardware_reset')
+			if first:
+				# On startup always release reset line first, so device is not held in reset.
+				try:
+					self._release_hw_reset_line()
+				except Exception:
+					pass
+			if first and not bool(getattr(self, '_hw_reset_on_start_done', False)):
+				# На первом запуске сначала пробуем восстановить связь без общего аппаратного сброса.
+				self._hw_reset_on_start_done = True
+			if need_hw_reset:
+				try:
+					self._hardware_reset_device(update_ui=False)
+					recovery_used = True
+				except Exception:
+					pass
+				try:
+					self._usb_err_need_hw_reset = False
+				except Exception:
+					pass
+			elif recovery_action == 'software_reset':
+				recovery_used = True
+				try:
+					self._send_soft_reset_via_cdc()
+				except Exception:
+					pass
+				try:
+					old_stream = getattr(self, 'stream', None)
+					if old_stream is not None and hasattr(old_stream, 'deep_reset'):
+						old_stream.deep_reset()
+						time.sleep(0.1)
+				except Exception:
+					pass
+			# После аппаратного reset дополнительно шлём CDC SOFT_RESET, чтобы добить recovery-путь.
+			if recovery_action == 'hardware_reset':
+				self._send_soft_reset_via_cdc()
 			# восстановим глобальный флаг running в модуле usb_stream (после close() он мог стать False)
 			try:
 				import usb_vendor.usb_stream as _usm  # type: ignore
@@ -7962,111 +9080,35 @@ class ScopeWindow:
 					_usm.running = True
 			except Exception:
 				pass
-			# frame_samples (SET_FRAME_SAMPLES) безопасен только для профиля 2; профиль 1 не трогаем
+			# frame_samples безопасен только для профиля 2; профиль 1 не трогаем
 			fs = self.expected_len_map.get(self.desired_profile, self.initial_expected) if (self.send_ns and int(self.desired_profile or 2) == 2) else None
-			# Для 200 Гц некоторые прошивки ожидают явной установки block rate — включим отправку частоты на старте
 			try:
 				os.environ['BMI30_SEND_BLOCK_RATE'] = '1'
 			except Exception:
 				pass
 			if bool(getattr(self, 'debug', False)):
 				print(f"[CONNECT] Creating USBStream, profile={self.desired_profile}, fs={fs}", flush=True)
-			self.stream = USBStream(profile=self.desired_profile, full=True, test_as_data=self.test_as_data, frame_samples=fs, fast_mode=True, assembler_independent=self.independent_channels)
-			# успешное подключение — сбросим счётчики ошибок переподключения
-			try:
-				self._usb_connect_err_count = 0
-			except Exception:
-				pass
-			# On every fresh connect: immediately force RUN state and start warmup from *now*.
-			# This prevents "FROZEN right after startup" and ignores early unstable thresholds.
-			try:
-				self._det_reset_and_arm_warmup('connect')
-			except Exception:
-				pass
-			# Сохраним порт info для power cycle без stream
-			self.last_port_info = self.stream.port_info
-			# Явная конфигурация устройства по согласованной последовательности
-			if self.apply_init_sequence:
+			stream = USBStream(profile=self.desired_profile, full=True, test_as_data=self.test_as_data, frame_samples=fs, fast_mode=True, assembler_independent=self.independent_channels)
+			if int(getattr(self, '_connect_attempt_id', 0)) != int(attempt_id):
 				try:
-					self._run_init_sequence()
-				except Exception as e_init:
-					print(f"[initseq] failed: {e_init}")
-			# Применим сохранённые параметры после подключения
+					if stream is not None:
+						stream.close()
+				except Exception:
+					pass
+				return
+		except Exception as e:
+			err = e
 			try:
-				self._apply_saved_device_settings()
+				self._usb_connect_err_count = int(getattr(self, "_usb_connect_err_count", 0)) + 1
 			except Exception:
 				pass
-			self._set_status("Устройство подключено, ожидание данных…", hold_sec=1.5)
-			self.connect_t = time.time()
-			self.last_frame_t = 0
-			self.no_data_warned = False
-			# Запускаем reader thread
-			if bool(getattr(self, 'debug', False)):
-				print(f"[CONNECT] reader_running={self.reader_running}, starting thread...", flush=True)
-			if not self.reader_running:
-				self.reader_running = True
-				self.reader_thread = threading.Thread(target=self._reader_thread_func, daemon=True)
-				self.reader_thread.start()
-				if bool(getattr(self, 'debug', False)):
-					print("[GUI] Reader thread started", flush=True)
-			else:
-				if bool(getattr(self, 'debug', False)):
-					print("[GUI] Reader thread already running", flush=True)
-		except SystemExit as se:
-			self.stream = None
-			print(f"[ERROR] SystemExit: {se}", flush=True)
-			self._set_status(str(se), hold_sec=2.0)
-		except Exception as e:
-			self.stream = None
-			print(f"[ERROR] Exception during connect: {e}", flush=True)
 			import traceback
 			traceback.print_exc()
-			msg = str(e)
-			# При любой ошибке подключения выполняем аппаратный сброс (с троттлингом)
-			try:
-				now = time.time()
-				min_reset_s = float(os.getenv("BMI30_USB_RESET_MIN_S", "8.0"))
-				min_power_s = float(os.getenv("BMI30_USB_POWERCYCLE_MIN_S", "30.0"))
-				last_reset = float(getattr(self, "_usb_connect_last_reset_t", 0.0) or 0.0)
-				last_power = float(getattr(self, "_usb_connect_last_power_t", 0.0) or 0.0)
-				self._usb_connect_err_count = int(getattr(self, "_usb_connect_err_count", 0)) + 1
-				if (now - last_reset) >= max(2.0, min_reset_s):
-					self._set_status("Ошибка подключения, аппаратный сброс…", hold_sec=2.0)
-					self._hardware_reset_device()
-					self._usb_connect_last_reset_t = now
-				# при серии ошибок попробуем power-cycle порта
-				if int(getattr(self, "_usb_connect_err_count", 0)) >= 3 and (now - last_power) >= max(5.0, min_power_s):
-					self._set_status("Ошибка подключения, перезапитка порта…", hold_sec=2.0)
-					try:
-						self._power_cycle_usb_port()
-					except Exception:
-						pass
-					self._usb_connect_last_power_t = now
-					self._usb_connect_err_count = 0
-			except Exception:
-				pass
-			self._set_status(f"Нет устройства ({e})", hold_sec=2.0)
-		finally:
-			self._connecting = False
-			if self.stream is None:
-				if not self.usb_retry_timer.isActive():
-					self.usb_retry_timer.start()
-			else:
-				self.usb_retry_timer.stop()
+		self._connect_result_queue.put((int(attempt_id), stream, err, recovery_used))
 
 	def _activate_stream(self):
 		if not self.usb_retry_timer.isActive():
 			self.usb_retry_timer.start()
-		# Optional: auto hardware reset on first activation
-		try:
-			if not bool(getattr(self, '_hw_reset_on_start_done', False)):
-				auto_hw = str(os.getenv("BMI30_HW_RESET_ON_START", "1")).lower() not in ("0", "false", "no")
-				if auto_hw:
-					self._hardware_reset_device()
-				self._hw_reset_on_start_done = True
-		except Exception:
-			pass
-		self._send_soft_reset_via_cdc()
 		self._try_connect(first=True)
 		# Транспорт при подключении посылает минимальный START сам.
 		# Не дублируем SET_PROFILE/START здесь, чтобы не подавить первые A/B кадры.
@@ -8143,15 +9185,15 @@ class ScopeWindow:
 			self._device_calib_dc_fast(frames=30)
 		except Exception:
 			pass
-		# Восстановим параметры коммутации/передачи, которые может сбросить прошивка.
-		try:
-			self._send_sync_mode(int(getattr(self, 'adc_comm_mode', 0) or 0))
-		except Exception:
-			pass
+		# Восстановим параметры передачи, которые может сбросить прошивка.
 		try:
 			tx_on = bool(getattr(self, 'tim2_enabled', False))
-			self._send_tim2_enable(tx_on)
-			self._send_tx_enable(tx_on)
+			ok_tim2 = self._send_tim2_enable(tx_on)
+			ok_tx = self._send_tx_enable(tx_on)
+			self.tim2_applied = bool(tx_on and ok_tim2 and ok_tx)
+			if not tx_on:
+				self.tim2_applied = False
+			self._update_tim2_btn_style()
 		except Exception:
 			pass
 		# Для режима AVG_ROI дополнительно повторно зададим avg_n.
@@ -8320,6 +9362,10 @@ class ScopeWindow:
 			except Exception:
 				pass
 			try:
+				self._clear_host_rx_indicator(force=True)
+			except Exception:
+				pass
+			try:
 				self.stream.close()
 			except Exception:
 				pass
@@ -8334,21 +9380,8 @@ class ScopeWindow:
 		except Exception:
 			pass
 
-	def _send_sync_mode(self, mode: int):
-		"""Отправить режим синхронизации: 0=master, 1=slave, 2=off."""
-		try:
-			if self.stream is None:
-				return
-			payload = bytes([int(mode) & 0xFF])
-			self.stream.send_cmd(CMD_SET_SYNC_MODE, payload)
-		except Exception as e:
-			try:
-				self._set_status(f"SYNC: ошибка отправки ({e})", hold_sec=2.0)
-			except Exception:
-				pass
-
 	def _adc_enable_flags(self):
-		"""Return (adc1_enabled, adc2_enabled) based on adc_comm_mode."""
+		"""Return host-side detector enable flags based on adc_comm_mode."""
 		try:
 			mode = int(getattr(self, 'adc_comm_mode', 0))
 		except Exception:
@@ -8360,7 +9393,7 @@ class ScopeWindow:
 		return True, True
 
 	def _cycle_sync_mode(self):
-		"""Переключить коммутацию ADC: оба -> ADC1 -> ADC2 -> оба."""
+		"""Переключить локальный источник детекции: оба -> ADC1 -> ADC2 -> оба."""
 		try:
 			cur = int(getattr(self, 'adc_comm_mode', 0))
 		except Exception:
@@ -8379,12 +9412,12 @@ class ScopeWindow:
 		self._update_sync_btn_style()
 		try:
 			label = {0: "ADC1+ADC2", 1: "ADC1", 2: "ADC2"}.get(next_mode, "ADC1+ADC2")
-			self._set_status(f"ADC COMM: {label}", hold_sec=2.0)
+			self._set_status(f"DET source: {label}", hold_sec=2.0)
 		except Exception:
 			pass
 
 	def _update_sync_btn_style(self):
-		"""Обновить вид кнопки коммутации ADC."""
+		"""Обновить вид кнопки локального выбора источника детекции."""
 		try:
 			mode = int(getattr(self, 'adc_comm_mode', 0))
 		except Exception:
@@ -8397,7 +9430,7 @@ class ScopeWindow:
 					self._btn_sync_m.setStyleSheet("color:#0b2d66; font-size:13pt; font-weight:700;")
 					self._btn_sync_slash.setStyleSheet("color:#e0e0e0; font-size:9pt; font-weight:300;")
 					self._btn_sync_s.setStyleSheet("color:#7a5a00; font-size:13pt; font-weight:700;")
-				self.btn_sync.setToolTip("ADC: 1+2 (оба включены)")
+				self.btn_sync.setToolTip("DET source: ADC1+ADC2")
 			elif mode == 1:
 				# только ADC1: светло‑синий фон
 				self.btn_sync.setStyleSheet("background-color: #7fb2ff; color: #0b1f3d; border:1px solid #5b8fd9;")
@@ -8405,7 +9438,7 @@ class ScopeWindow:
 					self._btn_sync_m.setStyleSheet("color:#0b2d66; font-size:13pt; font-weight:700;")
 					self._btn_sync_slash.setStyleSheet("color:#2b3f66; font-size:9pt; font-weight:300;")
 					self._btn_sync_s.setStyleSheet("color:#5a5a5a; font-size:9pt; font-weight:300;")
-				self.btn_sync.setToolTip("ADC: 1 (включён только ADC1)")
+				self.btn_sync.setToolTip("DET source: ADC1")
 			else:
 				# только ADC2: светло‑жёлтый фон
 				self.btn_sync.setStyleSheet("background-color: #ffe08a; color: #4a3700; border:1px solid #d1b15a;")
@@ -8413,68 +9446,307 @@ class ScopeWindow:
 					self._btn_sync_m.setStyleSheet("color:#5a5a5a; font-size:9pt; font-weight:300;")
 					self._btn_sync_slash.setStyleSheet("color:#6b5a2a; font-size:9pt; font-weight:300;")
 					self._btn_sync_s.setStyleSheet("color:#7a5a00; font-size:13pt; font-weight:700;")
-				self.btn_sync.setToolTip("ADC: 2 (включён только ADC2)")
+				self.btn_sync.setToolTip("DET source: ADC2")
 		except Exception:
 			pass
 
-	def _update_tim2_btn_style(self):
-		"""Обновить стиль кнопки передачи TIM2."""
+	def _parse_stm32_sync_mode_from_stat(self, st) -> tuple[str, str, bool]:
+		"""Best-effort parse of STM32 sync mode from STAT without affecting the device."""
 		try:
-			en = bool(getattr(self, 'tim2_enabled', False))
+			if not isinstance(st, (bytes, bytearray)) or len(st) < 4 or st[:4] != b'STAT':
+				return ("---", "device", False)
+			off_s = str(os.getenv("BMI30_SYNC_STATUS_OFFSET", "") or "").strip()
+			if not off_s:
+				return ("---", "device", True)
+			off = int(off_s, 0)
+			if off < 0 or off >= len(st):
+				return ("---", f"STAT[{off}]?", True)
+			mode = {0: "master", 1: "slave", 2: "off"}.get(int(st[off]) & 0xFF, "---")
+			return (mode, f"STAT[{off}]", True)
+		except Exception:
+			return ("---", "device", False)
+
+	def _poll_stm32_sync_mode(self, force: bool = False):
+		"""Read-only polling of STM32 sync mode for UI indication."""
+		now = time.time()
+		try:
+			if (not force) and (now - float(getattr(self, '_stm32_sync_last_poll_t', 0.0) or 0.0) < 1.0):
+				return
+		except Exception:
+			pass
+		self._stm32_sync_last_poll_t = now
+		st = None
+		try:
+			if self.stream is not None and hasattr(self.stream, '_get_status_ep0'):
+				self.stream._get_status_ep0()
+		except Exception:
+			pass
+		try:
+			if self.stream is not None:
+				st = getattr(self.stream, 'last_stat', None)
+		except Exception:
+			st = None
+		mode, source, responded = self._parse_stm32_sync_mode_from_stat(st)
+		self._stm32_sync_mode = mode
+		self._stm32_sync_source = source
+		self._stm32_sync_ok = bool(responded)
+
+	def _poll_err_step_status(self, force: bool = False):
+		"""Request short status `0x31` so the device returns current err/step for the GUI."""
+		st = getattr(self, 'stream', None)
+		if st is None:
+			return
+		now = time.time()
+		try:
+			interval_s = float(getattr(self, '_err_step_req_interval_s', 0.5) or 0.5)
+		except Exception:
+			interval_s = 0.5
+		if interval_s < 0.1:
+			interval_s = 0.1
+		try:
+			if (not force) and (now - float(getattr(self, '_err_step_last_req_t', 0.0) or 0.0) < interval_s):
+				return
+		except Exception:
+			pass
+		self._err_step_last_req_t = now
+		try:
+			if hasattr(st, 'request_err_step'):
+				st.request_err_step()
+			else:
+				st.send_cmd(CMD_GET_ERR_STEP, b"")
+		except Exception:
+			pass
+
+	def _err_step_status_text(self) -> str:
+		"""Compact GUI text for the latest `0x31` err/step reply."""
+		try:
+			stream = getattr(self, 'stream', None)
+			if stream is None:
+				return "ERR/STEP:--/--"
+			t_last = float(getattr(stream, 'last_err_step_t', 0.0) or 0.0)
+			if t_last <= 0.0 or (time.time() - t_last) > 5.0:
+				return "ERR/STEP:--/--"
+			vals = getattr(stream, 'last_err_step_vals', None)
+			if isinstance(vals, tuple) and len(vals) >= 2:
+				return f"ERR/STEP:{int(vals[0])}/{int(vals[1])}"
+			pkt = getattr(stream, 'last_err_step_pkt', None)
+			if isinstance(pkt, (bytes, bytearray)) and len(pkt) > 0:
+				return f"ERR/STEP:0x{bytes(pkt).hex()}"
+		except Exception:
+			pass
+		return "ERR/STEP:--/--"
+
+	def _stm32_sync_status_text(self) -> str:
+		"""Compact text for runtime legend."""
+		try:
+			mode = str(getattr(self, '_stm32_sync_mode', '---') or '---').upper()
+		except Exception:
+			mode = "---"
+		try:
+			source = str(getattr(self, '_stm32_sync_source', 'device') or 'device')
+		except Exception:
+			source = "device"
+		try:
+			ok = bool(getattr(self, '_stm32_sync_ok', False))
+		except Exception:
+			ok = False
+		if ok and source.startswith("STAT["):
+			return f"STM32:{mode}({source})"
+		if ok:
+			return f"STM32:{mode}"
+		return "STM32:---"
+
+	def _update_tim2_btn_style(self):
+		"""Обновить стиль кнопки передачи Tx200."""
+		try:
+			if bool(getattr(self, 'tim2_pending', False)):
+				self.btn_tim2.setStyleSheet("background-color: #b8860b; color: white; font-weight: bold; border:1px solid #7a5a00;")
+				self.btn_tim2.setToolTip("Передача Tx200: ожидание подтверждения устройства")
+				return
+		except Exception:
+			pass
+		try:
+			en = bool(getattr(self, 'tim2_applied', False))
 		except Exception:
 			en = False
 		try:
 			if en:
 				self.btn_tim2.setStyleSheet("background-color: #008800; color: white; font-weight: bold; border:1px solid #005500;")
-				self.btn_tim2.setToolTip("Передача TIM2: ВКЛ")
+				self.btn_tim2.setToolTip("Передача Tx200: ВКЛ")
 			else:
 				self.btn_tim2.setStyleSheet("background-color: #880000; color: white; font-weight: bold; border:1px solid #550000;")
-				self.btn_tim2.setToolTip("Передача TIM2: ВЫКЛ")
+				if bool(getattr(self, 'tim2_enabled', False)) and self.stream is None:
+					self.btn_tim2.setToolTip("Передача Tx200: ожидает USB")
+				elif bool(getattr(self, 'tim2_enabled', False)):
+					self.btn_tim2.setToolTip("Передача Tx200: запрос не подтвержден")
+				else:
+					self.btn_tim2.setToolTip("Передача Tx200: ВЫКЛ")
 		except Exception:
 			pass
 
-	def _send_tim2_enable(self, enabled: bool):
+	def _send_tim2_enable(self, enabled: bool, update_ui: bool = True):
 		"""Отправить CMD_SET_TIM2_ENABLE (0x1E)."""
 		try:
 			if self.stream is None:
-				return
+				return False
 			if hasattr(self.stream, 'set_tim2_enable'):
 				self.stream.set_tim2_enable(bool(enabled))
 			else:
 				payload = b"\x01" if bool(enabled) else b"\x00"
 				self.stream.send_cmd(CMD_SET_TIM2_ENABLE, payload)
+			return True
 		except Exception as e:
-			try:
-				self._set_status(f"TIM2: ошибка ({e})", hold_sec=2.0)
-			except Exception:
-				pass
+			if update_ui:
+				try:
+					self._set_status(f"Tx200: ошибка ({e})", hold_sec=2.0)
+				except Exception:
+					pass
+			return False
 
-	def _send_tx_enable(self, enabled: bool):
+	def _send_tx_enable(self, enabled: bool, update_ui: bool = True):
 		"""Отправить CMD_SET_TX_ENABLE (0x33)."""
 		try:
 			if self.stream is None:
-				return
+				return False
 			payload = b"\x01" if bool(enabled) else b"\x00"
 			# через USBStream, если реализовано
 			if hasattr(self.stream, 'set_tx_enable'):
 				self.stream.set_tx_enable(bool(enabled))
 			else:
 				self.stream.send_cmd(CMD_SET_TX_ENABLE, payload)
+			return True
 		except Exception as e:
+			if update_ui:
+				try:
+					self._set_status(f"TX: ошибка ({e})", hold_sec=2.0)
+				except Exception:
+					pass
+			return False
+
+	def _host_rx_indicator_is_owned_by_tx200(self) -> bool:
+		"""Если автоиндикация использует 0x33, ручной Tx200 имеет приоритет."""
+		try:
+			cmd = int(getattr(self, 'host_rx_indicator_cmd', CMD_SET_TX_ENABLE))
+		except Exception:
+			cmd = CMD_SET_TX_ENABLE
+		return bool(cmd == CMD_SET_TX_ENABLE and bool(getattr(self, 'tim2_enabled', False)))
+
+	def _send_host_rx_indicator(self, enabled: bool, stream=None) -> bool:
+		"""Отправить признак того, что RPi реально читает рабочий поток."""
+		if not bool(getattr(self, 'host_rx_indicator_enabled', False)):
+			return False
+		st = stream if stream is not None else getattr(self, 'stream', None)
+		if st is None:
+			return False
+		try:
+			cmd = int(getattr(self, 'host_rx_indicator_cmd', CMD_SET_TX_ENABLE))
+		except Exception:
+			cmd = CMD_SET_TX_ENABLE
+		try:
+			payload = b"\x01" if bool(enabled) else b"\x00"
+			if cmd == CMD_SET_TX_ENABLE and hasattr(st, 'set_tx_enable'):
+				st.set_tx_enable(bool(enabled))
+			else:
+				st.send_cmd(cmd, payload)
+			self._host_rx_indicator_last_send_t = time.time()
+			self._host_rx_indicator_state = bool(enabled)
+			return True
+		except Exception:
+			return False
+
+	def _clear_host_rx_indicator(self, stream=None, force: bool = False):
+		"""Погасить device-side индикацию host RX и сбросить локальное состояние."""
+		st = stream if stream is not None else getattr(self, 'stream', None)
+		try:
+			if st is not None and not self._host_rx_indicator_is_owned_by_tx200():
+				if bool(force) or bool(getattr(self, '_host_rx_indicator_state', False)):
+					self._send_host_rx_indicator(False, stream=st)
+		except Exception:
+			pass
+		self._host_rx_indicator_state = False
+		self._host_rx_indicator_last_send_t = 0.0
+
+	def _update_host_rx_indicator(self, now_t: float | None = None):
+		"""Синхронизировать индикацию с фактом получения рабочих кадров на RPi."""
+		if not bool(getattr(self, 'host_rx_indicator_enabled', False)):
+			self._host_rx_indicator_state = False
+			return
+		if self._host_rx_indicator_is_owned_by_tx200():
+			# Команда 0x33 занята ручным режимом Tx200; автоиндикацию отпускаем.
+			self._host_rx_indicator_state = False
+			return
+		if now_t is None:
+			now_t = time.time()
+		active = False
+		try:
+			lf = float(getattr(self, 'last_frame_t', 0.0) or 0.0)
+			timeout_s = float(getattr(self, 'host_rx_indicator_timeout_s', 1.0) or 1.0)
+			active = bool(
+				self.stream is not None
+				and self.base_buf_len is not None
+				and lf > 0.0
+				and (float(now_t) - lf) <= timeout_s
+			)
+		except Exception:
+			active = False
+		if bool(active) == bool(getattr(self, '_host_rx_indicator_state', False)):
+			return
+		if active:
+			self._send_host_rx_indicator(True)
+		else:
+			self._clear_host_rx_indicator()
+
+	def _confirm_tim2_by_device_status(self, expected: bool, attempts: int = 3) -> bool:
+		"""Best-effort подтверждение через ответ устройства STAT (GET_STATUS)."""
+		try:
+			if self.stream is None or not hasattr(self.stream, '_get_status_ep0'):
+				return False
+		except Exception:
+			return False
+		for _ in range(max(1, int(attempts))):
 			try:
-				self._set_status(f"TX: ошибка ({e})", hold_sec=2.0)
+				self.stream._get_status_ep0()
+				st = getattr(self.stream, 'last_stat', None)
+				if isinstance(st, (bytes, bytearray)) and len(st) >= 64 and st[:4] == b'STAT':
+					# Если задана маска — проверяем конкретный бит статуса.
+					mask_s = os.getenv('BMI30_TX_STATUS_MASK', '').strip()
+					if mask_s:
+						off = int(os.getenv('BMI30_TX_STATUS_OFFSET', '48'))
+						mask = int(mask_s, 0) & 0xFF
+						if 0 <= off < len(st):
+							bit_on = (int(st[off]) & mask) != 0
+							return bool(bit_on) == bool(expected)
+						return False
+					# По умолчанию подтверждаем фактом ответа устройства на GET_STATUS.
+					return True
 			except Exception:
 				pass
+			time.sleep(0.05)
+		return False
+
+	def _tim2_apply_worker(self, request_id: int, enabled: bool):
+		"""Фоновое применение Tx200 + подтверждение по ответу устройства."""
+		ok_tim2 = self._send_tim2_enable(bool(enabled), update_ui=False)
+		ok_tx = self._send_tx_enable(bool(enabled), update_ui=False)
+		status_ok = False
+		if ok_tim2 and ok_tx:
+			status_ok = self._confirm_tim2_by_device_status(bool(enabled), attempts=3)
+		self._tim2_result_queue.put((int(request_id), bool(enabled), bool(ok_tim2 and ok_tx and status_ok)))
 
 	def _send_start_stream(self):
-		"""START потока с учётом TIM2 enable (если разрешено)."""
+		"""START потока с учётом Tx200 enable (если разрешено)."""
 		try:
 			if self.stream is None:
 				return
 			# пользовательский стоп снят
 			self._stream_user_stopped = False
 			if bool(getattr(self, 'tim2_enabled', False)):
-				self._send_tim2_enable(True)
+				ok_tim2 = self._send_tim2_enable(True)
+				ok_tx = self._send_tx_enable(True)
+				self.tim2_applied = bool(ok_tim2 and ok_tx)
+			else:
+				self.tim2_applied = False
+			self._update_tim2_btn_style()
 			self.stream.send_cmd(CMD_START_STREAM, b"")
 		except Exception:
 			pass
@@ -8484,6 +9756,7 @@ class ScopeWindow:
 		try:
 			if self.stream is None:
 				return
+			self._clear_host_rx_indicator(force=True)
 			# помечаем, что остановлено пользователем
 			self._stream_user_stopped = True
 			# Используем EP0 stop, если доступно
@@ -8506,7 +9779,7 @@ class ScopeWindow:
 			pass
 
 	def _on_toggle_tim2(self, enabled: bool):
-		"""GUI: включить/выключить передачу TIM2."""
+		"""GUI: включить/выключить передачу Tx200."""
 		try:
 			self.tim2_enabled = bool(enabled)
 		except Exception:
@@ -8515,26 +9788,38 @@ class ScopeWindow:
 			save_ui_state(tim2_enabled=bool(self.tim2_enabled))
 		except Exception:
 			pass
-		self._update_tim2_btn_style()
 		try:
-			if self.stream is None:
-				return
-			if self.tim2_enabled:
-				self._stream_user_stopped = False
-				# Включаем внешний передатчик, поток не трогаем
-				self._send_tx_enable(True)
-				self._set_status("TX: передача ВКЛ", hold_sec=1.5)
-			else:
-				# Не останавливаем поток: выключаем только внешний передатчик
-				self._send_tx_enable(False)
-				self._stream_user_stopped = False
-				self._set_status("TX: передача ВЫКЛ (стрим продолжается)", hold_sec=1.5)
+			self._host_rx_indicator_state = False
 		except Exception:
 			pass
+		try:
+			if self.stream is None:
+				self.tim2_applied = False
+				self.tim2_pending = False
+				self._update_tim2_btn_style()
+				self._set_status("Tx200: нет USB, команда будет применена при подключении", hold_sec=1.5)
+				return
+			self._stream_user_stopped = False
+			self.tim2_pending = True
+			# До подтверждения от устройства не считаем состояние применённым.
+			self.tim2_applied = False
+			self._tim2_request_seq = int(getattr(self, '_tim2_request_seq', 0)) + 1
+			req_id = int(self._tim2_request_seq)
+			self._update_tim2_btn_style()
+			threading.Thread(target=self._tim2_apply_worker, args=(req_id, bool(self.tim2_enabled)), daemon=True).start()
+			self._set_status("Tx200: отправка команды, ожидание ответа устройства…", hold_sec=1.2)
+		except Exception:
+			self.tim2_pending = False
+			self.tim2_applied = False
+		self._update_tim2_btn_style()
 
 	def run(self):
 		self.win.resize(900, 600)
-		self.win.show()
+		if bool(getattr(self, 'gui_enabled', True)):
+			self.win.show()
+		else:
+			self.win.hide()
+			print("[GUI] disabled: окно скрыто, отрисовка отключена", flush=True)
 		# Запускаем цикл событий Qt корректно как для PyQt5 (exec_()), так и для PyQt6 (exec())
 		_app = QtWidgets.QApplication.instance()
 		if hasattr(_app, 'exec_'):

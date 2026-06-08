@@ -2,6 +2,24 @@
 	"version": "2.0.0",
 	"tasks": [
 		{
+			"label": "🧰 Utilities Menu",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"${workspaceFolder}/utilities/menu.sh"
+			],
+			"presentation": {
+				"echo": false,
+				"reveal": "always",
+				"focus": true,
+				"panel": "dedicated",
+				"showReuseMessage": false,
+				"clear": true
+			},
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
 			"label": "⛔ ОСТАНОВИТЬ BMI30",
 			"type": "shell",
 			"command": "pkill -9 -f BMI30.200.py; echo 'Процесс BMI30.200.py остановлен'; sleep 1",
@@ -17,7 +35,7 @@
 			"problemMatcher": []
 		},
 		{
-			"label": "Переключить версию BMI30",
+			"label": "Выбор версий BMI30",
 			"type": "shell",
 			"command": "bash",
 			"args": [
@@ -35,12 +53,12 @@
 			"problemMatcher": []
 		},
 		{
-			"label": "Run BMI30.200.py",
+			"label": "Run BMI30 working version",
 			"type": "shell",
 			"command": "bash",
 			"args": [
 				"-lc",
-				"cd '${workspaceFolder}' && if [[ -x .usbvenv/bin/python ]]; then exec ./.usbvenv/bin/python host/BMI30.200.py; elif [[ -x .venv/bin/python ]]; then exec ./.venv/bin/python host/BMI30.200.py; else echo 'Не найден Python в .usbvenv/bin/python или .venv/bin/python'; exit 1; fi"
+				"cd '${workspaceFolder}' && export BMI30_BEEP_REALTIME=1 BMI30_DETECT_IN_READER=1 BMI30_BEEP_HOLD_ENABLE=0 BMI30_BEEP_HOLD_DELAY=0.0 BMI30_DETECT_LOSS_SEC=0.0 BMI30_DETECT_COOLDOWN=0.05 BMI30_BEEP_SWEEP=0 BMI30_BEEP_INFO_TONE=0.10 BMI30_BEEP_INFO_GAP=0.0 BMI30_BEEP_CHANNEL_GAP=0.0 BMI30_BEEP_REPEAT_GAP=0.05 && if [[ -x .usbvenv/bin/python ]]; then exec ./.usbvenv/bin/python host/BMI30.200.py.2026-05-24-work; elif [[ -x .venv/bin/python ]]; then exec ./.venv/bin/python host/BMI30.200.py.2026-05-24-work; else echo 'Не найден Python в .usbvenv/bin/python или .venv/bin/python'; exit 1; fi"
 			],
 			"isBackground": false,
 			"problemMatcher": [

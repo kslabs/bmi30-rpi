@@ -3,6 +3,7 @@
 from __future__ import annotations
 import os
 import sys, time, json, os as _os_alias, struct
+import importlib
 import threading
 import datetime
 # Qt env: avoid GTK theme/plugin conflicts on RPi (Bookworm)
@@ -72,6 +73,24 @@ except Exception:
 		CMD_SET_SYNC_MODE = 0x1D
 
 
+def _import_gpio_module(module_name: str):
+	"""Import GPIO-related module, falling back to system dist-packages from venv."""
+	try:
+		return importlib.import_module(module_name)
+	except Exception:
+		pass
+	for extra_path in (
+		"/usr/lib/python3/dist-packages",
+		f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages",
+	):
+		try:
+			if os.path.isdir(extra_path) and extra_path not in sys.path:
+				sys.path.append(extra_path)
+		except Exception:
+			pass
+	return importlib.import_module(module_name)
+
+
 class PwmBeeper:
 	"""Best-effort beeper for RPi PWM0 (GPIO12).
 
@@ -119,7 +138,7 @@ class PwmBeeper:
 			return
 		# Try pigpio first
 		try:
-			import pigpio  # type: ignore
+			pigpio = _import_gpio_module('pigpio')  # type: ignore
 			pi = pigpio.pi()
 			if getattr(pi, 'connected', False):
 				self._backend = 'pigpio'
@@ -132,7 +151,7 @@ class PwmBeeper:
 			pass
 		# Try lgpio (recommended on Pi5 / modern distros)
 		try:
-			import lgpio  # type: ignore
+			lgpio = _import_gpio_module('lgpio')  # type: ignore
 			chip = 0
 			try:
 				chip = int(os.getenv('BMI30_GPIOCHIP', '0') or 0)
@@ -154,7 +173,7 @@ class PwmBeeper:
 			self._lg_h = None
 		# Fallback: RPi.GPIO software PWM
 		try:
-			import RPi.GPIO as GPIO  # type: ignore
+			GPIO = _import_gpio_module('RPi.GPIO')  # type: ignore
 			GPIO.setwarnings(False)
 			GPIO.setmode(GPIO.BCM)
 			GPIO.setup(self.gpio_pin, GPIO.OUT, initial=GPIO.LOW)  # Явно LOW при инициализации
@@ -1627,7 +1646,7 @@ class ScopeWindow:
 			if port is None:
 				print("[RESET] CDC порт не найден, пропускаем SOFT_RESET")
 				return
-			with serial.Serial(port, 115200, timeout=1) as ser:
+			with serial.Serial(port, 115200, timeout=0.2, write_timeout=0.2) as ser:
 				ser.write(bytes([CMD_SOFT_RESET]))
 				time.sleep(0.1)
 				print("[RESET] SOFT_RESET sent via CDC")

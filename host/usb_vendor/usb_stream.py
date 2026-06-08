@@ -13,15 +13,22 @@ CMD_SET_ROI_US    = 0x15
 CMD_START_STREAM  = 0x20
 CMD_STOP_STREAM   = 0x21
 CMD_GET_STATUS    = 0x30
+CMD_HOST_RX_ACK   = 0x36
 CMD_SET_FRAME_SAMPLES = 0x17
 CMD_ASYNC         = 0x18  # 0=strict pairs A/B, 1=independent A/B
 CMD_SET_WINDOWS    = 0x10  # payload: <HHHH> start0,len0,start1,len1
 CMD_SET_STREAM_MODE = 0x1A  # payload: <B> 0=LATEST(600), 1=LOSSLESS_ROI(200)
+CMD_SET_DC_CONFIG = 0x1F
+CMD_GET_DC_CONFIG = 0x3A
 # Device-side DC adaptation toggle (firmware-dependent). Override via env if needed.
 try:
     CMD_SET_DC_ADAPT = int(os.getenv("BMI30_CMD_SET_DC_ADAPT", "0x1B"), 0)
 except Exception:
     CMD_SET_DC_ADAPT = 0x1B
+try:
+    CMD_CALIB_DC_FAST = int(os.getenv("BMI30_CMD_CALIB_DC_FAST", "0x1E"), 0)
+except Exception:
+    CMD_CALIB_DC_FAST = 0x1E
 CMD_SET_ALT       = 0x31  # optional vendor EP0 control OUT to set alt
 CMD_SOFT_RESET   = 0x7E  # EP0 vendor control OUT, no data
 CMD_DEEP_RESET   = 0x7F  # EP0 vendor control OUT, no data
@@ -305,6 +312,12 @@ class USBStream:
             fm_env_val = None
         # По умолчанию быстрый режим ВКЛЮЧЕН (всегда рабочий режим)
         self.fast_mode = True if fast_mode is None and fm_env_val is None else bool(fast_mode if fast_mode is not None else fm_env_val)
+        try:
+            # Passive mode: host opens USB and reads status/data, but does not
+            # proactively reconfigure or start the STM32 on healthy connect.
+            self.passive_connect = str(os.getenv('BMI30_PASSIVE_CONNECT', '1')).lower() not in ('0', 'false', 'no')
+        except Exception:
+            self.passive_connect = True
 
         # Save assembler pairing overrides (None -> use env)
         self._asm_relaxed_override = assembler_relaxed
@@ -473,7 +486,8 @@ class USBStream:
         self.intf_num = intf_num
                 # Явно выбираем altsetting=1 для Vendor IF#2, где находятся bulk EP (новая прошивка)
         self.current_alt = 0
-        self._ensure_alt(intf_num, desired_alt=1)
+        if not self._ensure_alt(intf_num, desired_alt=1):
+            raise RuntimeError(f'unable to set vendor interface alt=1 for bulk endpoints {hex(EP_OUT)}/{hex(EP_IN)}')
         # Найдём дескриптор интерфейса с alt=0
         intf = usb.util.find_descriptor(
             cfg,
@@ -551,6 +565,7 @@ class USBStream:
         self.connected_t = time.time()
         self.last_rx_t = self.connected_t
         self.last_restart_t = 0.0
+        self._rx_flush_requested = False  # сигнал _rx_loop очистить буфер после рестарта
         # Сохраним порт info для power cycle
         self.port_info = self.get_port_path_info()
         # Старт: отправим профиль/режим/окна/частоту/размер кадра (если заданы), затем START
@@ -598,67 +613,68 @@ class USBStream:
                     time.sleep(0.02)
                 except Exception:
                     pass
-            try:
-                send_profile = str(os.getenv('BMI30_SEND_PROFILE','0')).lower() not in ('0','false','no')
-            except Exception:
-                send_profile = False
-            # Быстрый режим принудительно шлёт профиль и Ns до START
-            if self.fast_mode:
+            if not self.passive_connect:
                 try:
-                    prof = int(self.profile if self.profile is not None else 2)
-                    self.send_cmd(CMD_SET_PROFILE, bytes([prof & 0xFF])); time.sleep(0.2 if prof == 1 else 0.01)
+                    send_profile = str(os.getenv('BMI30_SEND_PROFILE','0')).lower() not in ('0','false','no')
                 except Exception:
-                    pass
-                try:
-                    # SET_FULL_MODE(1/0)
-                    self.send_cmd(CMD_SET_FULL_MODE, bytes([1 if self.full else 0])); time.sleep(0.05)
-                except Exception:
-                    pass
-                # Важно: SET_FRAME_SAMPLES (0x17) нельзя слать для профиля 1 — ломает поток.
-                # Для профиля 2 можно слать только если хост явно попросил (frame_samples!=None).
-                if self.frame_samples is not None and int(self.profile or 2) == 2:
+                    send_profile = False
+                # Быстрый режим принудительно шлёт профиль и Ns до START
+                if self.fast_mode:
                     try:
-                        ns = max(1, int(self.frame_samples)) & 0xFFFF
-                        self.send_cmd(CMD_SET_FRAME_SAMPLES, ns.to_bytes(2, 'little'))
+                        prof = int(self.profile if self.profile is not None else 2)
+                        self.send_cmd(CMD_SET_PROFILE, bytes([prof & 0xFF])); time.sleep(0.2 if prof == 1 else 0.01)
+                    except Exception:
+                        pass
+                    try:
+                        # SET_FULL_MODE(1/0)
+                        self.send_cmd(CMD_SET_FULL_MODE, bytes([1 if self.full else 0])); time.sleep(0.05)
+                    except Exception:
+                        pass
+                    # Важно: SET_FRAME_SAMPLES (0x17) нельзя слать для профиля 1 — ломает поток.
+                    # Для профиля 2 можно слать только если хост явно попросил (frame_samples!=None).
+                    if self.frame_samples is not None and int(self.profile or 2) == 2:
+                        try:
+                            ns = max(1, int(self.frame_samples)) & 0xFFFF
+                            self.send_cmd(CMD_SET_FRAME_SAMPLES, ns.to_bytes(2, 'little'))
+                            time.sleep(0.05)
+                        except Exception:
+                            pass
+                    # В fast-режиме дополнительно задаём частоту блока (200/300 Гц) перед START
+                    try:
+                        rate_hz = 200 if int(self.profile or 1) == 1 else 300
+                        self.set_block_rate(rate_hz)
                         time.sleep(0.05)
                     except Exception:
                         pass
-                # В fast-режиме дополнительно задаём частоту блока (200/300 Гц) перед START
+                elif send_profile:
+                    try:
+                        if self.profile is not None:
+                            self.send_cmd(CMD_SET_PROFILE, bytes([int(self.profile) & 0xFF])); time.sleep(0.02)
+                    except Exception:
+                        pass
                 try:
-                    rate_hz = 200 if int(self.profile or 1) == 1 else 300
-                    self.set_block_rate(rate_hz)
-                    time.sleep(0.05)
+                    self.send_cmd(CMD_SET_FULL_MODE, bytes([1 if self.full else 0])); time.sleep(0.02)
                 except Exception:
                     pass
-            elif send_profile:
+                if self.frame_samples is not None and int(self.profile or 2) == 2:
+                    try:
+                        # u16 LE (только для профиля 2; профиль 1 ломается при SET_FRAME_SAMPLES)
+                        ns = max(1, int(self.frame_samples)) & 0xFFFF
+                        self.send_cmd(CMD_SET_FRAME_SAMPLES, ns.to_bytes(2, 'little'))
+                        time.sleep(0.02)
+                    except Exception:
+                        pass
+                # Профиль 1 требует больше времени на инициализацию
+                delay = 0.3 if (int(self.profile if self.profile is not None else 2) == 1) else 0.05
+                time.sleep(delay)
+                self.send_cmd(CMD_START_STREAM, b"")
+                time.sleep(0.05)
+                # EP0 статус-пинг сразу после старта — выключен по умолчанию
                 try:
-                    if self.profile is not None:
-                        self.send_cmd(CMD_SET_PROFILE, bytes([int(self.profile) & 0xFF])); time.sleep(0.02)
+                    if str(os.getenv('BMI30_EP0_AFTER_START','0')).lower() not in ('0','false','no'):
+                        self._get_status_ep0()
                 except Exception:
                     pass
-            try:
-                self.send_cmd(CMD_SET_FULL_MODE, bytes([1 if self.full else 0])); time.sleep(0.02)
-            except Exception:
-                pass
-            if self.frame_samples is not None and int(self.profile or 2) == 2:
-                try:
-                    # u16 LE (только для профиля 2; профиль 1 ломается при SET_FRAME_SAMPLES)
-                    ns = max(1, int(self.frame_samples)) & 0xFFFF
-                    self.send_cmd(CMD_SET_FRAME_SAMPLES, ns.to_bytes(2, 'little'))
-                    time.sleep(0.02)
-                except Exception:
-                    pass
-            # Профиль 1 требует больше времени на инициализацию
-            delay = 0.3 if (int(self.profile if self.profile is not None else 2) == 1) else 0.05
-            time.sleep(delay)
-            self.send_cmd(CMD_START_STREAM, b"")
-            time.sleep(0.05)
-            # EP0 статус-пинг сразу после старта — выключен по умолчанию
-            try:
-                if str(os.getenv('BMI30_EP0_AFTER_START','0')).lower() not in ('0','false','no'):
-                    self._get_status_ep0()
-            except Exception:
-                pass
         except Exception:
             pass
     # Консервативный старт: без дополнительных пинков/GET_STATUS (сделаем только по запросу)
@@ -666,6 +682,9 @@ class USBStream:
         self.frames = 0; self.bytes = 0; self.crc_bad = 0; self.magic_bad = 0
         self.test_seen = 0
         self.last_stat = None
+        self.last_err_step_pkt = None
+        self.last_err_step_vals = None
+        self.last_err_step_t = 0.0
         # Track per-channel RX sequence continuity (adc_id=0/1).
         # This matches the user's definition of "no losses": each channel independently.
         self.seq_last_ch0: int | None = None
@@ -744,25 +763,43 @@ class USBStream:
         except Exception:
             pass
         self.stat_t = time.time()
-        self.th = threading.Thread(target=self._rx_loop, daemon=True)
-        self.th.start()
+        self._close_lock = threading.Lock()
+        self._closed = False
         self._fallback_done = False
         self._working_seen = False
         self.keepalive_last = self.connected_t
         self.restart_attempts = 0
+        self._ep_out_lock = threading.Lock()
+        try:
+            self.host_rx_ack_enabled = str(os.getenv('BMI30_HOST_RX_ACK', '1')).lower() not in ('0', 'false', 'no')
+        except Exception:
+            self.host_rx_ack_enabled = True
+        try:
+            self.host_rx_ack_interval = max(0.2, float(os.getenv('BMI30_HOST_RX_ACK_INTERVAL', '1.0')))
+        except Exception:
+            self.host_rx_ack_interval = 1.0
+        self.host_rx_ack_last = 0.0
+        self.host_rx_ack_fail = 0
+        self._host_rx_ack_stop = False
+        self._host_rx_ack_q = queue.Queue(maxsize=1)
+        self._host_rx_ack_th = threading.Thread(target=self._host_rx_ack_loop, daemon=True)
+        self._host_rx_ack_th.start()
         try:
             self.force_reopen = str(os.getenv('BMI30_FORCE_REOPEN','1')).lower() not in ('0','false','no')
         except Exception:
             self.force_reopen = True
         # Флаг: один раз авто-исправить несоответствие профиля/частоты после старта
         self._rate_mismatch_fixed = False
+        self.th = threading.Thread(target=self._rx_loop, daemon=True)
+        self.th.start()
 
     def set_block_rate(self, rate_hz: int):
         """Задать частоту блока (в Гц) через вендорский пакет 0x11."""
         try:
             import struct as _st
             payload = _st.pack('<BH', 0x11, int(rate_hz) & 0xFFFF)
-            _ = self.dev.write(EP_OUT, payload, timeout=1000)
+            with self._ep_out_lock:
+                _ = self.dev.write(EP_OUT, payload, timeout=1000)
             try:
                 print(f"[tx] set_block_rate {rate_hz}Hz")
             except Exception:
@@ -826,6 +863,12 @@ class USBStream:
                 pass
         return ready
 
+    def _status_len(self):
+        try:
+            return max(64, min(192, int(os.getenv('BMI30_STAT_LEN', '136'))))
+        except Exception:
+            return 136
+
     def _get_status_ep0(self):
         """Попробовать прочитать статус через EP0 (vendor control IN, recipient: device)."""
         try:
@@ -833,10 +876,10 @@ class USBStream:
             # bRequest: CMD_GET_STATUS
             # wValue: 0
             # wIndex: 0 (device)
-            # wLength: 64
+            # wLength: 136 for current STAT v5; older firmware may return a short 64B packet.
             data = None
             try:
-                data = self.dev.ctrl_transfer(0xC0, CMD_GET_STATUS, 0, 0, 64, timeout=300)
+                data = self.dev.ctrl_transfer(0xC0, CMD_GET_STATUS, 0, 0, self._status_len(), timeout=300)
             except usb.core.USBError as e:
                 # Время от времени устройство может NAK/STALL — это нормально
                 try:
@@ -854,6 +897,83 @@ class USBStream:
                 print('[ep0] GET_STATUS failed:', e)
             except Exception:
                 pass
+
+    def _host_rx_ack_loop(self):
+        while (not bool(getattr(self, '_host_rx_ack_stop', False))) and getattr(self, '_running', True):
+            try:
+                total_frames = self._host_rx_ack_q.get(timeout=0.2)
+            except Exception:
+                continue
+            try:
+                self._write_host_rx_ack(int(total_frames))
+            except Exception:
+                pass
+
+    def _queue_host_rx_ack(self, total_frames: int):
+        try:
+            self._host_rx_ack_q.put_nowait(int(total_frames))
+            return
+        except queue.Full:
+            pass
+        except Exception:
+            return
+        try:
+            _ = self._host_rx_ack_q.get_nowait()
+        except Exception:
+            pass
+        try:
+            self._host_rx_ack_q.put_nowait(int(total_frames))
+        except Exception:
+            pass
+
+    def _send_host_rx_ack(self, total_frames: int | None = None, force: bool = False):
+        """Queue a best-effort RX heartbeat without blocking the Bulk IN reader."""
+        try:
+            if not bool(getattr(self, 'host_rx_ack_enabled', True)):
+                return
+            if (not getattr(self, '_running', True)) or bool(getattr(self, 'disconnected', False)):
+                return
+            now = time.time()
+            interval = float(getattr(self, 'host_rx_ack_interval', 1.0) or 1.0)
+            if (not force) and (now - float(getattr(self, 'host_rx_ack_last', 0.0) or 0.0)) < interval:
+                return
+            if total_frames is None:
+                total_frames = int(getattr(self, 'rx_cnt_ch0', 0) or 0) + int(getattr(self, 'rx_cnt_ch1', 0) or 0)
+            self.host_rx_ack_last = now
+            self._queue_host_rx_ack(int(total_frames))
+        except Exception:
+            pass
+
+    def _write_host_rx_ack(self, total_frames: int):
+        """Worker-side write for HOST_RX_ACK. Never called from the reader hot path."""
+        try:
+            if not bool(getattr(self, 'host_rx_ack_enabled', True)):
+                return
+            if (not getattr(self, '_running', True)) or bool(getattr(self, 'disconnected', False)):
+                return
+            pkt = bytes([CMD_HOST_RX_ACK]) + struct.pack('<I', int(total_frames) & 0xFFFFFFFF)
+            try:
+                timeout_ms = int(os.getenv('BMI30_HOST_RX_ACK_TIMEOUT_MS', '20'))
+            except Exception:
+                timeout_ms = 20
+            timeout_ms = max(5, min(100, int(timeout_ms)))
+            with self._ep_out_lock:
+                self.dev.write(EP_OUT, pkt, timeout=timeout_ms)
+            self.host_rx_ack_fail = 0
+        except Exception as e:
+            try:
+                self.host_rx_ack_fail = int(getattr(self, 'host_rx_ack_fail', 0) or 0) + 1
+            except Exception:
+                self.host_rx_ack_fail = 1
+            try:
+                eno = getattr(e, 'errno', None)
+            except Exception:
+                eno = None
+            if eno in (5, 19, 32) or 'Invalid endpoint' in str(e):
+                try:
+                    self.disconnected = True
+                except Exception:
+                    pass
 
     def _clear_halt_eps(self):
         try:
@@ -945,11 +1065,21 @@ class USBStream:
         except Exception:
             pass
 
+    def request_rx_flush(self):
+        """Сигнал потоку чтения: очистить накопленный буфер после рестарта.
+        Устаревшие данные в buf могут содержать мусор или частичные кадры
+        от предыдущей сессии — их нужно выбросить перед первым новым кадром.
+        """
+        self._rx_flush_requested = True
+
     def restart_stream(self, full=True):
         """Повторно пнуть поток, если устройство молчит."""
         try:
             # Чистый рестарт: остановить, очистить и только потом запускать
             self._prepare_clean_start(stop_first=True)
+            # После STOP + alt-toggle устаревшие данные в буфере деффреймера
+            # становятся мусором — очищаем их перед первым новым кадром.
+            self.request_rx_flush()
             if full:
                 self.send_cmd(CMD_SET_FULL_MODE, bytes([1])); time.sleep(0.02)
             self.send_cmd(CMD_START_STREAM, b""); time.sleep(0.02)
@@ -990,38 +1120,70 @@ class USBStream:
                 pass
         self._fallback_done = True
     def close(self):
-        self._running = False
-        try:
-            self.send_cmd(CMD_STOP_STREAM,b"")
-        except Exception:
-            pass
-        # Переведём IF в alt=0 (idle), если возможно
-        try:
-            if hasattr(self, 'intf_num') and self.intf_num is not None:
+        with self._close_lock:
+            if bool(getattr(self, '_closed', False)):
+                return
+            self._closed = True
+
+            # Отправляем STOP напрямую через dev.write ДО того как снять _running,
+            # потому что send_cmd проверяет _running и вернётся немедленно если False.
+            try:
+                skip_stop = bool(getattr(self, 'disconnected', False))
+            except Exception:
+                skip_stop = False
+            self._host_rx_ack_stop = True
+            try:
+                th_ack = getattr(self, '_host_rx_ack_th', None)
+                if th_ack is not None and th_ack.is_alive() and th_ack is not threading.current_thread():
+                    th_ack.join(timeout=0.15)
+            except Exception:
+                pass
+            if not skip_stop:
                 try:
-                    usb.util.claim_interface(self.dev, self.intf_num)
+                    with self._ep_out_lock:
+                        self.dev.write(EP_OUT, bytes([CMD_STOP_STREAM]), timeout=500)
+                    print(f"[tx] cmd=0x{CMD_STOP_STREAM:02X} (close/direct)")
                 except Exception:
                     pass
+
+            self._running = False
+
+            # Дождёмся выхода RX-потока, чтобы не освобождать libusb ресурсы во время read().
+            try:
+                th = getattr(self, 'th', None)
+                if th is not None and th.is_alive() and th is not threading.current_thread():
+                    th.join(timeout=1.5)
+            except Exception:
+                pass
+
+            # Переведём IF в alt=0 (idle), если возможно
+            if not skip_stop:
                 try:
-                    self.dev.set_interface_altsetting(interface=self.intf_num, alternate_setting=0)
-                    self.current_alt = 0
+                    if hasattr(self, 'intf_num') and self.intf_num is not None:
+                        try:
+                            usb.util.claim_interface(self.dev, self.intf_num)
+                        except Exception:
+                            pass
+                        try:
+                            self.dev.set_interface_altsetting(interface=self.intf_num, alternate_setting=0)
+                            self.current_alt = 0
+                        except Exception:
+                            pass
                 except Exception:
                     pass
-        except Exception:
-            pass
-        # Освободим интерфейс и очистим ресурсы, чтобы следующий запуск был «с нуля»
-        try:
-            if hasattr(self, 'intf_num') and self.intf_num is not None:
-                try:
-                    usb.util.release_interface(self.dev, self.intf_num)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            usb.util.dispose_resources(self.dev)
-        except Exception:
-            pass
+            # Освободим интерфейс и очистим ресурсы, чтобы следующий запуск был «с нуля»
+            try:
+                if hasattr(self, 'intf_num') and self.intf_num is not None:
+                    try:
+                        usb.util.release_interface(self.dev, self.intf_num)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                usb.util.dispose_resources(self.dev)
+            except Exception:
+                pass
     def soft_reset(self):
         """Отправить EP0 SOFT_RESET (0x7E) вендорским control OUT без данных."""
         try:
@@ -1044,10 +1206,30 @@ class USBStream:
             return
         self._ensure_alt(self.intf_num, desired_alt=int(alt))
 
+    def request_err_step(self):
+        """Quietly request short bulk status `0x31`; device replies with `[0x31, err, step]`."""
+        try:
+            _ = self.dev.write(EP_OUT, bytes([0x31]), timeout=300)
+            return True
+        except Exception:
+            return False
+
     # --- internals ---
     def _ensure_alt(self, intf_num:int, desired_alt:int, retries:int=2):
         """Установить alt: стандартный SET_INTERFACE (0x0B) как основной, вендор SET_ALT(0x31) как fallback.
         После успеха — дождаться alt1/out_armed и сделать CLEAR_HALT."""
+        try:
+            retries = max(int(retries), int(os.getenv('BMI30_ALT_RETRIES', '8')))
+        except Exception:
+            retries = max(int(retries), 8)
+        try:
+            retry_sleep = max(0.02, min(0.5, float(os.getenv('BMI30_ALT_RETRY_SLEEP_S', '0.08'))))
+        except Exception:
+            retry_sleep = 0.08
+        try:
+            ready_timeout = max(0.1, min(2.0, float(os.getenv('BMI30_ALT_READY_TIMEOUT_S', '0.5'))))
+        except Exception:
+            ready_timeout = 0.5
         # === Попытка 1: стандартный SET_INTERFACE (preferred) ===
         for attempt in range(retries+1):
             try:
@@ -1069,11 +1251,11 @@ class USBStream:
                 print(f"[alt] set_interface_altsetting alt={desired_alt} ok (attempt {attempt+1})")
                 # После успешного alt — дождёмся готовности и сделаем CLEAR_HALT
                 try:
-                    self._wait_ready(timeout=0.2)
+                    self._wait_ready(timeout=ready_timeout)
                     self._clear_halt_eps()
                 except Exception:
                     pass
-                return
+                return True
             except Exception as e:
                 if attempt == retries:
                     try:
@@ -1084,7 +1266,7 @@ class USBStream:
                     usb.util.release_interface(self.dev, intf_num)
                 except Exception:
                     pass
-                time.sleep(0.02)
+                time.sleep(min(0.5, retry_sleep * (1.0 + 0.25 * attempt)))
         # === Попытка 2: стандартный control SET_INTERFACE (0x0B/0x01) ===
         try:
             bm = 0x01  # Host-to-Device, Standard, Interface
@@ -1093,11 +1275,11 @@ class USBStream:
             self.current_alt = int(desired_alt)
             print(f"[alt] ctrl SET_INTERFACE (0x0B/0x01) alt={desired_alt} ok")
             try:
-                self._wait_ready(timeout=0.2)
+                self._wait_ready(timeout=ready_timeout)
                 self._clear_halt_eps()
             except Exception:
                 pass
-            return
+            return True
         except Exception as e:
             try:
                 print(f"[alt] ctrl SET_INTERFACE (0x0B/0x01) alt={desired_alt} failed:", e)
@@ -1111,11 +1293,11 @@ class USBStream:
                 self.current_alt = int(desired_alt)
                 print(f"[alt] vendor SET_ALT(0x40) alt={desired_alt} ok")
                 try:
-                    self._wait_ready(timeout=0.2)
+                    self._wait_ready(timeout=ready_timeout)
                     self._clear_halt_eps()
                 except Exception:
                     pass
-                return
+                return True
             except Exception:
                 pass
             # Interface (0x41) с wIndex=2 как дополнительная попытка
@@ -1124,11 +1306,11 @@ class USBStream:
                 self.current_alt = int(desired_alt)
                 print(f"[alt] vendor SET_ALT(0x41) alt={desired_alt} ok")
                 try:
-                    self._wait_ready(timeout=0.2)
+                    self._wait_ready(timeout=ready_timeout)
                     self._clear_halt_eps()
                 except Exception:
                     pass
-                return
+                return True
             except Exception:
                 pass
         except Exception as ee:
@@ -1141,23 +1323,37 @@ class USBStream:
             print(f"[alt] unable to set alt={desired_alt} (all methods failed)")
         except Exception:
             pass
+        return False
     def send_cmd(self, cmd, payload:bytes):
+        # Не отправляем команды в закрытый/остановленный поток.
+        # close() устанавливает _running=False и alt=0, после чего EP_OUT
+        # становится недействительным — любые write() дадут "Invalid endpoint".
+        if (not getattr(self, '_running', True)) or bool(getattr(self, 'disconnected', False)):
+            return
         pkt = bytes([cmd])+payload
         last_err=None
         for i in range(3):
             try:
-                n = self.dev.write(EP_OUT, pkt, timeout=1000)
+                with self._ep_out_lock:
+                    n = self.dev.write(EP_OUT, pkt, timeout=1000)
                 print(f"[tx] cmd=0x{cmd:02X} n={n}")
                 return
             except Exception as e:
                 last_err=e
                 print(f"[tx-err] cmd=0x{cmd:02X} try={i+1} err={e}")
-                # Если EIO/STALL/EPIPE — проверим готовность, снимем HALT и повторим ожидание
+                if 'Invalid endpoint' in str(e):
+                    self.disconnected = True
+                    break
+                # Прерываем retry немедленно если поток закрыт за время ожидания
+                if not getattr(self, '_running', True):
+                    return
                 try:
                     eno = getattr(e, 'errno', None)
                 except Exception:
                     eno = None
-                if eno in (5, 32) or 'EPIPE' in str(e) or 'Input/Output' in str(e):
+                # EIO/STALL/EPIPE или ETIMEDOUT (110): пробуем CLEAR_HALT через EP0.
+                # EP0 всегда обрабатывается аппаратурой STM32 даже при зависшем firmware.
+                if eno in (5, 32, 110) or 'EPIPE' in str(e) or 'Input/Output' in str(e):
                     try:
                         self._get_status_ep0()
                         st = getattr(self, 'last_stat', None)
@@ -1173,9 +1369,14 @@ class USBStream:
                     except Exception:
                         pass
                 time.sleep(0.05)
-        # Если это EBUSY — пометим как отключение, чтобы верхний уровень переподключился
+        # Пометить disconnected при критических ошибках, чтобы верхний уровень переподключился.
         try:
-            if isinstance(last_err, usb.core.USBError) and getattr(last_err, 'errno', None) == 16:
+            eno_last = getattr(last_err, 'errno', None) if isinstance(last_err, Exception) else None
+            if isinstance(last_err, usb.core.USBError) and eno_last in (16, 19, 5):
+                # EBUSY/ENODEV/EIO — точно потеряли устройство
+                self.disconnected = True
+            elif isinstance(last_err, Exception) and 'Invalid endpoint' in str(last_err):
+                # Endpoint стал недействительным (alt сменился снаружи) — перезапуск
                 self.disconnected = True
         except Exception:
             pass
@@ -1199,26 +1400,86 @@ class USBStream:
         cmd = 0x1C
         payload = bytes([hz & 0xFF, (hz >> 8) & 0xFF])
         self.send_cmd(cmd, payload)
+
+    def set_dc_config_seconds(self, mode: int = 1, work_settle_s: float = 1.0, detect_settle_s: float = 0.25, fast_settle_s: float = 0.001, fast_duration_s: float = 6.0):
+        """Configure STM32-side DC adaptation timing (SET_DC_CONFIG v1)."""
+        def _ms(value, default):
+            try:
+                v = float(value)
+                if not (v >= 0.0):
+                    v = float(default)
+            except Exception:
+                v = float(default)
+            return max(0, min(0xFFFFFFFF, int(round(v * 1000.0))))
+
+        mode_u8 = max(0, min(255, int(mode)))
+        flags = 0
+        payload = struct.pack(
+            '<BBHIIII',
+            1,
+            mode_u8,
+            flags,
+            _ms(work_settle_s, 1.0),
+            _ms(detect_settle_s, 0.25),
+            _ms(fast_settle_s, 0.001),
+            _ms(fast_duration_s, 6.0),
+        )
+        self.send_cmd(CMD_SET_DC_CONFIG, payload)
+
+    def get_dc_config(self):
+        """Read STM32-side DC adaptation config via EP0 when firmware supports it."""
+        data = self.dev.ctrl_transfer(0xC0, CMD_GET_DC_CONFIG, 0, 0, 40, timeout=500)
+        bs = bytes(data) if data is not None else b''
+        if len(bs) < 40 or bs[:4] != b'DCCF':
+            return {'raw': bs.hex()}
+        sig, ver, mode, flags, work_ms, detect_ms, fast_settle_ms, fast_duration_ms, active_ms, mode_enter_ms, fast_until_ms, adapt_updates = struct.unpack('<4sBBHIIIIIIII', bs[:40])
+        return {
+            'version': int(ver),
+            'mode': int(mode),
+            'flags': int(flags),
+            'work_settle_ms': int(work_ms),
+            'detect_settle_ms': int(detect_ms),
+            'fast_settle_ms': int(fast_settle_ms),
+            'fast_duration_ms': int(fast_duration_ms),
+            'active_settle_ms': int(active_ms),
+            'mode_enter_ms': int(mode_enter_ms),
+            'fast_until_ms': int(fast_until_ms),
+            'adapt_updates': int(adapt_updates),
+        }
     
     def _rx_loop(self):
         buf = bytearray()
         MAGIC_LE = b"\x5A\xA5"
         while self._running and not self.disconnected:
+            # Очищаем устаревшие данные если запрошен flush после рестарта.
+            # Это нужно делать ДО чтения, чтобы мусор от старой сессии не попал
+            # в деффреймер вместе с новыми кадрами.
+            if getattr(self, '_rx_flush_requested', False):
+                if buf:
+                    print(f"[rx] flush stale buf ({len(buf)} bytes) after restart", flush=True)
+                buf.clear()
+                self._rx_flush_requested = False
             try:
                 # Читаем умеренными порциями как в рабочих скриптах (2KB)
                 data = bytes(self.dev.read(EP_IN, 2048, timeout=1000))
+            except ValueError as e:
+                if 'Invalid endpoint' in str(e):
+                    print(f"[disconnect] {e} => stop loop")
+                    self.disconnected = True
+                    break
+                print("USB value err", e); time.sleep(0.1); continue
             except usb.core.USBError as e:
                 if e.errno == 110: # timeout
                     # При длительном отсутствии рабочих кадров попробуем единоразовый fallback
                     now_t = time.time()
-                    if (not self._working_seen) and (not self._fallback_done) and (now_t - self.connected_t > 1.6):
+                    if (not self.passive_connect) and (not self._working_seen) and (not self._fallback_done) and (now_t - self.connected_t > 1.6):
                         self._do_fallback_start()
                     # Keepalive/мягкий рестарт: если давно не было вообще RX
                     if (now_t - self.last_rx_t) > float(getattr(self, 'keepalive_sec', 2.0)) and (now_t - self.keepalive_last) > 0.9:
                         # EP0 keepalive, даже если bulk OUT залип
                         self._get_status_ep0()
                         self.keepalive_last = now_t
-                    if (not getattr(self, 'disable_restart', False)) and (now_t - self.last_rx_t) > float(getattr(self, 'restart_after', 4.0)) and (now_t - self.last_restart_t) > float(getattr(self, 'restart_min_interval', 3.0)):
+                    if (not self.passive_connect) and (not getattr(self, 'disable_restart', False)) and (now_t - self.last_rx_t) > float(getattr(self, 'restart_after', 4.0)) and (now_t - self.last_restart_t) > float(getattr(self, 'restart_min_interval', 3.0)):
                         try:
                             # Выполним мягкий «чистый» рестарт: STOP + очистка EP + переустановка altsetting
                             self._prepare_clean_start(stop_first=True)
@@ -1239,6 +1500,9 @@ class USBStream:
                                 except Exception:
                                     pass
                             self.send_cmd(CMD_START_STREAM, b""); time.sleep(0.02)
+                            # После рестарта устаревшие данные в buf — мусор.
+                            # Запрашиваем очистку в начале следующей итерации.
+                            self._rx_flush_requested = True
                             self._prime_get_status()
                             self._kick_cdc_start()
                             self.last_restart_t = time.time()
@@ -1281,12 +1545,26 @@ class USBStream:
                 pos = 0
                 n = len(mv)
                 while pos + 4 <= n and mv[pos:pos+4] == b'STAT':
-                    if pos + 64 <= n:
-                        self.last_stat = bytes(mv[pos:pos+64])
-                        pos += 64
+                    rem_len = n - pos
+                    if rem_len >= 64:
+                        stat_len = rem_len if rem_len <= 192 else 64
+                        self.last_stat = bytes(mv[pos:pos+stat_len])
+                        pos += stat_len
                         continue
                     # если STAT неполный (маловероятно) — не трогаем, ждём доклейку
                     break
+                # Короткий служебный пакет 0x31: ожидаем как минимум [0x31, err, step].
+                # Сохраняем отдельно, чтобы GUI мог показать err/step без вмешательства в поток кадров.
+                if pos < n:
+                    rem = bytes(mv[pos:n])
+                    if rem and rem[0] == 0x31 and len(rem) <= 16:
+                        self.last_err_step_pkt = rem
+                        self.last_err_step_t = time.time()
+                        if len(rem) >= 3:
+                            self.last_err_step_vals = (int(rem[1]), int(rem[2]))
+                        else:
+                            self.last_err_step_vals = None
+                        pos = n
                 if pos < n:
                     buf.extend(mv[pos:].tobytes())
             if data:
@@ -1315,6 +1593,14 @@ class USBStream:
                     break
                 if magic != MAGIC:
                     # сдвинемся на байт вперёд и поищем магию снова
+                    self.magic_bad += 1
+                    del buf[0]
+                    continue
+                # Sanity-check: отбрасываем кадры с аномальным total_samples.
+                # Нулевой или слишком большой total_samples — признак битого заголовка.
+                # Ждать несуществующий payload нельзя: это заморозит поток.
+                # Граница 8192 покрывает все известные профили с запасом.
+                if total_samples == 0 or total_samples > 8192:
                     self.magic_bad += 1
                     del buf[0]
                     continue
@@ -1365,7 +1651,7 @@ class USBStream:
                 # Автопроверка: если хост явно задал frame_samples (и это профиль 2),
                 # а устройство пошло с другим total_samples — один раз попробуем пере-применить конфиг.
                 try:
-                    if (not self._rate_mismatch_fixed) and self.frame_samples is not None and int(getattr(self, 'profile', 2) or 2) == 2:
+                    if (not self.passive_connect) and (not self._rate_mismatch_fixed) and self.frame_samples is not None and int(getattr(self, 'profile', 2) or 2) == 2:
                         exp = int(self.frame_samples)
                         if int(total_samples) != exp:
                             self._rate_mismatch_fixed = True
@@ -1491,7 +1777,7 @@ class USBStream:
                 self._working_seen = True
             now=time.time()
             # Если видим только STAT и нет рабочих кадров — один раз пробуем fallback
-            if (not self._working_seen) and (not self._fallback_done) and (now - self.connected_t > 1.6):
+            if (not self.passive_connect) and (not self._working_seen) and (not self._fallback_done) and (now - self.connected_t > 1.6):
                 self._do_fallback_start()
             if now - self.stat_t >= 1.0:
                 with self.lock:
@@ -1509,6 +1795,12 @@ class USBStream:
                     except Exception:
                         fps_hz = float(frames_n)
                         bps_hz = float(bytes_n)
+                    if frames_n > 0:
+                        try:
+                            total_ack = int(getattr(self, 'rx_cnt_ch0', 0) or 0) + int(getattr(self, 'rx_cnt_ch1', 0) or 0)
+                            self._send_host_rx_ack(total_ack)
+                        except Exception:
+                            pass
                     try:
                         # compute deltas since last stat tick
                         try:

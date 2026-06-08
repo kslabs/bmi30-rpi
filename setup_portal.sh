@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+sudo rpi-eeprom-config#!/usr/bin/env bash
 # setup_portal.sh — Быстрая установка BMI30 Captive Portal (без полного install-скрипта)
 # Запуск: sudo bash setup_portal.sh
 set -euo pipefail
@@ -37,6 +37,7 @@ Type=simple
 ExecStart=/usr/bin/python3 $SERVER_DST
 Restart=always
 RestartSec=3
+EnvironmentFile=-/etc/default/bmi30-hotspot-info
 Environment=BMI30_HOTSPOT_IP=$HOTSPOT_IP
 
 [Install]
