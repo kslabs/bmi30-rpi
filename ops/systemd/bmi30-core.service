@@ -1,0 +1,19 @@
+[Unit]
+Description=BMI30 core service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=techaid
+Group=techaid
+WorkingDirectory=/home/techaid/Documents
+Environment=PYTHONUNBUFFERED=1
+Environment=QT_QPA_PLATFORM=offscreen
+EnvironmentFile=-/home/techaid/Documents/host/bmi30_split_active_version.env
+ExecStart=/bin/bash -lc 'cd /home/techaid/Documents; PY="${BMI30_PYTHON:-}"; if [ -z "$PY" ]; then if [ -x .usbvenv/bin/python ]; then PY=.usbvenv/bin/python; elif [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=python3; fi; fi; exec "$PY" "${BMI30_CORE_PATH:-host/BMI30.001.py}"'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

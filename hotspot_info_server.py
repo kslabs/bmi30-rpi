@@ -24,7 +24,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, quote
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 
 PORT         = int(os.getenv("BMI30_HOTSPOT_INFO_PORT",      "80"))
@@ -67,6 +67,7 @@ else:
 DEVICE_SYNC_CACHE_S = max(1, int(os.getenv("BMI30_DEVICE_SYNC_CACHE_S", "3")))
 SYNC_STATUS_OFFSET_S = os.getenv("BMI30_SYNC_STATUS_OFFSET", "").strip()
 PAGE_REV = os.getenv("BMI30_PAGE_REV", str(int(os.path.getmtime(__file__))))
+BMI30_SERVICE_URL = os.getenv("BMI30_SERVICE_URL", "http://127.0.0.1:8765").rstrip("/")
 TAGIT_LOGO_CANDIDATES = [
     os.getenv("BMI30_PORTAL_TAGIT_LOGO_PATH", "").strip(),
     os.path.join(os.path.dirname(__file__), "docs", "Tagit_Logo.png"),
@@ -725,10 +726,58 @@ def dc_config_from_form(form: dict[str, str]) -> dict[str, Any]:
     })
 
 
+def _bmi30_service_request(path: str, payload: dict[str, Any] | None = None, timeout: float = 1.2) -> dict[str, Any] | None:
+    url = f"{BMI30_SERVICE_URL}{path}"
+    try:
+        if payload is None:
+            with urlopen(url, timeout=timeout) as response:
+                data = response.read()
+        else:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+            with urlopen(req, timeout=timeout) as response:
+                data = response.read()
+        parsed = json.loads(data.decode("utf-8") or "{}")
+        return parsed if isinstance(parsed, dict) else {"ok": False, "error": "BMI30 service returned non-object JSON"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "service_url": BMI30_SERVICE_URL}
+
+
+def bmi30_service_status() -> dict[str, Any]:
+    data = _bmi30_service_request("/api/status", timeout=1.0)
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "BMI30 service unavailable", "service_url": BMI30_SERVICE_URL}
+    return data
+
+
+def bmi30_service_command(action: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    data = _bmi30_service_request(
+        "/api/command",
+        {"action": str(action), "params": dict(params or {})},
+        timeout=6.0,
+    )
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "BMI30 service unavailable", "service_url": BMI30_SERVICE_URL}
+    return data
+
+
 def apply_dc_config_to_device(cfg: dict[str, Any]) -> tuple[bool, str]:
     cfg = _normalize_dc_config(cfg)
     mode_value = DC_MODE_VALUES.get(str(cfg["mode"]), 1)
     detect_settle_s = cfg["detect_initial_settle_s"]
+    service_result = bmi30_service_command(
+        "dc_config",
+        {
+            "mode": mode_value,
+            "work_settle_s": cfg["work_settle_s"],
+            "detect_settle_s": detect_settle_s,
+            "fast_settle_s": cfg["fast_settle_s"],
+            "fast_duration_s": cfg["fast_duration_s"],
+        },
+    )
+    if service_result.get("ok"):
+        return True, "SET_DC_CONFIG sent via BMI30 core service"
+    service_error = str(service_result.get("error", "") or "")
     script = (
         "import sys;"
         "sys.path.insert(0, '/home/techaid/Documents/host');"
@@ -754,11 +803,13 @@ def apply_dc_config_to_device(cfg: dict[str, Any]) -> tuple[bool, str]:
             timeout=4.0,
         )
     except Exception as exc:
-        return False, f"Unable to contact device: {exc}"
+        prefix = f"Core service unavailable: {service_error}. " if service_error else ""
+        return False, f"{prefix}Unable to contact device: {exc}"
 
     output = (proc.stdout or proc.stderr or "").strip()
     if proc.returncode != 0:
-        return False, output or f"USB apply failed with exit code {proc.returncode}"
+        prefix = f"Core service unavailable: {service_error}. " if service_error else ""
+        return False, prefix + (output or f"USB apply failed with exit code {proc.returncode}")
     return True, output or "SET_DC_CONFIG sent"
 
 
@@ -3458,23 +3509,31 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       <div class="portal-content">
         <section class="portal-panel is-active" id="panel-antenna">
           <div class="summary-grid">
-            <div class="summary-item"><h3>Signal</h3><div class="metric"><span>Level</span><strong>---</strong></div><div class="metric"><span>Noise</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Signal</h3><div class="metric"><span>Level</span><strong data-bmi30="level">---</strong></div><div class="metric"><span>Thresholds</span><strong data-bmi30="thresholds">---</strong></div></div>
             <div class="summary-item"><h3>Sensors</h3>{temp_metrics}<div class="metric"><span>Optic active</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Device</h3><div class="metric"><span>Stream</span><strong>---</strong></div><div class="metric"><span>DC mode</span><strong>{html.escape(str(cfg['mode']))}</strong></div></div>
+            <div class="summary-item"><h3>Device</h3><div class="metric"><span>Stream</span><strong data-bmi30="stream">---</strong></div><div class="metric"><span>DC mode</span><strong>{html.escape(str(cfg['mode']))}</strong></div></div>
           </div>
         </section>
         <section class="portal-panel" id="panel-detection">
           <div class="summary-grid">
-            <div class="summary-item"><h3>Algorithm</h3><div class="metric"><span>Selected</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Tag Type</h3><div class="metric"><span>Current</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Thresholds</h3><div class="metric"><span>Mode</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Algorithm</h3><div class="metric"><span>Selected</span><strong data-bmi30="mode">---</strong></div></div>
+            <div class="summary-item"><h3>Tag Type</h3><div class="metric"><span>Current</span><strong data-bmi30="detector">---</strong></div></div>
+            <div class="summary-item"><h3>Thresholds</h3><div class="metric"><span>Ratio</span><strong data-bmi30="ratio">---</strong></div></div>
           </div>
         </section>
         <section class="portal-panel" id="panel-operation">
           <div class="summary-grid">
-            <div class="summary-item"><h3>Radar</h3><div class="metric"><span>Connection</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Transmission</h3><div class="metric"><span>Work time</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Profile</h3><div class="metric"><span>Active</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Radar</h3><div class="metric"><span>Connection</span><strong data-bmi30="connection">---</strong></div></div>
+            <div class="summary-item"><h3>Transmission</h3><div class="metric"><span>Work time</span><strong data-bmi30="uptime">---</strong></div></div>
+            <div class="summary-item"><h3>Profile</h3><div class="metric"><span>Active</span><strong data-bmi30="profile">---</strong></div></div>
+          </div>
+          <div class="actions actions-inline bmi30-controls">
+            <button class="link" type="button" data-bmi30-cmd="mode" data-idx="3">Mode 3</button>
+            <button class="link" type="button" data-bmi30-cmd="mode" data-idx="5">Mode 5</button>
+            <button class="link" type="button" data-bmi30-cmd="mode" data-idx="6">Mode 6</button>
+            <button class="link link-secondary" type="button" data-bmi30-cmd="start">Start</button>
+            <button class="link link-secondary" type="button" data-bmi30-cmd="stop">Stop</button>
+            <button class="link link-secondary" type="button" data-bmi30-cmd="reconnect">Reconnect</button>
           </div>
         </section>
         <section class="portal-panel" id="panel-group">
@@ -3871,6 +3930,70 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     }}
     _pollSensors();
     window.setInterval(_pollSensors, 5000);
+    // --- BMI30 core service polling and controls ---
+    var _bmi30Els = {{}};
+    document.querySelectorAll('[data-bmi30]').forEach(function (el) {{
+      _bmi30Els[el.getAttribute('data-bmi30')] = el;
+    }});
+    function _setBmi30(key, value) {{
+      var el = _bmi30Els[key];
+      if (el) {{ el.textContent = value; }}
+    }}
+    function _fmtAge(seconds) {{
+      if (seconds === null || seconds === undefined) {{ return '---'; }}
+      var s = Math.max(0, Number(seconds) || 0);
+      if (s < 60) {{ return s.toFixed(1) + 's'; }}
+      return Math.floor(s / 60) + 'm ' + Math.floor(s % 60) + 's';
+    }}
+    function _pollBmi30() {{
+      if (!Object.keys(_bmi30Els).length) {{ return; }}
+      fetch('/api/bmi30/status?v=' + Date.now(), {{ cache: 'no-store' }})
+        .then(function (r) {{ return r.ok ? r.json() : null; }})
+        .then(function (data) {{
+          if (!data) {{ return; }}
+          if (!data.ok) {{
+            _setBmi30('connection', 'service offline');
+            _setBmi30('stream', 'offline');
+            return;
+          }}
+          var conn = data.connection || {{}};
+          var mode = data.mode || {{}};
+          var det = data.detector || {{}};
+          var service = data.service || {{}};
+          var connected = conn.connected ? 'connected' : (conn.connecting ? 'connecting' : 'offline');
+          _setBmi30('connection', connected);
+          _setBmi30('stream', (mode.base_buf_len || 0) + ' samples, age ' + _fmtAge(conn.last_frame_age_s));
+          _setBmi30('mode', 'mode ' + (mode.selected || 0) + ', stream ' + (mode.stream_mode || 0));
+          _setBmi30('detector', (det.active ? 'active' : 'idle') + ' hold ' + (det.hold0 ? '1' : '0') + '/' + (det.hold1 ? '1' : '0'));
+          _setBmi30('ratio', Number(mode.det_ratio || 0).toFixed(1));
+          _setBmi30('level', (det.lvl0 || 0) + ' / ' + (det.lvl1 || 0));
+          _setBmi30('thresholds', (det.thr0 || 0) + ' / ' + (det.thr1 || 0));
+          _setBmi30('uptime', _fmtAge(service.uptime_s));
+          _setBmi30('profile', (mode.freq_hz || mode.desired_freq || 0) + ' Hz, avg ' + (mode.avg_n || 0));
+        }})
+        .catch(function () {{
+          _setBmi30('connection', 'service offline');
+          _setBmi30('stream', 'offline');
+        }});
+    }}
+    document.querySelectorAll('[data-bmi30-cmd]').forEach(function (btn) {{
+      btn.addEventListener('click', function () {{
+        var action = btn.getAttribute('data-bmi30-cmd') || '';
+        var params = {{}};
+        if (btn.hasAttribute('data-idx')) {{ params.idx = Number(btn.getAttribute('data-idx')); }}
+        btn.disabled = true;
+        fetch('/api/bmi30/command', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ action: action, params: params }})
+        }})
+          .then(function () {{ window.setTimeout(_pollBmi30, 350); }})
+          .catch(function () {{}})
+          .finally(function () {{ btn.disabled = false; }});
+      }});
+    }});
+    _pollBmi30();
+    window.setInterval(_pollBmi30, 2000);
     // patch setActivePanel to track current panel
     var _origSetActivePanel = setActivePanel;
     setActivePanel = function (name, updateHash) {{
@@ -4302,6 +4425,17 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
         # Checkbox + hidden fallback fields submit duplicate keys; use the last value.
         return {key: values[-1] if values else "" for key, values in parsed.items()}
 
+    def _read_json_body(self) -> dict[str, Any]:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = 0
+        raw = self.rfile.read(max(0, min(content_length, 1024 * 1024)))
+        if not raw:
+            return {}
+        payload = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+        return payload if isinstance(payload, dict) else {}
+
     def _read_cookie(self, name: str) -> str:
         raw_cookie = self.headers.get("Cookie", "")
         if not raw_cookie:
@@ -4427,9 +4561,29 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             if self._get_portal_session() is not None:
                 remember_portal_client(self.client_address[0] if self.client_address else "")
             data = collect_remote_access_targets(preferred_ip=preferred_ip)
+            data["bmi30"] = bmi30_service_status()
             payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(payload)
+            return
+
+        if path == "/api/bmi30/status":
+            session = self._get_portal_session()
+            if session is None:
+                self.send_response(HTTPStatus.FORBIDDEN)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            remember_portal_client(self.client_address[0] if self.client_address else "")
+            data = bmi30_service_status()
+            payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             if send_body:
@@ -4776,6 +4930,36 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path == "/api/bmi30/command":
+            session = self._get_portal_session()
+            if session is None:
+                self.send_response(HTTPStatus.FORBIDDEN)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            try:
+                payload = self._read_json_body()
+                action = str(payload.get("action") or "")
+                params = payload.get("params")
+                if not isinstance(params, dict):
+                    params = {k: v for k, v in payload.items() if k not in {"action", "params"}}
+                result = bmi30_service_command(action, params)
+                body = json.dumps(result, ensure_ascii=False).encode("utf-8")
+                self.send_response(HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_GATEWAY)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as exc:
+                body = json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8")
+                self.send_response(HTTPStatus.BAD_REQUEST)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            return
+
         if path == "/portal-account-config":
             session = self._get_portal_session()
             if session is None:
