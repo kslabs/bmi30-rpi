@@ -71,6 +71,24 @@
 			"problemMatcher": []
 		},
 		{
+			"label": "Выбор версий BMI30 ядра",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"${workspaceFolder}/switch_bmi30_core_versions.sh"
+			],
+			"presentation": {
+				"echo": false,
+				"reveal": "always",
+				"focus": true,
+				"panel": "dedicated",
+				"showReuseMessage": false,
+				"clear": true
+			},
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
 			"label": "Run BMI30 working version",
 			"type": "shell",
 			"command": "bash",

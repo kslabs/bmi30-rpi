@@ -594,6 +594,8 @@ for _env_key, _env_val in {
 	"BMI30_SOFT_RECOVERY_MIN_INTERVAL_S": "1.0",
 	"BMI30_SOFT_RECOVERY_RECENT_S": "2.0",
 	"BMI30_USB_REENUM_BACKOFF_S": "0.8",
+	"BMI30_RESET_ON_START": "0",
+	"BMI30_STARTUP_RESET_MODE": "off",
 	"BMI30_HARD_RESET_MIN_INTERVAL_S": "60.0",
 	"BMI30_FAULT_MODE_TRANSITION_WINDOW_S": "30.0",
 	"BMI30_FAULT_MODE5_DC_AUTOTUNE": "1",
@@ -2932,14 +2934,26 @@ class ScopeWindow:
 			self._set_status(f"Аппаратный сброс GPIO{gpio_pin}…", hold_sec=1.5)
 		except Exception:
 			pass
+		pulse_s = max(0.01, pulse_ms / 1000.0)
 		# Try lgpio first on Pi5/CM5 to avoid noisy pigpio fallback.
 		try:
 			lgpio = _import_gpio_module('lgpio')  # type: ignore
-			chip = lgpio.gpiochip_open(0)
-			lgpio.gpio_claim_output(chip, gpio_pin, 0)
-			time.sleep(max(0.01, pulse_ms / 1000.0))
-			lgpio.gpio_claim_input(chip, gpio_pin)
-			lgpio.gpiochip_close(chip)
+			chip = None
+			try:
+				chip = lgpio.gpiochip_open(0)
+				lgpio.gpio_claim_output(chip, gpio_pin, 0)
+				time.sleep(pulse_s)
+			finally:
+				# Never leave RESET line latched in LOW on backend errors.
+				if chip is not None:
+					try:
+						lgpio.gpio_claim_input(chip, gpio_pin)
+					except Exception:
+						pass
+					try:
+						lgpio.gpiochip_close(chip)
+					except Exception:
+						pass
 			time.sleep(wait_s)
 			try:
 				print("[HW-RESET] done backend=lgpio result=OK", flush=True)
@@ -2956,11 +2970,19 @@ class ScopeWindow:
 			pigpio = _import_gpio_module('pigpio')  # type: ignore
 			pi = pigpio.pi()
 			if getattr(pi, 'connected', False):
-				pi.set_mode(gpio_pin, pigpio.OUTPUT)
-				pi.write(gpio_pin, 0)
-				time.sleep(max(0.01, pulse_ms / 1000.0))
-				pi.set_mode(gpio_pin, pigpio.INPUT)  # Hi-Z
-				pi.stop()
+				try:
+					pi.set_mode(gpio_pin, pigpio.OUTPUT)
+					pi.write(gpio_pin, 0)
+					time.sleep(pulse_s)
+				finally:
+					try:
+						pi.set_mode(gpio_pin, pigpio.INPUT)  # Hi-Z
+					except Exception:
+						pass
+					try:
+						pi.stop()
+					except Exception:
+						pass
 				time.sleep(wait_s)
 				try:
 					print("[HW-RESET] done backend=pigpio result=OK", flush=True)
@@ -2977,10 +2999,18 @@ class ScopeWindow:
 			GPIO = _import_gpio_module('RPi.GPIO')  # type: ignore
 			GPIO.setwarnings(False)
 			GPIO.setmode(GPIO.BCM)
-			GPIO.setup(gpio_pin, GPIO.OUT, initial=GPIO.LOW)
-			time.sleep(max(0.01, pulse_ms / 1000.0))
-			GPIO.setup(gpio_pin, GPIO.IN, pull_up_down=GPIO.PUD_OFF)
-			GPIO.cleanup(gpio_pin)
+			try:
+				GPIO.setup(gpio_pin, GPIO.OUT, initial=GPIO.LOW)
+				time.sleep(pulse_s)
+			finally:
+				try:
+					GPIO.setup(gpio_pin, GPIO.IN, pull_up_down=GPIO.PUD_OFF)
+				except Exception:
+					pass
+				try:
+					GPIO.cleanup(gpio_pin)
+				except Exception:
+					pass
 			time.sleep(wait_s)
 			try:
 				print("[HW-RESET] done backend=RPi.GPIO result=OK", flush=True)
@@ -11298,7 +11328,7 @@ class ScopeWindow:
 		# One-time startup reset: fast by default; full 3-stage reset is kept for stall recovery.
 		try:
 			if not bool(getattr(self, '_hw_reset_on_start_done', False)):
-				reset_on_start = str(os.getenv("BMI30_RESET_ON_START", "1")).lower() not in ("0", "false", "no")
+				reset_on_start = str(os.getenv("BMI30_RESET_ON_START", "0")).lower() not in ("0", "false", "no")
 				if reset_on_start:
 					startup_reset_result = self._startup_reset_device()
 					try:
@@ -11325,7 +11355,7 @@ class ScopeWindow:
 			print("[HW-RESET] startup reset EXCEPTION", flush=True)
 		# Legacy opt-in soft reset when the full startup reset is disabled.
 		try:
-			reset_on_start = str(os.getenv("BMI30_RESET_ON_START", "1")).lower() not in ("0", "false", "no")
+			reset_on_start = str(os.getenv("BMI30_RESET_ON_START", "0")).lower() not in ("0", "false", "no")
 			auto_soft = (not reset_on_start) and str(os.getenv("BMI30_SOFT_RESET_ON_START", "0")).lower() not in ("0", "false", "no")
 			if auto_soft:
 				self._send_soft_reset_via_cdc()

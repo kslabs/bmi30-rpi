@@ -89,8 +89,7 @@ echo ""
 
 PS3="Введите номер (или 0 для выхода): "
 options=(
-    "РАБОЧАЯ - 2026-06-08 realtime-prevbuf - копия текущего первого пункта для правок"
-    "РАБОЧАЯ - 2026-06-03 realtime-prevbuf - предыдущая рабочая версия"
+    "РАБОЧАЯ - 2026-06-03 realtime-prevbuf - копия текущего первого пункта для правок"
     "РАБОЧАЯ - 2026-05-30 realtime-prevbuf - предыдущая рабочая версия"
     "РАБОЧАЯ - 2026-05-26 realtime-prevbuf - предыдущая рабочая версия"
     "РАБОЧАЯ - 2026-05-25 realtime-prevbuf - предыдущая копия для правок"
@@ -110,81 +109,76 @@ options=(
 select opt in "${options[@]}"; do
     case $REPLY in
         1)
-            echo "Запускаю РАБОЧУЮ версию 2026-06-08 realtime-prevbuf (копия текущего первого пункта для правок)..."
-            run_version "BMI30.200.py.2026-06-08-realtime-prevbuf"
-            break
-            ;;
-        2)
-            echo "Запускаю предыдущую РАБОЧУЮ версию 2026-06-03 realtime-prevbuf..."
+            echo "Запускаю РАБОЧУЮ версию 2026-06-03 realtime-prevbuf (копия текущего первого пункта для правок)..."
             run_version "BMI30.200.py.2026-06-03-realtime-prevbuf"
             break
             ;;
-        3)
+        2)
             echo "Запускаю предыдущую РАБОЧУЮ версию 2026-05-30 realtime-prevbuf..."
             run_version "BMI30.200.py.2026-05-30-realtime-prevbuf"
             break
             ;;
-        4)
+        3)
             echo "Запускаю предыдущую РАБОЧУЮ версию 2026-05-26 realtime-prevbuf..."
             run_version "BMI30.200.py.2026-05-26-realtime-prevbuf"
             break
             ;;
-        5)
+        4)
             echo "Запускаю предыдущую РАБОЧУЮ версию 2026-05-25 realtime-prevbuf..."
             run_version "BMI30.200.py.2026-05-25-realtime-prevbuf"
             break
             ;;
-        6)
+        5)
             echo "Запускаю БАЗОВУЮ сохраненную версию 2026-05-25 realtime-prevbuf..."
             run_version "BMI30.200.py.2026-05-25-realtime-prevbuf-base"
             break
             ;;
-        7)
+        6)
             echo "Запускаю предыдущую рабочую версию 2026-05-24 + AUTORESET..."
             run_version "BMI30.200.py.2026-05-24-work"
             break
             ;;
-        8)
+        7)
             echo "Запускаю исходную рабочую версию 2026-04-06 + AUTORESET..."
             run_version "BMI30.200.py.2026-04-06-autoreset"
             break
             ;;
-        9)
+        8)
             echo "Запускаю версию 2026-02-07 + AUTORESET..."
             run_version "BMI30.200.py.2026-02-07-autoreset"
             break
             ;;
-        10)
+        9)
             echo "Запускаю версию от 2026-02-07..."
             run_version "BMI30.200.py.2026-02-07"
             break
             ;;
-        11)
+        10)
             echo "Запускаю версию от 2026-02-11..."
             run_version "BMI30.200.py.old"
             break
             ;;
-        12)
+        11)
             echo "Запускаю версию от 2026-02-12..."
             run_version "BMI30.200.py.2026-02-12"
             break
             ;;
-        13)
+        12)
             echo "Запускаю версию от 2026-02-15..."
             run_version "BMI30.200.py.2026-02-15"
             break
             ;;
-        14)
+        13)
             echo "Запускаю версию от 2026-02-16 (с оптимизированными фильтрами)..."
             run_version "BMI30.200.py.2026-02-16"
             break
             ;;
-        15)
+        14)
             echo "Запускаю DEV-версию..."
             run_version "BMI30.200.py"
             break
             ;;
-        16|0)
+        15|0)
             echo "Выход."
             exit 0
             ;;

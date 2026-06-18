@@ -1,11 +1,31 @@
 #!/usr/bin/env python3
-import usb.core, usb.util, struct, time, threading, queue, sys, os
+import usb.core, usb.util, struct, time, threading, queue, sys, os, json
 from collections import deque
 
 VID=0xCAFE  # Автопоиск если не найдено
 PID=0x4001
 EP_IN=0x83  # vendor bulk IN (interface 2)
 EP_OUT=0x03 # vendor bulk OUT (interface 2)
+DEVICE_STATE_JSON = os.getenv("BMI30_DEVICE_STATE_JSON", "/tmp/bmi30_device_state.json")
+EVT1_EVENT_NAMES = {
+    0x00: "fw_info",
+    0x01: "temp_c",
+    0x02: "mcu_adc",
+    0x10: "optic_state",
+    0x11: "sync_state",
+    0x12: "mode_state",
+    0x13: "error_state",
+}
+
+def _float_env(name: str, dflt: float) -> float:
+    try:
+        return float(os.getenv(name, str(dflt)))
+    except Exception:
+        return dflt
+
+SERVICE_HEARTBEAT_S = max(1.0, _float_env("BMI30_SERVICE_HEARTBEAT_S", 30.0))
+SERVICE_LAG_S = max(2.0 * SERVICE_HEARTBEAT_S, _float_env("BMI30_SERVICE_LAG_S", 2.0 * SERVICE_HEARTBEAT_S))
+SERVICE_LAG_WRITE_S = max(5.0, _float_env("BMI30_SERVICE_LAG_WRITE_S", 10.0))
 
 CMD_SET_PROFILE   = 0x14
 CMD_SET_FULL_MODE = 0x13
@@ -19,6 +39,11 @@ CMD_ASYNC         = 0x18  # 0=strict pairs A/B, 1=independent A/B
 CMD_SET_WINDOWS    = 0x10  # payload: <HHHH> start0,len0,start1,len1
 CMD_SET_STREAM_MODE = 0x1A  # payload: <B> 0=LATEST(600), 1=LOSSLESS_ROI(200)
 CMD_SET_DC_CONFIG = 0x1F
+CMD_DEVICE_RESET = 0x22
+CMD_SAVE_DC_TO_FLASH = 0x2B
+CMD_TOGGLE_TIM2CH3_INV = 0x32
+CMD_HOST_RX_CLEAR = 0x37
+CMD_SET_DET_ADC = 0x3C
 CMD_GET_DC_CONFIG = 0x3A
 # Device-side DC adaptation toggle (firmware-dependent). Override via env if needed.
 try:
@@ -41,6 +66,66 @@ HDR_SIZE=32
 VF_ADC0   =0x01
 VF_ADC1   =0x02
 VF_CRC    =0x04
+
+def _u8_at(data: bytes, off: int):
+    try:
+        if len(data) > off:
+            return int(data[off]) & 0xFF
+    except Exception:
+        pass
+    return None
+
+def _u16_at(data: bytes, off: int):
+    try:
+        if len(data) >= off + 2:
+            return int.from_bytes(data[off:off + 2], "little")
+    except Exception:
+        pass
+    return None
+
+def _u32_at(data: bytes, off: int):
+    try:
+        if len(data) >= off + 4:
+            return int.from_bytes(data[off:off + 4], "little")
+    except Exception:
+        pass
+    return None
+
+def _i16_at(data: bytes, off: int):
+    try:
+        if len(data) >= off + 2:
+            return int.from_bytes(data[off:off + 2], "little", signed=True)
+    except Exception:
+        pass
+    return None
+
+def _status_byte_fields(value, label: str = "", node_id: int | None = None) -> dict:
+    try:
+        b = int(value) & 0xFF
+    except Exception:
+        b = 0
+    out = {
+        "status_byte": b,
+        "status_hex": f"0x{b:02X}",
+        "selector": b & 0x1F,
+        "optic_active": bool(b & 0x20),
+        "detadc1": bool(b & 0x40),
+        "detadc2": bool(b & 0x80),
+    }
+    if label:
+        out["label"] = label
+    if node_id is not None:
+        out["node_id"] = int(node_id)
+    return out
+
+def _merge_dict(base: dict, patch: dict) -> dict:
+    out = dict(base) if isinstance(base, dict) else {}
+    for key, value in (patch or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge_dict(out[key], value)
+        else:
+            out[key] = value
+    return out
 
 def crc16_ccitt_false(data:bytes, init=0xFFFF):
     crc=init
@@ -566,6 +651,16 @@ class USBStream:
         self.last_rx_t = self.connected_t
         self.last_restart_t = 0.0
         self._rx_flush_requested = False  # сигнал _rx_loop очистить буфер после рестарта
+        self.last_stat = None
+        self.last_evt1 = None
+        self.device_state_cache = {}
+        self.last_service_t = 0.0
+        self.last_evt1_t = 0.0
+        self.service_packets = 0
+        self.evt1_packets = 0
+        self.stat_packets = 0
+        self.service_lag_reported = False
+        self.service_lag_last_write_t = 0.0
         # Сохраним порт info для power cycle
         self.port_info = self.get_port_path_info()
         # Старт: отправим профиль/режим/окна/частоту/размер кадра (если заданы), затем START
@@ -681,7 +776,9 @@ class USBStream:
         self.lock = threading.Lock()
         self.frames = 0; self.bytes = 0; self.crc_bad = 0; self.magic_bad = 0
         self.test_seen = 0
-        self.last_stat = None
+        self.last_stat = getattr(self, "last_stat", None)
+        self.last_evt1 = getattr(self, "last_evt1", None)
+        self.device_state_cache = getattr(self, "device_state_cache", {}) or {}
         self.last_err_step_pkt = None
         self.last_err_step_vals = None
         self.last_err_step_t = 0.0
@@ -891,6 +988,12 @@ class USBStream:
             if data is not None and len(data) > 0:
                 bs = bytes(data)
                 self.last_stat = bs
+                try:
+                    patch = self._parse_stat_device_state(bs)
+                    patch["source"] = "ep0_stat"
+                    self._write_device_state_cache(patch)
+                except Exception:
+                    pass
                 print('[ep0] status len=', len(bs))
         except Exception as e:
             try:
@@ -1401,6 +1504,28 @@ class USBStream:
         payload = bytes([hz & 0xFF, (hz >> 8) & 0xFF])
         self.send_cmd(cmd, payload)
 
+    def set_det_adc(self, detadc1: bool = False, detadc2: bool = False, bits: int | None = None):
+        """Configure local DetADC status bits exported through RS485 status."""
+        if bits is None:
+            bits = (1 if detadc1 else 0) | (2 if detadc2 else 0)
+        self.send_cmd(CMD_SET_DET_ADC, bytes([int(bits) & 0x03]))
+
+    def host_rx_clear(self):
+        """Tell firmware to clear host RX/accounting state when recovering reader state."""
+        self.send_cmd(CMD_HOST_RX_CLEAR, b"")
+
+    def save_dc_to_flash(self):
+        """Request one-shot firmware-side save of the current DC snapshot to Flash."""
+        self.send_cmd(CMD_SAVE_DC_TO_FLASH, b"")
+
+    def toggle_tim2ch3_inv(self):
+        """Toggle TIM2CH3 inversion in firmware diagnostics."""
+        self.send_cmd(CMD_TOGGLE_TIM2CH3_INV, b"")
+
+    def device_reset(self):
+        """Request firmware-side DEVICE_RESET. Reset mode depends on firmware build."""
+        self.send_cmd(CMD_DEVICE_RESET, b"")
+
     def set_dc_config_seconds(self, mode: int = 1, work_settle_s: float = 1.0, detect_settle_s: float = 0.25, fast_settle_s: float = 0.001, fast_duration_s: float = 6.0):
         """Configure STM32-side DC adaptation timing (SET_DC_CONFIG v1)."""
         def _ms(value, default):
@@ -1410,7 +1535,7 @@ class USBStream:
                     v = float(default)
             except Exception:
                 v = float(default)
-            return max(0, min(0xFFFFFFFF, int(round(v * 1000.0))))
+            return max(1, min(0xFFFFFFFF, int(round(v * 1000.0))))
 
         mode_u8 = max(0, min(255, int(mode)))
         flags = 0
@@ -1445,7 +1570,433 @@ class USBStream:
             'mode_enter_ms': int(mode_enter_ms),
             'fast_until_ms': int(fast_until_ms),
             'adapt_updates': int(adapt_updates),
+            'dirty': bool(int(flags) & 0x0004),
         }
+
+    def _device_state_path(self) -> str:
+        return os.getenv("BMI30_DEVICE_STATE_JSON", DEVICE_STATE_JSON)
+
+    def _write_device_state_cache(self, patch: dict):
+        try:
+            now = time.time()
+            now_iso = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
+            patch = dict(patch or {})
+            host_only = bool(patch.pop("_host_only", False))
+            source = str(patch.get("source", "") or "")
+            service_patch = patch.get("service") if isinstance(patch.get("service"), dict) else {}
+            service_patch = dict(service_patch)
+            if source in {"bulk_evt1", "bulk_stat", "ep0_stat"}:
+                service_patch.update({
+                    "last_packet_at": now,
+                    "last_packet_iso": now_iso,
+                    "last_source": source,
+                    "event_lag": False,
+                    "event_lag_age_s": 0.0,
+                    "heartbeat_s": SERVICE_HEARTBEAT_S,
+                    "lag_threshold_s": SERVICE_LAG_S,
+                })
+            if source == "bulk_evt1":
+                evt = dict((patch.get("evt1") or {}).get("last") or {})
+                evt["host_time"] = now
+                evt["host_iso"] = now_iso
+                event_type = evt.get("event_type")
+                event_key = EVT1_EVENT_NAMES.get(int(event_type or 0), f"evt1_{int(event_type or 0):02x}")
+                evt["event_name"] = event_key
+                patch["evt1"] = _merge_dict(patch.get("evt1") if isinstance(patch.get("evt1"), dict) else {}, {"last": evt})
+                service_patch.update({
+                    "last_evt1_at": now,
+                    "last_evt1_iso": now_iso,
+                    "last_evt1_type": event_key,
+                    "last_evt1_seq": evt.get("event_seq"),
+                })
+                patch["event_updates"] = {
+                    event_key: {
+                        "updated_at": now,
+                        "updated_iso": now_iso,
+                        "event_seq": evt.get("event_seq"),
+                        "event_type": event_type,
+                    }
+                }
+            if service_patch:
+                patch["service"] = _merge_dict(patch.get("service") if isinstance(patch.get("service"), dict) else {}, service_patch)
+
+            payload = _merge_dict(getattr(self, "device_state_cache", {}) or {}, patch)
+            payload["schema"] = 1
+            payload["cache_written_at"] = now
+            payload["cache_written_iso"] = now_iso
+            if (not host_only) or not payload.get("updated_at"):
+                payload["updated_at"] = now
+                payload["updated_iso"] = now_iso
+            self.device_state_cache = payload
+            path = self._device_state_path()
+            directory = os.path.dirname(path) or "."
+            os.makedirs(directory, exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp, path)
+        except Exception:
+            pass
+
+    def _parse_stat_device_state(self, packet: bytes) -> dict:
+        bs = bytes(packet or b"")
+        flags_rt = _u16_at(bs, 48)
+        flags2 = _u16_at(bs, 50)
+        sync_local_status = _u8_at(bs, 99)
+        sync_seen_mask = _u32_at(bs, 100) or 0
+        sync_node_count = _u8_at(bs, 104)
+        local = _status_byte_fields(sync_local_status or 0, "Local") if sync_local_status is not None else {}
+        if local:
+            local["optic_active_sync"] = bool((sync_local_status or 0) & 0x20)
+            if flags_rt is not None:
+                local["optic_active_flags_runtime"] = bool(flags_rt & 0x0020)
+                local["optic_active"] = bool(local["optic_active_sync"] or (flags_rt & 0x0020))
+                local["tx_enabled"] = bool(flags_rt & 0x0010)
+        remote = []
+        if len(bs) > 105:
+            status_bytes = bytes(bs[105:min(len(bs), 136)])
+            for idx, value in enumerate(status_bytes):
+                node_id = idx + 1
+                seen = bool(sync_seen_mask & (1 << idx))
+                if not seen and value == 0:
+                    continue
+                item = _status_byte_fields(value, f"Node {node_id}", node_id)
+                item["seen"] = seen
+                remote.append(item)
+        result = {
+            "source": "bulk_stat",
+            "device_responded": True,
+            "stat": {
+                "len": len(bs),
+                "version": _u8_at(bs, 4),
+                "cur_samples": _u16_at(bs, 6),
+                "frame_bytes": _u16_at(bs, 8),
+                "flags_runtime": flags_rt,
+                "flags2": flags2,
+                "streaming": bool((flags_rt or 0) & 0x0001),
+                "stream_active": bool((flags_rt or 0) & 0x0008),
+                "host_rx_alive": bool((flags_rt or 0) & 0x0040),
+                "tx_enabled": bool((flags_rt or 0) & 0x0010),
+                "optic_active": bool((flags_rt or 0) & 0x0020),
+                "optic_hold_ds": _u16_at(bs, 96),
+                "led_pattern": _u8_at(bs, 98),
+                "sync_local_status": sync_local_status,
+                "sync_seen_mask": sync_seen_mask,
+                "sync_node_count": sync_node_count,
+            },
+        }
+        if local or remote:
+            result["sensors"] = {
+                "local": local,
+                "remote": remote,
+                "remote_count": len(remote),
+            }
+        return result
+
+    def _parse_evt1_device_state(self, packet: bytes) -> dict:
+        bs = bytes(packet or b"")
+        if len(bs) < 16 or bs[:4] != b"EVT1":
+            return {}
+        version = _u8_at(bs, 4) or 0
+        event_type = _u8_at(bs, 5) or 0
+        payload_len = _u16_at(bs, 6) or 0
+        payload = bs[16:16 + payload_len]
+        evt = {
+            "version": version,
+            "event_type": event_type,
+            "event_seq": _u32_at(bs, 8),
+            "device_tick_ms": _u32_at(bs, 12),
+            "payload_len": payload_len,
+        }
+        patch = {
+            "source": "bulk_evt1",
+            "device_responded": True,
+            "evt1": {"last": evt},
+        }
+        if event_type == 0x00 and len(payload) >= 47:
+            def _ascii_field(off: int, size: int) -> str:
+                try:
+                    return bytes(payload[off:off + size]).decode("ascii", errors="ignore").strip("\x00 ")
+                except Exception:
+                    return ""
+
+            uid_w0 = _u32_at(payload, 5)
+            uid_w1 = _u32_at(payload, 9)
+            uid_w2 = _u32_at(payload, 13)
+            fw_major = _u8_at(payload, 1)
+            fw_minor = _u8_at(payload, 2)
+            fw_patch = _u8_at(payload, 3)
+            fw_build = _u8_at(payload, 4)
+            version_text = ".".join(str(int(v or 0)) for v in (fw_major, fw_minor, fw_patch))
+            if fw_build:
+                version_text += f"+{int(fw_build)}"
+            fw_info = {
+                "payload_version": _u8_at(payload, 0),
+                "fw_major": fw_major,
+                "fw_minor": fw_minor,
+                "fw_patch": fw_patch,
+                "fw_build": fw_build,
+                "fw_version": version_text,
+                "uid_w0": uid_w0,
+                "uid_w1": uid_w1,
+                "uid_w2": uid_w2,
+                "uid96": "".join(f"{int(v or 0):08X}" for v in (uid_w2, uid_w1, uid_w0)),
+                "uid96_words": " ".join(f"{int(v or 0):08X}" for v in (uid_w2, uid_w1, uid_w0)),
+                "build_date": _ascii_field(17, 10),
+                "build_time": _ascii_field(27, 8),
+                "git_hash": _ascii_field(35, 12),
+            }
+            patch["events"] = {"fw_info": fw_info}
+            patch["identity"] = {"stm32": fw_info}
+        elif event_type == 0x01 and len(payload) >= 2:
+            temp_c = _i16_at(payload, 0)
+            patch["temperature"] = {"temp_c": temp_c, "source": "EVT1_TEMP_C"}
+            patch["events"] = {"temp_c": {"temp_c": temp_c}}
+        elif event_type == 0x02 and len(payload) >= 16:
+            temp_c = _i16_at(payload, 2)
+            mcu_adc = {
+                "payload_version": _u8_at(payload, 0),
+                "flags": _u8_at(payload, 1),
+                "temp_c": temp_c,
+                "vdda_mv": _u16_at(payload, 4),
+                "vbat_mv": _u16_at(payload, 6),
+                "raw_temp": _u16_at(payload, 8),
+                "raw_vrefint": _u16_at(payload, 10),
+                "raw_vbat": _u16_at(payload, 12),
+            }
+            patch["temperature"] = {"temp_c": temp_c, "source": "EVT1_MCU_ADC"}
+            patch["events"] = {"mcu_adc": mcu_adc}
+        elif event_type == 0x10 and len(payload) >= 8:
+            flags = _u8_at(payload, 1) or 0
+            optic = {
+                "payload_version": _u8_at(payload, 0),
+                "flags": flags,
+                "optic_active": bool(flags & 0x01),
+                "tx_enabled": bool(flags & 0x02),
+                "optic_power": _u8_at(payload, 2),
+                "led_pattern": _u8_at(payload, 3),
+                "optic_hold_ds": _u16_at(payload, 4),
+            }
+            patch["events"] = {"optic_state": optic}
+            patch["sensors"] = {"local": {
+                "label": "Local",
+                "optic_active": optic["optic_active"],
+                "tx_enabled": optic["tx_enabled"],
+                "optic_power": optic["optic_power"],
+                "led_pattern": optic["led_pattern"],
+                "optic_hold_ds": optic["optic_hold_ds"],
+            }}
+        elif event_type == 0x11 and len(payload) >= 16:
+            raw_mode = _u8_at(payload, 1)
+            display_char_i = _u8_at(payload, 3) or 0
+            try:
+                display_char = chr(display_char_i) if 32 <= display_char_i < 127 else ""
+            except Exception:
+                display_char = ""
+            local_status = _u8_at(payload, 13) or 0
+            sync_seen_mask = _u32_at(payload, 8) or 0
+            sync = {
+                "payload_version": _u8_at(payload, 0),
+                "raw_mode": raw_mode,
+                "role": {0: "master", 1: "slave", 2: "off"}.get(raw_mode, "---"),
+                "display_mode": _u8_at(payload, 2),
+                "display_char": display_char,
+                "local_node_id": _u8_at(payload, 4),
+                "active_status_count": _u8_at(payload, 5),
+                "total_devices": _u8_at(payload, 6),
+                "flags": _u8_at(payload, 7),
+                "sync_seen_mask": sync_seen_mask,
+                "display_value": _u8_at(payload, 12),
+                "local_status_flags": local_status,
+                "sync_age_ds": _u16_at(payload, 14),
+            }
+            local = _status_byte_fields(local_status, "Local")
+            patch["sync"] = sync
+            patch["events"] = {"sync_state": sync}
+            patch["sensors"] = {"local": local}
+        elif event_type == 0x12 and len(payload) >= 16:
+            flags = _u8_at(payload, 1) or 0
+            mode = {
+                "payload_version": _u8_at(payload, 0),
+                "flags": flags,
+                "streaming": bool(flags & 0x01),
+                "diag": bool(flags & 0x02),
+                "pending_init": bool(flags & 0x04),
+                "stream_active": bool(flags & 0x08),
+                "full_mode": bool(flags & 0x10),
+                "async_mode": bool(flags & 0x20),
+                "tx_enabled": bool(flags & 0x40),
+                "host_rx_alive": bool(flags & 0x80),
+                "stream_mode": _u8_at(payload, 2),
+                "ch_mode": _u8_at(payload, 3),
+                "host_profile": _u8_at(payload, 4),
+                "avg_n": _u8_at(payload, 5),
+                "cur_samples_per_frame": _u16_at(payload, 6),
+                "frame_samples_req": _u16_at(payload, 8),
+                "trunc_samples": _u16_at(payload, 10),
+                "sync_mode_public": _u8_at(payload, 12),
+                "sync_mode_host_forced": _u8_at(payload, 13),
+            }
+            patch["events"] = {"mode_state": mode}
+            patch["mode"] = mode
+        elif event_type == 0x13 and len(payload) >= 16:
+            flags = _u8_at(payload, 1) or 0
+            err = {
+                "payload_version": _u8_at(payload, 0),
+                "flags": flags,
+                "last_error_nonzero": bool(flags & 0x01),
+                "usb_in_busy_or_inflight": bool(flags & 0x02),
+                "last_error": _u16_at(payload, 2),
+                "error_counter": _u32_at(payload, 4),
+                "tx_force_idle_count": _u32_at(payload, 8),
+                "tx_drop_recovery_count": _u32_at(payload, 12),
+            }
+            patch["events"] = {"error_state": err}
+        return patch
+
+    def _service_next_known(self, mv, off: int, end: int) -> bool:
+        if off >= end:
+            return True
+        try:
+            if off + 2 <= end and bytes(mv[off:off + 2]) == b"\x5A\xA5":
+                return True
+            if off + 4 <= end and bytes(mv[off:off + 4]) in (b"STAT", b"EVT1"):
+                return True
+            if int(mv[off]) == 0x31 and (end - off) <= 16:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _service_packet_len(self, mv, pos: int, end: int):
+        try:
+            if pos + 4 <= end and bytes(mv[pos:pos + 4]) == b"EVT1":
+                if pos + 16 > end:
+                    return None
+                payload_len = int.from_bytes(bytes(mv[pos + 6:pos + 8]), "little")
+                total = 16 + payload_len
+                if total >= 16 and pos + total <= end:
+                    return total
+                return None
+            if pos + 4 <= end and bytes(mv[pos:pos + 4]) == b"STAT":
+                rem = end - pos
+                for stat_len in (136, 112, 64):
+                    if rem >= stat_len and self._service_next_known(mv, pos + stat_len, end):
+                        return stat_len
+                if 64 <= rem <= 192:
+                    return rem
+                if rem >= 136:
+                    return 136
+                if rem >= 64:
+                    return 64
+            if pos < end and int(mv[pos]) == 0x31 and (end - pos) <= 16:
+                return end - pos
+        except Exception:
+            return None
+        return None
+
+    def _find_next_known_packet(self, buf: bytearray) -> int:
+        try:
+            data = bytes(buf)
+            found = []
+            for marker in (b"\x5A\xA5", b"STAT", b"EVT1"):
+                idx = data.find(marker)
+                if idx >= 0:
+                    found.append(idx)
+            return min(found) if found else -1
+        except Exception:
+            return -1
+
+    def _trim_to_possible_packet_tail(self, buf: bytearray):
+        try:
+            if not buf:
+                return
+            data = bytes(buf)
+            max_keep = min(3, len(data))
+            keep = 0
+            for n in range(1, max_keep + 1):
+                tail = data[-n:]
+                if any(marker.startswith(tail) for marker in (b"\x5A\xA5", b"STAT", b"EVT1")):
+                    keep = n
+            if keep > 0:
+                del buf[:len(buf) - keep]
+            else:
+                buf.clear()
+        except Exception:
+            try:
+                del buf[:max(0, len(buf) - 1)]
+            except Exception:
+                pass
+
+    def _handle_service_packet(self, packet: bytes):
+        try:
+            bs = bytes(packet or b"")
+            now = time.time()
+            if len(bs) >= 4 and bs[:4] == b"STAT":
+                self.last_stat = bs
+                self.last_service_t = now
+                self.service_packets = int(getattr(self, "service_packets", 0) or 0) + 1
+                self.stat_packets = int(getattr(self, "stat_packets", 0) or 0) + 1
+                self.service_lag_reported = False
+                self._write_device_state_cache(self._parse_stat_device_state(bs))
+                return
+            if len(bs) >= 16 and bs[:4] == b"EVT1":
+                self.last_evt1 = bs
+                self.last_service_t = now
+                self.last_evt1_t = now
+                self.service_packets = int(getattr(self, "service_packets", 0) or 0) + 1
+                self.evt1_packets = int(getattr(self, "evt1_packets", 0) or 0) + 1
+                self.service_lag_reported = False
+                patch = self._parse_evt1_device_state(bs)
+                if patch:
+                    self._write_device_state_cache(patch)
+                return
+            if bs and bs[0] == 0x31 and len(bs) <= 16:
+                self.last_err_step_pkt = bs
+                self.last_err_step_t = time.time()
+                if len(bs) >= 3:
+                    self.last_err_step_vals = (int(bs[1]), int(bs[2]))
+                else:
+                    self.last_err_step_vals = None
+        except Exception:
+            pass
+
+    def _maybe_report_service_lag(self, now: float | None = None):
+        try:
+            now = time.time() if now is None else float(now)
+            if not bool(getattr(self, "_working_seen", False)):
+                return
+            last_evt = float(getattr(self, "last_evt1_t", 0.0) or 0.0)
+            if last_evt <= 0.0:
+                last_evt = float(getattr(self, "connected_t", now) or now)
+            age = max(0.0, now - last_evt)
+            if age < SERVICE_LAG_S:
+                return
+            last_write = float(getattr(self, "service_lag_last_write_t", 0.0) or 0.0)
+            if (now - last_write) < SERVICE_LAG_WRITE_S:
+                return
+            self.service_lag_reported = True
+            self.service_lag_last_write_t = now
+            self._write_device_state_cache({
+                "_host_only": True,
+                "service": {
+                    "event_lag": True,
+                    "event_lag_age_s": age,
+                    "heartbeat_s": SERVICE_HEARTBEAT_S,
+                    "lag_threshold_s": SERVICE_LAG_S,
+                    "last_evt1_at": last_evt if last_evt > 0.0 else None,
+                    "last_evt1_age_s": age,
+                    "last_rx_at": float(getattr(self, "last_rx_t", 0.0) or 0.0),
+                    "rx_cnt_ch0": int(getattr(self, "rx_cnt_ch0", 0) or 0),
+                    "rx_cnt_ch1": int(getattr(self, "rx_cnt_ch1", 0) or 0),
+                    "evt1_packets": int(getattr(self, "evt1_packets", 0) or 0),
+                    "stat_packets": int(getattr(self, "stat_packets", 0) or 0),
+                    "service_packets": int(getattr(self, "service_packets", 0) or 0),
+                },
+            })
+        except Exception:
+            pass
     
     def _rx_loop(self):
         buf = bytearray()
@@ -1539,52 +2090,49 @@ class USBStream:
                     time.sleep(0.05)
                     continue
                 print("USB err", e); time.sleep(0.1); continue
-            # перехват STAT коротких пакетов: выкусываем подряд и оставляем хвост
+            # Перехват служебных пакетов перед ADC deframer:
+            # STAT/EVT1 приходят по тому же Bulk IN, но не участвуют в seq-проверке ADC.
             if data:
                 mv = memoryview(data)
                 pos = 0
                 n = len(mv)
-                while pos + 4 <= n and mv[pos:pos+4] == b'STAT':
-                    rem_len = n - pos
-                    if rem_len >= 64:
-                        stat_len = rem_len if rem_len <= 192 else 64
-                        self.last_stat = bytes(mv[pos:pos+stat_len])
-                        pos += stat_len
-                        continue
-                    # если STAT неполный (маловероятно) — не трогаем, ждём доклейку
-                    break
-                # Короткий служебный пакет 0x31: ожидаем как минимум [0x31, err, step].
-                # Сохраняем отдельно, чтобы GUI мог показать err/step без вмешательства в поток кадров.
-                if pos < n:
-                    rem = bytes(mv[pos:n])
-                    if rem and rem[0] == 0x31 and len(rem) <= 16:
-                        self.last_err_step_pkt = rem
-                        self.last_err_step_t = time.time()
-                        if len(rem) >= 3:
-                            self.last_err_step_vals = (int(rem[1]), int(rem[2]))
-                        else:
-                            self.last_err_step_vals = None
-                        pos = n
+                while pos < n:
+                    pkt_len = self._service_packet_len(mv, pos, n)
+                    if not pkt_len:
+                        break
+                    self._handle_service_packet(bytes(mv[pos:pos + pkt_len]))
+                    pos += int(pkt_len)
                 if pos < n:
                     buf.extend(mv[pos:].tobytes())
             if data:
                 self.last_rx_t = time.time()
-            # выкидываем STAT пакеты как отдельные короткие сообщения
-            # (они не содержат магии и могут приходить как <=64 байт)
             # Дефрамер: ищем магию 0xA55A (LE: 5A A5), затем ждём весь кадр
             while True:
+                if (len(buf) >= 4 and bytes(buf[:4]) in (b"STAT", b"EVT1")) or (buf and buf[0] == 0x31 and len(buf) <= 16):
+                    buf_view = memoryview(bytes(buf))
+                    pkt_len = self._service_packet_len(buf_view, 0, len(buf_view))
+                    if pkt_len:
+                        self._handle_service_packet(bytes(buf[:pkt_len]))
+                        del buf[:pkt_len]
+                        continue
+                    break
                 if len(buf) < HDR_SIZE:
+                    idx = self._find_next_known_packet(buf)
+                    if idx > 0:
+                        del buf[:idx]
+                        continue
+                    if idx < 0 and len(buf) > 3:
+                        self._trim_to_possible_packet_tail(buf)
                     break
                 if not (buf[0] == 0x5A and buf[1] == 0xA5):
-                    idx = buf.find(MAGIC_LE)
+                    idx = self._find_next_known_packet(buf)
                     if idx == -1:
-                        # оставим хвост до 1 байта возможной магии
-                        del buf[:max(0, len(buf)-1)]
+                        # Оставим возможный хвост сигнатуры ADC/STAT/EVT1.
+                        self._trim_to_possible_packet_tail(buf)
                         break
                     else:
                         del buf[:idx]
-                        if len(buf) < HDR_SIZE:
-                            break
+                        continue
                 hdr_bytes = bytes(buf[:HDR_SIZE])
                 try:
                     (magic,ver,flags,seq,timestamp,total_samples,zone_count,zone1_offset,zone1_length,reserved,reserved2,crc16v)= struct.unpack('<H B B I I H H I I I H H', hdr_bytes)
@@ -1779,6 +2327,7 @@ class USBStream:
             # Если видим только STAT и нет рабочих кадров — один раз пробуем fallback
             if (not self.passive_connect) and (not self._working_seen) and (not self._fallback_done) and (now - self.connected_t > 1.6):
                 self._do_fallback_start()
+            self._maybe_report_service_lag(now)
             if now - self.stat_t >= 1.0:
                 with self.lock:
                     frames_n = self.frames

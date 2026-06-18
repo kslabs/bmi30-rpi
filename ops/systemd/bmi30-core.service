@@ -11,7 +11,7 @@ WorkingDirectory=/home/techaid/Documents
 Environment=PYTHONUNBUFFERED=1
 Environment=QT_QPA_PLATFORM=offscreen
 EnvironmentFile=-/home/techaid/Documents/host/bmi30_split_active_version.env
-ExecStart=/bin/bash -lc 'cd /home/techaid/Documents; PY="${BMI30_PYTHON:-}"; if [ -z "$PY" ]; then if [ -x .usbvenv/bin/python ]; then PY=.usbvenv/bin/python; elif [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=python3; fi; fi; exec "$PY" "${BMI30_CORE_PATH:-host/BMI30.001.py}"'
+ExecStart=/bin/bash -lc 'cd /home/techaid/Documents; PY="${BMI30_PYTHON:-}"; if [ -z "$PY" ]; then if [ -x .usbvenv/bin/python ]; then PY=.usbvenv/bin/python; elif [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=python3; fi; fi; if [ -z "${BMI30_CORE_PATH:-}" ] || [ ! -f "$BMI30_CORE_PATH" ]; then BMI30_CORE_PATH="$(find host -maxdepth 1 -type f -name "BMI30.001.py.*" | sort -V | tail -n 1)"; fi; exec "$PY" "${BMI30_CORE_PATH:-host/BMI30.001.py}"'
 Restart=always
 RestartSec=2
 

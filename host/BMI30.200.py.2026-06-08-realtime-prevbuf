@@ -419,7 +419,10 @@ def _rt_detector_meta(meta, ch: int = 0):
 	try:
 		if isinstance(meta, dict):
 			want_plot = bool(meta.get('want_plot', False))
-			ratio = float(meta.get('ratio', 2.0))
+			if int(ch) == 0:
+				ratio = float(meta.get('ratio0', meta.get('ratio', 2.0)))
+			else:
+				ratio = float(meta.get('ratio1', meta.get('ratio', 2.0)))
 			if int(ch) == 0:
 				thr = int(meta.get('thr0', meta.get('thr', 1)) or 1)
 			else:
@@ -436,9 +439,9 @@ def _rt_detector_meta(meta, ch: int = 0):
 					thr = int(meta[2])
 	except Exception:
 		pass
-	if not np.isfinite(ratio) or ratio <= 1.0:
+	if not np.isfinite(ratio) or ratio < 1.0:
 		ratio = 2.0
-	return bool(want_plot), float(ratio), max(1, int(thr or 1))
+	return bool(want_plot), _det_clamp_ratio(ratio, 2.0), max(1, int(thr or 1))
 
 
 def _rt_detector_close_inherited_device_fds():
@@ -1112,6 +1115,117 @@ def save_det_ratio(det_ratio: float):
 	except Exception:
 		pass
 
+def _det_parse_bool(value, default: bool = False) -> bool:
+	if value is None:
+		return bool(default)
+	if isinstance(value, bool):
+		return bool(value)
+	if isinstance(value, (int, float)):
+		return bool(value)
+	try:
+		return str(value).strip().lower() in ("1", "true", "yes", "y", "on", "t")
+	except Exception:
+		return bool(default)
+
+def _det_clamp_ratio(value, default: float = 2.0) -> float:
+	try:
+		val = float(value)
+	except Exception:
+		val = float(default)
+	try:
+		if not np.isfinite(val):
+			val = float(default)
+	except Exception:
+		val = float(default)
+	return float(max(1.0, min(4.0, round(val, 1))))
+
+def _det_clamp_confirm(value, default: int = 2) -> int:
+	try:
+		val = int(value)
+	except Exception:
+		val = int(default)
+	return int(max(1, min(6, val)))
+
+def save_det_channel_settings(settings: dict):
+	"""Save per-channel detector settings to config file (best-effort merge)."""
+	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+	try:
+		data = {}
+		if os.path.exists(config_file):
+			try:
+				with open(config_file, "r") as f:
+					data = json.load(f) or {}
+			except Exception:
+				data = {}
+		for key, val in (settings or {}).items():
+			data[str(key)] = val
+		# Legacy key follows upper/ADC1 for old clients.
+		if "det_ratio0" in data:
+			data["det_ratio"] = float(data.get("det_ratio0", 2.0))
+		with open(config_file, "w") as f:
+			json.dump(data, f)
+	except Exception:
+		pass
+
+def load_det_channel_settings() -> dict:
+	"""Load per-channel detector settings; keep old det_ratio as fallback."""
+	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+	data = {}
+	try:
+		with open(config_file, "r") as f:
+			data = json.load(f) or {}
+	except Exception:
+		data = {}
+	default_ratio = load_det_ratio()
+	cfg = {
+		"det_channel_enabled0": _det_parse_bool(data.get("det_channel_enabled0"), True),
+		"det_channel_enabled1": _det_parse_bool(data.get("det_channel_enabled1"), True),
+		"det_confirm_count0": _det_clamp_confirm(data.get("det_confirm_count0", os.getenv("BMI30_DETECT_CONFIRM_COUNT0", os.getenv("BMI30_DETECT_CONFIRM_COUNT", "2"))), 2),
+		"det_confirm_count1": _det_clamp_confirm(data.get("det_confirm_count1", os.getenv("BMI30_DETECT_CONFIRM_COUNT1", os.getenv("BMI30_DETECT_CONFIRM_COUNT", "2"))), 2),
+		"det_ratio0": _det_clamp_ratio(data.get("det_ratio0", data.get("det_threshold0", default_ratio)), default_ratio),
+		"det_ratio1": _det_clamp_ratio(data.get("det_ratio1", data.get("det_threshold1", default_ratio)), default_ratio),
+		"det_auto_ratio": _det_clamp_ratio(data.get("det_auto_ratio", os.getenv("BMI30_DETECT_AUTO_RATIO", "2.0")), 2.0),
+		"det_threshold_auto0": _det_parse_bool(data.get("det_threshold_auto0"), False),
+		"det_threshold_auto1": _det_parse_bool(data.get("det_threshold_auto1"), False),
+	}
+	try:
+		env = os.getenv("BMI30_DETECT_CHANNEL0_ENABLE")
+		if env is not None:
+			cfg["det_channel_enabled0"] = _det_parse_bool(env, True)
+	except Exception:
+		pass
+	try:
+		env = os.getenv("BMI30_DETECT_CHANNEL1_ENABLE")
+		if env is not None:
+			cfg["det_channel_enabled1"] = _det_parse_bool(env, True)
+	except Exception:
+		pass
+	try:
+		env = os.getenv("BMI30_DETECT_RATIO0")
+		if env is not None:
+			cfg["det_ratio0"] = _det_clamp_ratio(env, default_ratio)
+	except Exception:
+		pass
+	try:
+		env = os.getenv("BMI30_DETECT_RATIO1")
+		if env is not None:
+			cfg["det_ratio1"] = _det_clamp_ratio(env, default_ratio)
+	except Exception:
+		pass
+	try:
+		env = os.getenv("BMI30_DETECT_THRESHOLD_AUTO0")
+		if env is not None:
+			cfg["det_threshold_auto0"] = _det_parse_bool(env, False)
+	except Exception:
+		pass
+	try:
+		env = os.getenv("BMI30_DETECT_THRESHOLD_AUTO1")
+		if env is not None:
+			cfg["det_threshold_auto1"] = _det_parse_bool(env, False)
+	except Exception:
+		pass
+	return cfg
+
 def load_det_ratio() -> float:
 	"""Load detector ratio from config/env. Default=2.0."""
 	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
@@ -1772,9 +1886,17 @@ class ScopeWindow:
 		self._rt_det_proc_last_submit_t = 0.0
 		self._rt_det_proc_last_result_t = 0.0
 		try:
-			self._rt_det_confirm_count = int(os.getenv('BMI30_DETECT_CONFIRM_COUNT', '3'))
+			self._det_channel_settings = load_det_channel_settings()
 		except Exception:
-			self._rt_det_confirm_count = 3
+			self._det_channel_settings = {}
+		self._det_channel_enabled0 = _det_parse_bool(self._det_channel_settings.get("det_channel_enabled0"), True)
+		self._det_channel_enabled1 = _det_parse_bool(self._det_channel_settings.get("det_channel_enabled1"), True)
+		self._rt_det_confirm_count0 = _det_clamp_confirm(self._det_channel_settings.get("det_confirm_count0"), 2)
+		self._rt_det_confirm_count1 = _det_clamp_confirm(self._det_channel_settings.get("det_confirm_count1"), 2)
+		try:
+			self._rt_det_confirm_count = max(int(self._rt_det_confirm_count0), int(self._rt_det_confirm_count1))
+		except Exception:
+			self._rt_det_confirm_count = 2
 		if self._rt_det_confirm_count < 1:
 			self._rt_det_confirm_count = 1
 		try:
@@ -2258,9 +2380,19 @@ class ScopeWindow:
 			self._det_ratio = 2.0
 		# Clamp to allowed UI range
 		try:
-			self._det_ratio = max(1.1, min(3.0, round(float(self._det_ratio), 1)))
+			self._det_ratio = _det_clamp_ratio(self._det_ratio, 2.0)
 		except Exception:
 			self._det_ratio = 2.0
+		try:
+			settings = getattr(self, '_det_channel_settings', {}) or load_det_channel_settings()
+		except Exception:
+			settings = {}
+		self._det_ratio0 = _det_clamp_ratio(settings.get("det_ratio0", self._det_ratio), self._det_ratio)
+		self._det_ratio1 = _det_clamp_ratio(settings.get("det_ratio1", self._det_ratio), self._det_ratio)
+		self._det_auto_ratio = _det_clamp_ratio(settings.get("det_auto_ratio", 2.0), 2.0)
+		self._det_threshold_auto0 = _det_parse_bool(settings.get("det_threshold_auto0"), False)
+		self._det_threshold_auto1 = _det_parse_bool(settings.get("det_threshold_auto1"), False)
+		self._det_ratio = float(self._det_ratio0)
 		# If GUI already built, sync the combo box to the loaded value
 		try:
 			if getattr(self, 'det_ratio_box', None) is not None:
@@ -5894,16 +6026,34 @@ class ScopeWindow:
 			pass
 		return float(level_scale)
 
+	def _det_channel_ratio(self, channel: int) -> float:
+		ch = 0 if int(channel) == 0 else 1
+		try:
+			auto = bool(getattr(self, '_det_threshold_auto0' if ch == 0 else '_det_threshold_auto1', False))
+		except Exception:
+			auto = False
+		if auto:
+			try:
+				return _det_clamp_ratio(getattr(self, '_det_auto_ratio', 2.0), 2.0)
+			except Exception:
+				return 2.0
+		try:
+			return _det_clamp_ratio(getattr(self, '_det_ratio0' if ch == 0 else '_det_ratio1', 2.0), 2.0)
+		except Exception:
+			return 2.0
+
+	def _det_channel_confirm_count(self, channel: int) -> int:
+		ch = 0 if int(channel) == 0 else 1
+		try:
+			return _det_clamp_confirm(getattr(self, '_rt_det_confirm_count0' if ch == 0 else '_rt_det_confirm_count1', 2), 2)
+		except Exception:
+			return 2
+
 	def _rt_detector_submit_meta(self, channel: int | None = None):
 		try:
 			want_plot = bool(hasattr(self, 'num_buttons') and len(self.num_buttons) > 6 and self.num_buttons[6].isChecked())
 		except Exception:
 			want_plot = False
-		try:
-			ratio = float(getattr(self, '_det_ratio', 2.0))
-			ratio = round(float(min(3.0, max(1.1, ratio))), 1)
-		except Exception:
-			ratio = 2.0
 		try:
 			if channel is None:
 				thr0 = max(1, int(getattr(self, '_det_thr0', 1) or 1))
@@ -5916,7 +6066,13 @@ class ScopeWindow:
 		except Exception:
 			thr0 = 1
 			thr1 = 1
-		return (bool(want_plot), float(ratio), int(thr0), int(thr1))
+		return {
+			'want_plot': bool(want_plot),
+			'ratio0': float(self._det_channel_ratio(0)),
+			'ratio1': float(self._det_channel_ratio(1)),
+			'thr0': int(thr0),
+			'thr1': int(thr1),
+		}
 	
 	def _rt_detector_submit_process(self, channel: int, arr: np.ndarray, seq_val=None) -> bool:
 		if not self._rt_detector_process_start():
@@ -6316,8 +6472,7 @@ class ScopeWindow:
 		thr_prev = max(1, int(getattr(self, thr_key, 1) or 1))
 		setattr(self, seen_key, _now)
 		try:
-			ratio = float(getattr(self, '_det_ratio', 2.0))
-			ratio = round(float(min(3.0, max(1.1, ratio))), 1)
+			ratio = float(self._det_channel_ratio(ch))
 		except Exception:
 			ratio = 2.0
 		try:
@@ -6443,7 +6598,7 @@ class ScopeWindow:
 
 		hold0_prev = bool(getattr(self, '_det_hold0', False))
 		hold1_prev = bool(getattr(self, '_det_hold1', False))
-		confirm_count = max(1, int(getattr(self, '_rt_det_confirm_count', 3) or 3))
+		confirm_count = self._det_channel_confirm_count(ch)
 		fire_ch = bool((cnt >= confirm_count) or (bool(getattr(self, hold_key, False)) and bool(exceed_now)))
 		fire0 = bool(ch == 0 and fire_ch)
 		fire1 = bool(ch == 1 and fire_ch)
@@ -6765,14 +6920,6 @@ class ScopeWindow:
 		if int(getattr(self, '_det_thr1', 0)) <= 0 and lvl1 > 0:
 			self._det_thr1 = int(lvl1)
 
-		ratio = float(getattr(self, '_det_ratio', 2.0))
-		# Clamp and quantize to [1.1..3.0] with 0.1 step
-		try:
-			ratio = float(min(3.0, max(1.1, ratio)))
-			ratio = round(ratio, 1)
-		except Exception:
-			ratio = 2.0
-
 		def _peak_idx(arr: np.ndarray) -> int:
 			try:
 				if arr is None or (not hasattr(arr, 'size')) or arr.size == 0:
@@ -6812,6 +6959,10 @@ class ScopeWindow:
 				pass
 			if float(lvl) >= loss_ratio * float(base_thr):
 				setattr(self, present_key, _now)
+			try:
+				ratio = float(self._det_channel_ratio(ch))
+			except Exception:
+				ratio = 2.0
 			# Decide whether we currently have "detection":
 			# - HOLD means we previously fired and are still in detected/present state.
 			# - exceed_now means current level is above ratio*threshold.
@@ -6871,8 +7022,8 @@ class ScopeWindow:
 		ex0 = _step_one(0, lvl0, peak0)
 		ex1 = _step_one(1, lvl1, peak1)
 
-		fire0 = int(getattr(self, '_det_exceed0', 0)) >= 2
-		fire1 = int(getattr(self, '_det_exceed1', 0)) >= 2
+		fire0 = int(getattr(self, '_det_exceed0', 0)) >= self._det_channel_confirm_count(0)
+		fire1 = int(getattr(self, '_det_exceed1', 0)) >= self._det_channel_confirm_count(1)
 		# Учитываем включение ADC (выключенный канал не может вызвать FROZEN)
 		try:
 			adc1_en, adc2_en = self._adc_enable_flags()
@@ -7766,13 +7917,17 @@ class ScopeWindow:
 			self.base_buf_len = None
 			self.base_buf_len_bytes = None
 			self.freq_hz = None
-			self.data0 = np.zeros(0, dtype=np.int16)
-			self.data1 = np.zeros(0, dtype=np.int16)
+			self.data0 = np.zeros(self.max_samples, dtype=np.int32)
+			self.data1 = np.zeros(self.max_samples, dtype=np.int32)
 			self.data0_even = self.data0
 			self.data1_even = self.data1
-			self.data0_odd = np.zeros(0, dtype=np.int16)
-			self.data1_odd = np.zeros(0, dtype=np.int16)
-			self.timestamps = np.zeros(0, dtype=np.float64)
+			self.data0_odd = np.zeros(self.max_samples, dtype=np.int32)
+			self.data1_odd = np.zeros(self.max_samples, dtype=np.int32)
+			self.timestamps = np.zeros(self.max_samples, dtype=np.float64)
+			self.seq0_even = None
+			self.seq0_odd = None
+			self.seq1_even = None
+			self.seq1_odd = None
 			self._last_sample_ts = None
 			self.view_len = 0
 			self.slider_start.setEnabled(False)
@@ -7846,6 +8001,7 @@ class ScopeWindow:
 			return
 		if idx not in (3, 5):
 			return
+		detected_idx = idx
 		try:
 			prev_det_idx = getattr(self, '_det_last_mode_idx', None)
 		except Exception:
@@ -7854,6 +8010,13 @@ class ScopeWindow:
 			selected_before = int(self.num_group.checkedId())
 		except Exception:
 			selected_before = None
+		try:
+			if detected_idx == 3 and selected_before in (1, 2, 3):
+				idx = int(selected_before)
+			elif detected_idx == 5 and selected_before in (4, 5):
+				idx = int(selected_before)
+		except Exception:
+			idx = detected_idx
 		try:
 			origin_mode = int(getattr(self, "_stable_last_fault_mode_idx", -1) or -1)
 		except Exception:
@@ -7908,11 +8071,14 @@ class ScopeWindow:
 		except Exception:
 			pass
 		try:
-			self._set_view_mode(0)
+			if idx in (1, 2, 3):
+				self._set_view_mode({1: 1, 2: 2, 3: 0}.get(int(idx), 0))
+			else:
+				self._set_view_mode(0)
 		except Exception:
 			pass
 		try:
-			if idx == 3:
+			if int(sample_count) == 600:
 				self.stream_mode = 0
 				try:
 					gui_fps = int(os.getenv("BMI30_GUI_FPS", "16"))
@@ -7920,7 +8086,7 @@ class ScopeWindow:
 					gui_fps = 16
 				self.qtimer.setInterval(max(10, int(1000 / gui_fps)))
 			else:
-				self.stream_mode = 2
+				self.stream_mode = 1 if idx == 4 else 2
 				self.qtimer.setInterval(200)
 		except Exception:
 			pass
@@ -7935,7 +8101,7 @@ class ScopeWindow:
 		except Exception:
 			pass
 		try:
-			msg = f"BUF={sample_count}: режим {idx} определён по данным"
+			msg = f"BUF={sample_count}: transport mode {detected_idx}, display mode {idx}"
 			self._set_status(msg, hold_sec=2.0)
 			print(f"[mode-detect] {msg}" + (f" ({reason})" if reason else ""), flush=True)
 		except Exception:
@@ -9031,7 +9197,9 @@ class ScopeWindow:
 		# Обработка статуса подключения
 		if self.stream is None:
 			self._last_sample_ts = None
-			if self.num_group.checkedId() != 0:
+			if bool(getattr(self, '_stream_user_stopped', False)):
+				self._set_status("Поток остановлен")
+			elif self.num_group.checkedId() != 0:
 				if not self._connecting:
 					self._set_status("Подключение…", hold_sec=1.5)
 					self._activate_stream()
@@ -10473,9 +10641,17 @@ class ScopeWindow:
 		self.freq_hz = None
 		self._sample_len_mode_pending = None
 		self._sample_len_mode_sync_armed = True
-		self.data0 = np.zeros(0, dtype=np.int16)
-		self.data1 = np.zeros(0, dtype=np.int16)
-		self.timestamps = np.zeros(0, dtype=np.float64)
+		self.data0 = np.zeros(self.max_samples, dtype=np.int32)
+		self.data1 = np.zeros(self.max_samples, dtype=np.int32)
+		self.data0_even = self.data0
+		self.data1_even = self.data1
+		self.data0_odd = np.zeros(self.max_samples, dtype=np.int32)
+		self.data1_odd = np.zeros(self.max_samples, dtype=np.int32)
+		self.timestamps = np.zeros(self.max_samples, dtype=np.float64)
+		self.seq0_even = None
+		self.seq0_odd = None
+		self.seq1_even = None
+		self.seq1_odd = None
 		self._last_sample_ts = None
 		self.last_frame_t = 0
 		self.no_data_warned = False
@@ -11439,8 +11615,13 @@ class ScopeWindow:
 		except Exception:
 			val = 2.0
 		# clamp to allowed range and step
-		val = max(1.1, min(3.0, round(val, 1)))
+		val = _det_clamp_ratio(val, 2.0)
 		self._det_ratio = val
+		try:
+			self._det_ratio0 = val
+			self._det_ratio1 = val
+		except Exception:
+			pass
 		try:
 			save_det_ratio(val)
 		except Exception:
@@ -11449,6 +11630,88 @@ class ScopeWindow:
 			self._set_status(f"Det ratio: {val:.1f}", hold_sec=1.0)
 		except Exception:
 			pass
+
+	def _detector_settings_snapshot(self) -> dict:
+		return {
+			"det_channel_enabled0": bool(getattr(self, "_det_channel_enabled0", True)),
+			"det_channel_enabled1": bool(getattr(self, "_det_channel_enabled1", True)),
+			"det_confirm_count0": self._det_channel_confirm_count(0),
+			"det_confirm_count1": self._det_channel_confirm_count(1),
+			"det_ratio0": _det_clamp_ratio(getattr(self, "_det_ratio0", getattr(self, "_det_ratio", 2.0)), 2.0),
+			"det_ratio1": _det_clamp_ratio(getattr(self, "_det_ratio1", getattr(self, "_det_ratio", 2.0)), 2.0),
+			"det_auto_ratio": _det_clamp_ratio(getattr(self, "_det_auto_ratio", 2.0), 2.0),
+			"det_effective_ratio0": self._det_channel_ratio(0),
+			"det_effective_ratio1": self._det_channel_ratio(1),
+			"det_threshold_auto0": bool(getattr(self, "_det_threshold_auto0", False)),
+			"det_threshold_auto1": bool(getattr(self, "_det_threshold_auto1", False)),
+		}
+
+	def _set_detector_channel_settings(self, settings=None, persist: bool = True) -> dict:
+		settings = dict(settings or {})
+
+		def _pick(*names):
+			for name in names:
+				if name in settings:
+					return settings.get(name)
+			return None
+
+		val = _pick("enabled0", "upper_enabled", "det_channel_enabled0")
+		if val is not None:
+			self._det_channel_enabled0 = _det_parse_bool(val, True)
+		val = _pick("enabled1", "lower_enabled", "det_channel_enabled1")
+		if val is not None:
+			self._det_channel_enabled1 = _det_parse_bool(val, True)
+		val = _pick("confirm0", "count0", "upper_confirm", "det_confirm_count0")
+		if val is not None:
+			self._rt_det_confirm_count0 = _det_clamp_confirm(val, 2)
+		val = _pick("confirm1", "count1", "lower_confirm", "det_confirm_count1")
+		if val is not None:
+			self._rt_det_confirm_count1 = _det_clamp_confirm(val, 2)
+		val = _pick("ratio0", "threshold0", "upper_threshold", "det_ratio0")
+		if val is not None:
+			self._det_ratio0 = _det_clamp_ratio(val, 2.0)
+		val = _pick("ratio1", "threshold1", "lower_threshold", "det_ratio1")
+		if val is not None:
+			self._det_ratio1 = _det_clamp_ratio(val, 2.0)
+		val = _pick("auto0", "threshold_auto0", "upper_auto", "det_threshold_auto0")
+		if val is not None:
+			self._det_threshold_auto0 = _det_parse_bool(val, False)
+		val = _pick("auto1", "threshold_auto1", "lower_auto", "det_threshold_auto1")
+		if val is not None:
+			self._det_threshold_auto1 = _det_parse_bool(val, False)
+
+		try:
+			self._rt_det_confirm_count = max(self._det_channel_confirm_count(0), self._det_channel_confirm_count(1))
+		except Exception:
+			self._rt_det_confirm_count = 2
+		try:
+			self._det_ratio = float(getattr(self, "_det_ratio0", getattr(self, "_det_ratio", 2.0)))
+		except Exception:
+			self._det_ratio = 2.0
+		try:
+			if not bool(getattr(self, "_det_channel_enabled0", True)):
+				self._det_hold0 = False
+				self._det_exceed0 = 0
+				self._det_exceed_peak0 = None
+			if not bool(getattr(self, "_det_channel_enabled1", True)):
+				self._det_hold1 = False
+				self._det_exceed1 = 0
+				self._det_exceed_peak1 = None
+			if not (bool(getattr(self, "_det_channel_enabled0", True)) or bool(getattr(self, "_det_channel_enabled1", True))):
+				self._rt_stop_detection_outputs()
+		except Exception:
+			pass
+		snapshot = self._detector_settings_snapshot()
+		if persist:
+			try:
+				save_det_channel_settings(snapshot)
+			except Exception:
+				pass
+		try:
+			self._set_status("Tag Detection settings saved", hold_sec=1.0)
+		except Exception:
+			pass
+		return snapshot
 
 	# duplicate _on_freq_change removed
 
@@ -11495,11 +11758,16 @@ class ScopeWindow:
 			mode = int(getattr(self, 'adc_comm_mode', 0))
 		except Exception:
 			mode = 0
+		try:
+			adc1_enabled = bool(getattr(self, '_det_channel_enabled0', True))
+			adc2_enabled = bool(getattr(self, '_det_channel_enabled1', True))
+		except Exception:
+			adc1_enabled, adc2_enabled = True, True
 		if mode == 1:
-			return True, False
+			return bool(adc1_enabled), False
 		if mode == 2:
-			return False, True
-		return True, True
+			return False, bool(adc2_enabled)
+		return bool(adc1_enabled), bool(adc2_enabled)
 
 	def _cycle_sync_mode(self):
 		"""Переключить коммутацию ADC: оба -> ADC1 -> ADC2 -> оба."""

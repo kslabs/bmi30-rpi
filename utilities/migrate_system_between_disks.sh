@@ -89,9 +89,6 @@ run_precopy_backup() {
     info "Перед полным копированием проверяю и сохраняю изменения проекта в облако"
 
     backup_user="${SUDO_USER:-}"
-    if [[ -z "$backup_user" || "$backup_user" == "root" ]]; then
-        backup_user="$(stat -c '%U' "$WORKSPACE_DIR" 2>/dev/null || true)"
-    fi
     if [[ -n "$backup_user" && "$backup_user" != "root" ]]; then
         user_home="$(getent passwd "$backup_user" | awk -F: '{print $6}')"
         [[ -n "$user_home" ]] || die "Не удалось определить HOME пользователя $backup_user"
@@ -393,7 +390,7 @@ EOF
     [[ -b "$TARGET_BOOT_DEV" && -b "$TARGET_ROOT_DEV" ]] || die "После разметки не найдены целевые разделы"
 
     mkfs.vfat -F 32 -n BOOTFS "$TARGET_BOOT_DEV"
-    mkfs.ext4 -F -L rootfs -m 0 -E lazy_itable_init=0,lazy_journal_init=0 "$TARGET_ROOT_DEV"
+    mkfs.ext4 -F -L rootfs -m 0 "$TARGET_ROOT_DEV"
     partprobe "$TARGET_DISK"
     udevadm settle
 

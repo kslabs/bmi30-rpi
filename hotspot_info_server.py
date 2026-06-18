@@ -29,7 +29,11 @@ from urllib.request import Request, urlopen
 
 PORT         = int(os.getenv("BMI30_HOTSPOT_INFO_PORT",      "80"))
 HTTPS_PORT   = int(os.getenv("BMI30_HOTSPOT_INFO_HTTPS_PORT", "443"))
+CORE_SERVICE_URL = os.getenv("BMI30_SERVICE_URL", "http://127.0.0.1:8765").rstrip("/")
 REFRESH_S    = max(10, int(os.getenv("BMI30_HOTSPOT_INFO_REFRESH_S", "30")))
+SENSOR_REFRESH_S = max(1.0, float(os.getenv("BMI30_SENSOR_REFRESH_S", "2")))
+STM32_TEMP_CACHE_S = max(SENSOR_REFRESH_S, float(os.getenv("BMI30_STM32_TEMP_CACHE_S", str(SENSOR_REFRESH_S))))
+STM32_TEMP_QUERY_TIMEOUT_S = max(0.2, float(os.getenv("BMI30_STM32_TEMP_QUERY_TIMEOUT_S", "0.8")))
 HOTSPOT_IP   = os.getenv("BMI30_HOTSPOT_IP",   "10.42.0.1")
 HOTSPOT_CONN = os.getenv("BMI30_HOTSPOT_CONN",  "BMI30-Hotspot")
 WIFI_STA_IFACE = os.getenv("BMI30_WIFI_STA_IFACE", "wlan0")
@@ -66,14 +70,10 @@ else:
     CONFIG_JSON = next((path for path in _CONFIG_JSON_CANDIDATES if os.path.isfile(path)), _CONFIG_JSON_FALLBACK)
 DEVICE_SYNC_CACHE_S = max(1, int(os.getenv("BMI30_DEVICE_SYNC_CACHE_S", "3")))
 SYNC_STATUS_OFFSET_S = os.getenv("BMI30_SYNC_STATUS_OFFSET", "").strip()
+DEVICE_STATE_JSON = os.getenv("BMI30_DEVICE_STATE_JSON", "/tmp/bmi30_device_state.json")
+DEVICE_STATE_MAX_AGE_S = max(1, int(os.getenv("BMI30_DEVICE_STATE_MAX_AGE_S", "300")))
+PORTAL_USB_STATUS_POLL = os.getenv("BMI30_PORTAL_USB_STATUS_POLL", "0").strip().lower() in {"1", "true", "yes", "on"}
 PAGE_REV = os.getenv("BMI30_PAGE_REV", str(int(os.path.getmtime(__file__))))
-BMI30_SERVICE_URL = os.getenv("BMI30_SERVICE_URL", "http://127.0.0.1:8765").rstrip("/")
-BMI30_REPO_DIR = os.getenv("BMI30_REPO_DIR", "/home/techaid/Documents").rstrip("/")
-BMI30_HOST_DIR = os.getenv("BMI30_HOST_DIR", os.path.join(BMI30_REPO_DIR, "host")).rstrip("/")
-BMI30_SPLIT_ACTIVE_ENV = os.getenv(
-    "BMI30_SPLIT_ACTIVE_ENV",
-    os.path.join(BMI30_HOST_DIR, "bmi30_split_active_version.env"),
-)
 TAGIT_LOGO_CANDIDATES = [
     os.getenv("BMI30_PORTAL_TAGIT_LOGO_PATH", "").strip(),
     os.path.join(os.path.dirname(__file__), "docs", "Tagit_Logo.png"),
@@ -130,8 +130,12 @@ _SYNC_CACHE: dict[str, Any] = {
     "ts": 0.0,
     "responded": False,
     "value": "---",
+    "code": "",
     "source": "device",
 }
+_LCD_SYNC_CODE_RE = re.compile(r"^[MS][0-9]{2}$")
+_STM32_TEMP_CACHE: dict[str, Any] = {"ts": 0.0, "value": None}
+_STM32_TEMP_LOCK = threading.Lock()
 
 _PORTAL_CLIENTS: dict[str, float] = {}
 PORTAL_CLIENT_TTL_S = 15.0
@@ -155,6 +159,17 @@ DEFAULT_DC_CONFIG: dict[str, Any] = {
     "detect_ramp_s": 300.0,
     "fast_settle_s": 5.0,
     "fast_duration_s": 30.0,
+}
+
+DEFAULT_TAG_DETECTION_CONFIG: dict[str, Any] = {
+    "enabled0": True,
+    "enabled1": True,
+    "confirm0": 2,
+    "confirm1": 2,
+    "threshold0": 2.0,
+    "threshold1": 2.0,
+    "auto0": False,
+    "auto1": False,
 }
 
 # PDF документация
@@ -527,6 +542,118 @@ def run_command(*args: str) -> str:
     return proc.stdout.strip()
 
 
+def _read_first_text(paths: tuple[str, ...]) -> str:
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                value = f.read().replace("\x00", "").strip()
+            if value:
+                return value
+        except Exception:
+            continue
+    return ""
+
+
+def detect_rpi_identity() -> dict[str, str]:
+    info = {"serial": "", "model": "", "revision": "", "software_version": ""}
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                if ":" not in raw_line:
+                    continue
+                key, value = raw_line.split(":", 1)
+                key = key.strip().lower()
+                value = value.strip()
+                if key == "serial" and value:
+                    info["serial"] = value
+                elif key == "model" and value:
+                    info["model"] = value
+                elif key == "revision" and value:
+                    info["revision"] = value
+    except Exception:
+        pass
+    if not info["model"]:
+        info["model"] = _read_first_text((
+            "/sys/firmware/devicetree/base/model",
+            "/proc/device-tree/model",
+        ))
+    info["software_version"] = detect_rpi_software_version()
+    return info
+
+
+def _read_key_value_file(path: str) -> dict[str, str]:
+    data: dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                data[key.strip()] = value.strip().strip("'\"")
+    except Exception:
+        pass
+    return data
+
+
+def _format_active_app_version(path: str) -> str:
+    name = os.path.basename(str(path or "").strip())
+    if not name:
+        return ""
+    match = re.match(r"^(BMI30\.\d+)\.py\.(\d{4}-\d{2}-\d{2})(?:-(.+))?$", name)
+    if match:
+        suffix = (match.group(3) or "").strip()
+        return " ".join(part for part in (match.group(1), match.group(2), suffix) if part)
+    if name.startswith("BMI30."):
+        name = name[:-3] if name.endswith(".py") else name
+        name = name.replace(".py.", " ")
+        name = name.replace(".py", "")
+    return " ".join(name.split())
+
+
+def detect_rpi_software_version() -> str:
+    for env_name in ("BMI30_RPI_FW_VERSION", "BMI30_RPI_SOFTWARE_VERSION", "BMI30_HOST_FW_VERSION"):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+
+    value = _read_first_text((
+        "/etc/bmi30/rpi_fw_version",
+        "/etc/bmi30/rpi_software_version",
+        "/etc/bmi30/version",
+        "/usr/local/share/bmi30/version",
+        "/home/techaid/Documents/host/VERSION",
+        "/home/techaid/Documents/VERSION",
+    ))
+    if value:
+        return value.splitlines()[0].strip()
+
+    app_path = os.getenv("BMI30_APP_PATH", "").strip()
+    if not app_path:
+        for env_path in (
+            "/home/techaid/Documents/host/bmi30_active_version.env",
+            "/usr/local/bin/host/bmi30_active_version.env",
+            os.path.join(os.path.dirname(__file__), "host", "bmi30_active_version.env"),
+        ):
+            data = _read_key_value_file(env_path)
+            app_path = data.get("BMI30_APP_PATH", "").strip()
+            if app_path:
+                break
+    version = _format_active_app_version(app_path)
+    if version:
+        return version
+
+    os_release = _read_key_value_file("/etc/os-release")
+    return os_release.get("PRETTY_NAME", "").strip()
+
+
+def format_rpi_identity(info: dict[str, str]) -> str:
+    serial = str(info.get("serial") or "").strip() or "---"
+    version = str(info.get("software_version") or "").strip() or "---"
+    return f"{serial} / FW {version}"
+
+
+
 def _now_monotonic() -> float:
     return time.monotonic()
 
@@ -579,6 +706,116 @@ def _float_form_value(form: dict[str, str], key: str, default: float, minimum: f
     except Exception:
         value = float(default)
     return max(float(minimum), min(float(maximum), value))
+
+
+def _int_form_value(form: dict[str, str], key: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(str(form.get(key, default)).strip())
+    except Exception:
+        value = int(default)
+    return max(int(minimum), min(int(maximum), value))
+
+
+def _bool_form_value(form: dict[str, str], key: str, default: bool = False) -> bool:
+    raw = form.get(key, "1" if default else "0")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y", "t"}
+
+
+def _normalize_tag_detection_config(raw: Any = None) -> dict[str, Any]:
+    source = raw if isinstance(raw, dict) else {}
+    cfg = dict(DEFAULT_TAG_DETECTION_CONFIG)
+    cfg.update({k: source.get(k, v) for k, v in DEFAULT_TAG_DETECTION_CONFIG.items()})
+    cfg["enabled0"] = bool(cfg.get("enabled0", True))
+    cfg["enabled1"] = bool(cfg.get("enabled1", True))
+    cfg["confirm0"] = _int_form_value(cfg, "confirm0", 2, 1, 6)
+    cfg["confirm1"] = _int_form_value(cfg, "confirm1", 2, 1, 6)
+    cfg["threshold0"] = round(_float_form_value(cfg, "threshold0", 2.0, 1.0, 4.0), 1)
+    cfg["threshold1"] = round(_float_form_value(cfg, "threshold1", 2.0, 1.0, 4.0), 1)
+    cfg["auto0"] = bool(cfg.get("auto0", False))
+    cfg["auto1"] = bool(cfg.get("auto1", False))
+    return cfg
+
+
+def load_tag_detection_config() -> dict[str, Any]:
+    cfg = _normalize_tag_detection_config(_load_config_json().get("tag_detection"))
+    core_cfg = load_tag_detection_config_from_core()
+    if core_cfg is not None:
+        cfg.update(core_cfg)
+    return _normalize_tag_detection_config(cfg)
+
+
+def save_tag_detection_config(cfg: dict[str, Any]) -> None:
+    payload = _load_config_json()
+    payload["tag_detection"] = _normalize_tag_detection_config(cfg)
+    payload["tag_detection_updated_at"] = int(time.time())
+    _save_config_json(payload)
+
+
+def tag_detection_config_from_form(form: dict[str, str]) -> dict[str, Any]:
+    return _normalize_tag_detection_config({
+        "enabled0": _bool_form_value(form, "enabled0", True),
+        "enabled1": _bool_form_value(form, "enabled1", True),
+        "confirm0": _int_form_value(form, "confirm0", 2, 1, 6),
+        "confirm1": _int_form_value(form, "confirm1", 2, 1, 6),
+        "threshold0": _float_form_value(form, "threshold0", 2.0, 1.0, 4.0),
+        "threshold1": _float_form_value(form, "threshold1", 2.0, 1.0, 4.0),
+        "auto0": _bool_form_value(form, "auto0", False),
+        "auto1": _bool_form_value(form, "auto1", False),
+    })
+
+
+def load_tag_detection_config_from_core() -> dict[str, Any] | None:
+    try:
+        with urlopen(f"{CORE_SERVICE_URL}/api/status", timeout=0.5) as response:
+            status = json.loads(response.read().decode("utf-8") or "{}")
+        channels = ((status or {}).get("detector") or {}).get("channels") or {}
+        upper = channels.get("upper") or {}
+        lower = channels.get("lower") or {}
+        if not isinstance(upper, dict) or not isinstance(lower, dict):
+            return None
+        return _normalize_tag_detection_config({
+            "enabled0": bool(upper.get("enabled", True)),
+            "enabled1": bool(lower.get("enabled", True)),
+            "confirm0": upper.get("confirm_count", 2),
+            "confirm1": lower.get("confirm_count", 2),
+            "threshold0": upper.get("threshold", 2.0),
+            "threshold1": lower.get("threshold", 2.0),
+            "auto0": bool(upper.get("auto_threshold", False)),
+            "auto1": bool(lower.get("auto_threshold", False)),
+        })
+    except Exception:
+        return None
+
+
+def apply_tag_detection_config_to_core(cfg: dict[str, Any]) -> tuple[bool, str]:
+    cfg = _normalize_tag_detection_config(cfg)
+    payload = {
+        "action": "tag_detection",
+        "params": {
+            "enabled0": bool(cfg["enabled0"]),
+            "enabled1": bool(cfg["enabled1"]),
+            "confirm0": int(cfg["confirm0"]),
+            "confirm1": int(cfg["confirm1"]),
+            "threshold0": float(cfg["threshold0"]),
+            "threshold1": float(cfg["threshold1"]),
+            "auto0": bool(cfg["auto0"]),
+            "auto1": bool(cfg["auto1"]),
+        },
+    }
+    try:
+        req = Request(
+            f"{CORE_SERVICE_URL}/api/command",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=2.5) as response:
+            result = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception as exc:
+        return False, f"Unable to contact BMI30 core service: {exc}"
+    if not bool(result.get("ok", False)):
+        return False, str(result.get("error") or "BMI30 core service rejected detector settings")
+    return True, "Tag Detection settings sent to BMI30 core service"
 
 
 def _normalize_dc_config(raw: Any = None) -> dict[str, Any]:
@@ -732,153 +969,10 @@ def dc_config_from_form(form: dict[str, str]) -> dict[str, Any]:
     })
 
 
-def _bmi30_service_request(path: str, payload: dict[str, Any] | None = None, timeout: float = 1.2) -> dict[str, Any] | None:
-    url = f"{BMI30_SERVICE_URL}{path}"
-    try:
-        if payload is None:
-            with urlopen(url, timeout=timeout) as response:
-                data = response.read()
-        else:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            req = Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
-            with urlopen(req, timeout=timeout) as response:
-                data = response.read()
-        parsed = json.loads(data.decode("utf-8") or "{}")
-        return parsed if isinstance(parsed, dict) else {"ok": False, "error": "BMI30 service returned non-object JSON"}
-    except Exception as exc:
-        return {"ok": False, "error": str(exc), "service_url": BMI30_SERVICE_URL}
-
-
-def bmi30_service_status() -> dict[str, Any]:
-    data = _bmi30_service_request("/api/status", timeout=1.0)
-    if not isinstance(data, dict):
-        return {"ok": False, "error": "BMI30 service unavailable", "service_url": BMI30_SERVICE_URL}
-    return data
-
-
-def bmi30_service_command(action: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    data = _bmi30_service_request(
-        "/api/command",
-        {"action": str(action), "params": dict(params or {})},
-        timeout=6.0,
-    )
-    if not isinstance(data, dict):
-        return {"ok": False, "error": "BMI30 service unavailable", "service_url": BMI30_SERVICE_URL}
-    return data
-
-
-def _split_env_unquote(value: str) -> str:
-    value = str(value or "").strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        return value[1:-1]
-    return value.replace("\\ ", " ")
-
-
-def load_bmi30_split_active_env() -> dict[str, str]:
-    payload = {
-        "BMI30_CORE_PATH": "host/BMI30.001.py",
-        "BMI30_GUI_PATH": "host/BMI30.GUI.001.py",
-        "BMI30_SERVICE_URL": BMI30_SERVICE_URL,
-    }
-    try:
-        with open(BMI30_SPLIT_ACTIVE_ENV, "r", encoding="utf-8") as f:
-            for raw_line in f:
-                line = raw_line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key = key.strip()
-                if key in payload:
-                    payload[key] = _split_env_unquote(value)
-    except Exception:
-        pass
-    return payload
-
-
-def _repo_relative_path(path_value: str) -> str:
-    value = str(path_value or "").strip()
-    if not value:
-        raise ValueError("Empty BMI30 path.")
-    if os.path.isabs(value):
-        rel = os.path.relpath(value, BMI30_REPO_DIR)
-    else:
-        rel = value
-    rel = rel.replace("\\", "/")
-    if rel.startswith("../") or rel == ".." or rel.startswith("/"):
-        raise ValueError("BMI30 path must stay inside repository.")
-    return rel
-
-
-def list_bmi30_core_versions() -> list[dict[str, str]]:
-    host_dir = pathlib.Path(BMI30_HOST_DIR)
-    versions: list[dict[str, str]] = []
-    try:
-        candidates = sorted(host_dir.glob("BMI30.[0-9][0-9][0-9].py"))
-    except Exception:
-        candidates = []
-    for path in candidates:
-        try:
-            head = path.read_text(encoding="utf-8", errors="replace")[:8192]
-        except Exception:
-            continue
-        if "BMI30 core service" not in head and "SERVICE_VERSION" not in head:
-            continue
-        rel = os.path.relpath(str(path), BMI30_REPO_DIR).replace("\\", "/")
-        versions.append({"path": rel, "name": path.name})
-    return versions
-
-
-def save_bmi30_core_version(core_path: str) -> str:
-    rel = _repo_relative_path(core_path)
-    allowed = {item["path"] for item in list_bmi30_core_versions()}
-    if rel not in allowed:
-        raise ValueError("Selected Core service version is not available or not service-compatible.")
-    active = load_bmi30_split_active_env()
-    active["BMI30_CORE_PATH"] = rel
-    active.setdefault("BMI30_GUI_PATH", "host/BMI30.GUI.001.py")
-    active.setdefault("BMI30_SERVICE_URL", BMI30_SERVICE_URL)
-    directory = os.path.dirname(BMI30_SPLIT_ACTIVE_ENV) or "."
-    os.makedirs(directory, exist_ok=True)
-    tmp_path = f"{BMI30_SPLIT_ACTIVE_ENV}.tmp"
-    try:
-        owner_stat = os.stat(BMI30_SPLIT_ACTIVE_ENV)
-    except FileNotFoundError:
-        owner_stat = os.stat(directory)
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write("# Auto-generated by BMI30 web portal.\n")
-        f.write("# GUI version can be selected from the debug terminal menu.\n")
-        f.write(f"BMI30_CORE_PATH={active['BMI30_CORE_PATH']}\n")
-        f.write(f"BMI30_GUI_PATH={active['BMI30_GUI_PATH']}\n")
-        f.write(f"BMI30_SERVICE_URL={active['BMI30_SERVICE_URL']}\n")
-    try:
-        os.chown(tmp_path, owner_stat.st_uid, owner_stat.st_gid)
-    except Exception:
-        pass
-    try:
-        os.chmod(tmp_path, 0o644)
-    except Exception:
-        pass
-    os.replace(tmp_path, BMI30_SPLIT_ACTIVE_ENV)
-    return rel
-
-
 def apply_dc_config_to_device(cfg: dict[str, Any]) -> tuple[bool, str]:
     cfg = _normalize_dc_config(cfg)
     mode_value = DC_MODE_VALUES.get(str(cfg["mode"]), 1)
     detect_settle_s = cfg["detect_initial_settle_s"]
-    service_result = bmi30_service_command(
-        "dc_config",
-        {
-            "mode": mode_value,
-            "work_settle_s": cfg["work_settle_s"],
-            "detect_settle_s": detect_settle_s,
-            "fast_settle_s": cfg["fast_settle_s"],
-            "fast_duration_s": cfg["fast_duration_s"],
-        },
-    )
-    if service_result.get("ok"):
-        return True, "SET_DC_CONFIG sent via BMI30 core service"
-    service_error = str(service_result.get("error", "") or "")
     script = (
         "import sys;"
         "sys.path.insert(0, '/home/techaid/Documents/host');"
@@ -904,13 +998,11 @@ def apply_dc_config_to_device(cfg: dict[str, Any]) -> tuple[bool, str]:
             timeout=4.0,
         )
     except Exception as exc:
-        prefix = f"Core service unavailable: {service_error}. " if service_error else ""
-        return False, f"{prefix}Unable to contact device: {exc}"
+        return False, f"Unable to contact device: {exc}"
 
     output = (proc.stdout or proc.stderr or "").strip()
     if proc.returncode != 0:
-        prefix = f"Core service unavailable: {service_error}. " if service_error else ""
-        return False, prefix + (output or f"USB apply failed with exit code {proc.returncode}")
+        return False, output or f"USB apply failed with exit code {proc.returncode}"
     return True, output or "SET_DC_CONFIG sent"
 
 
@@ -927,25 +1019,32 @@ def _load_ui_sync_mode_from_config() -> str:
     return "---"
 
 
-def _read_device_status_packet() -> bytes | None:
-    """Query device via USB GET_STATUS and return raw STAT packet if available."""
-    script = (
-        "import sys;"
-        "sys.path.insert(0, '/home/techaid/Documents/host');"
-        "from usb_vendor.usb_stream import USBStream;"
-        "s=USBStream(profile=1, full=True, fast_mode=True);"
-        "ok=None;"
-        "\n"
-        "try:\n"
-        " s._get_status_ep0();\n"
-        " st=getattr(s,'last_stat',None);\n"
-        " ok=st if isinstance(st,(bytes,bytearray)) and len(st)>=8 else None\n"
-        "finally:\n"
-        " s.close()\n"
-        "\n"
-        "import sys as _s;"
-        "_s.stdout.buffer.write(ok if ok else b'')"
-    )
+def _read_device_ep0_packet(request: int, length: int, magic: bytes) -> bytes | None:
+    """Query device via USB EP0 and return a packet with the expected magic."""
+    request_i = int(request) & 0xFF
+    length_i = max(1, int(length))
+    magic_b = bytes(magic)
+    script = f"""
+import os
+import sys
+import usb.core
+
+request = {request_i}
+length = {length_i}
+magic = {magic_b!r}
+ok = b''
+vid = int(os.getenv('BMI30_USB_VID', '0xCAFE'), 0)
+pid = int(os.getenv('BMI30_USB_PID', '0x4001'), 0)
+try:
+    dev = usb.core.find(idVendor=vid, idProduct=pid)
+    if dev is not None:
+        data = bytes(dev.ctrl_transfer(0xC0, request, 0, 0, length, timeout=500))
+        if data[:len(magic)] == magic:
+            ok = data
+except Exception:
+    ok = b''
+sys.stdout.buffer.write(ok)
+"""
     try:
         proc = subprocess.run(
             ["python3", "-c", script],
@@ -961,25 +1060,220 @@ def _read_device_status_packet() -> bytes | None:
         return None
 
 
+def _read_device_status_packet() -> bytes | None:
+    """Query device via USB GET_STATUS and return raw STAT packet if available."""
+    return _read_device_ep0_packet(0x30, 136, b"STAT")
+
+
+def _read_device_state_cache(max_age_s: int | None = None) -> dict[str, Any]:
+    """Read last device state published by the main Bulk IN reader."""
+    try:
+        with open(DEVICE_STATE_JSON, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return {}
+        ts = float(payload.get("updated_at", 0.0) or 0.0)
+        age = max(0.0, time.time() - ts) if ts > 0 else None
+        limit = DEVICE_STATE_MAX_AGE_S if max_age_s is None else int(max_age_s)
+        if age is None or age > limit:
+            payload = dict(payload)
+            payload["_stale"] = True
+            payload["_age_s"] = age
+            return payload
+        payload["_stale"] = False
+        payload["_age_s"] = age
+        return payload
+    except Exception:
+        return {}
+
+
+def _device_cache_temperature(cache: dict[str, Any]) -> float | None:
+    for path in (
+        ("temperature", "temp_c"),
+        ("events", "mcu_adc", "temp_c"),
+        ("events", "temp_c", "temp_c"),
+    ):
+        cur: Any = cache
+        for key in path:
+            if not isinstance(cur, dict):
+                cur = None
+                break
+            cur = cur.get(key)
+        if isinstance(cur, (int, float)):
+            return float(cur)
+    return None
+
+
+def _device_cache_sensors(cache: dict[str, Any]) -> dict[str, Any]:
+    sensors = cache.get("sensors") if isinstance(cache.get("sensors"), dict) else {}
+    local = sensors.get("local") if isinstance(sensors.get("local"), dict) else {}
+    remote_raw = sensors.get("remote") if isinstance(sensors.get("remote"), list) else []
+    remote = [item for item in remote_raw if isinstance(item, dict)]
+    stat = cache.get("stat") if isinstance(cache.get("stat"), dict) else {}
+    events = cache.get("events") if isinstance(cache.get("events"), dict) else {}
+    return {
+        "available": bool(cache) and not bool(cache.get("_stale")),
+        "stale": bool(cache.get("_stale")) if cache else True,
+        "age_s": cache.get("_age_s"),
+        "source": str(cache.get("source", "")) if cache else "",
+        "updated_at": cache.get("updated_at"),
+        "updated_iso": cache.get("updated_iso"),
+        "cache_written_at": cache.get("cache_written_at"),
+        "cache_written_iso": cache.get("cache_written_iso"),
+        "evt1": cache.get("evt1") if isinstance(cache.get("evt1"), dict) else {},
+        "event_updates": cache.get("event_updates") if isinstance(cache.get("event_updates"), dict) else {},
+        "service": cache.get("service") if isinstance(cache.get("service"), dict) else {},
+        "identity": cache.get("identity") if isinstance(cache.get("identity"), dict) else {},
+        "local": local,
+        "remote": remote,
+        "remote_count": len(remote),
+        "stat": stat,
+        "events": events,
+        "mode": cache.get("mode") if isinstance(cache.get("mode"), dict) else {},
+        "sync": cache.get("sync") if isinstance(cache.get("sync"), dict) else {},
+    }
+
+
+def _stm32_identity_from_cache(cache: dict[str, Any]) -> dict[str, Any]:
+    identity = cache.get("identity") if isinstance(cache.get("identity"), dict) else {}
+    stm32 = identity.get("stm32") if isinstance(identity.get("stm32"), dict) else {}
+    if stm32:
+        return stm32
+    events = cache.get("events") if isinstance(cache.get("events"), dict) else {}
+    fw_info = events.get("fw_info") if isinstance(events.get("fw_info"), dict) else {}
+    return fw_info
+
+
+def format_stm32_identity(info: dict[str, Any]) -> str:
+    if not info:
+        return "---"
+    uid = str(info.get("uid96_words") or info.get("uid96") or "").strip()
+    build_date = str(info.get("build_date") or "").strip()
+    build_time = str(info.get("build_time") or "").strip()
+    firmware = " ".join(part for part in (build_date, build_time) if part).strip()
+    if not firmware:
+        firmware = str(info.get("fw_version") or "").strip()
+    parts = []
+    if uid:
+        parts.append(uid)
+    if firmware:
+        parts.append("FW " + firmware)
+    return " / ".join(parts) if parts else "---"
+
+
+def _sync_mode_from_device_cache(cache: dict[str, Any]) -> dict[str, Any] | None:
+    if not cache or bool(cache.get("_stale")):
+        return None
+    sync = cache.get("sync") if isinstance(cache.get("sync"), dict) else {}
+    events = cache.get("events") if isinstance(cache.get("events"), dict) else {}
+    if not sync and isinstance(events.get("sync_state"), dict):
+        sync = events["sync_state"]
+    value = str(sync.get("role") or "").strip().lower()
+    raw_mode = sync.get("raw_mode")
+    if not value or value == "---":
+        try:
+            value = {0: "master", 1: "slave", 2: "off"}.get(int(raw_mode), "---")
+        except Exception:
+            value = "---"
+    display_char = str(sync.get("display_char") or "").strip()
+    display_value = sync.get("display_value")
+    code = ""
+    try:
+        if display_char:
+            code = f"{display_char}{int(display_value):02d}"
+    except Exception:
+        code = display_char
+    return {
+        "value": value or "---",
+        "code": code,
+        "source": "event-cache",
+        "device_responded": True,
+    }
+
+
+def _read_device_lcd_status_packet() -> bytes | None:
+    """Query device via USB GET_LCD_STATUS and return raw LCDS packet if available."""
+    return _read_device_ep0_packet(0x38, 24, b"LCDS")
+
+
+def _lcd_sync_code(lcd: bytes | None) -> str:
+    """Extract a compact LCD role code such as M00/S00/S01."""
+    if not isinstance(lcd, (bytes, bytearray)) or len(lcd) < 8 or bytes(lcd[:4]) != b"LCDS":
+        return ""
+
+    candidates: list[bytes] = []
+    if len(lcd) >= 23:
+        candidates.append(bytes(lcd[20:23]))
+    for off in range(4, max(4, len(lcd) - 2)):
+        chunk = bytes(lcd[off:off + 3])
+        if all(32 <= b < 127 for b in chunk):
+            candidates.append(chunk)
+
+    for chunk in candidates:
+        try:
+            code = chunk.decode("ascii", errors="strict").upper()
+        except Exception:
+            continue
+        if _LCD_SYNC_CODE_RE.fullmatch(code):
+            return code
+    return ""
+
+
+def _sync_role_from_lcd_status(lcd: bytes | None) -> str:
+    code = _lcd_sync_code(lcd)
+    return _sync_role_from_lcd_code(code)
+
+
+def _sync_role_from_lcd_code(code: str) -> str:
+    if code.startswith("M"):
+        return "master"
+    if code.startswith("S"):
+        return "slave"
+    return ""
+
+
 def detect_sync_mode() -> dict[str, Any]:
     """
     Source is the device.
-    - If device does not respond: show '---'.
-    - If device responds: show mode (from STAT offset if configured, otherwise
-      use last known UI mode as fallback while still requiring device response).
+    - Normal path: use event cache written by the Bulk IN reader (EVT1/STAT).
+    - Optional fallback: USB control polling only when BMI30_PORTAL_USB_STATUS_POLL=1.
     """
     now = time.time()
     if (now - float(_SYNC_CACHE.get("ts", 0.0))) < DEVICE_SYNC_CACHE_S:
         return {
             "value": str(_SYNC_CACHE.get("value", "---")),
+            "code": str(_SYNC_CACHE.get("code", "")),
             "source": str(_SYNC_CACHE.get("source", "device")),
             "device_responded": bool(_SYNC_CACHE.get("responded", False)),
         }
 
+    cached = _sync_mode_from_device_cache(_read_device_state_cache())
+    if cached is not None:
+        _SYNC_CACHE.update({
+            "ts": now,
+            "responded": True,
+            "value": cached["value"],
+            "code": cached.get("code", ""),
+            "source": cached.get("source", "event-cache"),
+        })
+        return cached
+
+    if not PORTAL_USB_STATUS_POLL:
+        _SYNC_CACHE.update({"ts": now, "responded": False, "value": "---", "code": "", "source": "event-cache"})
+        return {"value": "---", "code": "", "source": "event-cache", "device_responded": False}
+
+    lcd = _read_device_lcd_status_packet()
+    code = _lcd_sync_code(lcd)
+    mode = _sync_role_from_lcd_code(code)
+    if mode:
+        _SYNC_CACHE.update({"ts": now, "responded": True, "value": mode, "code": code, "source": "device"})
+        return {"value": mode, "code": code, "source": "device", "device_responded": True}
+
     st = _read_device_status_packet()
     if not st:
-        _SYNC_CACHE.update({"ts": now, "responded": False, "value": "---", "source": "device"})
-        return {"value": "---", "source": "device", "device_responded": False}
+        responded = lcd is not None
+        _SYNC_CACHE.update({"ts": now, "responded": responded, "value": "---", "code": "", "source": "device"})
+        return {"value": "---", "code": "", "source": "device", "device_responded": responded}
 
     mode = "---"
     source = "device"
@@ -992,18 +1286,11 @@ def detect_sync_mode() -> dict[str, Any]:
             if 0 <= off < len(st):
                 b = int(st[off]) & 0xFF
                 mode = {0: "master", 1: "slave", 2: "off"}.get(b, "---")
-                source = f"device:STAT[{off}]"
         except Exception:
             pass
 
-    # If STAT layout is unknown, still require live device response,
-    # but use last known UI mode as fallback.
-    if mode == "---":
-        mode = _load_ui_sync_mode_from_config()
-        source = "device+ui_cache" if mode != "---" else "device"
-
-    _SYNC_CACHE.update({"ts": now, "responded": True, "value": mode, "source": source})
-    return {"value": mode, "source": source, "device_responded": True}
+    _SYNC_CACHE.update({"ts": now, "responded": True, "value": mode, "code": "", "source": source})
+    return {"value": mode, "code": "", "source": source, "device_responded": True}
 
 
 def detect_logo_path(candidates: list[str]) -> str:
@@ -1087,15 +1374,15 @@ def render_debug_style_css() -> str:
     }
     html[data-ui-style="crystal"]{
       color-scheme:light;
-      --bg:#f5f7fa;--bg-2:#f0f3f8;--glass:rgba(255,255,255,.65);--glass-strong:rgba(255,255,255,.78);
-      --glass-fallback:#fafbfc;--panel:rgba(255,255,255,.68);--panel-fallback:#fafbfc;--text:#1a1f2e;
-      --muted:#6b7280;--line:rgba(255,255,255,.85);--line-soft:rgba(30,41,59,.08);--accent:#0f766e;
-      --accent-2:#2563eb;--accent-soft:rgba(15,118,110,.12);--warm:rgba(59,130,246,.10);--grid-line:rgba(30,41,59,.04);
-      --edge-shadow:rgba(15,23,42,.12);--input-bg:rgba(255,255,255,.70);--portal-border:rgba(59,130,246,.30);
+      --bg:#eef3f8;--bg-2:#e4ebf4;--glass:rgba(255,255,255,.74);--glass-strong:rgba(255,255,255,.86);
+      --glass-fallback:#f8fbff;--panel:rgba(255,255,255,.78);--panel-fallback:#f8fbff;--text:#111827;
+      --muted:#4b5563;--line:rgba(100,116,139,.26);--line-soft:rgba(30,41,59,.13);--accent:#0d6f69;
+      --accent-2:#1d4ed8;--accent-soft:rgba(15,118,110,.16);--warm:rgba(59,130,246,.13);--grid-line:rgba(30,41,59,.055);
+      --edge-shadow:rgba(15,23,42,.18);--input-bg:rgba(255,255,255,.82);--portal-border:rgba(59,130,246,.40);
       --form-error-border:#fed7d7;--form-error-bg:rgba(254,242,242,.90);--form-error-text:#c53030;
-      --footer:#6b7280;--note-bg:rgba(255,255,255,.60);--note-border:rgba(59,130,246,.20);--note-text:#3f4655;--shine:.88;
-      --panel-shadow:0 0 0 1px rgba(255,255,255,.80),0 2px 4px rgba(0,0,0,.04),0 12px 24px rgba(59,130,246,.10),0 20px 48px rgba(15,23,42,.08),inset 0 1px 1px rgba(255,255,255,.95),inset 0 -12px 24px rgba(59,130,246,.05);
-      --panel-hover-shadow:0 0 0 1px rgba(255,255,255,.88),0 3px 6px rgba(0,0,0,.06),0 16px 32px rgba(59,130,246,.14),0 28px 64px rgba(15,23,42,.12),inset 0 1px 1px rgba(255,255,255,.98),inset 0 -14px 28px rgba(59,130,246,.08);
+      --footer:#596273;--note-bg:rgba(255,255,255,.72);--note-border:rgba(59,130,246,.30);--note-text:#303846;--shine:.94;
+      --panel-shadow:0 0 0 1px rgba(255,255,255,.92),0 3px 8px rgba(15,23,42,.08),0 16px 34px rgba(59,130,246,.16),0 30px 68px rgba(15,23,42,.14),inset 0 1px 1px rgba(255,255,255,1),inset 0 -14px 28px rgba(59,130,246,.08);
+      --panel-hover-shadow:0 0 0 1px rgba(255,255,255,.98),0 4px 10px rgba(15,23,42,.10),0 20px 42px rgba(59,130,246,.20),0 38px 82px rgba(15,23,42,.18),inset 0 1px 1px rgba(255,255,255,1),inset 0 -16px 30px rgba(59,130,246,.11);
     }
     html[data-ui-style="crystal"][data-theme-mode="dark"]{
       color-scheme:dark;
@@ -1111,9 +1398,9 @@ def render_debug_style_css() -> str:
     }
     html[data-ui-style="crystal"] body{
       background:
-        radial-gradient(800px 400px at 20% 10%,rgba(59,130,246,.08),rgba(59,130,246,0) 60%),
-        radial-gradient(600px 300px at 80% 90%,rgba(20,184,166,.06),rgba(20,184,166,0) 55%),
-        linear-gradient(180deg,#f5f7fa 0%,#f0f3f8 100%);
+        radial-gradient(800px 400px at 20% 10%,rgba(59,130,246,.11),rgba(59,130,246,0) 60%),
+        radial-gradient(600px 300px at 80% 90%,rgba(20,184,166,.08),rgba(20,184,166,0) 55%),
+        linear-gradient(180deg,#eef3f8 0%,#e4ebf4 100%);
     }
     html[data-ui-style="crystal"] body::before{
       background:linear-gradient(135deg,rgba(59,130,246,.03),rgba(255,255,255,0) 40%);
@@ -1124,8 +1411,8 @@ def render_debug_style_css() -> str:
     html[data-ui-style="crystal"] .security-note,
     html[data-ui-style="crystal"] .panel{
       border-radius:24px;
-      background:linear-gradient(135deg,rgba(255,255,255,.80),rgba(255,255,255,.50) 60%,rgba(255,255,255,.72));
-      border:1px solid rgba(255,255,255,.90);
+      background:linear-gradient(135deg,rgba(255,255,255,.90),rgba(255,255,255,.62) 60%,rgba(255,255,255,.82));
+      border:1px solid rgba(100,116,139,.30);
       box-shadow:var(--panel-shadow);
       backdrop-filter:blur(20px) saturate(1.20) brightness(1.05);
       -webkit-backdrop-filter:blur(20px) saturate(1.20) brightness(1.05);
@@ -1135,7 +1422,7 @@ def render_debug_style_css() -> str:
     html[data-ui-style="crystal"] .security-note::before,
     html[data-ui-style="crystal"] .panel::before{
       top:0;left:0;right:0;height:45%;
-      background:linear-gradient(180deg,rgba(255,255,255,.85),rgba(255,255,255,.30),rgba(255,255,255,0));
+      background:linear-gradient(180deg,rgba(255,255,255,.92),rgba(255,255,255,.38),rgba(255,255,255,0));
       mix-blend-mode:screen;
       opacity:var(--shine);
     }
@@ -1145,15 +1432,15 @@ def render_debug_style_css() -> str:
     html[data-ui-style="crystal"] .panel::after{
       inset:0;
       border-radius:inherit;
-      background:linear-gradient(125deg,rgba(255,255,255,.60),rgba(255,255,255,0) 30%,rgba(255,255,255,0) 70%,rgba(255,255,255,.40));
+      background:linear-gradient(125deg,rgba(255,255,255,.70),rgba(255,255,255,0) 30%,rgba(255,255,255,0) 70%,rgba(255,255,255,.48));
       mix-blend-mode:normal;
-      opacity:.50;
+      opacity:.58;
     }
     html[data-ui-style="crystal"] .card:hover{
       box-shadow:var(--panel-hover-shadow);
     }
     html[data-ui-style="crystal"] .hero{
-      background:linear-gradient(180deg,rgba(255,255,255,.82),rgba(255,255,255,.55) 60%,rgba(255,255,255,.74));
+      background:linear-gradient(180deg,rgba(255,255,255,.92),rgba(255,255,255,.66) 60%,rgba(255,255,255,.84));
     }
     html[data-ui-style="crystal"] h1,
     html[data-ui-style="crystal"] h2,
@@ -1181,27 +1468,27 @@ def render_debug_style_css() -> str:
       position:relative;
       overflow:hidden;
       border-radius:12px;
-      background:linear-gradient(135deg,rgba(255,255,255,.80),rgba(255,255,255,.50) 60%,rgba(255,255,255,.72));
-      border:1px solid rgba(255,255,255,.88);
+      background:linear-gradient(135deg,rgba(255,255,255,.90),rgba(255,255,255,.62) 60%,rgba(255,255,255,.82));
+      border:1px solid rgba(100,116,139,.30);
       color:var(--text);
-      box-shadow:0 0 0 1px rgba(255,255,255,.70),0 4px 12px rgba(59,130,246,.10),0 12px 28px rgba(15,23,42,.06),inset 0 1px 1px rgba(255,255,255,.95),inset 0 -8px 16px rgba(59,130,246,.04);
+      box-shadow:0 0 0 1px rgba(255,255,255,.86),0 5px 14px rgba(59,130,246,.14),0 14px 32px rgba(15,23,42,.09),inset 0 1px 1px rgba(255,255,255,1),inset 0 -9px 18px rgba(59,130,246,.07);
     }
     html[data-ui-style="crystal"] .sbtn::before,
     html[data-ui-style="crystal"] .link::before,
     html[data-ui-style="crystal"] .menu-btn::before,
     html[data-ui-style="crystal"] .mode-option::before{
       content:"";position:absolute;inset:0;
-      background:linear-gradient(180deg,rgba(255,255,255,.70),rgba(255,255,255,.20),rgba(255,255,255,0));
-      pointer-events:none;opacity:.60;
+      background:linear-gradient(180deg,rgba(255,255,255,.78),rgba(255,255,255,.24),rgba(255,255,255,0));
+      pointer-events:none;opacity:.68;
     }
     html[data-ui-style="crystal"] .sbtn:hover,
     html[data-ui-style="crystal"] .link:hover,
     html[data-ui-style="crystal"] .menu-btn:hover,
     html[data-ui-style="crystal"] .mode-option:hover{
-      background:linear-gradient(135deg,rgba(255,255,255,.86),rgba(255,255,255,.58) 60%,rgba(255,255,255,.80));
-      border-color:rgba(255,255,255,.94);
+      background:linear-gradient(135deg,rgba(255,255,255,.96),rgba(255,255,255,.70) 60%,rgba(255,255,255,.90));
+      border-color:rgba(100,116,139,.40);
       transform:translateY(-2px);
-      box-shadow:0 0 0 1px rgba(255,255,255,.76),0 6px 16px rgba(59,130,246,.14),0 16px 36px rgba(15,23,42,.10),inset 0 1px 1px rgba(255,255,255,.98),inset 0 -8px 16px rgba(59,130,246,.06);
+      box-shadow:0 0 0 1px rgba(255,255,255,.92),0 7px 18px rgba(59,130,246,.18),0 18px 40px rgba(15,23,42,.13),inset 0 1px 1px rgba(255,255,255,1),inset 0 -9px 18px rgba(59,130,246,.09);
     }
     html[data-ui-style="crystal"] .sbtn:active,
     html[data-ui-style="crystal"] .link:active,
@@ -1235,10 +1522,10 @@ def render_debug_style_css() -> str:
     html[data-ui-style="crystal"] .debug-close{
       border-radius:12px;
       min-height:44px;
-      background:linear-gradient(135deg,rgba(255,255,255,.80),rgba(255,255,255,.50) 60%,rgba(255,255,255,.72));
-      border:1px solid rgba(255,255,255,.88);
+      background:linear-gradient(135deg,rgba(255,255,255,.90),rgba(255,255,255,.62) 60%,rgba(255,255,255,.82));
+      border:1px solid rgba(100,116,139,.30);
       color:var(--text);
-      box-shadow:0 0 0 1px rgba(255,255,255,.70),0 4px 12px rgba(59,130,246,.08),inset 0 1px 1px rgba(255,255,255,.95),inset 0 -6px 12px rgba(59,130,246,.04);
+      box-shadow:0 0 0 1px rgba(255,255,255,.86),0 5px 14px rgba(59,130,246,.12),inset 0 1px 1px rgba(255,255,255,1),inset 0 -7px 14px rgba(59,130,246,.07);
     }
     html[data-ui-style="crystal"][data-theme-mode="dark"] body{
       background:
@@ -1340,16 +1627,16 @@ def render_debug_style_css() -> str:
     }
     html[data-ui-style="neumorph"][data-theme-mode="dark"]{
       color-scheme:dark;
-      --bg:#25282d;--bg-2:#25282d;--glass:#25282d;--glass-strong:#2b2f35;
-      --glass-fallback:#25282d;--panel:#25282d;--panel-fallback:#25282d;--text:#edf0f4;
-      --muted:#a9afb8;--line:rgba(255,255,255,.08);--line-soft:rgba(255,255,255,.07);--accent:#c7ccd4;
-      --accent-2:#ff8a55;--accent-soft:rgba(255,255,255,.05);--warm:rgba(255,255,255,0);--grid-line:rgba(0,0,0,0);
-      --edge-shadow:rgba(0,0,0,.52);--input-bg:#25282d;--portal-border:rgba(255,255,255,.08);
-      --form-error-border:rgba(255,138,110,.24);--form-error-bg:#322927;--form-error-text:#ffc1b6;
-      --footer:#999fa8;--note-bg:#25282d;--note-border:rgba(255,255,255,.08);--note-text:#bac1cb;--shine:.0;
-      --neumo-hi:rgba(255,255,255,.07);--neumo-lo:rgba(0,0,0,.48);
+      --bg:#2a2e34;--bg-2:#24282e;--glass:#2a2e34;--glass-strong:#333842;
+      --glass-fallback:#2b3037;--panel:#2b3037;--panel-fallback:#2b3037;--text:#f2f5f8;
+      --muted:#b5bcc6;--line:rgba(255,255,255,.13);--line-soft:rgba(255,255,255,.10);--accent:#d6dbe3;
+      --accent-2:#ff9464;--accent-soft:rgba(255,255,255,.075);--warm:rgba(255,255,255,0);--grid-line:rgba(0,0,0,0);
+      --edge-shadow:rgba(0,0,0,.62);--input-bg:#2b3037;--portal-border:rgba(255,255,255,.13);
+      --form-error-border:rgba(255,148,120,.30);--form-error-bg:#372d2b;--form-error-text:#ffc8bf;
+      --footer:#a6adb7;--note-bg:#2b3037;--note-border:rgba(255,255,255,.12);--note-text:#c8ced7;--shine:.0;
+      --neumo-hi:rgba(255,255,255,.13);--neumo-lo:rgba(0,0,0,.62);
       --panel-shadow:12px 12px 24px var(--neumo-lo),-12px -12px 24px var(--neumo-hi);
-      --panel-hover-shadow:14px 14px 28px rgba(0,0,0,.54),-14px -14px 28px rgba(255,255,255,.08);
+      --panel-hover-shadow:14px 14px 28px rgba(0,0,0,.66),-14px -14px 28px rgba(255,255,255,.15);
     }
     html[data-ui-style="neumorph"] body{
       background:linear-gradient(145deg,var(--bg),var(--bg-2));
@@ -2633,9 +2920,15 @@ def render_html_page(
     hotspot_ip = html.escape(data["hotspot"]["ip"])
     access_ip  = html.escape(data.get("access", {}).get("ip", data["hotspot"]["ip"]))
     access_role = html.escape(data.get("access", {}).get("role", "hotspot"))
-    sync_mode  = html.escape(data.get("sync_mode", {}).get("value", "off").upper())
-    sync_src   = html.escape(data.get("sync_mode", {}).get("source", "unknown"))
-    sync_ok    = bool(data.get("sync_mode", {}).get("device_responded", False))
+    sync_payload = data.get("sync_mode", {})
+    sync_value = str(sync_payload.get("value", "off"))
+    if sync_value.lower() in {"master", "slave"}:
+        sync_value = sync_value.capitalize()
+    sync_mode  = html.escape(sync_value)
+    sync_code  = html.escape(str(sync_payload.get("code", "")))
+    sync_src   = html.escape(str(sync_payload.get("source", "unknown")))
+    sync_extra = sync_code or sync_src
+    sync_ok    = bool(sync_payload.get("device_responded", False))
     has_tagit_logo = bool(data.get("logos", {}).get("tagit", {}).get("available", False))
     has_am_logo = bool(data.get("logos", {}).get("am", {}).get("available", False))
     ssh_user   = html.escape(data["services"].get("ssh_user", "techaid"))
@@ -2902,7 +3195,7 @@ def render_html_page(
     {am_logo_html}
     </div>
     <h1>{hostname}</h1>
-    <p>IM Mark Detection System</p>
+    <p>EM Anti-theft EAS System</p>
   </div>
 
   <div class="card wifi-card">
@@ -2913,7 +3206,7 @@ def render_html_page(
             <dt>Hotspot IP</dt>
       <dd class="mono">{hotspot_ip}</dd>
             <dt>Sync Mode</dt>
-            <dd class="mono">{sync_mode} <span class="subtle">({sync_src})</span></dd>
+            <dd class="mono">{sync_mode} <span class="subtle">({sync_extra})</span></dd>
             <dt>Device Link</dt>
             <dd>{'online' if sync_ok else '---'}</dd>
     </dl>
@@ -3114,43 +3407,202 @@ def _read_rpi_temperatures() -> list[tuple[str, float]]:
     return results
 
 
-def render_portal_page(hostname: str, session_username: str = "", session_role: str = "user", notice: str = "", notice_kind: str = "ok") -> bytes:
+def _read_rpi_hwmon_readings() -> list[dict[str, Any]]:
+    """Return raw Raspberry Pi hwmon readings with neutral labels."""
+    readings: list[dict[str, Any]] = []
+    try:
+        import glob as _glob
+        import re as _re
+        paths = sorted(_glob.glob("/sys/class/hwmon/hwmon*"))
+    except Exception:
+        return readings
+
+    for hwmon_path in paths:
+        try:
+            hwmon_name = open(f"{hwmon_path}/name").read().strip()
+        except Exception:
+            hwmon_name = os.path.basename(hwmon_path)
+        for pattern in ("in*_input", "curr*_input", "power*_input", "*_raw", "*_alarm"):
+            try:
+                files = sorted(_glob.glob(f"{hwmon_path}/{pattern}"))
+            except Exception:
+                files = []
+            for file_path in files:
+                name = os.path.basename(file_path)
+                try:
+                    raw_text = open(file_path).read().strip()
+                except Exception:
+                    continue
+                if not raw_text:
+                    continue
+                item: dict[str, Any] = {
+                    "label": f"{hwmon_name} {name}",
+                    "raw": raw_text,
+                    "unit": "",
+                    "path": file_path,
+                }
+                try:
+                    raw_i = int(raw_text, 0)
+                except Exception:
+                    raw_i = None
+                if raw_i is not None and _re.fullmatch(r"temp\d+_input", name):
+                    item["value"] = round(raw_i / 1000.0, 2)
+                    item["unit"] = "C"
+                elif raw_i is not None and _re.fullmatch(r"in\d+_input", name):
+                    item["value"] = raw_i
+                    item["unit"] = "mV"
+                elif raw_i is not None and _re.fullmatch(r"curr\d+_input", name):
+                    item["value"] = raw_i
+                    item["unit"] = "mA"
+                elif raw_i is not None and _re.fullmatch(r"power\d+_input", name):
+                    item["value"] = raw_i
+                    item["unit"] = "uW"
+                elif raw_i is not None:
+                    item["value"] = raw_i
+                else:
+                    item["value"] = raw_text
+                readings.append(item)
+    return readings
+
+
+def _decode_stm32_temperature_raw(raw: int) -> float | None:
+    """Decode STM32 CDC temperature raw value to Celsius."""
+    raw_i = int(raw)
+    if abs(raw_i) >= 1000:
+        candidates = (raw_i / 100.0, raw_i / 10.0, float(raw_i))
+    elif abs(raw_i) >= 200:
+        candidates = (raw_i / 10.0, raw_i / 100.0, float(raw_i))
+    else:
+        candidates = (float(raw_i), raw_i / 10.0, raw_i / 100.0)
+    for value in candidates:
+        if -55.0 <= value <= 150.0:
+            return value
+    return None
+
+
+def _query_stm32_temperature_cdc() -> float | None:
+    """Read STM32 temperature via low-priority CDC diagnostic command 0x31."""
+    script = f"""
+import glob
+import struct
+import sys
+import time
+
+try:
+    import serial
+except Exception:
+    sys.exit(0)
+
+for port in sorted(glob.glob('/dev/ttyACM*')):
+    try:
+        with serial.Serial(port=port, baudrate=115200, timeout=0.12, write_timeout=0.12) as ser:
+            try:
+                ser.reset_input_buffer()
+            except Exception:
+                pass
+            ser.write(bytes([0x31]))
+            ser.flush()
+            buf = bytearray()
+            deadline = time.monotonic() + 0.35
+            while len(buf) < 16 and time.monotonic() < deadline:
+                chunk = ser.read(16 - len(buf))
+                if chunk:
+                    buf.extend(chunk)
+                else:
+                    time.sleep(0.01)
+        data = bytes(buf)
+        idx = data.find(bytes([0x80, 0x31]))
+        if idx >= 0 and idx + 4 <= len(data):
+            raw = struct.unpack('<h', data[idx + 2:idx + 4])[0]
+            print(raw)
+            sys.exit(0)
+    except Exception:
+        continue
+"""
+    try:
+        proc = subprocess.run(
+            ["python3", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=STM32_TEMP_QUERY_TIMEOUT_S,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    raw_s = (proc.stdout or "").strip().splitlines()
+    if not raw_s:
+        return None
+    try:
+        raw = int(raw_s[-1].strip(), 0)
+    except Exception:
+        return None
+    return _decode_stm32_temperature_raw(raw)
+
+
+def read_stm32_temperature() -> float | None:
+    """Return cached STM32 temperature; probe CDC at most once per cache interval."""
+    now = time.time()
+    cached_ts = float(_STM32_TEMP_CACHE.get("ts", 0.0) or 0.0)
+    cached_value = _STM32_TEMP_CACHE.get("value")
+    if (now - cached_ts) < STM32_TEMP_CACHE_S:
+        return cached_value if isinstance(cached_value, (int, float)) else None
+
+    if not _STM32_TEMP_LOCK.acquire(blocking=False):
+        return cached_value if isinstance(cached_value, (int, float)) else None
+    try:
+        now = time.time()
+        cached_ts = float(_STM32_TEMP_CACHE.get("ts", 0.0) or 0.0)
+        cached_value = _STM32_TEMP_CACHE.get("value")
+        if (now - cached_ts) < STM32_TEMP_CACHE_S:
+            return cached_value if isinstance(cached_value, (int, float)) else None
+        value = _query_stm32_temperature_cdc()
+        _STM32_TEMP_CACHE.update({"ts": time.time(), "value": value})
+        return value
+    finally:
+        _STM32_TEMP_LOCK.release()
+
+
+def render_portal_page(
+    hostname: str,
+    session_username: str = "",
+    session_role: str = "user",
+    notice: str = "",
+    notice_kind: str = "ok",
+    request_host: str = "",
+) -> bytes:
     title = html.escape(hostname)
+    rpi_identity_text = html.escape(format_rpi_identity(detect_rpi_identity()))
+    initial_device_cache = _read_device_state_cache(max_age_s=24 * 60 * 60)
+    stm32_identity_text = html.escape(format_stm32_identity(_stm32_identity_from_cache(initial_device_cache)))
     signed_in_as = html.escape(session_username)
     access_label = "Engineering access" if session_role == "engineer" else "User access"
     cfg = load_dc_config()
+    tag_cfg = load_tag_detection_config()
+    tag_enabled0_checked = " checked" if tag_cfg["enabled0"] else ""
+    tag_enabled1_checked = " checked" if tag_cfg["enabled1"] else ""
+    tag_auto0_checked = " checked" if tag_cfg["auto0"] else ""
+    tag_auto1_checked = " checked" if tag_cfg["auto1"] else ""
+    tag_threshold0_readonly = " readonly" if tag_cfg["auto0"] else ""
+    tag_threshold1_readonly = " readonly" if tag_cfg["auto1"] else ""
+    tag_confirm0_options = "\n".join(
+        f'<option value="{i}"{" selected" if int(tag_cfg["confirm0"]) == i else ""}>{i}</option>'
+        for i in range(1, 7)
+    )
+    tag_confirm1_options = "\n".join(
+        f'<option value="{i}"{" selected" if int(tag_cfg["confirm1"]) == i else ""}>{i}</option>'
+        for i in range(1, 7)
+    )
+    tag_threshold0_value = f'{float(tag_cfg["threshold0"]):.1f}'
+    tag_threshold1_value = f'{float(tag_cfg["threshold1"]):.1f}'
+    core_oscilloscope_url = "/portal-oscilloscope"
     portal_auth = load_portal_auth_config()
     portal_username = html.escape(portal_auth["username"])
     hotspot_cfg = detect_hotspot_connection()
     hotspot_ssid = html.escape(hotspot_cfg.get("ssid") or hotspot_cfg.get("connection_id") or "BMI30-Hotspot")
     hotspot_profile = html.escape(hotspot_cfg.get("connection_id") or "NetworkManager")
     config_payload = _load_config_json()
-    split_active = load_bmi30_split_active_env()
-    core_versions = list_bmi30_core_versions()
-    active_core_note = ""
-    try:
-        active_core_path = _repo_relative_path(split_active.get("BMI30_CORE_PATH", "host/BMI30.001.py"))
-    except ValueError as exc:
-        active_core_path = "host/BMI30.001.py"
-        active_core_note = f" Saved Core path in env is invalid: {exc}"
-    core_version_paths = {item["path"] for item in core_versions}
-    if core_versions:
-        core_options_parts = []
-        if active_core_path not in core_version_paths:
-            core_options_parts.append(
-                f'<option value="{html.escape(active_core_path, quote=True)}" selected>{html.escape(os.path.basename(active_core_path))} (saved, unavailable)</option>'
-            )
-        core_options_parts.extend(
-            f'<option value="{html.escape(item["path"], quote=True)}"{" selected" if item["path"] == active_core_path else ""}>{html.escape(item["name"])}</option>'
-            for item in core_versions
-        )
-        core_options = "".join(core_options_parts)
-    else:
-        core_options = '<option value="">No service-compatible Core versions found</option>'
-    core_select_disabled = "" if core_versions else " disabled"
-    active_core_label = html.escape(os.path.basename(active_core_path))
-    active_core_rel = html.escape(active_core_path)
-    active_core_notice = html.escape(active_core_note)
     wifi_meta_raw = config_payload.get("wifi_internet")
     wifi_meta = wifi_meta_raw if isinstance(wifi_meta_raw, dict) else {}
     wifi_active = detect_wifi_internet_connection(WIFI_STA_IFACE)
@@ -3183,6 +3635,21 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     else:
         temp_metrics = ('<div class="metric"><span>Temperature</span><strong data-sensor="rpi-cpu">N/A</strong></div>'
                         '<div class="metric"><span>STM32</span><strong data-sensor="stm32-temp">---</strong></div>')
+    device_sensor_metrics = (
+        '<div class="metric"><span>Last device update</span><strong data-sensor-text="device-cache">---</strong></div>'
+        '<div class="metric"><span>Local optic</span><strong data-sensor-text="local-optic">---</strong></div>'
+        '<div class="sensor-list sensor-list-block" data-sensor-list="stm32-raw-sensors"></div>'
+        '<div class="sensor-list sensor-list-block" data-sensor-list="rpi-hwmon"></div>'
+    )
+    operation_optic_metrics = (
+        '<div class="sensor-list" data-sensor-list="optic-sensors"></div>'
+    )
+    group_rs485_metrics = (
+        '<div class="metric"><span>Last status update</span><strong data-sensor-text="group-cache">---</strong></div>'
+        '<div class="metric"><span>Local RS485 D1</span><strong data-sensor-text="local-detadc1">---</strong></div>'
+        '<div class="metric"><span>Local RS485 D2</span><strong data-sensor-text="local-detadc2">---</strong></div>'
+        '<div class="sensor-list" data-sensor-list="remote-sensors"></div>'
+    )
     remote_desktop = load_remote_desktop_config()
     remote_username = html.escape(str(remote_desktop["username"]))
     remote_password_state = "Saved" if remote_desktop.get("password_saved") else "Current system password"
@@ -3234,7 +3701,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             f'      <button class="pdf-btn" data-action="next-page" title="Next page">Next →</button>'
             f'      <div class="pdf-actions">'
             f'        <a class="pdf-btn pdf-dl-btn" href="/portal-doc-download?doc={doc_id}">↓ PDF</a>'
-            f'        <button class="pdf-update-btn" data-action="apply-update" data-doc="{doc_id}" hidden>↑ Обновить</button>'
+            f'        <button class="pdf-update-btn" data-action="apply-update" data-doc="{doc_id}" hidden>↑ Update</button>'
             f'        <span class="pdf-check-status" data-doc-status="{doc_id}"></span>'
             f'      </div>'
             f'    </div>'
@@ -3343,7 +3810,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       }}
     }}
     *{{box-sizing:border-box;margin:0;padding:0}}
-    body{{min-height:100vh;padding:clamp(18px,3vw,30px);display:grid;place-items:center;
+    body{{min-height:100vh;width:100%;padding:clamp(12px,2vw,28px);display:block;
           background:
             linear-gradient(135deg,var(--accent-soft) 0%,transparent 36%),
             linear-gradient(315deg,var(--warm) 0%,transparent 40%),
@@ -3354,8 +3821,8 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
           background-image:linear-gradient(var(--grid-line) 1px,transparent 1px),linear-gradient(90deg,var(--grid-line) 1px,transparent 1px);
           background-size:56px 56px;mask-image:linear-gradient(180deg,rgba(0,0,0,.70),rgba(0,0,0,.18) 78%,transparent);
           -webkit-mask-image:linear-gradient(180deg,rgba(0,0,0,.70),rgba(0,0,0,.18) 78%,transparent)}}
-    .panel{{position:relative;overflow:visible;width:min(100%,1180px);background:var(--panel);
-            border:1px solid var(--line);border-radius:8px;padding:clamp(22px,4vw,42px);
+    .panel{{position:relative;overflow:visible;width:100%;max-width:none;min-width:0;background:var(--panel);
+            border:1px solid var(--line);border-radius:8px;padding:clamp(18px,2.4vw,38px);
             box-shadow:var(--panel-shadow);backdrop-filter:blur(18px) saturate(1.24);
             -webkit-backdrop-filter:blur(18px) saturate(1.24)}}
     .panel::before{{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;
@@ -3375,26 +3842,43 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     p{{font-size:16px;line-height:1.6;color:var(--muted);max-width:34rem}}
     .session-tag{{display:inline-flex;align-items:center;gap:8px;margin:0 0 14px;padding:8px 12px;border-radius:999px;
                   background:var(--accent-soft);color:var(--text);font-size:12px;font-weight:600}}
+    .portal-side{{display:grid;justify-items:end;align-content:start;gap:8px;max-width:min(760px,100%);min-width:min(360px,100%)}}
     .session-block{{display:grid;justify-items:end;align-content:start;gap:8px;max-width:min(540px,100%)}}
     .session-notice-slot{{width:min(540px,100%);min-height:0}}
     .session-notice-slot .notice{{margin:0}}
     .session-notice-slot .notice-error{{margin:0}}
-    .host{{display:inline-block;margin-top:8px;font-family:ui-monospace,"SFMono-Regular",Consolas,monospace;color:var(--text)}}
-    .portal-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:22px}}
-    .portal-title{{min-width:240px}}
-    .portal-shell{{display:grid;grid-template-columns:minmax(190px,240px) minmax(0,1fr);gap:20px;align-items:start}}
+    .device-identity{{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:5px 14px;margin-top:8px;
+                      font-family:ui-monospace,"SFMono-Regular",Consolas,monospace;color:var(--text);
+                      font-size:13px;line-height:1.35;max-width:min(520px,100%)}}
+    .device-meta{{display:grid;grid-template-columns:max-content minmax(0,max-content);justify-content:end;gap:3px 10px;margin:0;
+                  font-family:ui-monospace,"SFMono-Regular",Consolas,monospace;font-size:12px;line-height:1.25;
+                  max-width:min(760px,100%);text-align:left}}
+    .device-meta .identity-label{{font-size:14px}}
+    .device-meta .identity-value{{max-width:min(620px,52vw)}}
+    .identity-label{{align-self:baseline;color:var(--accent);font-size:16px;font-weight:900;text-transform:uppercase;letter-spacing:0}}
+    .identity-value{{min-width:0;color:var(--muted);overflow-wrap:anywhere}}
+    .identity-device-value{{color:var(--text);font-size:16px;font-weight:900}}
+    .portal-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:22px;min-width:0}}
+    .portal-title{{min-width:min(240px,100%)}}
+    @media (max-width:720px){{
+      .portal-side,.session-block{{justify-items:start;min-width:0;width:100%}}
+      .device-meta{{justify-content:start;max-width:100%}}
+      .device-meta .identity-value{{max-width:100%}}
+    }}
+    .portal-shell{{display:grid;grid-template-columns:minmax(190px,260px) minmax(0,1fr);gap:clamp(14px,1.7vw,28px);align-items:start;min-width:0}}
     .portal-menu{{display:grid;gap:8px;position:sticky;top:18px}}
     .menu-btn{{width:100%;min-height:44px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg);
                color:var(--text);font:inherit;font-weight:700;text-align:left;padding:10px 12px;cursor:pointer;
-               display:flex;align-items:center;gap:10px;transition:background-color .14s ease,border-color .14s ease,transform .14s ease}}
+               display:flex;align-items:center;gap:10px;text-decoration:none;
+               transition:background-color .14s ease,border-color .14s ease,transform .14s ease}}
     .menu-btn:hover{{background:var(--accent-soft);border-color:var(--accent)}}
     .menu-btn[aria-selected="true"]{{background:var(--accent-soft);border-color:var(--accent);transform:translateY(1px);box-shadow:inset 0 2px 6px rgba(0,0,0,.12),inset 0 0 0 1px var(--accent)}}
     .menu-index{{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;
                  background:var(--panel);border:1px solid var(--line);font-size:12px;color:var(--accent);flex:0 0 auto}}
-    .portal-content{{min-width:0}}
+    .portal-content{{min-width:0;width:100%}}
     .portal-panel{{display:none}}
     .portal-panel.is-active{{display:block}}
-    .summary-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:18px}}
+    .summary-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:12px;margin-top:18px}}
     .summary-item{{border-top:1px solid var(--line);padding-top:12px}}
     .metric{{display:flex;align-items:baseline;justify-content:space-between;gap:12px;border-top:1px solid var(--line);
              padding:11px 0;color:var(--text)}}
@@ -3418,6 +3902,12 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     #panel-antenna .metric{{padding:7px 0;gap:18px}}
     #panel-antenna .metric span{{font-size:12px;line-height:1.2}}
     #panel-antenna .metric strong{{font-size:14px;line-height:1.2;min-width:78px;text-align:right}}
+    #panel-antenna .sensor-list,#panel-operation .sensor-list,#panel-group .sensor-list{{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}}
+    #panel-antenna .sensor-list-block{{padding-top:8px;border-top:1px solid var(--line)}}
+    #panel-antenna .sensor-chip,#panel-operation .sensor-chip,#panel-group .sensor-chip{{display:inline-flex;align-items:center;gap:5px;max-width:100%;
+      border:1px solid var(--line);border-radius:6px;background:var(--note-bg);
+      color:var(--text);font-size:11px;line-height:1.2;padding:5px 7px;overflow-wrap:anywhere}}
+    #panel-antenna .sensor-chip b,#panel-operation .sensor-chip b,#panel-group .sensor-chip b{{font-size:11px;color:var(--accent)}}
     .security-note{{display:none;margin-top:18px;border:1px solid var(--note-border);background:var(--note-bg);
                     color:var(--note-text);border-radius:8px;padding:12px 14px;font-size:12px;line-height:1.55;
                     box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
@@ -3425,19 +3915,30 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     .config-form{{display:grid;gap:18px;margin-top:18px}}
     .section{{border-top:1px solid var(--line);padding-top:18px}}
     .section h2{{font-size:17px;line-height:1.25;margin-bottom:10px}}
-    .mode-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}}
+    .mode-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,150px),1fr));gap:8px}}
     .mode-option{{display:flex;align-items:center;justify-content:center;min-height:48px;border:1px solid var(--line);
                   border-radius:8px;background:var(--note-bg);cursor:pointer;font-weight:700;color:var(--text)}}
     .mode-option input{{position:absolute;opacity:0;pointer-events:none}}
     .mode-option:has(input:checked){{border-color:var(--accent);background:var(--accent-soft);box-shadow:inset 0 0 0 1px var(--accent)}}
-    .fields{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}
+    .fields{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:12px}}
     .field{{display:grid;gap:6px}}
     .field span{{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:700;color:var(--text)}}
     .field input,.field select{{width:100%;min-height:42px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg);
                   color:var(--text);font:inherit;padding:9px 11px;box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
     .field select{{appearance:auto}}
     .field small{{font-size:12px;line-height:1.45;color:var(--muted)}}
-    .privacy-status-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:0 0 14px}}
+    .tag-settings{{width:100%;border-collapse:collapse;margin-top:14px;border-top:1px solid var(--line)}}
+    .tag-settings th,.tag-settings td{{padding:12px 10px;border-bottom:1px solid var(--line);vertical-align:middle;text-align:left}}
+    .tag-settings th{{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}}
+    .tag-settings .tag-desc{{width:48%;min-width:220px;color:var(--text)}}
+    .tag-settings .tag-desc small{{display:block;margin-top:3px;color:var(--muted);font-size:12px;line-height:1.4}}
+    .tag-settings .tag-channel{{width:26%;text-align:center}}
+    .tag-control{{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:42px}}
+    .tag-control input[type="checkbox"]{{width:16px;height:16px;accent-color:var(--accent)}}
+    .tag-control input[type="number"],.tag-control select{{width:min(100%,120px);min-height:40px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg);
+                  color:var(--text);font:inherit;padding:8px 10px;box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
+    .tag-control input[readonly]{{opacity:.46;cursor:not-allowed}}
+    .privacy-status-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,170px),1fr));gap:10px;margin:0 0 14px}}
     .privacy-status{{border:1px solid var(--line);border-radius:8px;background:var(--note-bg);padding:11px 12px;
                      box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
     .privacy-status h3{{margin:0 0 8px;font-size:14px;display:flex;align-items:center;justify-content:space-between;gap:8px}}
@@ -3454,7 +3955,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     .privacy-form h3{{margin-bottom:0}}
     .privacy-toggle{{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;color:var(--muted);cursor:pointer}}
     .privacy-toggle input{{width:16px;height:16px;accent-color:var(--accent)}}
-    .privacy-fields{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;align-items:end}}
+    .privacy-fields{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));gap:10px;align-items:end}}
     .privacy-fields .field input,.privacy-fields .field select{{min-height:40px}}
     .privacy-action{{align-self:end}}
     .privacy-action .actions{{margin-top:0}}
@@ -3536,6 +4037,16 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       html[data-ui-style="neumorph"] .menu-btn[aria-selected="true"]{{box-shadow:inset 4px 4px 8px var(--neumo-lo),inset -4px -4px 8px var(--neumo-hi)}}
       .summary-grid{{grid-template-columns:1fr}}
       .mode-grid,.fields{{grid-template-columns:1fr}}
+      .tag-settings,.tag-settings tbody,.tag-settings tr,.tag-settings td{{display:block;width:100%}}
+      .tag-settings thead{{display:none}}
+      .tag-settings tr{{padding:10px 0;border-bottom:1px solid var(--line)}}
+      .tag-settings th,.tag-settings td{{border-bottom:none;padding:7px 4px}}
+      .tag-settings .tag-desc{{min-width:0;width:100%;font-weight:700}}
+      .tag-settings .tag-channel{{width:100%;text-align:left}}
+      .tag-settings .tag-channel::before{{display:block;margin-bottom:4px;color:var(--muted);font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.04em}}
+      .tag-settings .tag-channel:nth-child(2)::before{{content:"Upper Channel"}}
+      .tag-settings .tag-channel:nth-child(3)::before{{content:"Lower Channel"}}
+      .tag-control{{justify-content:flex-start}}
       .privacy-status-grid{{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}}
       .privacy-status{{padding:8px 7px}}
       .privacy-status h3{{font-size:12px}}
@@ -3550,6 +4061,15 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       .privacy-title-actions{{gap:6px}}
       .privacy-title-actions .link{{min-height:30px;padding:5px 8px;font-size:11px}}
       .scroll-top-btn{{right:8px;bottom:8px}}
+    }}
+    @media (max-width:560px){{
+      .portal-title{{min-width:0;width:100%}}
+      .session-block{{justify-items:start;width:100%;max-width:none}}
+      .session-tag{{width:100%;justify-content:flex-start;white-space:normal}}
+      .privacy-status-grid,.privacy-fields{{grid-template-columns:1fr}}
+      .privacy-title-row{{display:grid;gap:8px}}
+      .actions{{width:100%}}
+      .actions .link{{width:100%}}
     }}
     .pdf-viewer{{display:block;position:relative}}
         .pdf-controls{{display:flex;align-items:center;justify-content:space-between;gap:10px;
@@ -3613,11 +4133,19 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       <div class="portal-title">
         <p class="eyebrow">BMI30 Management Portal</p>
         <h1>Device Control</h1>
-        <p><span class="host">Device: {title}</span></p>
+        <p class="device-identity">
+          <span class="identity-label">Device</span><strong class="identity-value identity-device-value">{title}</strong>
+        </p>
       </div>
-      <div class="session-block">
-        <p class="session-tag">Signed in as {signed_in_as or "authorized user"} · {access_label}</p>
-        <div class="session-notice-slot">{notice_html}</div>
+      <div class="portal-side">
+        <p class="device-meta">
+          <span class="identity-label">RPI</span><span class="identity-value">{rpi_identity_text}</span>
+          <span class="identity-label">STM32</span><span class="identity-value" data-sensor-text="header-stm32">{stm32_identity_text}</span>
+        </p>
+        <div class="session-block">
+          <p class="session-tag">Signed in as {signed_in_as or "authorized user"} · {access_label}</p>
+          <div class="session-notice-slot">{notice_html}</div>
+        </div>
       </div>
     </div>
     <div class="portal-shell">
@@ -3631,60 +4159,82 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
         <button class="menu-btn" type="button" data-panel="statistics" aria-selected="false" title="Shows runtime counters, detection history, communication quality, and service statistics."><span class="menu-index">7</span>Statistics</button>
         <button class="menu-btn" type="button" data-panel="documentation" aria-selected="false"><span class="menu-index">8</span>Documentation</button>
         <button class="menu-btn" type="button" data-panel="about" aria-selected="false" title="Shows device identity, firmware version, host software version, serial number, and hardware info."><span class="menu-index">9</span>About Device</button>
+        <a class="menu-btn" href="{core_oscilloscope_url}" target="_blank" rel="noopener noreferrer" title="Open BMI30 core oscilloscope page in a new tab."><span class="menu-index">10</span>Oscilloscope</a>
         <a class="menu-btn" href="/portal-logout" aria-label="Sign Out"><span class="menu-index" aria-hidden="true">&#x21AA;</span>Sign Out</a>
       </nav>
       <div class="portal-content">
         <section class="portal-panel is-active" id="panel-antenna">
           <div class="summary-grid">
-            <div class="summary-item"><h3>Signal</h3><div class="metric"><span>Level</span><strong data-bmi30="level">---</strong></div><div class="metric"><span>Thresholds</span><strong data-bmi30="thresholds">---</strong></div></div>
-            <div class="summary-item"><h3>Sensors</h3>{temp_metrics}<div class="metric"><span>Optic active</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Device</h3><div class="metric"><span>Stream</span><strong data-bmi30="stream">---</strong></div><div class="metric"><span>DC mode</span><strong>{html.escape(str(cfg['mode']))}</strong></div></div>
+            <div class="summary-item"><h3>Signal</h3><div class="metric"><span>TX</span><strong data-sensor-text="local-tx">---</strong></div><div class="metric"><span>Level</span><strong>---</strong></div><div class="metric"><span>Noise</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Sensors</h3>{temp_metrics}{device_sensor_metrics}</div>
+            <div class="summary-item"><h3>Device</h3><div class="metric"><span>Stream</span><strong>---</strong></div><div class="metric"><span>DC mode</span><strong>{html.escape(str(cfg['mode']))}</strong></div></div>
           </div>
         </section>
         <section class="portal-panel" id="panel-detection">
-          <div class="summary-grid">
-            <div class="summary-item"><h3>Algorithm</h3><div class="metric"><span>Selected</span><strong data-bmi30="mode">---</strong></div></div>
-            <div class="summary-item"><h3>Tag Type</h3><div class="metric"><span>Current</span><strong data-bmi30="detector">---</strong></div></div>
-            <div class="summary-item"><h3>Thresholds</h3><div class="metric"><span>Ratio</span><strong data-bmi30="ratio">---</strong></div></div>
-          </div>
+          <form class="config-form" method="post" action="/portal-tag-detection-config">
+            <div class="section">
+              <h2>Channel Decision Settings</h2>
+              <table class="tag-settings">
+                <thead>
+                  <tr>
+                    <th class="tag-desc">Parameter</th>
+                    <th class="tag-channel">Upper Channel</th>
+                    <th class="tag-channel">Lower Channel</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="tag-desc">Detection channel enable<small>Disabled channels do not participate in the tag decision.</small></td>
+                    <td class="tag-channel">
+                      <label class="tag-control"><input type="hidden" name="enabled0" value="0"><input type="checkbox" name="enabled0" value="1"{tag_enabled0_checked}>Enabled</label>
+                    </td>
+                    <td class="tag-channel">
+                      <label class="tag-control"><input type="hidden" name="enabled1" value="0"><input type="checkbox" name="enabled1" value="1"{tag_enabled1_checked}>Enabled</label>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td class="tag-desc">Detection confirmations<small>Number of detections before accepting the decision. Range 1-6, default 2.</small></td>
+                    <td class="tag-channel"><label class="tag-control"><select name="confirm0">{tag_confirm0_options}</select></label></td>
+                    <td class="tag-channel"><label class="tag-control"><select name="confirm1">{tag_confirm1_options}</select></label></td>
+                  </tr>
+                  <tr>
+                    <td class="tag-desc">Automatic threshold<small>When enabled, the manual threshold field is inactive.</small></td>
+                    <td class="tag-channel">
+                      <label class="tag-control"><input type="hidden" name="auto0" value="0"><input type="checkbox" name="auto0" value="1" data-tag-auto="upper"{tag_auto0_checked}>Auto</label>
+                    </td>
+                    <td class="tag-channel">
+                      <label class="tag-control"><input type="hidden" name="auto1" value="0"><input type="checkbox" name="auto1" value="1" data-tag-auto="lower"{tag_auto1_checked}>Auto</label>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td class="tag-desc">Manual trigger threshold<small>Range 1.0-4.0 with 0.1 step.</small></td>
+                    <td class="tag-channel"><label class="tag-control"><input name="threshold0" data-tag-threshold="upper" type="number" min="1" max="4" step="0.1" value="{tag_threshold0_value}"{tag_threshold0_readonly}></label></td>
+                    <td class="tag-channel"><label class="tag-control"><input name="threshold1" data-tag-threshold="lower" type="number" min="1" max="4" step="0.1" value="{tag_threshold1_value}"{tag_threshold1_readonly}></label></td>
+                  </tr>
+                </tbody>
+              </table>
+              <p class="notice">Upper and Lower channels are independent. Shared detector behavior remains controlled by the core service and DC compensation settings.</p>
+            </div>
+            <div class="actions actions-inline">
+              <button class="link" type="submit" name="apply" value="1">Save and Apply to Core</button>
+              <button class="link link-secondary" type="submit" name="apply" value="0">Save Only</button>
+            </div>
+          </form>
         </section>
         <section class="portal-panel" id="panel-operation">
           <div class="summary-grid">
-            <div class="summary-item"><h3>Radar</h3><div class="metric"><span>Connection</span><strong data-bmi30="connection">---</strong></div></div>
-            <div class="summary-item"><h3>Transmission</h3><div class="metric"><span>Work time</span><strong data-bmi30="uptime">---</strong></div></div>
-            <div class="summary-item"><h3>Profile</h3><div class="metric"><span>Active</span><strong data-bmi30="profile">---</strong></div></div>
+            <div class="summary-item"><h3>Radar</h3><div class="metric"><span>Connection</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Transmission</h3><div class="metric"><span>Work time</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Profile</h3><div class="metric"><span>Active</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Optic</h3>{operation_optic_metrics}</div>
           </div>
-          <div class="actions actions-inline bmi30-controls">
-            <button class="link" type="button" data-bmi30-cmd="mode" data-idx="3">Mode 3</button>
-            <button class="link" type="button" data-bmi30-cmd="mode" data-idx="5">Mode 5</button>
-            <button class="link" type="button" data-bmi30-cmd="mode" data-idx="6">Mode 6</button>
-            <button class="link link-secondary" type="button" data-bmi30-cmd="start">Start</button>
-            <button class="link link-secondary" type="button" data-bmi30-cmd="stop">Stop</button>
-            <button class="link link-secondary" type="button" data-bmi30-cmd="reconnect">Reconnect</button>
-          </div>
-          <form class="config-form" method="post" action="/portal-core-version-config">
-            <div class="section">
-              <h3>Core service version</h3>
-              <div class="fields">
-                <label class="field">
-                  <span>Active Core</span>
-                  <select name="core_path"{core_select_disabled}>{core_options}</select>
-                </label>
-                <div class="metric"><span>Saved</span><strong>{active_core_label}</strong></div>
-              </div>
-              <p class="notice">Current active path: {active_core_rel}. GUI debug versions are selected from the terminal task menu.{active_core_notice}</p>
-            </div>
-            <div class="actions actions-inline">
-              <button class="link" type="submit" name="apply" value="1"{core_select_disabled}>Save and Restart Core</button>
-              <button class="link link-secondary" type="submit" name="apply" value="0"{core_select_disabled}>Save Only</button>
-            </div>
-          </form>
         </section>
         <section class="portal-panel" id="panel-group">
           <div class="summary-grid">
             <div class="summary-item"><h3>Role</h3><div class="metric"><span>Mode</span><strong>---</strong></div></div>
             <div class="summary-item"><h3>Sync</h3><div class="metric"><span>Status</span><strong>---</strong></div></div>
             <div class="summary-item"><h3>Peers</h3><div class="metric"><span>Count</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>RS485 Status</h3>{group_rs485_metrics}</div>
           </div>
         </section>
         <section class="portal-panel" id="panel-dc">
@@ -3966,6 +4516,19 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
       }});
     }});
     setActivePanel((window.location.hash || '#antenna').slice(1), false);
+    function updateTagThresholdInputs() {{
+      ['upper', 'lower'].forEach(function (name) {{
+        var auto = document.querySelector('[data-tag-auto="' + name + '"]');
+        var input = document.querySelector('[data-tag-threshold="' + name + '"]');
+        if (auto && input) {{
+          input.readOnly = !!auto.checked;
+        }}
+      }});
+    }}
+    Array.prototype.slice.call(document.querySelectorAll('[data-tag-auto]')).forEach(function (el) {{
+      el.addEventListener('change', updateTagThresholdInputs);
+    }});
+    updateTagThresholdInputs();
     var docTabs = Array.prototype.slice.call(document.querySelectorAll('.doc-tab'));
     var docPages = Array.prototype.slice.call(document.querySelectorAll('.doc-page'));
     function setDocPage(name) {{
@@ -4047,97 +4610,249 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
     }}
     updateConnectionCounts();
     window.setInterval(updateConnectionCounts, 5000);
-    // --- Sensor polling (panel-antenna only) ---
+    // --- Sensor/status polling from local event cache only ---
     var _activePanel = (window.location.hash || '#antenna').slice(1);
     var _sensorEls = {{}};
+    var _sensorTextEls = {{}};
+    var _sensorListEls = {{}};
     document.querySelectorAll('[data-sensor]').forEach(function (el) {{
       _sensorEls[el.getAttribute('data-sensor')] = el;
+    }});
+    document.querySelectorAll('[data-sensor-text]').forEach(function (el) {{
+      _sensorTextEls[el.getAttribute('data-sensor-text')] = el;
+    }});
+    document.querySelectorAll('[data-sensor-list]').forEach(function (el) {{
+      _sensorListEls[el.getAttribute('data-sensor-list')] = el;
     }});
     function _updateSensorEl(key, value) {{
       var el = _sensorEls[key];
       if (!el) {{ return; }}
       el.textContent = (value !== null && value !== undefined) ? value.toFixed(1) + '\u00b0C' : '---';
     }}
+    function _updateSensorTextEl(key, value) {{
+      var el = _sensorTextEls[key];
+      if (!el) {{ return; }}
+      el.textContent = (value !== null && value !== undefined && value !== '') ? String(value) : '---';
+    }}
+    function _formatBool(value) {{
+      if (value === true) {{ return 'ON'; }}
+      if (value === false) {{ return 'off'; }}
+      return '---';
+    }}
+    function _formatCacheAge(age) {{
+      if (typeof age !== 'number' || !isFinite(age)) {{ return ''; }}
+      var rounded = Math.max(0, Math.round(age));
+      if (rounded < 90) {{ return String(rounded) + 's ago'; }}
+      if (rounded < 5400) {{ return String(Math.round(rounded / 60)) + 'm ago'; }}
+      return String(Math.round(rounded / 3600)) + 'h ago';
+    }}
+    function _formatClock(ts) {{
+      if (typeof ts !== 'number' || !isFinite(ts) || ts <= 0) {{ return ''; }}
+      try {{
+        return new Date(ts * 1000).toLocaleTimeString([], {{hour:'2-digit', minute:'2-digit', second:'2-digit'}});
+      }} catch (error) {{
+        return '';
+      }}
+    }}
+    function _formatLastDeviceUpdate(device) {{
+      device = device || {{}};
+      var service = device.service || {{}};
+      var source = device.source || '';
+      var evt = (device.evt1 && device.evt1.last) ? device.evt1.last : null;
+      var eventNames = {{
+        0: 'FW_INFO',
+        1: 'TEMP_C',
+        2: 'MCU_ADC',
+        16: 'OPTIC_STATE',
+        17: 'SYNC_STATE',
+        18: 'MODE_STATE',
+        19: 'ERROR_STATE'
+      }};
+      var label = 'event-cache';
+      if (source === 'bulk_evt1') {{
+        label = 'EVT1';
+        if (evt && eventNames[evt.event_type]) {{
+          label += ' ' + eventNames[evt.event_type];
+        }}
+        if (evt && evt.event_seq !== null && evt.event_seq !== undefined) {{
+          label += ' #' + String(evt.event_seq);
+        }}
+      }} else if (source === 'bulk_stat') {{
+        label = 'STAT event';
+      }} else if (source === 'ep0_stat') {{
+        label = 'STAT baseline';
+      }} else if (source) {{
+        label = source;
+      }}
+      var age = _formatCacheAge(device.age_s);
+      var clock = _formatClock(device.updated_at);
+      if (service.event_lag) {{
+        var lag = _formatCacheAge(service.last_evt1_age_s || service.event_lag_age_s || device.age_s);
+        return 'service lag' + (lag ? ', EVT1 ' + lag : '');
+      }}
+      var parts = [label];
+      if (age) {{ parts.push(age); }}
+      if (clock) {{ parts.push(clock); }}
+      if (device.stale) {{
+        return 'stale' + (age ? ', ' + age : '');
+      }}
+      return device.available ? parts.join(', ') : '---';
+    }}
+    function _eventAgeLabel(device, key) {{
+      device = device || {{}};
+      var updates = device.event_updates || {{}};
+      var item = updates[key] || {{}};
+      var ts = item.updated_at;
+      if (typeof ts !== 'number' || !isFinite(ts) || ts <= 0) {{ return ''; }}
+      return _formatCacheAge((Date.now() / 1000) - ts);
+    }}
+    function _formatStm32Identity(device) {{
+      device = device || {{}};
+      var identity = device.identity || {{}};
+      var events = device.events || {{}};
+      var info = identity.stm32 || events.fw_info || null;
+      if (!info) {{ return '---'; }}
+      var uid = info.uid96_words || info.uid96 || '';
+      var buildDate = info.build_date || '';
+      var buildTime = info.build_time || '';
+      var firmware = [buildDate, buildTime].filter(Boolean).join(' ');
+      if (!firmware) {{ firmware = info.fw_version || ''; }}
+      var parts = [];
+      if (uid) {{ parts.push(String(uid)); }}
+      if (firmware) {{ parts.push('FW ' + String(firmware)); }}
+      return parts.length ? parts.join(' / ') : '---';
+    }}
+    function _setRemoteSensors(items) {{
+      var el = _sensorListEls['remote-sensors'];
+      if (!el) {{ return; }}
+      el.textContent = '';
+      if (!items || !items.length) {{
+        var empty = document.createElement('span');
+        empty.className = 'sensor-chip';
+        empty.textContent = 'Remote: ---';
+        el.appendChild(empty);
+        return;
+      }}
+      items.forEach(function (item) {{
+        var chip = document.createElement('span');
+        chip.className = 'sensor-chip';
+        var node = document.createElement('b');
+        node.textContent = 'N' + String(item.node_id || item.selector || '?');
+        chip.appendChild(node);
+        chip.appendChild(document.createTextNode(
+          ' O:' + _formatBool(item.optic_active) +
+          ' D1:' + _formatBool(item.detadc1) +
+          ' D2:' + _formatBool(item.detadc2)
+        ));
+        el.appendChild(chip);
+      }});
+    }}
+    function _formatReadingValue(item) {{
+      if (!item) {{ return '---'; }}
+      var value = item.value;
+      if (value === null || value === undefined || value === '') {{
+        value = item.raw;
+      }}
+      if (value === null || value === undefined || value === '') {{ return '---'; }}
+      var suffix = item.unit ? ' ' + item.unit : '';
+      return String(value) + suffix;
+    }}
+    function _setSensorChips(listKey, title, items) {{
+      var el = _sensorListEls[listKey];
+      if (!el) {{ return; }}
+      el.textContent = '';
+      var head = document.createElement('span');
+      head.className = 'sensor-chip';
+      var titleEl = document.createElement('b');
+      titleEl.textContent = title;
+      head.appendChild(titleEl);
+      if (!items || !items.length) {{
+        head.appendChild(document.createTextNode(' ---'));
+        el.appendChild(head);
+        return;
+      }}
+      el.appendChild(head);
+      items.forEach(function (item) {{
+        var chip = document.createElement('span');
+        chip.className = 'sensor-chip';
+        if (item.path) {{ chip.title = item.path; }}
+        var label = document.createElement('b');
+        label.textContent = item.label || item.key || '?';
+        chip.appendChild(label);
+        chip.appendChild(document.createTextNode(' ' + _formatReadingValue(item)));
+        el.appendChild(chip);
+      }});
+    }}
+    function _stm32RawSensorItems(device) {{
+      var events = (device && device.events) ? device.events : {{}};
+      var mcu = events.mcu_adc || {{}};
+      var items = [];
+      function add(label, value, unit) {{
+        if (value !== null && value !== undefined && value !== '') {{
+          items.push({{label: label, value: value, unit: unit || ''}});
+        }}
+      }}
+      add('mcu_ver', mcu.payload_version, '');
+      add('mcu_flags', mcu.flags, '');
+      add('VDDA', mcu.vdda_mv, 'mV');
+      add('VBAT', mcu.vbat_mv, 'mV');
+      add('raw_temp', mcu.raw_temp, '');
+      add('raw_vrefint', mcu.raw_vrefint, '');
+      add('raw_vbat', mcu.raw_vbat, '');
+      add('mcu_adc_age', _eventAgeLabel(device, 'mcu_adc'), '');
+      return items;
+    }}
+    function _opticSensorItems(device) {{
+      var events = (device && device.events) ? device.events : {{}};
+      var optic = events.optic_state || {{}};
+      var items = [];
+      function add(label, value, unit) {{
+        if (value !== null && value !== undefined && value !== '') {{
+          items.push({{label: label, value: value, unit: unit || ''}});
+        }}
+      }}
+      add('optic_ver', optic.payload_version, '');
+      add('optic_flags', optic.flags, '');
+      add('optic_active', optic.optic_active, '');
+      add('optic_power', optic.optic_power, '');
+      add('optic_hold_ds', optic.optic_hold_ds, 'ds');
+      add('led_pattern', optic.led_pattern, '');
+      add('optic_age', _eventAgeLabel(device, 'optic_state'), '');
+      return items;
+    }}
+    function _updateDeviceSensors(device) {{
+      device = device || {{}};
+      var local = device.local || {{}};
+      var events = device.events || {{}};
+      var optic = events.optic_state || {{}};
+      var updateText = _formatLastDeviceUpdate(device);
+      _updateSensorTextEl('device-cache', updateText);
+      _updateSensorTextEl('group-cache', updateText);
+      _updateSensorTextEl('local-optic', _formatBool(local.optic_active));
+      _updateSensorTextEl('local-detadc1', _formatBool(local.detadc1));
+      _updateSensorTextEl('local-detadc2', _formatBool(local.detadc2));
+      _updateSensorTextEl('local-tx', _formatBool(local.tx_enabled !== undefined ? local.tx_enabled : optic.tx_enabled));
+      _updateSensorTextEl('header-stm32', _formatStm32Identity(device));
+      _setRemoteSensors(device.remote || []);
+      _setSensorChips('stm32-raw-sensors', 'STM32 raw', _stm32RawSensorItems(device));
+      _setSensorChips('optic-sensors', 'Optic raw', _opticSensorItems(device));
+    }}
     function _pollSensors() {{
-      if (_activePanel !== 'antenna') {{ return; }}
+      if (_activePanel !== 'antenna' && _activePanel !== 'operation' && _activePanel !== 'group') {{ return; }}
       fetch('/api/sensors?v=' + Date.now(), {{ cache: 'no-store' }})
         .then(function (r) {{ return r.ok ? r.json() : null; }})
         .then(function (data) {{
           if (!data) {{ return; }}
           var rpi = data.rpi || {{}};
           Object.keys(rpi).forEach(function (k) {{ _updateSensorEl('rpi-' + k, rpi[k]); }});
-          if (data.stm32 !== null && data.stm32 !== undefined) {{
-            _updateSensorEl('stm32-temp', data.stm32);
-          }}
+          _updateSensorEl('stm32-temp', data.stm32);
+          _updateDeviceSensors(data.device || {{}});
+          _setSensorChips('rpi-hwmon', 'RPI hwmon', data.rpi_hwmon || []);
         }})
         .catch(function () {{}});
     }}
     _pollSensors();
-    window.setInterval(_pollSensors, 5000);
-    // --- BMI30 core service polling and controls ---
-    var _bmi30Els = {{}};
-    document.querySelectorAll('[data-bmi30]').forEach(function (el) {{
-      _bmi30Els[el.getAttribute('data-bmi30')] = el;
-    }});
-    function _setBmi30(key, value) {{
-      var el = _bmi30Els[key];
-      if (el) {{ el.textContent = value; }}
-    }}
-    function _fmtAge(seconds) {{
-      if (seconds === null || seconds === undefined) {{ return '---'; }}
-      var s = Math.max(0, Number(seconds) || 0);
-      if (s < 60) {{ return s.toFixed(1) + 's'; }}
-      return Math.floor(s / 60) + 'm ' + Math.floor(s % 60) + 's';
-    }}
-    function _pollBmi30() {{
-      if (!Object.keys(_bmi30Els).length) {{ return; }}
-      fetch('/api/bmi30/status?v=' + Date.now(), {{ cache: 'no-store' }})
-        .then(function (r) {{ return r.ok ? r.json() : null; }})
-        .then(function (data) {{
-          if (!data) {{ return; }}
-          if (!data.ok) {{
-            _setBmi30('connection', 'service offline');
-            _setBmi30('stream', 'offline');
-            return;
-          }}
-          var conn = data.connection || {{}};
-          var mode = data.mode || {{}};
-          var det = data.detector || {{}};
-          var service = data.service || {{}};
-          var connected = conn.connected ? 'connected' : (conn.connecting ? 'connecting' : 'offline');
-          _setBmi30('connection', connected);
-          _setBmi30('stream', (mode.base_buf_len || 0) + ' samples, age ' + _fmtAge(conn.last_frame_age_s));
-          _setBmi30('mode', 'mode ' + (mode.selected || 0) + ', stream ' + (mode.stream_mode || 0));
-          _setBmi30('detector', (det.active ? 'active' : 'idle') + ' hold ' + (det.hold0 ? '1' : '0') + '/' + (det.hold1 ? '1' : '0'));
-          _setBmi30('ratio', Number(mode.det_ratio || 0).toFixed(1));
-          _setBmi30('level', (det.lvl0 || 0) + ' / ' + (det.lvl1 || 0));
-          _setBmi30('thresholds', (det.thr0 || 0) + ' / ' + (det.thr1 || 0));
-          _setBmi30('uptime', _fmtAge(service.uptime_s));
-          _setBmi30('profile', (mode.freq_hz || mode.desired_freq || 0) + ' Hz, avg ' + (mode.avg_n || 0));
-        }})
-        .catch(function () {{
-          _setBmi30('connection', 'service offline');
-          _setBmi30('stream', 'offline');
-        }});
-    }}
-    document.querySelectorAll('[data-bmi30-cmd]').forEach(function (btn) {{
-      btn.addEventListener('click', function () {{
-        var action = btn.getAttribute('data-bmi30-cmd') || '';
-        var params = {{}};
-        if (btn.hasAttribute('data-idx')) {{ params.idx = Number(btn.getAttribute('data-idx')); }}
-        btn.disabled = true;
-        fetch('/api/bmi30/command', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ action: action, params: params }})
-        }})
-          .then(function () {{ window.setTimeout(_pollBmi30, 350); }})
-          .catch(function () {{}})
-          .finally(function () {{ btn.disabled = false; }});
-      }});
-    }});
-    _pollBmi30();
-    window.setInterval(_pollBmi30, 2000);
+    window.setInterval(_pollSensors, {SENSOR_REFRESH_S * 1000});
     // patch setActivePanel to track current panel
     var _origSetActivePanel = setActivePanel;
     setActivePanel = function (name, updateHash) {{
@@ -4310,15 +5025,15 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             }}
             if (statusEl) {{
               if (data && !data.online) {{
-                statusEl.textContent = 'Нет интернета';
+                statusEl.textContent = 'Offline';
               }} else {{
-                statusEl.textContent = 'Проверено только что';
+                statusEl.textContent = 'Checked just now';
               }}
             }}
           }})
           .catch(function() {{
             var statusEl = document.querySelector('[data-doc-status="' + docId + '"]');
-            if (statusEl) {{ statusEl.textContent = 'Ошибка проверки'; }}
+            if (statusEl) {{ statusEl.textContent = 'Check failed'; }}
           }});
       }}
 
@@ -4327,7 +5042,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
         button.classList.add('is-loading');
         button.disabled = true;
         var oldText = button.textContent;
-        button.textContent = 'Обновление...';
+        button.textContent = 'Updating...';
 
         fetch('/portal-pdf-refresh?doc=' + encodeURIComponent(docId))
           .then(function(response) {{
@@ -4339,7 +5054,7 @@ def render_portal_page(hostname: str, session_username: str = "", session_role: 
             loadPdf(docId);
           }})
           .catch(function() {{
-            button.textContent = 'Ошибка обновления';
+            button.textContent = 'Update failed';
             window.setTimeout(function() {{
               button.textContent = oldText;
             }}, 1800);
@@ -4569,16 +5284,12 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
         # Checkbox + hidden fallback fields submit duplicate keys; use the last value.
         return {key: values[-1] if values else "" for key, values in parsed.items()}
 
-    def _read_json_body(self) -> dict[str, Any]:
+    def _read_raw_post_body(self) -> bytes:
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             content_length = 0
-        raw = self.rfile.read(max(0, min(content_length, 1024 * 1024)))
-        if not raw:
-            return {}
-        payload = json.loads(raw.decode("utf-8", errors="replace") or "{}")
-        return payload if isinstance(payload, dict) else {}
+        return self.rfile.read(max(content_length, 0))
 
     def _read_cookie(self, name: str) -> str:
         raw_cookie = self.headers.get("Cookie", "")
@@ -4624,6 +5335,88 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             ),
             status=HTTPStatus.SEE_OTHER,
         )
+
+    def _require_portal_session(self) -> dict[str, Any] | None:
+        session = self._get_portal_session()
+        if session is None:
+            self._send_redirect(
+                self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
+                set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
+            )
+            return None
+        remember_portal_client(self.client_address[0] if self.client_address else "")
+        return session
+
+    def _rewrite_core_html_for_portal(self, payload: bytes) -> bytes:
+        text = payload.decode("utf-8", errors="replace")
+        replacements = {
+            "'/api/status'": "'/portal-core/api/status'",
+            '"/api/status"': '"/portal-core/api/status"',
+            "'/api/command'": "'/portal-core/api/command'",
+            '"/api/command"': '"/portal-core/api/command"',
+            "'/api/frame?": "'/portal-core/api/frame?",
+            '"/api/frame?': '"/portal-core/api/frame?',
+        }
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        return text.encode("utf-8")
+
+    def _proxy_core_request(self, send_body: bool, method: str = "GET", body: bytes | None = None) -> None:
+        path = self.path.split("?", 1)[0]
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        if path == "/portal-core":
+            core_path = "/"
+        elif path.startswith("/portal-core/"):
+            core_path = "/" + path[len("/portal-core/"):]
+        else:
+            core_path = "/"
+        url = f"{CORE_SERVICE_URL}{core_path}"
+        if query:
+            url = f"{url}?{query}"
+        headers = {"Accept": self.headers.get("Accept", "*/*")}
+        content_type = self.headers.get("Content-Type")
+        if content_type:
+            headers["Content-Type"] = content_type
+        try:
+            request = Request(url, data=body if method.upper() != "GET" else None, headers=headers, method=method.upper())
+            with urlopen(request, timeout=4.0) as response:
+                payload = response.read()
+                response_type = response.headers.get("Content-Type", "application/octet-stream")
+                status = HTTPStatus(response.status)
+        except Exception as exc:
+            payload = json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8")
+            response_type = "application/json; charset=utf-8"
+            status = HTTPStatus.BAD_GATEWAY
+        self.send_response(status)
+        self.send_header("Content-Type", response_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if send_body:
+            self.wfile.write(payload)
+
+    def _send_portal_oscilloscope(self, send_body: bool) -> None:
+        if self._require_portal_session() is None:
+            return
+        try:
+            with urlopen(f"{CORE_SERVICE_URL}/", timeout=4.0) as response:
+                payload = self._rewrite_core_html_for_portal(response.read())
+        except Exception as exc:
+            payload = (
+                "<!doctype html><html><head><meta charset=\"utf-8\">"
+                "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                "<title>BMI30 Oscilloscope</title></head><body>"
+                "<h1>BMI30 Oscilloscope</h1>"
+                f"<p>Unable to contact BMI30 core service: {html.escape(str(exc))}</p>"
+                "</body></html>"
+            ).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if send_body:
+            self.wfile.write(payload)
 
     def _handle_request(self, send_body: bool) -> None:
         path = self.path.split("?", 1)[0]
@@ -4700,34 +5493,24 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
                 self.wfile.write(payload)
             return
 
+        if path == "/portal-oscilloscope":
+            self._send_portal_oscilloscope(send_body)
+            return
+
+        if path.startswith("/portal-core/") or path == "/portal-core":
+            if self._require_portal_session() is None:
+                return
+            self._proxy_core_request(send_body, method="GET")
+            return
+
         # JSON API
         if path == "/api/status":
             if self._get_portal_session() is not None:
                 remember_portal_client(self.client_address[0] if self.client_address else "")
             data = collect_remote_access_targets(preferred_ip=preferred_ip)
-            data["bmi30"] = bmi30_service_status()
             payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            if send_body:
-                self.wfile.write(payload)
-            return
-
-        if path == "/api/bmi30/status":
-            session = self._get_portal_session()
-            if session is None:
-                self.send_response(HTTPStatus.FORBIDDEN)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                return
-            remember_portal_client(self.client_address[0] if self.client_address else "")
-            data = bmi30_service_status()
-            payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             if send_body:
@@ -4743,7 +5526,15 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
                 return
             rpi_temps = _read_rpi_temperatures()
             rpi_data = {lbl.lower(): round(t, 1) for lbl, t in rpi_temps}
-            sensors_data: dict = {"rpi": rpi_data, "stm32": None}
+            rpi_hwmon = _read_rpi_hwmon_readings()
+            device_cache = _read_device_state_cache()
+            stm32_temp = _device_cache_temperature(device_cache)
+            sensors_data: dict = {
+                "rpi": rpi_data,
+                "rpi_hwmon": rpi_hwmon,
+                "stm32": round(stm32_temp, 1) if isinstance(stm32_temp, (int, float)) else None,
+                "device": _device_cache_sensors(device_cache),
+            }
             payload = json.dumps(sensors_data, ensure_ascii=False).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -4782,6 +5573,13 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             if query.get("error", [""])[0] == "1":
                 notice = "DC configuration saved, but the device did not accept the live apply. Check USB connection and try again."
                 notice_kind = "error"
+            if query.get("tag_saved", [""])[0] == "1":
+                notice = "Tag Detection settings saved."
+            if query.get("tag_applied", [""])[0] == "1":
+                notice = "Tag Detection settings saved and sent to BMI30 core."
+            if query.get("tag_error", [""])[0] == "1":
+                notice = "Tag Detection settings saved, but BMI30 core did not accept the live apply. Check core service and try again."
+                notice_kind = "error"
             if query.get("account", [""])[0] == "1":
                 notice = "Portal login and password saved."
             if query.get("hotspot", [""])[0] == "1":
@@ -4794,13 +5592,6 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
                 notice = "Remote desktop RDP/VNC login saved."
             if query.get("channel", [""])[0] == "1":
                 notice = "Communication channel permission saved."
-            if query.get("core_saved", [""])[0] == "1":
-                notice = "Core service version saved."
-            if query.get("core_restarted", [""])[0] == "1":
-                notice = "Core service version saved and restarted."
-            if query.get("core_error", [""])[0] == "1":
-                notice = query.get("message", ["Unable to save Core service version."])[0][:240]
-                notice_kind = "error"
             if query.get("privacy_error", [""])[0] == "1":
                 notice = query.get("message", ["Unable to save privacy settings."])[0][:240]
                 notice_kind = "error"
@@ -4810,6 +5601,7 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
                 session_role=str(session.get("r", "user")),
                 notice=notice,
                 notice_kind=notice_kind,
+                request_host=self.headers.get("Host", ""),
             )
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -5081,78 +5873,10 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
-        if path == "/api/bmi30/command":
-            session = self._get_portal_session()
-            if session is None:
-                self.send_response(HTTPStatus.FORBIDDEN)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+        if path.startswith("/portal-core/") or path == "/portal-core":
+            if self._require_portal_session() is None:
                 return
-            try:
-                payload = self._read_json_body()
-                action = str(payload.get("action") or "")
-                params = payload.get("params")
-                if not isinstance(params, dict):
-                    params = {k: v for k, v in payload.items() if k not in {"action", "params"}}
-                result = bmi30_service_command(action, params)
-                body = json.dumps(result, ensure_ascii=False).encode("utf-8")
-                self.send_response(HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_GATEWAY)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception as exc:
-                body = json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8")
-                self.send_response(HTTPStatus.BAD_REQUEST)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            return
-
-        if path == "/portal-core-version-config":
-            session = self._get_portal_session()
-            if session is None:
-                self._send_redirect(
-                    self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
-                    status=HTTPStatus.SEE_OTHER,
-                    set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
-                )
-                return
-
-            form = self._read_post_form()
-            core_path = form.get("core_path", "").strip()
-            apply_now = form.get("apply", "1").strip().lower() not in {"0", "false", "off", "no"}
-            try:
-                save_bmi30_core_version(core_path)
-                if apply_now:
-                    ok, message = _systemctl("restart", "bmi30-core.service", timeout=25.0)
-                    if not ok:
-                        self._send_redirect(
-                            self._absolute_url(
-                                f"/portal?core_error=1&message={quote((message or 'Unable to restart Core service')[:240])}#operation",
-                                scheme=self._preferred_scheme(),
-                            ),
-                            status=HTTPStatus.SEE_OTHER,
-                        )
-                        return
-                    suffix = "core_restarted=1"
-                else:
-                    suffix = "core_saved=1"
-            except Exception as exc:
-                self._send_redirect(
-                    self._absolute_url(
-                        f"/portal?core_error=1&message={quote(str(exc)[:240])}#operation",
-                        scheme=self._preferred_scheme(),
-                    ),
-                    status=HTTPStatus.SEE_OTHER,
-                )
-                return
-            self._send_redirect(
-                self._absolute_url(f"/portal?{suffix}#operation", scheme=self._preferred_scheme()),
-                status=HTTPStatus.SEE_OTHER,
-            )
+            self._proxy_core_request(True, method="POST", body=self._read_raw_post_body())
             return
 
         if path == "/portal-account-config":
@@ -5337,6 +6061,49 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/portal-tag-detection-config":
+            session = self._get_portal_session()
+            if session is None:
+                self._send_redirect(
+                    self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
+                    status=HTTPStatus.SEE_OTHER,
+                    set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
+                )
+                return
+
+            form = self._read_post_form()
+            cfg = tag_detection_config_from_form(form)
+            try:
+                save_tag_detection_config(cfg)
+            except Exception:
+                payload = render_portal_page(
+                    collect_remote_access_targets(preferred_ip=extract_request_host_ip(self.headers.get("Host", "")))["hostname"],
+                    session_username=str(session.get("u", "")),
+                    session_role=str(session.get("r", "user")),
+                    notice="Unable to save Tag Detection settings.",
+                    notice_kind="error",
+                    request_host=self.headers.get("Host", ""),
+                )
+                self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
+            apply_now = form.get("apply", "1").strip().lower() not in {"0", "false", "off", "no"}
+            if apply_now:
+                ok, _message = apply_tag_detection_config_to_core(cfg)
+                suffix = "?tag_applied=1#detection" if ok else "?tag_error=1#detection"
+            else:
+                suffix = "?tag_saved=1#detection"
+            self._send_redirect(
+                self._absolute_url(f"/portal{suffix}", scheme=self._preferred_scheme()),
+                status=HTTPStatus.SEE_OTHER,
+            )
+            return
+
         if path == "/portal-dc-config":
             session = self._get_portal_session()
             if session is None:
@@ -5358,6 +6125,7 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
                     session_role=str(session.get("r", "user")),
                     notice="Unable to save DC configuration.",
                     notice_kind="error",
+                    request_host=self.headers.get("Host", ""),
                 )
                 self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
                 self.send_header("Content-Type", "text/html; charset=utf-8")

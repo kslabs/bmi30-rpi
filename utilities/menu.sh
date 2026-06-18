@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 WORKSPACE_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+BMI30_CORE_SERVICE="${BMI30_CORE_SERVICE:-bmi30-core.service}"
 
 pause_menu() {
     printf "\nНажмите Enter, чтобы вернуться в меню..."
@@ -22,9 +23,108 @@ run_action() {
     fi
 }
 
+bmi30_core_state_text() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        printf "systemctl недоступен"
+        return 0
+    fi
+
+    local state
+    state="$(systemctl is-active "$BMI30_CORE_SERVICE" 2>&1 || true)"
+    case "$state" in
+        *"Failed to connect"*|*"System has not been booted"*|*"Host is down"*)
+            printf "systemd недоступен"
+            ;;
+        active)
+            printf "запущено"
+            ;;
+        inactive)
+            printf "остановлено"
+            ;;
+        activating)
+            printf "запускается"
+            ;;
+        deactivating)
+            printf "останавливается"
+            ;;
+        failed)
+            printf "ошибка"
+            ;;
+        unknown|"")
+            if systemctl cat "$BMI30_CORE_SERVICE" >/dev/null 2>&1; then
+                printf "неизвестно"
+            else
+                printf "сервис не найден"
+            fi
+            ;;
+        *)
+            printf "%s" "$state"
+            ;;
+    esac
+}
+
+bmi30_core_enabled_text() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local enabled
+    enabled="$(systemctl is-enabled "$BMI30_CORE_SERVICE" 2>/dev/null || true)"
+    case "$enabled" in
+        enabled)
+            printf "автозапуск включен"
+            ;;
+        disabled)
+            printf "автозапуск выключен"
+            ;;
+        static|generated|indirect|alias)
+            printf "%s" "$enabled"
+            ;;
+        ""|not-found|*"Failed to connect"*|*"System has not been booted"*|*"Host is down"*)
+            ;;
+        *)
+            printf "%s" "$enabled"
+            ;;
+    esac
+}
+
+show_bmi30_core_status() {
+    local state_text enabled_text
+    state_text="$(bmi30_core_state_text)"
+    enabled_text="$(bmi30_core_enabled_text)"
+
+    printf "Автономное ядро BMI30: %s" "$state_text"
+    if [[ -n "$enabled_text" ]]; then
+        printf " / %s" "$enabled_text"
+    fi
+    printf " (%s)\n" "$BMI30_CORE_SERVICE"
+}
+
+run_core_service_action() {
+    local title="$1"
+    local action="$2"
+
+    run_action "$title" sudo systemctl "$action" "$BMI30_CORE_SERVICE"
+    printf "\n"
+    show_bmi30_core_status
+}
+
+show_core_service_details() {
+    show_bmi30_core_status
+    printf "\n"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 0
+    fi
+
+    systemctl --no-pager --full status "$BMI30_CORE_SERVICE" || true
+}
+
 show_menu() {
     printf "\nBMI30 Utilities Menu\n"
     printf "===================\n"
+    show_bmi30_core_status
+    printf "\n"
     printf "1. Проверить источник загрузки\n"
     printf "2. Проверить BOOT_ORDER загрузчика\n"
     printf "3. Сделать USB приоритетом загрузки\n"
@@ -38,8 +138,12 @@ show_menu() {
     printf "11. Открыть README утилит\n"
     printf "12. Задеплоить hotspot_info_server.py (обновить страницу)\n"
     printf "13. Сделать backup сейчас в облако\n"
-    printf "16. Синхронизировать проект сейчас\n"
-    printf "18. Проверить статус cloud sync\n"
+    printf "14. Меню версий автономного ядра BMI30\n"
+    printf "15. Запустить автономное ядро BMI30\n"
+    printf "16. Остановить автономное ядро BMI30\n"
+    printf "17. Синхронизировать проект сейчас\n"
+    printf "18. Показать подробный статус автономного ядра BMI30\n"
+    printf "19. Проверить статус cloud sync\n"
     printf "0. Выход\n"
 }
 
@@ -89,10 +193,22 @@ while true; do
         13)
             run_action "Backup проекта в облако" bash "$SCRIPT_DIR/backup_to_cloud.sh"
             ;;
+        14)
+            run_action "Меню версий автономного ядра BMI30" bash "$WORKSPACE_DIR/switch_bmi30_core_versions.sh"
+            ;;
+        15)
+            run_core_service_action "Запуск автономного ядра BMI30" start
+            ;;
         16)
+            run_core_service_action "Остановка автономного ядра BMI30" stop
+            ;;
+        17)
             run_action "Синхронизация проекта" bash "$SCRIPT_DIR/cloud_sync_now.sh" --today-only
             ;;
         18)
+            run_action "Статус автономного ядра BMI30" show_core_service_details
+            ;;
+        19)
             run_action "Статус backup" bash "$SCRIPT_DIR/backup_status.sh"
             ;;
         0|q|Q|exit)

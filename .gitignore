@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+
+*.log
+out.log
+status.json
+
+*.npz
+*.npz.bak
+host/bmi30_faults.log
+host/bmi30_sel.json
+
+backups/
+test_logs/
+.bmi30_cloud_sync/
+
+.vscode/launch.json
+.vscode/settings.json
+
+*.tmp
+*.bak
+*.codex-broken-backup-*
+*.restore-backup-*
+
+udo netstat -tulpn | grep -E ":80|:443"
