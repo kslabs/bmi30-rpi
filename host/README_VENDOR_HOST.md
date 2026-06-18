@@ -627,12 +627,13 @@ dev.write(EP_OUT, bytes([0x2B]), timeout=1000)
 
 ## 7. Быстрые команды для host-скриптов
 
-Версии автономного ядра BMI30
-- В VS Code: `Terminal -> Run Task -> Выбор версий BMI30 ядра`.
-- Текущее ядро сохранено как `host/BMI30.001.py.2026-06-17-yesterday`.
-- Рабочая копия на сегодня: `host/BMI30.001.py.2026-06-18-today`.
-- Автозапуск `bmi30-core.service` сейчас смотрит на сегодняшнюю копию через `host/bmi30_split_active_version.env`.
-- В этом же меню есть запуск, остановка, перезапуск и подробный статус работающего ядра.
+Версии BMI30 split-системы
+- В VS Code: `Terminal -> Run Task -> Выбор версий BMI30 split-системы`.
+- Вчерашняя split-версия сохранена как core-файл `host/BMI30.001.py.2026-06-17-yesterday`.
+- Рабочая split-версия на сегодня: `BMI30 split 2026-06-18-today` с core-файлом `host/BMI30.001.py.2026-06-18-today`.
+- Активная/autostart версия хранится в `host/bmi30_split_active_version.env` вместе с core/gui/web путями.
+- Портал показывает активную split-версию в шапке, разделе About и JSON API `/api/status`.
+- В этом же меню есть запуск, остановка, перезапуск и подробный статус работающей split-системы.
 
 Основной reader
 - python HostTools/vendor_stream_read.py --vid 0xCAFE --pid 0x4001 --intf 2 --ep-in 0x83 --ep-out 0x03 --profile 2 --block-hz 200 --frame-samples 10 --frames 80 --ab-strict

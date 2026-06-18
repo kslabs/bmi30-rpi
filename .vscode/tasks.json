@@ -71,11 +71,11 @@
 			"problemMatcher": []
 		},
 		{
-			"label": "Выбор версий BMI30 ядра",
+			"label": "Выбор версий BMI30 split-системы",
 			"type": "shell",
 			"command": "bash",
 			"args": [
-				"${workspaceFolder}/switch_bmi30_core_versions.sh"
+				"${workspaceFolder}/switch_bmi30_split_versions.sh"
 			],
 			"presentation": {
 				"echo": false,

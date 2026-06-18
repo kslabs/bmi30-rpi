@@ -611,6 +611,143 @@ def _format_active_app_version(path: str) -> str:
     return " ".join(name.split())
 
 
+def _natural_version_key(value: str) -> list[Any]:
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", value)]
+
+
+def _unique_existing_text_paths(paths: tuple[str, ...]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for raw_path in paths:
+        path = str(raw_path or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        unique.append(path)
+    return unique
+
+
+def _bmi30_project_roots() -> tuple[str, ...]:
+    script_dir = os.path.abspath(os.path.dirname(__file__))
+    return (
+        "/home/techaid/Documents",
+        script_dir,
+        os.path.dirname(script_dir),
+    )
+
+
+def _resolve_project_path(path: str) -> str:
+    path = str(path or "").strip()
+    if not path:
+        return ""
+    if os.path.isabs(path):
+        return path
+    for root in _bmi30_project_roots():
+        candidate = os.path.join(root, path)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(_bmi30_project_roots()[0], path)
+
+
+def _split_active_env_candidates() -> list[str]:
+    return _unique_existing_text_paths((
+        os.getenv("BMI30_SPLIT_ACTIVE_ENV", ""),
+        "/home/techaid/Documents/host/bmi30_split_active_version.env",
+        os.path.join(os.path.dirname(__file__), "host", "bmi30_split_active_version.env"),
+        "/usr/local/bin/host/bmi30_split_active_version.env",
+    ))
+
+
+def _find_latest_split_core_path() -> str:
+    candidates: list[pathlib.Path] = []
+    for root in _bmi30_project_roots():
+        host_dir = pathlib.Path(root) / "host"
+        if not host_dir.is_dir():
+            continue
+        candidates.extend(path for path in host_dir.glob("BMI30.001.py.*") if path.is_file())
+    if not candidates:
+        return ""
+    latest = sorted(candidates, key=lambda path: _natural_version_key(path.name))[-1]
+    try:
+        return str(latest.relative_to(pathlib.Path("/home/techaid/Documents")))
+    except ValueError:
+        return str(latest)
+
+
+def _split_version_from_core_path(path: str) -> str:
+    name = os.path.basename(str(path or "").strip())
+    if not name:
+        return ""
+    if name == "BMI30.001.py":
+        return "dev-current"
+    if name.startswith("BMI30.001.py."):
+        return name[len("BMI30.001.py."):]
+    match = re.search(r"(\d{4}-\d{2}-\d{2}(?:-[A-Za-z0-9_.-]+)?)", name)
+    if match:
+        return match.group(1)
+    return name
+
+
+def _format_split_system_label(version: str, core_path: str = "") -> str:
+    version = str(version or "").strip()
+    if not version:
+        version = _split_version_from_core_path(core_path)
+    if not version:
+        return ""
+    return f"BMI30 split {version}"
+
+
+def detect_bmi30_split_system_version() -> dict[str, str]:
+    env_path = ""
+    data: dict[str, str] = {}
+    for candidate in _split_active_env_candidates():
+        candidate_data = _read_key_value_file(candidate)
+        if candidate_data:
+            env_path = candidate
+            data = candidate_data
+            break
+
+    version = os.getenv("BMI30_SPLIT_VERSION", "").strip() or data.get("BMI30_SPLIT_VERSION", "").strip()
+    label = os.getenv("BMI30_SPLIT_LABEL", "").strip() or data.get("BMI30_SPLIT_LABEL", "").strip()
+    selected_by = os.getenv("BMI30_SPLIT_SELECTED_BY", "").strip() or data.get("BMI30_SPLIT_SELECTED_BY", "").strip()
+    selected_at = os.getenv("BMI30_SPLIT_SELECTED_AT", "").strip() or data.get("BMI30_SPLIT_SELECTED_AT", "").strip()
+    core_path = os.getenv("BMI30_CORE_PATH", "").strip() or data.get("BMI30_CORE_PATH", "").strip()
+    gui_path = os.getenv("BMI30_GUI_PATH", "").strip() or data.get("BMI30_GUI_PATH", "").strip()
+    portal_path = os.getenv("BMI30_PORTAL_PATH", "").strip() or data.get("BMI30_PORTAL_PATH", "").strip()
+    service_url = os.getenv("BMI30_SERVICE_URL", "").strip() or data.get("BMI30_SERVICE_URL", "").strip() or CORE_SERVICE_URL
+
+    source = selected_by or ("env" if env_path else "")
+    if core_path and not os.path.exists(_resolve_project_path(core_path)):
+        source = "auto-latest-fallback"
+        core_path = ""
+
+    if not core_path:
+        latest_core = _find_latest_split_core_path()
+        if latest_core:
+            core_path = latest_core
+            source = source or "auto-latest-fallback"
+
+    if not version:
+        version = _split_version_from_core_path(core_path)
+    if not label:
+        label = _format_split_system_label(version, core_path)
+    if not source:
+        source = "unknown"
+
+    return {
+        "version": version or "",
+        "label": label or "",
+        "selected_by": selected_by or source,
+        "selected_at": selected_at or "",
+        "source": source,
+        "core_path": core_path or "",
+        "gui_path": gui_path or "",
+        "portal_path": portal_path or "",
+        "service_url": service_url,
+        "active_env": env_path,
+    }
+
+
 def detect_rpi_software_version() -> str:
     for env_name in ("BMI30_RPI_FW_VERSION", "BMI30_RPI_SOFTWARE_VERSION", "BMI30_HOST_FW_VERSION"):
         value = os.getenv(env_name, "").strip()
@@ -627,6 +764,10 @@ def detect_rpi_software_version() -> str:
     ))
     if value:
         return value.splitlines()[0].strip()
+
+    split_version = detect_bmi30_split_system_version().get("label", "").strip()
+    if split_version:
+        return split_version
 
     app_path = os.getenv("BMI30_APP_PATH", "").strip()
     if not app_path:
@@ -2827,6 +2968,7 @@ def collect_remote_access_targets(preferred_ip: str | None = None) -> dict[str, 
             break
 
     sync_mode = detect_sync_mode()
+    split_system = detect_bmi30_split_system_version()
     tagit_logo_path = detect_logo_path(TAGIT_LOGO_CANDIDATES)
     am_logo_path = detect_logo_path(AM_LOGO_CANDIDATES)
     web_scheme = "https" if is_https_enabled() and FORCE_HTTPS else "http"
@@ -2857,6 +2999,7 @@ def collect_remote_access_targets(preferred_ip: str | None = None) -> dict[str, 
         },
         "channels": load_channel_permissions(),
         "sync_mode": sync_mode,
+        "split_system": split_system,
         "logos": {
             "tagit": {
                 "available": bool(tagit_logo_path),
@@ -3573,6 +3716,11 @@ def render_portal_page(
     request_host: str = "",
 ) -> bytes:
     title = html.escape(hostname)
+    split_system = detect_bmi30_split_system_version()
+    split_system_label = html.escape(split_system.get("label") or split_system.get("version") or "---")
+    split_system_source = html.escape(split_system.get("source") or split_system.get("selected_by") or "---")
+    split_system_core = html.escape(split_system.get("core_path") or "---")
+    split_system_selected_at = html.escape(split_system.get("selected_at") or "---")
     rpi_identity_text = html.escape(format_rpi_identity(detect_rpi_identity()))
     initial_device_cache = _read_device_state_cache(max_age_s=24 * 60 * 60)
     stm32_identity_text = html.escape(format_stm32_identity(_stm32_identity_from_cache(initial_device_cache)))
@@ -4141,6 +4289,7 @@ def render_portal_page(
         <p class="device-meta">
           <span class="identity-label">RPI</span><span class="identity-value">{rpi_identity_text}</span>
           <span class="identity-label">STM32</span><span class="identity-value" data-sensor-text="header-stm32">{stm32_identity_text}</span>
+          <span class="identity-label">Split</span><span class="identity-value" data-split-version>{split_system_label}</span>
         </p>
         <div class="session-block">
           <p class="session-tag">Signed in as {signed_in_as or "authorized user"} · {access_label}</p>
@@ -4481,7 +4630,8 @@ def render_portal_page(
           <div class="summary-grid">
             <div class="summary-item"><h3>Identity</h3><div class="metric"><span>Hostname</span><strong>{title}</strong></div><div class="metric"><span>Serial</span><strong>---</strong></div></div>
             <div class="summary-item"><h3>Firmware</h3><div class="metric"><span>Version</span><strong>---</strong></div><div class="metric"><span>Build</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Host</h3><div class="metric"><span>Software</span><strong>BMI30 Portal</strong></div><div class="metric"><span>Role</span><strong>{access_label}</strong></div></div>
+            <div class="summary-item"><h3>Split System</h3><div class="metric"><span>Version</span><strong data-split-version>{split_system_label}</strong></div><div class="metric"><span>Source</span><strong data-split-source>{split_system_source}</strong></div></div>
+            <div class="summary-item"><h3>Host</h3><div class="metric"><span>Software</span><strong>BMI30 Portal</strong></div><div class="metric"><span>Role</span><strong>{access_label}</strong></div><div class="metric"><span>Core</span><strong data-split-core>{split_system_core}</strong></div><div class="metric"><span>Selected</span><strong data-split-selected-at>{split_system_selected_at}</strong></div></div>
           </div>
         </section>
       </div>
@@ -4604,6 +4754,19 @@ def render_portal_page(
             if (Object.prototype.hasOwnProperty.call(counts, key)) {{
               el.textContent = String(counts[key]);
             }}
+          }});
+          var split = data && data.split_system ? data.split_system : {{}};
+          document.querySelectorAll('[data-split-version]').forEach(function (el) {{
+            el.textContent = split.label || split.version || '---';
+          }});
+          document.querySelectorAll('[data-split-source]').forEach(function (el) {{
+            el.textContent = split.source || split.selected_by || '---';
+          }});
+          document.querySelectorAll('[data-split-core]').forEach(function (el) {{
+            el.textContent = split.core_path || '---';
+          }});
+          document.querySelectorAll('[data-split-selected-at]').forEach(function (el) {{
+            el.textContent = split.selected_at || '---';
           }});
         }})
         .catch(function () {{}});

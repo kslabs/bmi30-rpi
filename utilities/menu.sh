@@ -93,7 +93,7 @@ show_bmi30_core_status() {
     state_text="$(bmi30_core_state_text)"
     enabled_text="$(bmi30_core_enabled_text)"
 
-    printf "Автономное ядро BMI30: %s" "$state_text"
+    printf "BMI30 split-система: %s" "$state_text"
     if [[ -n "$enabled_text" ]]; then
         printf " / %s" "$enabled_text"
     fi
@@ -138,11 +138,11 @@ show_menu() {
     printf "11. Открыть README утилит\n"
     printf "12. Задеплоить hotspot_info_server.py (обновить страницу)\n"
     printf "13. Сделать backup сейчас в облако\n"
-    printf "14. Меню версий автономного ядра BMI30\n"
-    printf "15. Запустить автономное ядро BMI30\n"
-    printf "16. Остановить автономное ядро BMI30\n"
+    printf "14. Меню версий BMI30 split-системы\n"
+    printf "15. Запустить BMI30 split-систему\n"
+    printf "16. Остановить BMI30 split-систему\n"
     printf "17. Синхронизировать проект сейчас\n"
-    printf "18. Показать подробный статус автономного ядра BMI30\n"
+    printf "18. Показать подробный статус BMI30 split-системы\n"
     printf "19. Проверить статус cloud sync\n"
     printf "0. Выход\n"
 }
@@ -194,19 +194,19 @@ while true; do
             run_action "Backup проекта в облако" bash "$SCRIPT_DIR/backup_to_cloud.sh"
             ;;
         14)
-            run_action "Меню версий автономного ядра BMI30" bash "$WORKSPACE_DIR/switch_bmi30_core_versions.sh"
+            run_action "Меню версий BMI30 split-системы" bash "$WORKSPACE_DIR/switch_bmi30_split_versions.sh"
             ;;
         15)
-            run_core_service_action "Запуск автономного ядра BMI30" start
+            run_core_service_action "Запуск BMI30 split-системы" start
             ;;
         16)
-            run_core_service_action "Остановка автономного ядра BMI30" stop
+            run_core_service_action "Остановка BMI30 split-системы" stop
             ;;
         17)
             run_action "Синхронизация проекта" bash "$SCRIPT_DIR/cloud_sync_now.sh" --today-only
             ;;
         18)
-            run_action "Статус автономного ядра BMI30" show_core_service_details
+            run_action "Статус BMI30 split-системы" show_core_service_details
             ;;
         19)
             run_action "Статус backup" bash "$SCRIPT_DIR/backup_status.sh"
