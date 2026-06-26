@@ -29,51 +29,111 @@ load_active_env() {
     : "${BMI30_SPLIT_SELECTED_AT:=}"
 }
 
-list_split_versions() {
-    SPLIT_CORE_FILES=()
+split_core_files_oldest_first() {
+    local path files=()
 
-    local path
     for path in "$HOST_DIR"/BMI30.001.py "$HOST_DIR"/BMI30.001.py.*; do
         [[ -f "$path" ]] || continue
-        SPLIT_CORE_FILES+=("$(basename "$path")")
+        files+=("$(basename "$path")")
     done
+
+    [[ ${#files[@]} -gt 0 ]] || return 0
+    printf '%s\n' "${files[@]}" | sort -V
+}
+
+promote_active_split_version() {
+    local active_file=""
+    local core_file
+    local ordered=()
+
+    if [[ "${BMI30_CORE_PATH:-}" == host/* ]]; then
+        active_file="${BMI30_CORE_PATH#host/}"
+    fi
+
+    if [[ -z "$active_file" ]]; then
+        return 0
+    fi
+
+    for core_file in "${SPLIT_CORE_FILES[@]}"; do
+        if [[ "$core_file" == "$active_file" ]]; then
+            ordered+=("$core_file")
+            break
+        fi
+    done
+
+    if [[ ${#ordered[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    for core_file in "${SPLIT_CORE_FILES[@]}"; do
+        [[ "$core_file" == "$active_file" ]] && continue
+        ordered+=("$core_file")
+    done
+
+    SPLIT_CORE_FILES=("${ordered[@]}")
+}
+
+list_split_versions() {
+    mapfile -t SPLIT_CORE_FILES < <(split_core_files_oldest_first)
 
     if [[ ${#SPLIT_CORE_FILES[@]} -eq 0 ]]; then
         echo "Нет версий split-системы host/BMI30.001.py*"
         exit 1
     fi
 
-    mapfile -t SPLIT_CORE_FILES < <(printf '%s\n' "${SPLIT_CORE_FILES[@]}" | sort -V)
+    mapfile -t SPLIT_CORE_FILES < <(printf '%s\n' "${SPLIT_CORE_FILES[@]}" | sort -Vr)
+    promote_active_split_version
 }
 
 latest_split_core_file() {
-    list_split_versions
+    local files=()
+    mapfile -t files < <(split_core_files_oldest_first)
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo "Нет версий split-системы host/BMI30.001.py*" >&2
+        exit 1
+    fi
+
     local last_index
-    last_index=$((${#SPLIT_CORE_FILES[@]} - 1))
-    printf '%s\n' "${SPLIT_CORE_FILES[$last_index]}"
+    last_index=$((${#files[@]} - 1))
+    printf '%s\n' "${files[$last_index]}"
 }
 
 split_version_from_core_file() {
     local core_file="$1"
+    local date_part time_part core_path
 
-    if [[ "$core_file" == "BMI30.001.py" ]]; then
-        printf '%s\n' "dev-current"
-        return 0
+    core_path="$HOST_DIR/$core_file"
+    if [[ "$core_file" =~ ([0-9]{4}-[0-9]{2}-[0-9]{2}) ]]; then
+        date_part="${BASH_REMATCH[1]}"
+    elif [[ -f "$core_path" ]]; then
+        date_part="$(date -r "$core_path" '+%Y-%m-%d')"
+    else
+        date_part="$(date '+%Y-%m-%d')"
     fi
 
-    printf '%s\n' "${core_file#BMI30.001.py.}"
+    if [[ -f "$core_path" ]]; then
+        time_part="$(date -r "$core_path" '+%H%M')"
+    else
+        time_part="$(date '+%H%M')"
+    fi
+
+    printf '%s-%s\n' "$date_part" "$time_part"
 }
 
 split_label_from_core_file() {
     local core_file="$1"
-    local version
-    version="$(split_version_from_core_file "$core_file")"
+    local version date_part time_part
 
-    if [[ "$version" == "dev-current" ]]; then
-        printf '%s\n' "BMI30 split dev-current"
-    else
-        printf '%s\n' "BMI30 split $version"
+    version="$(split_version_from_core_file "$core_file")"
+    if [[ "$version" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})-([0-9]{2})([0-9]{2})$ ]]; then
+        date_part="${BASH_REMATCH[1]}"
+        time_part="${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
+        printf '%s %s\n' "$date_part" "$time_part"
+        return 0
     fi
+
+    printf '%s\n' "$version"
 }
 
 save_active_split() {
@@ -250,12 +310,6 @@ split_label_suffix() {
     local core_file="$1"
     local latest="$2"
     local suffix=""
-
-    if [[ "$core_file" == "BMI30.001.py.2026-06-17-yesterday" ]]; then
-        suffix+="  [вчерашнее]"
-    elif [[ "$core_file" == "BMI30.001.py.2026-06-18-today" ]]; then
-        suffix+="  [сегодняшнее]"
-    fi
 
     if [[ "host/$core_file" == "$BMI30_CORE_PATH" ]]; then
         suffix+="  [active]"
