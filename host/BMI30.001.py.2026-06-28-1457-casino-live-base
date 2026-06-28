@@ -202,17 +202,25 @@ def _apply_default_dc_config(scope: Any, mode: int | None = None, reason: str = 
             fast_settle_s = active_settle_s
             fast_duration_s = active_settle_s
     try:
+        fast_duration_wire_s = float(fast_duration_s)
+        if int(mode_value) == 2:
+            fast_duration_wire_s = max(float(fast_duration_wire_s), float(active_settle_s))
         stream.set_dc_config_seconds(
             mode=mode_value,
             work_settle_s=float(cfg["work_settle_s"]),
             detect_settle_s=float(cfg["detect_settle_s"]),
             fast_settle_s=fast_settle_s,
-            fast_duration_s=fast_duration_s,
+            fast_duration_s=fast_duration_wire_s,
         )
+        try:
+            if hasattr(scope, "_device_set_dc_adapt"):
+                scope._device_set_dc_adapt(True)
+        except Exception:
+            pass
         print(
             f"[DC] default config applied mode={DC_MODE_NAMES.get(mode_value, mode_value)} "
             f"W={float(cfg['work_settle_s']):g}s D={float(cfg['detect_settle_s']):g}s "
-            f"F={float(cfg['fast_settle_s']):g}s active={float(active_settle_s):g}s "
+            f"F={float(cfg['fast_settle_s']):g}s active={float(active_settle_s):g}s wire_start={float(fast_duration_wire_s):g}s "
             f"profile={profile_name} reason={reason}",
             flush=True,
         )
