@@ -416,10 +416,16 @@ class USBStream:
         except Exception:
             self.ignore_ready_flags = True
         try:
-            # По умолчанию разрешаем рестарт, чтобы удерживать поток длительно
+            # Общий флаг рестарта; фактический локальный recovery ниже по умолчанию выключен.
             self.disable_restart = str(os.getenv('BMI30_DISABLE_RESTART','0')).lower() not in ('0','false','no')
         except Exception:
             self.disable_restart = False
+        try:
+            # Current firmware/host policy: the GUI/upper layer owns recovery because
+            # it can take two EP0 STAT snapshots and restore the user's last mode.
+            self.local_recovery_enabled = str(os.getenv('BMI30_USBSTREAM_LOCAL_RECOVERY', '0')).lower() not in ('0', 'false', 'no')
+        except Exception:
+            self.local_recovery_enabled = False
         try:
             self.disable_cdc_kick = str(os.getenv('BMI30_DISABLE_CDC_KICK','1')).lower() not in ('0','false','no')
         except Exception:
@@ -439,7 +445,8 @@ class USBStream:
             self.keepalive_sec = _float_env('BMI30_KEEPALIVE_SEC', 1.0)
             self.restart_after = _float_env('BMI30_RESTART_AFTER', 2.5)
             self.restart_min_interval = _float_env('BMI30_RESTART_MIN_INTERVAL', 2.0)
-            self.disable_restart = False
+            if self.local_recovery_enabled:
+                self.disable_restart = False
         # функция сканирования всех интерфейсов устройства
         def scan_device(dev):
             infos=[]
@@ -652,6 +659,7 @@ class USBStream:
         self.last_restart_t = 0.0
         self._rx_flush_requested = False  # сигнал _rx_loop очистить буфер после рестарта
         self.last_stat = None
+        self.last_stat_t = 0.0
         self.last_evt1 = None
         self.device_state_cache = {}
         self.last_service_t = 0.0
@@ -775,8 +783,11 @@ class USBStream:
     # Консервативный старт: без дополнительных пинков/GET_STATUS (сделаем только по запросу)
         self.lock = threading.Lock()
         self.frames = 0; self.bytes = 0; self.crc_bad = 0; self.magic_bad = 0
+        self.last_crc_bad_info = None
+        self._crc_bad_log_count = 0
         self.test_seen = 0
         self.last_stat = getattr(self, "last_stat", None)
+        self.last_stat_t = float(getattr(self, "last_stat_t", 0.0) or 0.0)
         self.last_evt1 = getattr(self, "last_evt1", None)
         self.device_state_cache = getattr(self, "device_state_cache", {}) or {}
         self.last_err_step_pkt = None
@@ -988,6 +999,7 @@ class USBStream:
             if data is not None and len(data) > 0:
                 bs = bytes(data)
                 self.last_stat = bs
+                self.last_stat_t = time.time()
                 try:
                     patch = self._parse_stat_device_state(bs)
                     patch["source"] = "ep0_stat"
@@ -1201,6 +1213,15 @@ class USBStream:
             pass
     def _do_fallback_start(self):
         """Единовременный мягкий пинок потока, если видим только STAT/тишину."""
+        if not bool(getattr(self, 'local_recovery_enabled', False)):
+            try:
+                if not bool(getattr(self, '_local_recovery_disabled_logged', False)):
+                    print("[recovery] USBStream local fallback disabled; upper layer must fault-probe via EP0 STAT", flush=True)
+                    self._local_recovery_disabled_logged = True
+            except Exception:
+                pass
+            self._fallback_done = True
+            return
         if self._fallback_done:
             return
         try:
@@ -1935,6 +1956,7 @@ class USBStream:
             now = time.time()
             if len(bs) >= 4 and bs[:4] == b"STAT":
                 self.last_stat = bs
+                self.last_stat_t = now
                 self.last_service_t = now
                 self.service_packets = int(getattr(self, "service_packets", 0) or 0) + 1
                 self.stat_packets = int(getattr(self, "stat_packets", 0) or 0) + 1
@@ -2023,14 +2045,14 @@ class USBStream:
                 if e.errno == 110: # timeout
                     # При длительном отсутствии рабочих кадров попробуем единоразовый fallback
                     now_t = time.time()
-                    if (not self.passive_connect) and (not self._working_seen) and (not self._fallback_done) and (now_t - self.connected_t > 1.6):
+                    if bool(getattr(self, 'local_recovery_enabled', False)) and (not self.passive_connect) and (not self._working_seen) and (not self._fallback_done) and (now_t - self.connected_t > 1.6):
                         self._do_fallback_start()
                     # Keepalive/мягкий рестарт: если давно не было вообще RX
                     if (now_t - self.last_rx_t) > float(getattr(self, 'keepalive_sec', 2.0)) and (now_t - self.keepalive_last) > 0.9:
                         # EP0 keepalive, даже если bulk OUT залип
                         self._get_status_ep0()
                         self.keepalive_last = now_t
-                    if (not self.passive_connect) and (not getattr(self, 'disable_restart', False)) and (now_t - self.last_rx_t) > float(getattr(self, 'restart_after', 4.0)) and (now_t - self.last_restart_t) > float(getattr(self, 'restart_min_interval', 3.0)):
+                    if bool(getattr(self, 'local_recovery_enabled', False)) and (not self.passive_connect) and (not getattr(self, 'disable_restart', False)) and (now_t - self.last_rx_t) > float(getattr(self, 'restart_after', 4.0)) and (now_t - self.last_restart_t) > float(getattr(self, 'restart_min_interval', 3.0)):
                         try:
                             # Выполним мягкий «чистый» рестарт: STOP + очистка EP + переустановка altsetting
                             self._prepare_clean_start(stop_first=True)
@@ -2165,6 +2187,28 @@ class USBStream:
                         calc = crc16_ccitt_false(payload, calc)
                         if calc != crc16v:
                             self.crc_bad += 1
+                            self.last_crc_bad_info = {
+                                "seq": int(seq),
+                                "timestamp": int(timestamp),
+                                "adc_id": 0 if (flags & VF_ADC0) else (1 if (flags & VF_ADC1) else -1),
+                                "flags": int(flags),
+                                "samples": int(total_samples),
+                                "reserved": int(reserved),
+                                "reserved2": int(reserved2),
+                                "crc_expected": int(crc16v),
+                                "crc_calc": int(calc),
+                            }
+                            try:
+                                if int(getattr(self, '_crc_bad_log_count', 0) or 0) < int(os.getenv('BMI30_CRC_BAD_PRINT_LIMIT', '5')):
+                                    self._crc_bad_log_count = int(getattr(self, '_crc_bad_log_count', 0) or 0) + 1
+                                    print(
+                                        f"[crc_bad] seq={seq} flags=0x{int(flags)&0xFF:02X} adc={self.last_crc_bad_info['adc_id']} "
+                                        f"samples={total_samples} reserved={int(reserved)} reserved2=0x{int(reserved2)&0xFFFF:04X} "
+                                        f"calc=0x{int(calc)&0xFFFF:04X} got=0x{int(crc16v)&0xFFFF:04X}",
+                                        flush=True,
+                                    )
+                            except Exception:
+                                pass
                     except Exception:
                         # если что-то пошло не так при расчёте CRC — не мешаем потоку
                         self.crc_bad += 1
@@ -2325,7 +2369,7 @@ class USBStream:
                 self._working_seen = True
             now=time.time()
             # Если видим только STAT и нет рабочих кадров — один раз пробуем fallback
-            if (not self.passive_connect) and (not self._working_seen) and (not self._fallback_done) and (now - self.connected_t > 1.6):
+            if bool(getattr(self, 'local_recovery_enabled', False)) and (not self.passive_connect) and (not self._working_seen) and (not self._fallback_done) and (now - self.connected_t > 1.6):
                 self._do_fallback_start()
             self._maybe_report_service_lag(now)
             if now - self.stat_t >= 1.0:

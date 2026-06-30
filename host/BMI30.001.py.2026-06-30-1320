@@ -29,10 +29,30 @@ from urllib.parse import parse_qs, unquote, urlparse
 import numpy as np  # type: ignore
 
 
+_ADC_CENTER = 32768.0
+_U16_MAX = 65535.0
+_PRODUCT_FULL_SCALE = _ADC_CENTER * _ADC_CENTER
+_PRODUCT_FULLSCALE_U16_SCALE = _PRODUCT_FULL_SCALE / _U16_MAX
+
+
+def _product_default_scale() -> float:
+    return float(_PRODUCT_FULLSCALE_U16_SCALE)
+
+
+def _product_display_scale() -> float:
+    try:
+        scale = float(os.getenv("BMI30_PROD_SCALE", "") or _product_default_scale())
+    except Exception:
+        scale = _product_default_scale()
+    if not np.isfinite(scale) or scale <= 0.0:
+        scale = _product_default_scale()
+    return float(scale)
+
+
 SERVICE_VERSION = "001"
 HOST_DIR = Path(__file__).resolve().parent
 REPO_DIR = HOST_DIR.parent
-DEFAULT_ENGINE_FILE = HOST_DIR / "BMI30.200.py.2026-06-28-1457-casino-live-base"
+DEFAULT_ENGINE_FILE = HOST_DIR / "BMI30.200.py.2026-06-29-1138-dc-adapt-state-machine"
 ENGINE_FILE = Path(os.getenv("BMI30_ENGINE_SOURCE", str(DEFAULT_ENGINE_FILE))).expanduser()
 API_HOST = os.getenv("BMI30_SERVICE_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("BMI30_SERVICE_PORT", "8765"))
@@ -48,6 +68,67 @@ DC_SETTLE_MAX_S = 86400.0
 DEVICE_STATE_JSON = Path(os.getenv("BMI30_DEVICE_STATE_JSON", "/tmp/bmi30_device_state.json")).expanduser()
 DEVICE_STATE_MAX_AGE_S = max(1, int(os.getenv("BMI30_DEVICE_STATE_MAX_AGE_S", "300")))
 _LCD_SYNC_CODE_RE = re.compile(r"^[MS][0-9]{2}$")
+_QT_CALL_QUEUE: queue.Queue[Any] = queue.Queue()
+_QT_CALL_PUMP_LOCK = threading.Lock()
+_QT_CALL_PUMP_STARTED = False
+
+
+def _queue_qt_call(fn: Any) -> None:
+    try:
+        _QT_CALL_QUEUE.put(fn)
+    except Exception as exc:
+        print(f"[BMI30.001] queue Qt call failed: {exc}", flush=True)
+
+
+def _call_qt_later_s(delay_s: float, fn: Any) -> None:
+    try:
+        delay = max(0.0, float(delay_s))
+    except Exception:
+        delay = 0.0
+    if delay <= 0.0:
+        _queue_qt_call(fn)
+        return
+    try:
+        timer = threading.Timer(delay, lambda: _queue_qt_call(fn))
+        timer.daemon = True
+        timer.start()
+    except Exception:
+        _queue_qt_call(fn)
+
+
+def _start_qt_call_pump(qtcore: Any) -> None:
+    global _QT_CALL_PUMP_STARTED
+    with _QT_CALL_PUMP_LOCK:
+        if _QT_CALL_PUMP_STARTED:
+            return
+        _QT_CALL_PUMP_STARTED = True
+
+    def _pump() -> None:
+        global _QT_CALL_PUMP_STARTED
+        while True:
+            try:
+                fn = _QT_CALL_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as exc:
+                print(f"[BMI30.001] Qt queued call failed: {exc}", flush=True)
+        try:
+            qtcore.QTimer.singleShot(50, _pump)
+        except Exception as exc:
+            print(f"[BMI30.001] Qt call pump stopped: {exc}", flush=True)
+            with _QT_CALL_PUMP_LOCK:
+                _QT_CALL_PUMP_STARTED = False
+
+    try:
+        qtcore.QTimer.singleShot(50, _pump)
+    except Exception as exc:
+        print(f"[BMI30.001] Qt call pump start failed: {exc}", flush=True)
+        with _QT_CALL_PUMP_LOCK:
+            _QT_CALL_PUMP_STARTED = False
+
+
 _CONFIG_JSON_ENV = os.getenv("BMI30_CONFIG_JSON", "").strip()
 if _CONFIG_JSON_ENV:
     CONFIG_JSON = Path(_CONFIG_JSON_ENV).expanduser()
@@ -275,11 +356,6 @@ def _apply_default_dc_config(scope: Any, mode: int | None = None, reason: str = 
             fast_settle_s=float(expected["fast_settle_s"]),
             fast_duration_s=float(expected["fast_duration_s"]),
         )
-        try:
-            if hasattr(scope, "_device_set_dc_adapt"):
-                scope._device_set_dc_adapt(True)
-        except Exception:
-            pass
         print(
             f"[DC] default config applied mode={expected['mode']} "
             f"W={float(expected['config_work_settle_s']):g}s D={float(expected['config_detect_settle_s']):g}s "
@@ -859,9 +935,20 @@ class ScopeApi:
             selected = int(self.scope.num_group.checkedId())
         except Exception:
             selected = 0
-        profile = _dc_steady_profile_for_mode(selected)
+        try:
+            restore_profile = str(getattr(self.scope, "_host_dc_startup_restore_profile", "") or "").strip().lower()
+        except Exception:
+            restore_profile = ""
+        if restore_profile not in {"work", "acquisition", "detection"}:
+            profile = _dc_steady_profile_for_mode(selected)
+        else:
+            profile = restore_profile
         if profile:
             _apply_default_dc_config(self.scope, reason=f"{reason}:restore_{profile}", profile=profile)
+        try:
+            self.scope._host_dc_startup_restore_profile = ""
+        except Exception:
+            pass
 
     def _start_dc_startup_compensation(self, selected: int, reason: str = "") -> bool:
         try:
@@ -872,13 +959,23 @@ class ScopeApi:
             return False
         delay_s = _dc_startup_restore_delay_s()
         try:
+            restore_profile = str(getattr(self.scope, "_host_dc_desired_profile", "") or "").strip().lower()
+        except Exception:
+            restore_profile = ""
+        if restore_profile not in {"work", "acquisition", "detection"}:
+            restore_profile = _dc_steady_profile_for_mode(selected)
+        try:
+            self.scope._host_dc_startup_restore_profile = restore_profile
+        except Exception:
+            pass
+        try:
             self.scope._host_dc_startup_until = time.time() + max(0.2, delay_s)
         except Exception:
             pass
         ok = _apply_default_dc_config(self.scope, reason=f"{reason}:startup", profile="startup")
         if _dc_steady_profile_for_mode(selected):
             try:
-                self.qtcore.QTimer.singleShot(int(max(0.2, delay_s) * 1000), lambda: self._restore_dc_after_startup(reason))
+                _call_qt_later_s(max(0.2, delay_s), lambda: self._restore_dc_after_startup(reason))
             except Exception:
                 pass
         return bool(ok)
@@ -986,6 +1083,30 @@ class ScopeApi:
             enabled = bool(params.get("enabled", params.get("value", True)))
             scope._set_sound_enabled(enabled, reason="api", announce=True)
             return {"ok": True, "sound_enabled": enabled}
+        if action in {"optic_hold", "optic_delay", "set_optic_hold", "optic_hold_ds"}:
+            raw = params.get("hold_ds", params.get("ds", None))
+            if raw is None:
+                sec = params.get("seconds", params.get("sec", params.get("value", None)))
+                try:
+                    hold_ds = int(round(float(sec) * 10)) if sec is not None else 30
+                except Exception:
+                    hold_ds = 30
+            else:
+                try:
+                    hold_ds = int(raw)
+                except Exception:
+                    hold_ds = 30
+            hold_ds = max(0, min(100, hold_ds))
+            if not hasattr(scope, "_send_optic_hold_ds"):
+                raise RuntimeError("engine does not support optic hold")
+            ok = bool(scope._send_optic_hold_ds(hold_ds))
+            return {"ok": ok, "optic_hold_ds": hold_ds, "optic_hold_seconds": round(hold_ds / 10.0, 1)}
+        if action in {"optic_reaction", "set_optic_reaction", "optic_reaction_enabled"}:
+            enabled = _api_bool(params.get("enabled", params.get("value", True)), True)
+            if not hasattr(scope, "_set_optic_reaction_enabled"):
+                raise RuntimeError("engine does not support optic reaction")
+            scope._set_optic_reaction_enabled(enabled)
+            return {"ok": True, "optic_reaction_enabled": bool(enabled)}
         if action in {"normalization", "normalize", "norm", "xcorr_norm"}:
             current = bool(getattr(scope, "xcorr_norm_enabled", False))
             enabled = _api_bool(params.get("enabled", params.get("value", not current)), not current)
@@ -1286,6 +1407,7 @@ class ScopeApi:
         det_thr1 = int(getattr(scope, "_det_thr1", 0) or 0)
         det_lvl0 = int(getattr(scope, "_det_last_lvl0", 0) or 0)
         det_lvl1 = int(getattr(scope, "_det_last_lvl1", 0) or 0)
+        det_display_scale = _product_display_scale()
         try:
             gate_until0 = float(getattr(scope, "_det_burst_gate_until0", 0.0) or 0.0)
         except Exception:
@@ -1350,6 +1472,7 @@ class ScopeApi:
                     "pending": bool(getattr(scope, "tim2_pending", False)),
                 },
                 "sound": {"enabled": bool(getattr(scope, "_sound_enabled", False))},
+                "optic": {"reaction_enabled": bool(getattr(scope, "optic_reaction_enabled", False))},
                 "normalization": {"enabled": bool(getattr(scope, "xcorr_norm_enabled", False))},
                 "optimize": {
                     "dc_autotune_active": bool(getattr(scope, "_dc_autotune_active", False)),
@@ -1363,6 +1486,8 @@ class ScopeApi:
                     "thr1": det_thr1,
                     "lvl0": det_lvl0,
                     "lvl1": det_lvl1,
+                    "display_scale": det_display_scale,
+                    "display_unit": "u16",
                     "hold0": det_hold0,
                     "hold1": det_hold1,
                     "pre_fire0": pre_fire0,
@@ -1460,6 +1585,11 @@ class ScopeApi:
                     "count": int(getattr(scope, "_frame_integrity_count", 0) or 0),
                     "last": getattr(scope, "_frame_integrity_last", None),
                 },
+                "frame_amplitude": {
+                    "enabled": bool(getattr(scope, "frame_amp_trace", False)),
+                    "count": int(getattr(scope, "_frame_amp_count", 0) or 0),
+                    "last": getattr(scope, "_frame_amp_last", None),
+                },
                 "status_text": _text_from_label(getattr(scope, "legend_lbl", None)),
             }
         )
@@ -1504,42 +1634,16 @@ class ScopeApi:
                 scale = 0.0
             else:
                 scale = float(65535.0 / span)
-            try:
-                source = str(getattr(scope, "_det_last_source", getattr(scope, "_det_source", "prod")) or "prod").strip().lower()
-            except Exception:
-                source = "prod"
-            if source == "norm":
-                det_mul = float(65535.0 / ((32768.0 * 32768.0) + 1e-12))
-                det_unit = "norm"
-            else:
-                try:
-                    level_scale = float(getattr(scope, "_det_last_level_scale", 0.0) or 0.0)
-                except Exception:
-                    level_scale = 0.0
-                if level_scale <= 0.0:
-                    try:
-                        level_scale = float(os.getenv("BMI30_DETECT_LEVEL_SCALE", "") or 0.0)
-                    except Exception:
-                        level_scale = 0.0
-                if level_scale <= 0.0:
-                    try:
-                        level_scale = float(os.getenv("BMI30_PROD_SCALE", "100") or 100.0)
-                    except Exception:
-                        level_scale = 100.0
-                if not np.isfinite(level_scale) or level_scale <= 0.0:
-                    level_scale = 100.0
-                det_mul = float(1.0 / level_scale)
-                det_unit = f"raw/{level_scale:g}"
-            det_min = lo * det_mul
-            det_max = hi * det_mul
-            det_span = span * det_mul
+            det_min = lo
+            det_max = hi
+            det_span = span
             screen_per_det = float(65535.0 / det_span) if np.isfinite(det_span) and det_span > 1e-12 else 0.0
             try:
-                display_scale = float(os.getenv("BMI30_PROD_SCALE", "100") or 100.0)
+                display_scale = float(os.getenv("BMI30_PROD_SCALE", "") or _product_default_scale())
             except Exception:
-                display_scale = 100.0
+                display_scale = _product_default_scale()
             if not np.isfinite(display_scale) or display_scale <= 0.0:
-                display_scale = 100.0
+                display_scale = _product_default_scale()
             display_vals = np.clip(vals / display_scale, 0.0, 65535.0)
             display_min = float(np.min(display_vals))
             display_max = float(np.max(display_vals))
@@ -1553,7 +1657,7 @@ class ScopeApi:
                 "det_max": float(det_max),
                 "det_span": float(det_span),
                 "screen_per_det": screen_per_det,
-                "det_unit": det_unit,
+                "det_unit": "raw-product",
                 "display_min": display_min,
                 "display_max": display_max,
                 "display_span": display_span,
@@ -1704,6 +1808,44 @@ def _send_binary(handler: BaseHTTPRequestHandler, data: bytes, content_type: str
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
+
+
+def _api_command_log_params(params: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key, value in (params or {}).items():
+        name = str(key)
+        lname = name.lower()
+        if any(mark in lname for mark in ("pass", "token", "secret", "cookie", "auth")):
+            safe[name] = "<redacted>"
+            continue
+        if isinstance(value, (bool, int, float)) or value is None:
+            safe[name] = value
+        elif isinstance(value, str):
+            safe[name] = value[:120]
+        elif isinstance(value, (list, tuple)):
+            safe[name] = f"<{type(value).__name__}:{len(value)}>"
+        elif isinstance(value, dict):
+            safe[name] = f"<dict:{len(value)}>"
+        else:
+            safe[name] = f"<{type(value).__name__}>"
+    return safe
+
+
+def _log_api_command(handler: BaseHTTPRequestHandler, action: str, params: dict[str, Any]) -> None:
+    try:
+        peer = handler.client_address[0] if getattr(handler, "client_address", None) else "?"
+        ua = str(handler.headers.get("User-Agent", ""))[:120]
+        ref = str(handler.headers.get("Referer", ""))[:160]
+        src = str(handler.headers.get("X-BMI30-Source", ""))[:80]
+        safe_params = _api_command_log_params(params)
+        print(
+            f"[API-CMD] peer={peer} action={action} source={src or '-'} "
+            f"params={json.dumps(_json_safe(safe_params), ensure_ascii=False, separators=(',', ':'))} "
+            f"ref={ref or '-'} ua={ua or '-'}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[API-CMD] log failed action={action}: {exc}", flush=True)
 
 
 def _player_upload_limit_bytes() -> int:
@@ -1965,6 +2107,7 @@ class ServiceHandler(BaseHTTPRequestHandler):
                 raise ValueError("missing action")
             action_l = action.strip().lower()
             timeout = 60.0 if action_l.startswith(("player_", "player_raw_")) else 8.0
+            _log_api_command(self, action_l, params)
             _send_json(self, api.submit(action, params, timeout=timeout))
         except Exception as exc:
             _send_json(self, {"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -2469,10 +2612,12 @@ function detectorThresholdKey(ev,channel){let key=channel==='lower'?'lower':'upp
 function setText(id,text){setElText(byId(id),text)}
 function detectorCount(v){v=Number(v||0);return Number.isFinite(v)&&v>0?Math.floor(v):0}
 function resetDetectorCounter(channel){let key=channel==='lower'?'lower':'upper';detectorFireSeq[key]=null;detectorFlashUntil[key]=0;cmd('reset_detector_counts',{channel:channel}).catch(e=>{setText('serviceState','error');setText('conn',String(e))})}
-function detectorLevelText(v){v=Number(v);return Number.isFinite(v)?String(Math.max(0,Math.min(65535,Math.round(v)))):'-----'}
-function detectorNoiseHtml(lvl,thr,avg){return '<i class="det-noise-label">x/t/a&nbsp;</i><i class="det-noise-num">'+detectorLevelText(lvl)+'</i><i class="det-noise-sep">/</i><i class="det-noise-num">'+detectorLevelText(thr)+'</i><i class="det-noise-sep">/</i><i class="det-noise-num">'+detectorLevelText(avg)+'</i>'}
+function detectorDisplayScale(det){let v=Number((det||{}).display_scale);if(!Number.isFinite(v)||v<=0)v=16384.250003814755;return v}
+function detectorDisplayLevel(v,det){v=Number(v);if(!Number.isFinite(v)||v<0)return NaN;let scale=detectorDisplayScale(det);return Math.max(0,Math.min(65535,Math.round(v/scale)))}
+function detectorLevelText(v,det){let x=detectorDisplayLevel(v,det);return Number.isFinite(x)?String(x):'-----'}
+function detectorNoiseHtml(lvl,thr,avg,det){return '<i class="det-noise-label">x/t/a&nbsp;</i><i class="det-noise-num">'+detectorLevelText(lvl,det)+'</i><i class="det-noise-sep">/</i><i class="det-noise-num">'+detectorLevelText(thr,det)+'</i><i class="det-noise-sep">/</i><i class="det-noise-num">'+detectorLevelText(avg,det)+'</i>'}
 function detectorNoiseSource(thr,lvl){let t=Number(thr);if(Number.isFinite(t)&&t>0)return t;let x=Number(lvl);return Number.isFinite(x)?x:NaN}
-function updateDetectorNoiseAvg(key,value){let v=Number(value),prev=Number(detectorNoiseAvg[key]);if(!Number.isFinite(v)||v<0)return Number.isFinite(prev)?prev:NaN;v=Math.max(0,Math.min(65535,v));if(!Number.isFinite(prev)||prev<0)prev=v;else prev=prev+(v-prev)/DETECTOR_NOISE_AVG_N;detectorNoiseAvg[key]=prev;return prev}
+function updateDetectorNoiseAvg(key,value){let v=Number(value),prev=Number(detectorNoiseAvg[key]);if(!Number.isFinite(v)||v<0)return Number.isFinite(prev)?prev:NaN;v=Math.max(0,v);if(!Number.isFinite(prev)||prev<0)prev=v;else prev=prev+(v-prev)/DETECTOR_NOISE_AVG_N;detectorNoiseAvg[key]=prev;return prev}
 function ensureDetectorMarkup(){let el=byId('detText');if(!el)return null;if(el.dataset.detectorUi!=='1'){setClassName(el,'det-rich det-tall');el.innerHTML='<span class="det-state" id="detState"></span><span class="det-stack"><button type="button" class="det-ch" id="detUpperBtn"></button><button type="button" class="det-ch" id="detLowerBtn"></button></span><span class="det-noise-stack"><span class="det-noise" id="detUpperNoise"></span><span class="det-noise" id="detLowerNoise"></span></span>';el.dataset.detectorUi='1';let up=byId('detUpperBtn'),lo=byId('detLowerBtn');if(up)up.onclick=function(){resetDetectorCounter('upper')};if(lo)lo.onclick=function(){resetDetectorCounter('lower')}}else{setClassName(el,'det-rich det-tall')}return{state:byId('detState'),up:byId('detUpperBtn'),lo:byId('detLowerBtn'),upNoise:byId('detUpperNoise'),loNoise:byId('detLowerNoise')}}
 function renderDetector(det){
   det=det||{};
@@ -2498,9 +2643,9 @@ function renderDetector(det){
   let loClass=loHold?(loGate?'fire-alert':'fire-l'):(loPre?'pre-fire':(loGate?'gate':(loOn?'on':'off')));
   let upAvg=updateDetectorNoiseAvg('upper',detectorNoiseSource(det.thr0,det.lvl0));
   let loAvg=updateDetectorNoiseAvg('lower',detectorNoiseSource(det.thr1,det.lvl1));
-  let upNoise=detectorNoiseHtml(det.lvl0,det.thr0,upAvg);
-  let loNoise=detectorNoiseHtml(det.lvl1,det.thr1,loAvg);
-  let noiseTitle='xpk/thr/a'+DETECTOR_NOISE_AVG_N;
+  let upNoise=detectorNoiseHtml(det.lvl0,det.thr0,upAvg,det);
+  let loNoise=detectorNoiseHtml(det.lvl1,det.thr1,loAvg,det);
+  let noiseTitle='xpk/thr/a'+DETECTOR_NOISE_AVG_N+' display 0..65535';
   let upSeen=Number(det.confirm_seen0)||0,loSeen=Number(det.confirm_seen1)||0;
   let upNeed=Number(det.confirm_need0)||Number(upper.confirm_count)||0,loNeed=Number(det.confirm_need1)||Number(lower.confirm_count)||0;
   let upText=upGate?'U:--':(upPre?('U:F '+upSeen+'/'+upNeed):'U:'+upSeq),loText=loGate?'L:--':(loPre?('L:F '+loSeen+'/'+loNeed):'L:'+loSeq);
@@ -2521,8 +2666,8 @@ function renderDetector(det){
   setTooltip(ui.lo,loTip);
   setElHtml(ui.upNoise,upNoise);
   setElHtml(ui.loNoise,loNoise);
-  setTooltip(ui.upNoise,'Upper detector-scale '+noiseTitle);
-  setTooltip(ui.loNoise,'Lower detector-scale '+noiseTitle);
+  setTooltip(ui.upNoise,'Upper '+noiseTitle);
+  setTooltip(ui.loNoise,'Lower '+noiseTitle);
 }
 function traceStats(arr){if(!arr||!arr.length)return '---';let mn=65535,mx=0;for(let i=0;i<arr.length;i++){let v=arr[i]|0;if(v<mn)mn=v;if(v>mx)mx=v}return mn+'..'+mx}
 function resizeCanvas(canvas){let r=canvas.getBoundingClientRect();let d=window.devicePixelRatio||1;let w=Math.max(1,Math.floor(r.width*d));let h=Math.max(1,Math.floor(r.height*d));if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}return {w:w,h:h,d:d}}
@@ -2589,12 +2734,12 @@ function drawTrace(ctx,arr,color,w,plotH){let n=arr&&arr.length||0;if(n<2)return
 function drawPlot(canvas,empty,xs,a,b,prod,c1,c2,c3,win,markers,frameMark){let size=resizeCanvas(canvas);let ctx=canvas.getContext('2d');let labelH=Math.max(24*size.d,22);let plotH=Math.max(24,size.h-labelH);let count=Math.max((a&&a.length)||0,(b&&b.length)||0,(prod&&prod.length)||0);drawGrid(ctx,size.w,size.h,plotH,labelH,size.d);drawWorkingWindow(ctx,win,xs,count,size.w,plotH,size.d);drawMarkerRanges(ctx,markers||[],xs,count,size.w,plotH,size.d,frameMark);drawXAxis(ctx,xs,count,size.w,size.h,plotH,labelH,size.d);let ok=(a&&a.length>1)||(b&&b.length>1)||(prod&&prod.length>1);if(ok){drawTrace(ctx,a,c1,size.w,plotH);drawTrace(ctx,b,c2,size.w,plotH);drawTrace(ctx,prod,c3,size.w,plotH)}empty.style.display=ok?'none':'grid'}
 function normNumber(v){v=Number(v);if(!Number.isFinite(v))return'---';let a=Math.abs(v);if(a>=1000000||(a>0&&a<0.01))return v.toExponential(2);if(a>=1000)return String(Math.round(v));let s=v.toFixed(2);return s.replace(/\.?0+$/,'')}
 function normScale(v){v=Number(v);if(!Number.isFinite(v)||v<=0)return'0';if(v>=1000||v<0.01)return v.toExponential(2);let s=v.toFixed(3);return s.replace(/\.?0+$/,'')}
-function setNormReadout(id,stats,label){let el=byId(id);if(!el)return;if(!stats){setElText(el,'');setClassToggle(el,'active',false);setTooltip(el,'');return}let text=label+' src:'+normNumber(stats.display_min)+'..'+normNumber(stats.display_max)+' d='+normNumber(stats.display_span);setElText(el,text);setClassToggle(el,'active',true);setTooltip(el,'Source product magnitude in the normal display scale 0..65535: '+normNumber(stats.display_min)+'..'+normNumber(stats.display_max)+', span '+normNumber(stats.display_span)+'. Calculated as abs(raw)/BMI30_PROD_SCALE from zero before normalization. Raw magnitude: '+normNumber(stats.min)+'..'+normNumber(stats.max)+'.')}
+function setNormReadout(id,stats,label){let el=byId(id);if(!el)return;if(!stats){setElText(el,'');setClassToggle(el,'active',false);setTooltip(el,'');return}let text=label+' src:'+normNumber(stats.display_min)+'..'+normNumber(stats.display_max)+' d='+normNumber(stats.display_span);setElText(el,text);setClassToggle(el,'active',true);setTooltip(el,'Source product magnitude in the normal display scale 0..65535: '+normNumber(stats.display_min)+'..'+normNumber(stats.display_max)+', span '+normNumber(stats.display_span)+'. Calculated as abs(raw)/product scale from zero before normalization; BMI30_PROD_SCALE overrides the full-scale ADC default. Raw magnitude: '+normNumber(stats.min)+'..'+normNumber(stats.max)+'.')}
 	function updateNormReadouts(f,showProd){if(!showProd||!f){setNormReadout('upperNorm',null,'');setNormReadout('lowerNorm',null,'');return}setNormReadout('upperNorm',f.prod_norm0,'N');setNormReadout('lowerNorm',f.prod_norm1,'N')}
 	function applyModeVisibility(mode){mode=Number(mode)||0;let upper=byId('upperCard'),lower=byId('lowerCard'),scope=document.querySelector('.scope');setClassToggle(upper,'hidden',mode===2);setClassToggle(lower,'hidden',mode===1);setClassToggle(scope,'single',mode===1||mode===2);if(scope){scope.dataset.scopeMode=String(mode)}}
 	function playerArrayCopy(arr){if(!arr)return[];try{return Array.prototype.slice.call(arr)}catch(e){let out=[];for(let i=0;i<(arr.length||0);i++)out.push(Number(arr[i])||0);return out}}
 	function playerCompactFrame(f){if(!f||!f.available)return null;let out={ok:!!f.ok,available:!!f.available,base_buf_len:Number(f.base_buf_len)||0,step:Number(f.step)||1,count:Number(f.count)||((f.x||[]).length||0),last_frame_t:Number(f.last_frame_t)||0,_channels:f._channels||lastFrameChannels||'both',prod_norm0:f.prod_norm0||null,prod_norm1:f.prod_norm1||null};['x','data0_even','data0_odd','data1_even','data1_odd','prod0','prod1','prod0_normed','prod1_normed'].forEach(function(k){if(f[k])out[k]=playerArrayCopy(f[k])});return out}
-	function playerCompactStatus(s){s=s||{};let mode=s.mode||{},det=s.detector||{},tim2=s.tim2||{},sound=s.sound||{},win=s.working_window||null;return{t:Date.now(),mode_selected:Number(mode.selected)||0,stream_mode:Number(mode.stream_mode)||0,base_buf_len:Number(mode.base_buf_len)||0,freq_hz:Number(mode.freq_hz||mode.desired_freq)||0,avg_n:Number(mode.avg_n)||0,working_window:win,tx:!!tim2.enabled,sound:!!sound.enabled,detector:{enabled:!!det.enabled,active:!!det.active,thr0:Number(det.thr0)||0,thr1:Number(det.thr1)||0,lvl0:Number(det.lvl0)||0,lvl1:Number(det.lvl1)||0,hold0:!!det.hold0,hold1:!!det.hold1,fire_seq0:detectorCount(det.fire_seq0),fire_seq1:detectorCount(det.fire_seq1),gate0:!!det.gate0,gate1:!!det.gate1,gate_reason0:String(det.gate_reason0||''),gate_reason1:String(det.gate_reason1||''),channels:det.channels||{}}}}
+	function playerCompactStatus(s){s=s||{};let mode=s.mode||{},det=s.detector||{},tim2=s.tim2||{},sound=s.sound||{},win=s.working_window||null;return{t:Date.now(),mode_selected:Number(mode.selected)||0,stream_mode:Number(mode.stream_mode)||0,base_buf_len:Number(mode.base_buf_len)||0,freq_hz:Number(mode.freq_hz||mode.desired_freq)||0,avg_n:Number(mode.avg_n)||0,working_window:win,tx:!!tim2.enabled,sound:!!sound.enabled,detector:{enabled:!!det.enabled,active:!!det.active,thr0:Number(det.thr0)||0,thr1:Number(det.thr1)||0,lvl0:Number(det.lvl0)||0,lvl1:Number(det.lvl1)||0,display_scale:Number(det.display_scale)||detectorDisplayScale(det),display_unit:String(det.display_unit||'u16'),hold0:!!det.hold0,hold1:!!det.hold1,fire_seq0:detectorCount(det.fire_seq0),fire_seq1:detectorCount(det.fire_seq1),gate0:!!det.gate0,gate1:!!det.gate1,gate_reason0:String(det.gate_reason0||''),gate_reason1:String(det.gate_reason1||''),channels:det.channels||{}}}}
 	function playerTagTypeValue(value){let v=String(value||'').trim().toLowerCase().replace(/[^a-z0-9_-]+/g,'_');if(v==='tag_casino'||v==='casino_tag'||v==='cas')v='casino';if(v==='tag_barkhausen'||v==='bark'||v==='barkhausen_tag')v='barkhausen';if(v==='tag_microwire'||v==='micro'||v==='mic'||v==='microwire_tag')v='microwire';if(v==='tag_paper'||v==='paper_tag'||v==='pap')v='paper';return(v==='barkhausen'||v==='microwire'||v==='paper')?v:'casino'}
 	function playerTagTypeLong(value){let v=playerTagTypeValue(value);return v==='barkhausen'?'Barkhausen':(v==='microwire'?'Microwire':(v==='paper'?'Paper':'Casino'))}
 	function playerTagTypeShort(value){let v=playerTagTypeValue(value);return v==='barkhausen'?'BARK':(v==='microwire'?'MICRO':(v==='paper'?'PAPER':'CASINO'))}
@@ -2682,6 +2827,7 @@ def main() -> int:
         print(f"[BMI30.001] engine Qt import failed: {engine.PG_IMPORT_ERR}", flush=True)
         return 2
     scope = engine.ScopeWindow()
+    _start_qt_call_pump(engine.QtCore)
     _install_detector_flash_hooks(scope)
     _apply_default_avg_n(scope)
     _apply_default_detector_settings(scope)
@@ -2720,16 +2866,13 @@ def main() -> int:
                 except Exception:
                     pass
                 try:
-                    engine.QtCore.QTimer.singleShot(
-                        int(max(0.2, delay_s) * 1000),
-                        lambda: _restore_default_dc_after_startup(5, reason),
-                    )
+                    _call_later_s(max(0.2, delay_s), lambda: _restore_default_dc_after_startup(5, reason))
                 except Exception:
                     pass
                 return
             if attempt < 20:
                 try:
-                    engine.QtCore.QTimer.singleShot(300, lambda: _schedule_mode5_startup_dc(reason, attempt + 1))
+                    _call_later_s(0.3, lambda: _schedule_mode5_startup_dc(reason, attempt + 1))
                 except Exception:
                     pass
 
@@ -2748,7 +2891,7 @@ def main() -> int:
                 if stream_mode != 2:
                     if attempt < 12:
                         try:
-                            engine.QtCore.QTimer.singleShot(300, lambda: _schedule_default_dc_apply(reason, attempt + 1))
+                            _call_later_s(0.3, lambda: _schedule_default_dc_apply(reason, attempt + 1))
                         except Exception:
                             pass
                     return
@@ -2761,20 +2904,15 @@ def main() -> int:
                 return
             if attempt < 12:
                 try:
-                    engine.QtCore.QTimer.singleShot(300, lambda: _schedule_default_dc_apply(reason, attempt + 1))
+                    _call_later_s(0.3, lambda: _schedule_default_dc_apply(reason, attempt + 1))
                 except Exception:
                     pass
 
         def _call_later_s(delay_s: float, fn: Any) -> None:
             try:
-                timer = threading.Timer(max(0.0, float(delay_s)), fn)
-                timer.daemon = True
-                timer.start()
+                _call_qt_later_s(delay_s, fn)
             except Exception:
-                try:
-                    fn()
-                except Exception:
-                    pass
+                _queue_qt_call(fn)
 
         def _dc_verify_profile() -> str:
             try:
@@ -2829,6 +2967,13 @@ def main() -> int:
                 if not mismatches:
                     _set_dc_verify_status(True, profile, "ok")
                     return
+                if mismatches == ["unavailable"]:
+                    _set_dc_verify_status(False, profile, "readback_unavailable", mismatches)
+                    print(
+                        f"[DC] verify unavailable profile={profile}; skip reapply",
+                        flush=True,
+                    )
+                    return
                 try:
                     scope._host_dc_verify_fix_count = int(getattr(scope, "_host_dc_verify_fix_count", 0) or 0) + 1
                 except Exception:
@@ -2844,7 +2989,7 @@ def main() -> int:
                 print(f"[DC] verify failed: {exc}", flush=True)
             finally:
                 try:
-                    engine.QtCore.QTimer.singleShot(int(interval_s * 1000), _periodic_dc_verify)
+                    _call_later_s(interval_s, _periodic_dc_verify)
                 except Exception:
                     pass
 
@@ -2885,6 +3030,12 @@ def main() -> int:
             def _det_dc_startup_active() -> bool:
                 try:
                     return time.time() < float(getattr(scope, "_host_dc_startup_until", 0.0) or 0.0)
+                except Exception:
+                    return False
+
+            def _det_dc_dynamic_profiles_enabled() -> bool:
+                try:
+                    return str(os.getenv("BMI30_DC_DYNAMIC_PROFILES", "0")).lower() not in ("0", "false", "no", "off")
                 except Exception:
                     return False
 
@@ -2950,16 +3101,22 @@ def main() -> int:
                 delay_s = max(0.05, min(5.0, float(delay_s)))
                 try:
                     scope._host_dc_pending_profile = "work"
-                    engine.QtCore.QTimer.singleShot(
-                        int(delay_s * 1000),
-                        lambda seq=seq: _det_dc_apply_pending_work(seq, reason),
-                    )
+                    _call_later_s(delay_s, lambda seq=seq: _det_dc_apply_pending_work(seq, reason))
                 except Exception:
                     _det_dc_apply_pending_work(seq, reason)
 
             def _det_dc_pre_fire(channel: Any, count: Any = 0, confirm_count: Any = 0) -> None:
+                if not _det_dc_dynamic_profiles_enabled():
+                    return
                 if not _det_dc_selected_active() or _det_dc_startup_active():
                     return
+                try:
+                    if time.time() < float(getattr(scope, "_host_dc_detection_until", 0.0) or 0.0):
+                        return
+                    if str(getattr(scope, "_host_dc_desired_profile", "") or "") == "detection":
+                        return
+                except Exception:
+                    pass
                 try:
                     count_i = int(count)
                 except Exception:
@@ -2976,13 +3133,28 @@ def main() -> int:
                 _det_dc_schedule_work_restore("pre_fire:restore_work", delay_s, desired_now=False)
 
             def _det_dc_detection_fire(fired0: Any = False, fired1: Any = False, reason: str = "det_fire") -> None:
+                if not _det_dc_dynamic_profiles_enabled():
+                    return
                 if not _det_dc_selected_active() or _det_dc_startup_active():
                     return
                 if not (bool(fired0) or bool(fired1)):
                     return
+                now = time.time()
+                delay_s = _det_dc_restore_delay("BMI30_DC_DETECTION_RESTORE_DELAY_S", 0.2)
+                try:
+                    if str(getattr(scope, "_host_dc_desired_profile", "") or "") == "detection":
+                        if now < float(getattr(scope, "_host_dc_detection_until", 0.0) or 0.0):
+                            return
+                except Exception:
+                    pass
                 _det_dc_cancel_pending()
                 _det_dc_set_desired("detection")
+                try:
+                    scope._host_dc_detection_until = now + delay_s
+                except Exception:
+                    pass
                 _det_dc_apply_profile("detection", reason)
+                _det_dc_schedule_work_restore("detection:restore_work", delay_s, desired_now=False)
 
             def _arg_value(args: tuple[Any, ...], kwargs: dict[str, Any], index: int, name: str, default: Any = None) -> Any:
                 if name in kwargs:
@@ -3017,6 +3189,8 @@ def main() -> int:
 
             def _set_det_gpio_with_dc_profile(a_on: bool, b_on: bool, *args: Any, **kwargs: Any):
                 result = orig_set_det_gpio(a_on, b_on, *args, **kwargs)
+                if not _det_dc_dynamic_profiles_enabled():
+                    return result
                 if _det_dc_selected_active():
                     active = bool(a_on) or bool(b_on)
                     if active:
@@ -3038,10 +3212,10 @@ def main() -> int:
             scope._set_det_gpio = _set_det_gpio_with_dc_profile
         except Exception as exc:
             print(f"[DC] detector profile hook failed: {exc}", flush=True)
-        engine.QtCore.QTimer.singleShot(700, lambda: _schedule_mode5_startup_dc("initial_mode_5", 0))
-        engine.QtCore.QTimer.singleShot(700, lambda: _schedule_default_dc_apply("initial_mode_6plus", 0))
-        engine.QtCore.QTimer.singleShot(2500, lambda: _schedule_default_dc_apply("initial_mode_settle", 0))
-        engine.QtCore.QTimer.singleShot(int(_dc_verify_interval_s() * 1000), _periodic_dc_verify)
+        _call_later_s(0.7, lambda: _schedule_mode5_startup_dc("initial_mode_5", 0))
+        _call_later_s(0.7, lambda: _schedule_default_dc_apply("initial_mode_6plus", 0))
+        _call_later_s(2.5, lambda: _schedule_default_dc_apply("initial_mode_settle", 0))
+        _call_later_s(_dc_verify_interval_s(), _periodic_dc_verify)
     except Exception as exc:
         print(f"[DC] mode restore hook failed: {exc}", flush=True)
     try:
@@ -3053,7 +3227,7 @@ def main() -> int:
     API = ScopeApi(scope, engine.QtCore)
     server = start_http_server()
     try:
-        engine.QtCore.QTimer.singleShot(20, scope._run_deferred_autostart)
+        _call_qt_later_s(0.02, scope._run_deferred_autostart)
     except Exception:
         scope._run_deferred_autostart()
     app = engine.QtWidgets.QApplication.instance()

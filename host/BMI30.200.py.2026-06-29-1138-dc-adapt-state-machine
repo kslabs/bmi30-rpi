@@ -39,6 +39,64 @@ import numpy as np  # type: ignore
 import serial, glob
 import threading, queue
 
+_RT_ADC_CENTER = 32768.0
+_RT_U16_MAX = 65535.0
+_RT_PRODUCT_FULL_SCALE = _RT_ADC_CENTER * _RT_ADC_CENTER
+_RT_PRODUCT_FULLSCALE_U16_SCALE = _RT_PRODUCT_FULL_SCALE / _RT_U16_MAX
+_RT_DETECT_LEVEL_MAX = (1 << 63) - 1
+
+
+def _rt_product_default_scale() -> float:
+	return float(_RT_PRODUCT_FULLSCALE_U16_SCALE)
+
+
+def _rt_detector_legacy_level_scale(level_scale: float | None = None) -> float:
+	try:
+		scale = float(level_scale if level_scale is not None else 0.0)
+	except Exception:
+		scale = 0.0
+	if scale <= 0.0:
+		try:
+			scale = float(os.getenv('BMI30_DETECT_LEVEL_SCALE', '') or 0.0)
+		except Exception:
+			scale = 0.0
+	if scale <= 0.0:
+		try:
+			scale = float(os.getenv('BMI30_PROD_SCALE', '') or _rt_product_default_scale())
+		except Exception:
+			scale = _rt_product_default_scale()
+	if not np.isfinite(scale) or scale <= 0.0:
+		scale = _rt_product_default_scale()
+	return float(scale)
+
+
+def _rt_clamp_detector_level(value, default: int = 0, minimum: int = 0) -> int:
+	try:
+		if isinstance(value, (int, np.integer)):
+			val = int(value)
+		else:
+			val = int(round(float(value)))
+	except Exception:
+		val = int(default)
+	if val < int(minimum):
+		val = int(minimum)
+	if val > _RT_DETECT_LEVEL_MAX:
+		return int(_RT_DETECT_LEVEL_MAX)
+	return int(val)
+
+
+def _rt_legacy_level_to_product_units(value, level_scale: float | None = None, minimum: int = 0) -> int:
+	try:
+		val = float(value)
+	except Exception:
+		val = 0.0
+	if not np.isfinite(val):
+		val = 0.0
+	if val <= 0.0 and int(minimum) <= 0:
+		return 0
+	scale = _rt_detector_legacy_level_scale(level_scale)
+	return _rt_clamp_detector_level(val * scale, default=int(minimum), minimum=int(minimum))
+
 
 def _rt_detector_level_from_peak(peak_value: float, source: str, level_scale: float) -> int:
 	try:
@@ -47,18 +105,7 @@ def _rt_detector_level_from_peak(peak_value: float, source: str, level_scale: fl
 		mx = 0.0
 	if not np.isfinite(mx) or mx <= 0.0:
 		return 0
-	try:
-		if str(source or 'prod').strip().lower() == 'norm':
-			return int(max(0, min(65535, int((mx / ((32768.0 * 32768.0) + 1e-12)) * 65535.0))))
-	except Exception:
-		pass
-	try:
-		scale = float(level_scale)
-	except Exception:
-		scale = 100.0
-	if not np.isfinite(scale) or scale <= 0.0:
-		scale = 100.0
-	return int(max(0, min(65535, int(mx / scale))))
+	return _rt_clamp_detector_level(mx)
 
 
 def _rt_product_abs_array(prod_arr):
@@ -676,7 +723,8 @@ def _rt_detector_quarter_trigger_min_level() -> int:
 		value = int(os.getenv('BMI30_RT_QUARTER_TRIGGER_MIN_LEVEL', '1000'))
 	except Exception:
 		value = 1000
-	return max(1, min(65535, int(value)))
+	value = max(1, min(65535, int(value)))
+	return _rt_legacy_level_to_product_units(value, minimum=1)
 
 
 def _rt_detector_ref_noise_max_level() -> int:
@@ -684,7 +732,8 @@ def _rt_detector_ref_noise_max_level() -> int:
 		value = int(os.getenv('BMI30_RT_REF_NOISE_MAX_LEVEL', '32768'))
 	except Exception:
 		value = 32768
-	return max(0, min(65535, int(value)))
+	value = max(0, min(65535, int(value)))
+	return _rt_legacy_level_to_product_units(value, minimum=0)
 
 
 def _rt_detector_locality_supported(prod_arr: np.ndarray, peak_idx: int, peak_value: float, ratio: float) -> bool:
@@ -745,12 +794,12 @@ def _rt_detector_locality_supported(prod_arr: np.ndarray, peak_idx: int, peak_va
 			allow_span = str(os.getenv('BMI30_RT_LOCALITY_ALLOW_MARK_SPAN', '1')).lower() not in ('0', 'false', 'no')
 		except Exception:
 			allow_span = True
-		if allow_span:
-			try:
-				span = max(max_gap + radius, int(os.getenv('BMI30_RT_LOCALITY_MARK_SPAN', str(max_gap + radius))))
-			except Exception:
-				span = max_gap + radius
-			_mark(peak_idx - span, peak_idx + span + 1)
+			if allow_span:
+				try:
+					span = max(max_gap + radius, int(os.getenv('BMI30_RT_LOCALITY_MARK_SPAN', str(max_gap + radius))))
+				except Exception:
+					span = max_gap + radius
+				_mark(peak_idx - span, peak_idx + span + 1)
 		outside_mask = ~allowed
 		outside = arr[outside_mask]
 		if outside.size <= 0:
@@ -897,12 +946,12 @@ def _rt_detector_raw_array_supported(raw_arr: np.ndarray, peak_idx: int, ratio: 
 			allow_span = str(os.getenv('BMI30_RT_RAW_ALLOW_MARK_SPAN', '1')).lower() not in ('0', 'false', 'no')
 		except Exception:
 			allow_span = True
-		if allow_span:
-			try:
-				span = max(max_gap + radius, int(os.getenv('BMI30_RT_RAW_MARK_SPAN', str(max_gap + radius))))
-			except Exception:
-				span = max_gap + radius
-			_mark(peak_idx - span, peak_idx + span + 1)
+			if allow_span:
+				try:
+					span = max(max_gap + radius, int(os.getenv('BMI30_RT_RAW_MARK_SPAN', str(max_gap + radius))))
+				except Exception:
+					span = max_gap + radius
+				_mark(peak_idx - span, peak_idx + span + 1)
 		cutoff = peak / float(raw_ratio)
 		try:
 			max_total_fraction = float(os.getenv('BMI30_RT_RAW_MAX_TOTAL_FRACTION', '0.55'))
@@ -990,8 +1039,8 @@ def _rt_detector_product_current_prev(current: np.ndarray, previous: np.ndarray,
 		n = 0
 	if n <= 1:
 		return None
-	cur = np.asarray(current[:n], dtype=np.int32) - np.int32(32768)
-	prev = np.asarray(previous[:n], dtype=np.int32) - np.int32(32768)
+	cur = np.asarray(current[:n], dtype=np.int64) - np.int64(32768)
+	prev = np.asarray(previous[:n], dtype=np.int64) - np.int64(32768)
 	search_start, search_end = _rt_detector_mark_window_bounds(n)
 	if search_end <= search_start:
 		search_start, search_end = 0, n
@@ -1021,7 +1070,7 @@ def _rt_detector_product_current_prev(current: np.ndarray, previous: np.ndarray,
 		max_shift = 0
 	if max_shift <= 0:
 		shift = 0
-		prod_abs = np.empty(n, dtype=np.int32)
+		prod_abs = np.empty(n, dtype=np.int64)
 		np.multiply(cur, prev, out=prod_abs)
 		np.abs(prod_abs, out=prod_abs)
 		local_idx, peak_value, peak_supported = _segment_peak(prod_abs, 0)
@@ -1081,21 +1130,21 @@ def _rt_detector_product_display(current: np.ndarray, previous: np.ndarray, shif
 	if n <= 1:
 		return None
 	try:
-			cur = np.asarray(current[:n], dtype=np.int32) - np.int32(32768)
-			prev = np.asarray(previous[:n], dtype=np.int32) - np.int32(32768)
-			out = np.zeros(n, dtype=np.int32)
-			shift = int(shift or 0)
-			if shift >= 0:
-				end = n - shift
-				if end > 0:
-					np.multiply(cur[:end], prev[shift:shift + end], out=out[:end])
-					np.abs(out[:end], out=out[:end])
-			else:
-				start = -shift
-				if start < n:
-					np.multiply(cur[start:n], prev[:n - start], out=out[start:n])
-					np.abs(out[start:n], out=out[start:n])
-			return out
+		cur = np.asarray(current[:n], dtype=np.int64) - np.int64(32768)
+		prev = np.asarray(previous[:n], dtype=np.int64) - np.int64(32768)
+		out = np.zeros(n, dtype=np.int64)
+		shift = int(shift or 0)
+		if shift >= 0:
+			end = n - shift
+			if end > 0:
+				np.multiply(cur[:end], prev[shift:shift + end], out=out[:end])
+				np.abs(out[:end], out=out[:end])
+		else:
+			start = -shift
+			if start < n:
+				np.multiply(cur[start:n], prev[:n - start], out=out[start:n])
+				np.abs(out[start:n], out=out[start:n])
+		return out
 	except Exception:
 		return None
 
@@ -1269,7 +1318,7 @@ def _rt_detector_process_main(shm_names, max_samples: int, req_q, res_q, stop_ev
 							continue
 						cur = np.array(current[:n], dtype=np.int32, copy=True)
 						prev_arr = np.array(previous[:n], dtype=np.int32, copy=True)
-						made = _rt_detector_product_current_prev(cur, prev_arr, int(max_shift), str(source or 'prod'), float(level_scale or 100.0))
+						made = _rt_detector_product_current_prev(cur, prev_arr, int(max_shift), str(source or 'prod'), float(level_scale or _rt_product_default_scale()))
 						if made is not None:
 							want_plot, ratio, thr = _rt_detector_meta(meta, int(ch_i))
 							result = _rt_detector_build_result(int(ch_i), int(seq), made, cur, prev_arr, want_plot, ratio, thr)
@@ -1295,7 +1344,7 @@ def _rt_detector_process_main(shm_names, max_samples: int, req_q, res_q, stop_ev
 					cur = np.array(views[ch][:n], dtype=np.int32, copy=True)
 				ch = 0 if int(ch) == 0 else 1
 				if prev[ch] is not None and bool(active):
-					made = _rt_detector_product_current_prev(cur, prev[ch], int(max_shift), str(source or 'prod'), float(level_scale or 100.0))
+					made = _rt_detector_product_current_prev(cur, prev[ch], int(max_shift), str(source or 'prod'), float(level_scale or _rt_product_default_scale()))
 					if made is not None:
 						want_plot, ratio, thr = _rt_detector_meta(meta, int(ch))
 						result = _rt_detector_build_result(int(ch), int(seq), made, cur, prev[ch], want_plot, ratio, thr)
@@ -1370,6 +1419,15 @@ except Exception:
 		CMD_SET_TX_ENABLE = int(os.getenv("BMI30_CMD_SET_TX_ENABLE", "0x33"), 0)
 	except Exception:
 		CMD_SET_TX_ENABLE = 0x33
+
+# Optional: optic hold duration command (SET_OPTIC_HOLD, u16 deciseconds)
+try:
+	from usb_vendor.usb_stream import CMD_SET_OPTIC_HOLD  # type: ignore
+except Exception:
+	try:
+		CMD_SET_OPTIC_HOLD = int(os.getenv("BMI30_CMD_SET_OPTIC_HOLD", "0x39"), 0)
+	except Exception:
+		CMD_SET_OPTIC_HOLD = 0x39
 
 # Optional: device-side DC adaptation toggle (not present in older usb_stream.py)
 try:
@@ -1861,6 +1919,33 @@ def _det_parse_bool(value, default: bool = False) -> bool:
 	except Exception:
 		return bool(default)
 
+def save_sound_enabled(enabled: bool):
+	"""Save user sound permission to config file (best-effort merge)."""
+	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+	try:
+		data = {}
+		if os.path.exists(config_file):
+			try:
+				with open(config_file, "r") as f:
+					data = json.load(f) or {}
+			except Exception:
+				data = {}
+		data["sound_enabled"] = bool(enabled)
+		with open(config_file, "w") as f:
+			json.dump(data, f)
+	except Exception:
+		pass
+
+def load_sound_enabled(default: bool = False) -> bool:
+	"""Load user sound permission from config file."""
+	config_file = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+	try:
+		with open(config_file, "r") as f:
+			data = json.load(f) or {}
+		return _det_parse_bool(data.get("sound_enabled"), bool(default))
+	except Exception:
+		return bool(default)
+
 def _det_clamp_ratio(value, default: float = 2.0) -> float:
 	try:
 		val = float(value)
@@ -1885,7 +1970,7 @@ def _det_clamp_step(value, default: int = 1) -> int:
 		val = int(value)
 	except Exception:
 		val = int(default)
-	return int(max(1, min(65535, val)))
+	return int(max(1, min(_RT_DETECT_LEVEL_MAX, val)))
 
 def _det_clamp_noise_unit(value, default: str = "adc") -> str:
 	try:
@@ -2409,7 +2494,7 @@ class ScopeWindow:
 			self.btn_pwm.setFixedSize(21, 21)
 		except Exception:
 			pass
-		self._sound_enabled = _env_bool("BMI30_SOUND_ENABLE_DEFAULT", False)
+		self._sound_enabled = load_sound_enabled(_env_bool("BMI30_SOUND_ENABLE_DEFAULT", False))
 		try:
 			self.btn_pwm.setChecked(bool(self._sound_enabled))
 		except Exception:
@@ -2928,6 +3013,54 @@ class ScopeWindow:
 		self._frame_integrity_count = 0
 		self._frame_integrity_last_t = 0.0
 		self._frame_integrity_last = None
+		# Observation-only amplitude trace: catches whole-frame amplitude/center excursions.
+		try:
+			self.frame_amp_trace = str(os.getenv('BMI30_FRAME_AMP_TRACE', '1')).lower() not in ('0','false','no')
+		except Exception:
+			self.frame_amp_trace = True
+		try:
+			self.frame_amp_window = max(8, int(os.getenv('BMI30_FRAME_AMP_WINDOW', '48')))
+		except Exception:
+			self.frame_amp_window = 48
+		try:
+			self.frame_amp_min_baseline = max(4, int(os.getenv('BMI30_FRAME_AMP_MIN_BASELINE', '18')))
+		except Exception:
+			self.frame_amp_min_baseline = 18
+		try:
+			self.frame_amp_up_ratio = max(1.1, float(os.getenv('BMI30_FRAME_AMP_UP_RATIO', '2.8')))
+		except Exception:
+			self.frame_amp_up_ratio = 2.8
+		try:
+			self.frame_amp_down_ratio = min(0.95, max(0.05, float(os.getenv('BMI30_FRAME_AMP_DOWN_RATIO', '0.40'))))
+		except Exception:
+			self.frame_amp_down_ratio = 0.40
+		try:
+			self.frame_amp_center_adc = max(0, int(os.getenv('BMI30_FRAME_AMP_CENTER_ADC', '1500')))
+		except Exception:
+			self.frame_amp_center_adc = 1500
+		try:
+			self.frame_amp_log_interval_s = max(0.0, float(os.getenv('BMI30_FRAME_AMP_LOG_INTERVAL_S', '2.0')))
+		except Exception:
+			self.frame_amp_log_interval_s = 2.0
+		try:
+			self.frame_amp_ep0_stat = str(os.getenv('BMI30_FRAME_AMP_EP0_STAT', '1')).lower() not in ('0','false','no','off')
+		except Exception:
+			self.frame_amp_ep0_stat = True
+		try:
+			self.frame_amp_ep0_min_interval_s = max(0.1, float(os.getenv('BMI30_FRAME_AMP_EP0_MIN_INTERVAL_S', '0.75')))
+		except Exception:
+			self.frame_amp_ep0_min_interval_s = 0.75
+		try:
+			self.frame_amp_ep0_timeout_ms = max(20, min(300, int(os.getenv('BMI30_FRAME_AMP_EP0_TIMEOUT_MS', '60'))))
+		except Exception:
+			self.frame_amp_ep0_timeout_ms = 60
+		self._frame_amp_baseline = {}
+		self._frame_amp_center_baseline = {}
+		self._frame_amp_active = {}
+		self._frame_amp_last_t = {}
+		self._frame_amp_ep0_last_t = 0.0
+		self._frame_amp_count = 0
+		self._frame_amp_last = None
 		# Опционально: срезать хвост внутренней очереди ассемблера (независимые каналы) чтобы не было лага
 		try:
 			self.flush_asm_queue = str(os.getenv('BMI30_FLUSH_ASM_QUEUE', '0')).lower() not in ('0','false','no')
@@ -3133,9 +3266,9 @@ class ScopeWindow:
 		self._legend_last_runtime_t: float = 0.0
 		# --- Signal detection (per-channel) over correlation/product array ---
 		self._det_enabled = str(os.getenv("BMI30_DETECT_ENABLE", "1")).lower() not in ("0", "false", "no")
-		# Detector input source:
-		# - "norm": use normalized product max (0..1) mapped to u16 (0..65535) -> slow/stable adaptation
-		# - "prod": use raw centered product max scaled down by BMI30_DETECT_LEVEL_SCALE/BMI30_PROD_SCALE -> legacy/raw mode
+			# Detector input source:
+			# - "norm": use normalized product max (0..1) mapped back to full product units.
+			# - "prod": use raw centered product max directly; display scaling is separate.
 		try:
 			# Default is 'prod' because user-visible correlation/product graph operates in this domain.
 			self._det_source = str(os.getenv("BMI30_DETECT_SOURCE", "prod")).strip().lower()
@@ -3146,7 +3279,7 @@ class ScopeWindow:
 		except Exception:
 			self._det_source = "prod"
 		try:
-			self._det_thr_init = int(os.getenv("BMI30_DETECT_THR_INIT", "0"))
+			self._det_thr_init = _rt_legacy_level_to_product_units(int(os.getenv("BMI30_DETECT_THR_INIT", "0")), minimum=0)
 		except Exception:
 			self._det_thr_init = 0
 		self._det_thr0 = int(self._det_thr_init)
@@ -3195,6 +3328,9 @@ class ScopeWindow:
 		# Счетчики последовательных срабатываний для динамика (нужно 2 подряд)
 		self._beep_consecutive0 = 0  # последовательные срабатывания канала 0
 		self._beep_consecutive1 = 0  # последовательные срабатывания канала 1
+		# Optic reaction: when enabled, the tag-detection beep is gated by the local optic
+		# sensor (fires only while the optic sensor is active). Default off keeps legacy behavior.
+		self.optic_reaction_enabled = False
 		# Detector warmup: during the first seconds after startup, thresholds adapt but
 		# we ignore any early "fire" (no freeze, no hold, no beep) to avoid false startup freezes.
 		try:
@@ -3203,7 +3339,7 @@ class ScopeWindow:
 				self._det_warmup_sec = 0.0
 		except Exception:
 			self._det_warmup_sec = 0.0
-		# Во время прогрева ускоряем адаптацию порога, чтобы быстрее уйти от 65535.
+			# Во время прогрева ускоряем адаптацию порога, чтобы быстрее уйти от стартового плато.
 		try:
 			self._det_warmup_step_mul = float(os.getenv('BMI30_DETECT_WARMUP_STEP_MUL', '10'))
 			if (not np.isfinite(self._det_warmup_step_mul)) or self._det_warmup_step_mul < 1.0:
@@ -3326,7 +3462,7 @@ class ScopeWindow:
 			self._init_det_gpio()
 		except Exception:
 			pass
-		# Detection parameters (u16 domain 0..65535)
+			# Detection parameters (raw centered-product domain)
 		try:
 			# Default is x2 threshold (can be overridden via config/env).
 			self._det_ratio = float(load_det_ratio())
@@ -3551,6 +3687,7 @@ class ScopeWindow:
 		self._hard_reset_last_t = 0.0
 		self._auto_reset_just_occurred = False  # флаг: произошел авторесет, нужно восстановить режим
 		self._auto_reset_restore_idx = None
+		self._auto_reset_restore_sound = None
 		self._last_mode_button_click_idx = None
 		self._last_mode_button_click_t = 0.0
 		self._sample_len_mode_sync_armed = True
@@ -4319,6 +4456,45 @@ class ScopeWindow:
 			"txcplt_low": (r2 >> 12) & 0x000F,
 		}
 
+	def _latest_stat_diag(self) -> dict:
+		try:
+			st_obj = getattr(self, 'stream', None)
+			raw = getattr(st_obj, 'last_stat', None) if st_obj is not None else None
+			parsed = self._parse_fault_stat(raw, "last_stat")
+		except Exception:
+			parsed = {"valid": False}
+			st_obj = getattr(self, 'stream', None)
+		try:
+			last_t = float(getattr(st_obj, 'last_stat_t', 0.0) or 0.0) if st_obj is not None else 0.0
+			age_s = max(0.0, time.time() - last_t) if last_t > 0 else None
+		except Exception:
+			age_s = None
+		def _i(name):
+			try:
+				val = parsed.get(name)
+				return None if val is None else int(val)
+			except Exception:
+				return None
+		return {
+			"stat_valid": bool(parsed.get("valid")),
+			"stat_age_s": age_s,
+			"stat_prod": _i("produced_seq"),
+			"stat_sent0": _i("sent0"),
+			"stat_sent1": _i("sent1"),
+			"stat_txcplt": _i("dbg_tx_cplt"),
+			"stat_dma0": _i("dma0"),
+			"stat_dma1": _i("dma1"),
+			"stat_wr": _i("wr"),
+			"stat_seq": _i("cur_stream_seq"),
+			"stat_flags_rt": _i("flags_rt"),
+			"stat_flags2": _i("flags2"),
+			"stat_now_ms": _i("now_ms"),
+			"stat_last_full0_ms": _i("last_full0_ms"),
+			"stat_last_full1_ms": _i("last_full1_ms"),
+			"stat_packets": int(getattr(st_obj, 'stat_packets', 0) or 0) if st_obj is not None else 0,
+			"service_packets": int(getattr(st_obj, 'service_packets', 0) or 0) if st_obj is not None else 0,
+		}
+
 	def _trace_frame_integrity(self, channel: str, samples, frame):
 		"""Log physically unlikely in-frame jumps with firmware snapshot diagnostics.
 
@@ -4406,6 +4582,137 @@ class ScopeWindow:
 			)
 			if bool(getattr(self, 'reader_debug', False)):
 				print(f"[frame_integrity] {channel} seq={seq} idx={idx} {v0}->{v1} r2=0x{diag['reserved2']:04X}", flush=True)
+		except Exception:
+			pass
+
+	def _trace_frame_amplitude(self, channel: str, samples, frame):
+		"""Log whole-frame amplitude excursions without changing the stream."""
+		try:
+			if not bool(getattr(self, 'frame_amp_trace', True)) or samples is None:
+				return
+			arr = np.asarray(samples, dtype=np.float64)
+			if arr.size < 20:
+				return
+			arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+			try:
+				r2 = int(getattr(frame, 'reserved2', 0) or 0) & 0xFFFF
+			except Exception:
+				r2 = 0
+			key = f"{str(channel)}{r2 & 1}"
+			vmin, p05, med, p95, vmax = [float(x) for x in np.percentile(arr, [0, 5, 50, 95, 100])]
+			span = max(0.0, float(p95 - p05))
+			if not np.isfinite(span):
+				return
+			window = max(8, int(getattr(self, 'frame_amp_window', 80) or 80))
+			base_map = getattr(self, '_frame_amp_baseline', None)
+			center_map = getattr(self, '_frame_amp_center_baseline', None)
+			active_map = getattr(self, '_frame_amp_active', None)
+			last_t_map = getattr(self, '_frame_amp_last_t', None)
+			if not isinstance(base_map, dict):
+				base_map = {}
+				self._frame_amp_baseline = base_map
+			if not isinstance(center_map, dict):
+				center_map = {}
+				self._frame_amp_center_baseline = center_map
+			if not isinstance(active_map, dict):
+				active_map = {}
+				self._frame_amp_active = active_map
+			if not isinstance(last_t_map, dict):
+				last_t_map = {}
+				self._frame_amp_last_t = last_t_map
+			hist = base_map.get(key)
+			if hist is None or getattr(hist, 'maxlen', None) != window:
+				hist = deque(maxlen=window)
+				base_map[key] = hist
+			center_hist = center_map.get(key)
+			if center_hist is None or getattr(center_hist, 'maxlen', None) != window:
+				center_hist = deque(maxlen=window)
+				center_map[key] = center_hist
+			min_base = max(4, int(getattr(self, 'frame_amp_min_baseline', 18) or 18))
+			if len(hist) < min_base:
+				hist.append(span)
+				center_hist.append(med)
+				return
+			base_span = float(np.median(np.asarray(hist, dtype=np.float64)))
+			base_center = float(np.median(np.asarray(center_hist, dtype=np.float64))) if len(center_hist) else med
+			if not np.isfinite(base_span) or base_span <= 1e-9:
+				hist.append(span)
+				center_hist.append(med)
+				return
+			ratio = float(span / base_span)
+			center_shift = float(med - base_center)
+			reasons = []
+			if ratio >= max(1.1, float(getattr(self, 'frame_amp_up_ratio', 2.8) or 2.8)):
+				reasons.append(f"span_up={ratio:.2f}x")
+			elif ratio <= min(0.95, max(0.05, float(getattr(self, 'frame_amp_down_ratio', 0.40) or 0.40))):
+				reasons.append(f"span_down={ratio:.2f}x")
+			if abs(center_shift) >= max(float(getattr(self, 'frame_amp_center_adc', 1500) or 1500), base_span * 1.4):
+				reasons.append(f"center_shift={center_shift:+.0f}")
+			active = bool(active_map.get(key, False))
+			state = "anom" if reasons else ("recover" if active else "normal")
+			now = time.time()
+			should_log = bool(reasons) or active
+			if reasons and active and (now - float(last_t_map.get(key, 0.0) or 0.0)) < max(0.0, float(getattr(self, 'frame_amp_log_interval_s', 0.5) or 0.0)):
+				should_log = False
+			active_map[key] = bool(reasons)
+			# Keep the baseline adaptive so a several-second level change becomes one event
+			# with recovery, not an endless stream of identical anomaly lines.
+			hist.append(span)
+			center_hist.append(med)
+			if not should_log:
+				return
+			last_t_map[key] = now
+			try:
+				seq = int(getattr(frame, 'seq', -1))
+				ts = int(getattr(frame, 'timestamp', -1))
+				flags = int(getattr(frame, 'flags', 0) or 0)
+			except Exception:
+				seq, ts, flags = -1, -1, 0
+			try:
+				crc_bad = int(getattr(getattr(self, 'stream', None), 'crc_bad', 0) or 0)
+			except Exception:
+				crc_bad = 0
+			diag = self._snapshot_diag_from_frame(frame)
+			try:
+				if bool(getattr(self, 'frame_amp_ep0_stat', True)):
+					ep0_now = time.time()
+					ep0_last = float(getattr(self, '_frame_amp_ep0_last_t', 0.0) or 0.0)
+					ep0_min = float(getattr(self, 'frame_amp_ep0_min_interval_s', 0.75) or 0.75)
+					if (ep0_now - ep0_last) >= ep0_min:
+						self._frame_amp_ep0_last_t = ep0_now
+						self._read_ep0_stat_136(timeout_ms=int(getattr(self, 'frame_amp_ep0_timeout_ms', 60) or 60))
+			except Exception:
+				pass
+			stat_diag = self._latest_stat_diag()
+			head = [int(x) for x in arr[:min(8, int(arr.size))].tolist()]
+			info = {
+				"channel": str(channel), "key": key, "state": state,
+				"reason": ",".join(reasons) if reasons else "back_to_baseline",
+				"seq": seq, "timestamp": ts, "flags": flags, "samples": int(arr.size),
+				"min": int(vmin), "p05": int(p05), "median": int(med), "p95": int(p95), "max": int(vmax),
+				"span": int(span), "base_span": int(base_span), "ratio": ratio,
+				"center_shift": int(center_shift), "crc_bad": crc_bad, "head": head, **diag, **stat_diag,
+			}
+			self._frame_amp_count = int(getattr(self, '_frame_amp_count', 0) or 0) + 1
+			self._frame_amp_last = info
+			self._fault_log_line(
+				f"[frame_amplitude] ts={self._fault_timestamp()} ch={channel} key={key} state={state} "
+				f"reason={info['reason']} seq={seq} dev_ts={ts} flags=0x{flags & 0xFF:02X} samples={int(arr.size)} "
+				f"span={int(span)} base_span={int(base_span)} ratio={ratio:.2f} "
+				f"p05={int(p05)} med={int(med)} p95={int(p95)} min={int(vmin)} max={int(vmax)} "
+				f"center_shift={int(center_shift)} reserved={diag['reserved']} reserved2=0x{diag['reserved2']:04X} "
+				f"buf_idx={diag['buffer_index']} src_slot={diag['source_slot']} "
+				f"snapshot={int(diag['snapshot_used'])} gen_changed={int(diag['generation_changed'])} "
+				f"fifo_guard={int(diag['fifo_guard_near_reuse'])} consumed_after={int(diag['source_consumed_after_snapshot'])} "
+				f"txcplt_low={diag['txcplt_low']} crc_bad={crc_bad} "
+				f"stat_valid={int(stat_diag['stat_valid'])} stat_age={stat_diag['stat_age_s'] if stat_diag['stat_age_s'] is not None else -1:.3f} "
+				f"stat_prod={self._fmt_int(stat_diag['stat_prod'])} stat_sent={self._fmt_int(stat_diag['stat_sent0'])}/{self._fmt_int(stat_diag['stat_sent1'])} "
+				f"stat_txcplt={self._fmt_int(stat_diag['stat_txcplt'])} stat_dma={self._fmt_int(stat_diag['stat_dma0'])}/{self._fmt_int(stat_diag['stat_dma1'])} "
+				f"stat_wr={self._fmt_int(stat_diag['stat_wr'])} stat_seq={self._fmt_int(stat_diag['stat_seq'])} "
+				f"stat_flags={self._fmt_hex16(stat_diag['stat_flags_rt'])}/{self._fmt_hex16(stat_diag['stat_flags2'])} "
+				f"stat_now={self._fmt_int(stat_diag['stat_now_ms'])} stat_full={self._fmt_int(stat_diag['stat_last_full0_ms'])}/{self._fmt_int(stat_diag['stat_last_full1_ms'])} "
+				f"stat_pkts={stat_diag['stat_packets']} svc_pkts={stat_diag['service_packets']} head={head}"
+			)
 		except Exception:
 			pass
 
@@ -4779,6 +5086,7 @@ class ScopeWindow:
 					try:
 						if getattr(self, "stream", None) is not None:
 							self.stream.last_stat = bs
+							self.stream.last_stat_t = time.time()
 					except Exception:
 						pass
 					return bs, f"{source} EP0 len={len(bs)}"
@@ -4810,10 +5118,10 @@ class ScopeWindow:
 
 	def _fault_probe_and_log(self, reason: str) -> dict:
 		if not self._fault_probe_lock.acquire(False):
-			try:
-				return dict(getattr(self, "_last_fault_probe_result", {}) or {})
-			except Exception:
-				return {}
+				try:
+					return dict(getattr(self, "_last_fault_probe_result", {}) or {})
+				except Exception:
+					return {}
 		try:
 			self._fault_probe_inflight = True
 			reason_s = str(reason or "fault")
@@ -5300,6 +5608,10 @@ class ScopeWindow:
 			except Exception:
 				probe_result = {}
 			verdict = str(probe_result.get("verdict") or "")
+			try:
+				self._auto_reset_restore_sound = self._sound_restore_target()
+			except Exception:
+				self._auto_reset_restore_sound = None
 			self._mute_detection_after_fault(reason_s or "stall")
 			self._auto_reset_restore_idx = restore_idx
 			self._sample_len_mode_pending = None
@@ -5933,11 +6245,11 @@ class ScopeWindow:
 				prod1_raw = prod1_mag
 			else:
 				try:
-					scale = float(os.getenv('BMI30_PROD_SCALE', '100'))
+					scale = float(self._rt_product_display_scale())
 				except Exception:
-					scale = 100.0
+					scale = _rt_product_default_scale()
 				if not np.isfinite(scale) or scale == 0.0:
-					scale = 100.0
+					scale = _rt_product_default_scale()
 				self._xcorr_prod_scale = float(scale)
 				prod0_raw = prod0_mag / scale
 				prod1_raw = prod1_mag / scale
@@ -6140,20 +6452,28 @@ class ScopeWindow:
 			pass
 
 	def _device_set_dc_adapt(self, enabled: bool):
-		"""Toggle device-side DC adaptation if supported by firmware."""
+		"""Legacy SET_DC_ADAPT hook.
+
+		Websplit uses SET_DC_CONFIG as the single source of truth for device-side
+		DC compensation. The legacy toggle is left behind an env flag for older
+		firmware, but it is not sent during normal operation.
+		"""
 		try:
 			if self.stream is None:
+				return
+			try:
+				use_legacy = _env_bool("BMI30_USE_LEGACY_DC_ADAPT", False)
+			except Exception:
+				use_legacy = False
+			if not use_legacy:
 				return
 			requested = bool(enabled)
 			try:
 				allow_off = _env_bool("BMI30_ALLOW_DC_ADAPT_OFF", False)
 			except Exception:
 				allow_off = False
-			# DC compensation is firmware-side and should keep running; timing
-			# profiles control its speed. Legacy detector paths may still request
-			# OFF on a hold/freeze event, so keep the device armed by default.
 			if not requested and not allow_off:
-				requested = True
+				return
 			payload = b"\x01" if requested else b"\x00"
 			self.stream.send_cmd(CMD_SET_DC_ADAPT, payload)
 		except Exception:
@@ -6490,7 +6810,7 @@ class ScopeWindow:
 		except Exception:
 			return False
 
-	def _set_sound_enabled(self, enabled: bool, reason: str = "", announce: bool = False):
+	def _set_sound_enabled(self, enabled: bool, reason: str = "", announce: bool = False, persist: bool | None = None):
 		"""Set user sound permission; disabling always silences PWM immediately."""
 		en = bool(enabled)
 		try:
@@ -6521,6 +6841,13 @@ class ScopeWindow:
 			self._update_pwm_btn_style()
 		except Exception:
 			pass
+		if persist is None:
+			persist = str(reason or "").strip().lower() in ("api", "ui", "user")
+		if bool(persist):
+			try:
+				save_sound_enabled(en)
+			except Exception:
+				pass
 		if announce:
 			try:
 				if en:
@@ -6535,6 +6862,16 @@ class ScopeWindow:
 					self._set_status(msg, hold_sec=2.0)
 			except Exception:
 				pass
+
+	def _sound_restore_target(self) -> bool:
+		try:
+			current = bool(getattr(self, '_sound_enabled', False))
+		except Exception:
+			current = False
+		try:
+			return bool(load_sound_enabled(current))
+		except Exception:
+			return current
 
 	def _select_mode3_silent_after_fault(self, reason: str = ""):
 		"""Select temporary safe mode 3 after a stall/USB fault without changing startup mode."""
@@ -6644,6 +6981,13 @@ class ScopeWindow:
 			if not bool(self._sound_allowed()):
 				self._stop_sound_now()
 				return
+			# Optic reaction gating: when enabled, suppress the detection beep unless the
+			# local optic sensor is currently active. Fail-open if optic state is unknown/stale.
+			if bool(getattr(self, 'optic_reaction_enabled', False)):
+				_optic_state = self._current_optic_active()
+				if _optic_state is False:
+					self._stop_sound_now()
+					return
 			try:
 				now = time.time()
 				fired0 = bool(fired0) and bool(self._det_output_active(0, now))
@@ -7152,7 +7496,7 @@ class ScopeWindow:
 		m_start = np.zeros(marker_count, dtype=np.uint16)
 		m_end = np.zeros(marker_count, dtype=np.uint16)
 		m_peak = np.zeros(marker_count, dtype=np.uint16)
-		m_level = np.zeros(marker_count, dtype=np.uint16)
+		m_level = np.zeros(marker_count, dtype=np.uint64)
 		m_shift = np.zeros(marker_count, dtype=np.int16)
 		m_peak_value = np.zeros(marker_count, dtype=np.float64)
 		m_kind = np.empty(marker_count, dtype='U16')
@@ -7167,7 +7511,7 @@ class ScopeWindow:
 			m_start[i] = max(0, min(65535, int(marker.get('start', 0) or 0)))
 			m_end[i] = max(0, min(65535, int(marker.get('end', 0) or 0)))
 			m_peak[i] = max(0, min(65535, int(marker.get('peak', 0) or 0)))
-			m_level[i] = max(0, min(65535, int(marker.get('level', 0) or 0)))
+			m_level[i] = _rt_clamp_detector_level(marker.get('level', 0) or 0)
 			m_shift[i] = max(-32768, min(32767, int(marker.get('shift', 0) or 0)))
 			m_peak_value[i] = float(marker.get('peak_value', 0.0) or 0.0)
 			m_kind[i] = str(marker.get('kind', 'tag') or 'tag')[:16]
@@ -7178,7 +7522,7 @@ class ScopeWindow:
 			mode_selected = 0
 		np.savez_compressed(
 			filepath,
-			schema=np.array([1], dtype=np.uint16),
+			schema=np.array([2], dtype=np.uint16),
 			source=np.array(['raw_usb_before_detection'], dtype='U32'),
 			created_at=np.array([datetime.datetime.now().isoformat(timespec='seconds')], dtype='U32'),
 			started_t=np.array([float(started_t or 0.0)], dtype=np.float64),
@@ -7223,7 +7567,7 @@ class ScopeWindow:
 			starts = np.asarray(data['marker_start'], dtype=np.int32) if 'marker_start' in files else np.zeros(len(packets), dtype=np.int32)
 			ends = np.asarray(data['marker_end'], dtype=np.int32) if 'marker_end' in files else starts + 1
 			peaks = np.asarray(data['marker_peak'], dtype=np.int32) if 'marker_peak' in files else starts
-			levels = np.asarray(data['marker_level'], dtype=np.int32) if 'marker_level' in files else np.zeros(len(packets), dtype=np.int32)
+			levels = np.asarray(data['marker_level'], dtype=np.int64) if 'marker_level' in files else np.zeros(len(packets), dtype=np.int64)
 			shifts = np.asarray(data['marker_shift'], dtype=np.int32) if 'marker_shift' in files else np.zeros(len(packets), dtype=np.int32)
 			kinds = np.asarray(data['marker_kind']) if 'marker_kind' in files else np.array(['tag'] * len(packets), dtype='U16')
 			for i, pkt in enumerate(packets):
@@ -7254,11 +7598,11 @@ class ScopeWindow:
 				scale = float(self._rt_product_display_scale())
 			except Exception:
 				try:
-					scale = float(os.getenv('BMI30_PROD_SCALE', '100') or 100.0)
+					scale = float(os.getenv('BMI30_PROD_SCALE', '') or _rt_product_default_scale())
 				except Exception:
-					scale = 100.0
+					scale = _rt_product_default_scale()
 			if not np.isfinite(scale) or scale <= 0.0:
-				scale = 100.0
+				scale = _rt_product_default_scale()
 			vals = np.asarray(arr[:n:step], dtype=np.float64) / float(scale)
 			vals = np.nan_to_num(vals, nan=0.0, posinf=65535.0, neginf=0.0)
 			vals = np.clip(vals, 0.0, 65535.0).astype(np.uint16)
@@ -7303,22 +7647,22 @@ class ScopeWindow:
 				display_scale = float(self._rt_product_display_scale())
 			except Exception:
 				try:
-					display_scale = float(os.getenv('BMI30_PROD_SCALE', '100') or 100.0)
+					display_scale = float(os.getenv('BMI30_PROD_SCALE', '') or _rt_product_default_scale())
 				except Exception:
-					display_scale = 100.0
+					display_scale = _rt_product_default_scale()
 			if not np.isfinite(display_scale) or display_scale <= 0.0:
-				display_scale = 100.0
+				display_scale = _rt_product_default_scale()
 			display_vals = np.clip(vals / display_scale, 0.0, 65535.0)
 			return {
-				'min': lo,
-				'max': hi,
-				'span': span,
-				'scale': scale,
-				'det_min': lo / display_scale,
-				'det_max': hi / display_scale,
-				'det_span': span / display_scale,
-				'screen_per_det': float(65535.0 / (span / display_scale)) if span > 1e-12 else 0.0,
-				'det_unit': f'raw/{display_scale:g}',
+					'min': lo,
+					'max': hi,
+					'span': span,
+					'scale': scale,
+					'det_min': lo,
+					'det_max': hi,
+					'det_span': span,
+					'screen_per_det': float(65535.0 / span) if span > 1e-12 else 0.0,
+					'det_unit': 'raw-product',
 				'display_min': float(np.min(display_vals)),
 				'display_max': float(np.max(display_vals)),
 				'display_span': float(np.max(display_vals) - np.min(display_vals)),
@@ -7366,16 +7710,18 @@ class ScopeWindow:
 
 	def _player_offline_update_threshold(self, channel: int, threshold: int, level: int, in_detect: bool) -> int:
 		try:
-			threshold = max(1, int(threshold or 1))
-			level = max(0, min(65535, int(level or 0)))
+			threshold = _rt_clamp_detector_level(threshold or 1, default=1, minimum=1)
+			level = _rt_clamp_detector_level(level or 0)
 		except Exception:
 			threshold, level = 1, 0
 		up, down = self._player_offline_noise_steps(channel, bool(in_detect))
+		up = self._rt_detector_step_to_level_units(up)
+		down = self._rt_detector_step_to_level_units(down)
 		if level > threshold:
 			threshold += int(up)
 		else:
 			threshold -= int(down)
-		return max(1, min(65535, int(threshold)))
+		return _rt_clamp_detector_level(threshold, default=1, minimum=1)
 
 	def player_recording_load(self, name: str = 'latest', max_points: int = 600, max_frames: int = 800):
 		path = self._player_record_file_path(name)
@@ -7444,11 +7790,11 @@ class ScopeWindow:
 					level_scale = 0.0
 				if level_scale <= 0.0 or not np.isfinite(level_scale):
 					try:
-						level_scale = float(os.getenv('BMI30_PROD_SCALE', '100') or 100.0)
+						level_scale = float(os.getenv('BMI30_PROD_SCALE', '') or _rt_product_default_scale())
 					except Exception:
-						level_scale = 100.0
+						level_scale = _rt_product_default_scale()
 			if level_scale <= 0.0 or not np.isfinite(level_scale):
-				level_scale = 100.0
+				level_scale = _rt_product_default_scale()
 			try:
 				max_shift = int(getattr(self, '_rt_det_max_shift', 0) or 0)
 			except Exception:
@@ -7504,7 +7850,7 @@ class ScopeWindow:
 						'peak': int(peak_idx),
 						'peak_value': float(peak_value),
 					}
-				level_i = max(0, min(65535, int(level or 0)))
+					level_i = _rt_clamp_detector_level(level or 0)
 				if level_i <= 0:
 					det_cnt[ch] = 0
 					if det_hold[ch]:
@@ -7716,7 +8062,7 @@ class ScopeWindow:
 		try:
 			if prod_arr is not None:
 				arr = np.asarray(prod_arr)
-				if arr.size > peak:
+			if arr.size > peak:
 					arr = np.abs(arr.astype(np.float64, copy=False))
 					pv = float(abs(peak_value)) if np.isfinite(float(peak_value or 0.0)) else 0.0
 					pv = max(pv, float(arr[peak]))
@@ -7761,11 +8107,11 @@ class ScopeWindow:
 				self._player_record_markers.append({
 					'packet_idx': int(packet_idx),
 					'channel': int(ch),
-					'start': int(start),
-					'end': int(end),
-					'peak': int(peak),
-					'level': int(max(0, min(65535, int(lvl or 0)))),
-					'shift': int(shift or 0),
+						'start': int(start),
+						'end': int(end),
+						'peak': int(peak),
+						'level': _rt_clamp_detector_level(lvl or 0),
+						'shift': int(shift or 0),
 					'peak_value': float(peak_value or 0.0),
 					'kind': str(kind or 'tag')[:16],
 					'host_t': time.time(),
@@ -8042,10 +8388,10 @@ class ScopeWindow:
 			seq0_odd_arr = np.zeros(n_frames, dtype=np.int32)
 			seq1_even_arr = np.zeros(n_frames, dtype=np.int32)
 			seq1_odd_arr = np.zeros(n_frames, dtype=np.int32)
-			det_thr0_arr = np.zeros(n_frames, dtype=np.int32)
-			det_thr1_arr = np.zeros(n_frames, dtype=np.int32)
-			det_lvl0_arr = np.zeros(n_frames, dtype=np.int32)
-			det_lvl1_arr = np.zeros(n_frames, dtype=np.int32)
+			det_thr0_arr = np.zeros(n_frames, dtype=np.int64)
+			det_thr1_arr = np.zeros(n_frames, dtype=np.int64)
+			det_lvl0_arr = np.zeros(n_frames, dtype=np.int64)
+			det_lvl1_arr = np.zeros(n_frames, dtype=np.int64)
 			det_shift0_arr = np.zeros(n_frames, dtype=np.int32)
 			det_shift1_arr = np.zeros(n_frames, dtype=np.int32)
 			det_amp0_arr = np.zeros(n_frames, dtype=np.int32)
@@ -8190,7 +8536,7 @@ class ScopeWindow:
 			source = str(getattr(self, '_det_source', 'prod') or 'prod')
 			level_scale = float(self._rt_detector_level_scale())
 		except Exception:
-			source, level_scale = 'prod', 100.0
+			source, level_scale = 'prod', _rt_product_default_scale()
 		made = _rt_detector_product_current_prev(current[:n], previous[:n], int(max_shift), source, float(level_scale))
 		if made is None:
 			return None
@@ -8208,29 +8554,11 @@ class ScopeWindow:
 			source = str(getattr(self, '_det_source', 'prod') or 'prod').strip().lower()
 		except Exception:
 			source = 'prod'
-		if source == 'norm':
-			return int(max(0, min(65535, int((mx / ((32768.0 * 32768.0) + 1e-12)) * 65535.0))))
 		try:
-			level_scale = float(getattr(self, '_det_level_scale', 0.0) or 0.0)
+			level_scale = float(self._rt_detector_level_scale())
 		except Exception:
-			level_scale = 0.0
-		if level_scale <= 0.0:
-			try:
-				level_scale = float(os.getenv('BMI30_DETECT_LEVEL_SCALE', '') or 0.0)
-			except Exception:
-				level_scale = 0.0
-		if level_scale <= 0.0:
-			try:
-				level_scale = float(os.getenv('BMI30_PROD_SCALE', '100') or 100.0)
-			except Exception:
-				level_scale = 100.0
-			if not np.isfinite(level_scale) or level_scale <= 0.0:
-				level_scale = 100.0
-			try:
-				self._det_last_level_scale = float(level_scale)
-			except Exception:
-				pass
-			return int(max(0, min(65535, int(mx / level_scale))))
+			level_scale = _rt_detector_legacy_level_scale()
+		return _rt_detector_level_from_peak(mx, source, level_scale)
 
 	def _rt_detector_process_start(self) -> bool:
 		if not bool(getattr(self, '_rt_det_process_enabled', False)):
@@ -8258,6 +8586,11 @@ class ScopeWindow:
 			daemon=True,
 			)
 			self._rt_det_proc.start()
+			try:
+				self._rt_det_proc_started_t = time.time()
+				self._rt_det_proc_first_submit_t = 0.0
+			except Exception:
+				pass
 			print(f"[RT-DETECT] process started pid={self._rt_det_proc.pid}", flush=True)
 			return True
 		except Exception as e:
@@ -8299,6 +8632,8 @@ class ScopeWindow:
 		self._rt_det_proc_result_count = 0
 		self._rt_det_proc_last_submit_t = 0.0
 		self._rt_det_proc_last_result_t = 0.0
+		self._rt_det_proc_started_t = 0.0
+		self._rt_det_proc_first_submit_t = 0.0
 	
 	def _rt_detector_level_scale(self) -> float:
 		try:
@@ -8312,16 +8647,23 @@ class ScopeWindow:
 				level_scale = 0.0
 		if level_scale <= 0.0:
 			try:
-				level_scale = float(os.getenv('BMI30_PROD_SCALE', '100') or 100.0)
+				level_scale = float(os.getenv('BMI30_PROD_SCALE', '') or _rt_product_default_scale())
 			except Exception:
-				level_scale = 100.0
+				level_scale = _rt_product_default_scale()
 		if not np.isfinite(level_scale) or level_scale <= 0.0:
-			level_scale = 100.0
+			level_scale = _rt_product_default_scale()
 		try:
 			self._det_last_level_scale = float(level_scale)
 		except Exception:
 			pass
 		return float(level_scale)
+
+	def _rt_detector_step_to_level_units(self, value) -> int:
+		try:
+			scale = float(self._rt_detector_level_scale())
+		except Exception:
+			scale = _rt_detector_legacy_level_scale()
+		return _rt_legacy_level_to_product_units(value, scale, minimum=1)
 
 	def _det_channel_ratio(self, channel: int) -> float:
 		ch = 0 if int(channel) == 0 else 1
@@ -8470,6 +8812,8 @@ class ScopeWindow:
 					return False
 			try:
 				self._rt_det_proc_submit_count = int(getattr(self, '_rt_det_proc_submit_count', 0)) + 1
+				if float(getattr(self, '_rt_det_proc_first_submit_t', 0.0) or 0.0) <= 0.0:
+					self._rt_det_proc_first_submit_t = time.time()
 				self._rt_det_proc_last_submit_t = time.time()
 			except Exception:
 				pass
@@ -8515,6 +8859,8 @@ class ScopeWindow:
 					return False
 			try:
 				self._rt_det_proc_submit_count = int(getattr(self, '_rt_det_proc_submit_count', 0)) + 1
+				if float(getattr(self, '_rt_det_proc_first_submit_t', 0.0) or 0.0) <= 0.0:
+					self._rt_det_proc_first_submit_t = time.time()
 				self._rt_det_proc_last_submit_t = time.time()
 			except Exception:
 				pass
@@ -8537,10 +8883,14 @@ class ScopeWindow:
 			results = int(getattr(self, '_rt_det_proc_result_count', 0) or 0)
 			last_result = float(getattr(self, '_rt_det_proc_last_result_t', 0.0) or 0.0)
 			last_submit = float(getattr(self, '_rt_det_proc_last_submit_t', 0.0) or 0.0)
+			first_submit = float(getattr(self, '_rt_det_proc_first_submit_t', 0.0) or 0.0)
+			started = float(getattr(self, '_rt_det_proc_started_t', 0.0) or 0.0)
 			now = time.time()
-			if results <= 0 and submits >= 4:
+			if started > 0.0 and (now - started) < 1.5:
+				return False
+			if results <= 0 and submits >= 8 and first_submit > 0.0 and (now - first_submit) >= 1.0:
 				return True
-			if submits > 0 and last_submit > 0.0 and (now - last_submit) >= 0.25 and (last_result <= 0.0 or last_result < last_submit):
+			if results > 0 and last_result > 0.0 and last_submit > 0.0 and last_result < last_submit and (now - last_result) >= 1.0 and (now - last_submit) >= 0.25:
 				return True
 		except Exception:
 			return True
@@ -8548,11 +8898,11 @@ class ScopeWindow:
 
 	def _rt_product_display_scale(self) -> float:
 		try:
-			scale = float(os.getenv('BMI30_PROD_SCALE', '100') or 100.0)
+			scale = float(os.getenv('BMI30_PROD_SCALE', '') or _rt_product_default_scale())
 		except Exception:
-			scale = 100.0
+			scale = _rt_product_default_scale()
 		if not np.isfinite(scale) or scale <= 0.0:
-			scale = 100.0
+			scale = _rt_product_default_scale()
 		try:
 			self._xcorr_prod_scale = float(scale)
 		except Exception:
@@ -8720,14 +9070,14 @@ class ScopeWindow:
 		except Exception:
 			pass
 
-	def _rt_level_u16(self, arr: np.ndarray) -> int:
-		try:
-			if arr is None or (not hasattr(arr, 'size')) or arr.size == 0:
-				return 0
-			with np.errstate(invalid='ignore'):
-				mx = float(np.nanmax(np.abs(arr)))
-		except Exception:
-			mx = 0.0
+		def _rt_level_full(self, arr: np.ndarray) -> int:
+			try:
+				if arr is None or (not hasattr(arr, 'size')) or arr.size == 0:
+					return 0
+				with np.errstate(invalid='ignore'):
+					mx = float(np.nanmax(np.abs(arr)))
+			except Exception:
+				mx = 0.0
 		if not np.isfinite(mx) or mx <= 0.0:
 			return 0
 		try:
@@ -8735,28 +9085,12 @@ class ScopeWindow:
 		except Exception:
 			source = 'prod'
 		if source == 'norm':
-			return int(max(0, min(65535, int((mx / ((32768.0 * 32768.0) + 1e-12)) * 65535.0))))
+			return _rt_clamp_detector_level(mx * _RT_PRODUCT_FULL_SCALE)
 		try:
-			level_scale = float(getattr(self, '_det_level_scale', 0.0) or 0.0)
-		except Exception:
-			level_scale = 0.0
-		if level_scale <= 0.0:
-			try:
-				level_scale = float(os.getenv('BMI30_DETECT_LEVEL_SCALE', '') or 0.0)
-			except Exception:
-				level_scale = 0.0
-		if level_scale <= 0.0:
-			try:
-				level_scale = float(os.getenv('BMI30_PROD_SCALE', '100') or 100.0)
-			except Exception:
-				level_scale = 100.0
-		if not np.isfinite(level_scale) or level_scale <= 0.0:
-			level_scale = 100.0
-		try:
-			self._det_last_level_scale = float(level_scale)
+			self._det_last_level_scale = float(self._rt_detector_level_scale())
 		except Exception:
 			pass
-		return int(max(0, min(65535, int(mx / level_scale))))
+		return _rt_clamp_detector_level(mx)
 
 	def _det_output_min_s(self) -> float:
 		try:
@@ -8878,7 +9212,7 @@ class ScopeWindow:
 		if not (in_warmup or in_fast):
 			step_mul = 1.0
 		try:
-			lvl = int(max(0, min(65535, int(lvl))))
+			lvl = _rt_clamp_detector_level(lvl)
 		except Exception:
 			lvl = 0
 		try:
@@ -8947,8 +9281,6 @@ class ScopeWindow:
 		if float(lvl) >= float(base_thr):
 			setattr(self, present_key, _now)
 		adaptive_exceed_now = bool(float(lvl) >= ratio * float(thr_prev))
-		if (not adaptive_exceed_now) and int(lvl) >= 65535 and int(thr_prev) >= 65535:
-			adaptive_exceed_now = True
 		quarter_candidate_now = bool(int(lvl) >= _rt_detector_quarter_trigger_min_level())
 		candidate_now = bool(adaptive_exceed_now or quarter_candidate_now)
 		level_exceed_now = bool(adaptive_exceed_now)
@@ -9141,6 +9473,12 @@ class ScopeWindow:
 					base_down = max(1, int(round(float(thr_prev) * float(base_down) / 100.0)))
 				except Exception:
 					base_down = max(1, int(base_down))
+			else:
+				base_up = self._rt_detector_step_to_level_units(base_up)
+				base_down = self._rt_detector_step_to_level_units(base_down)
+		else:
+			base_up = self._rt_detector_step_to_level_units(base_up)
+			base_down = self._rt_detector_step_to_level_units(base_down)
 		up = base_up * step_mul
 		down = base_down * step_mul
 		if int(lvl) > thr_prev:
@@ -9157,7 +9495,7 @@ class ScopeWindow:
 			thr_new = thr_prev + int(up_step)
 		else:
 			thr_new = thr_prev - int(down)
-		thr_new = int(max(1, min(65535, thr_new)))
+		thr_new = _rt_clamp_detector_level(thr_new, default=1, minimum=1)
 		if not bool(getattr(self, '_det_dc_frozen', False)):
 			setattr(self, thr_key, thr_new)
 
@@ -9241,10 +9579,12 @@ class ScopeWindow:
 					pass
 				if not bool(getattr(self, '_prev_freeze_state', False)):
 					self._freeze_fire_count += 1
-				self._det_dc_frozen = True
+				# DC compensation must keep running on the device; this flag is
+				# detector bookkeeping only and must not freeze firmware DC adapt.
+				self._det_dc_frozen = False
 				self._prev_freeze_state = True
 				try:
-					self._device_set_dc_adapt(False)
+					self._device_set_dc_adapt(True)
 				except Exception:
 					pass
 			try:
@@ -9366,10 +9706,9 @@ class ScopeWindow:
 	def _update_signal_detection(self, prod0_arr: np.ndarray, prod1_arr: np.ndarray, shift0: int, shift1: int, source: str = 'norm'):
 		"""Per-channel signal detection.
 
-		By default (source='norm'), we use normalized product max (0..1) mapped to a u16-like level (0..65535).
-		This keeps threshold adaptation stable/slow even when raw product magnitudes swing a lot.
-
-		Alternative (source='prod'): use raw centered product max scaled by BMI30_DETECT_LEVEL_SCALE (or BMI30_PROD_SCALE).
+		By default (source='norm'), normalized product max (0..1) is mapped back to
+		raw centered-product units. Alternative (source='prod') uses raw centered
+		product magnitude directly. Display scaling remains separate.
 
 		Threshold adaptation is ALWAYS active, but uses two sets of step sizes:
 		- no-detect: +20 / -5
@@ -9446,50 +9785,31 @@ class ScopeWindow:
 		if (not in_freeze) and ((_now - float(getattr(self, '_det_last_fire_t', 0.0))) < float(getattr(self, '_det_cooldown_s', 1.0))):
 			return
 
-		def _level_u16(arr: np.ndarray) -> int:
-			"""Return detector level (0..65535) from product array magnitude."""
-			try:
-				if arr is None or (not hasattr(arr, 'size')) or (arr.size == 0):
-					return 0
-				with np.errstate(invalid='ignore'):
-					mx = float(np.nanmax(np.abs(arr)))
-			except Exception:
-				mx = 0.0
-			if not np.isfinite(mx) or mx <= 0.0:
-				return 0
-			if source == 'norm':
-				# Normalized product magnitude is ~[0..1]. Map to u16 for stable adaptation.
+			def _level_full(arr: np.ndarray) -> int:
+				"""Return detector level from product array magnitude in raw product units."""
 				try:
-					self._det_last_level_scale = 0.0
+					if arr is None or (not hasattr(arr, 'size')) or (arr.size == 0):
+						return 0
+					with np.errstate(invalid='ignore'):
+						mx = float(np.nanmax(np.abs(arr)))
+				except Exception:
+					mx = 0.0
+				if not np.isfinite(mx) or mx <= 0.0:
+					return 0
+				if source == 'norm':
+					# Normalized product magnitude is ~[0..1]. Map back to full product units.
+					try:
+						self._det_last_level_scale = 0.0
+					except Exception:
+						pass
+					return _rt_clamp_detector_level(mx * _RT_PRODUCT_FULL_SCALE)
+				try:
+					self._det_last_level_scale = float(self._rt_detector_level_scale())
 				except Exception:
 					pass
-				v = int(mx * 65535.0)
-				return int(max(0, min(65535, v)))
-			# Raw product mode: scale down to u16-like range.
-			try:
-				level_scale = float(getattr(self, '_det_level_scale', 0.0) or 0.0)
-			except Exception:
-				level_scale = 0.0
-			if level_scale <= 0.0:
-				try:
-					level_scale = float(os.getenv('BMI30_DETECT_LEVEL_SCALE', '') or 0.0)
-				except Exception:
-					level_scale = 0.0
-			if level_scale <= 0.0:
-				try:
-					level_scale = float(os.getenv('BMI30_PROD_SCALE', '100') or 100.0)
-				except Exception:
-					level_scale = 100.0
-			if not np.isfinite(level_scale) or level_scale <= 0.0:
-				level_scale = 100.0
-			try:
-				self._det_last_level_scale = float(level_scale)
-			except Exception:
-				pass
-			v = int(mx / level_scale)
-			return int(max(0, min(65535, v)))
-		lvl0 = _level_u16(prod0_arr)
-		lvl1 = _level_u16(prod1_arr)
+				return _rt_clamp_detector_level(mx)
+		lvl0 = _level_full(prod0_arr)
+		lvl1 = _level_full(prod1_arr)
 		try:
 			self._det_last_lvl0 = int(lvl0)
 			self._det_last_lvl1 = int(lvl1)
@@ -9566,37 +9886,35 @@ class ScopeWindow:
 				ratio = float(self._det_channel_ratio(ch))
 			except Exception:
 				ratio = 2.0
-			# Decide whether we currently have "detection":
-			# - HOLD means we previously fired and are still in detected/present state.
-			# - exceed_now means current level is above ratio*threshold.
-			exceed_now = bool(float(lvl) >= ratio * float(thr_prev))
-			if (not exceed_now) and int(lvl) >= 65535 and int(thr_prev) >= 65535:
-				exceed_now = True
-			in_detect = bool(getattr(self, hold_key, False)) or bool(exceed_now)
-			training_noise = bool(in_warmup or in_fast)
-			adapt_as_detect = bool(in_detect and not training_noise)
-			# Step sizes per user requirement:
-			# - detect: +4 / -1
-			# - no detect: +40 / -10
-			# Во время прогрева/быстрого сброса умножаем шаги для ускорения адаптации.
-			up = (5 if adapt_as_detect else 50) * step_mul
-			down = (1 if adapt_as_detect else 5) * step_mul
-			if int(lvl) > thr_prev:
-				up_step = int(up)
-				if training_noise:
-					try:
-						alpha = float(getattr(self, '_det_fast_adapt_alpha', 0.35) or 0.35)
-						if (not np.isfinite(alpha)) or alpha <= 0.0:
-							alpha = 0.35
-						alpha = min(1.0, max(0.01, alpha))
-						up_step = max(up_step, int((int(lvl) - int(thr_prev)) * alpha))
-					except Exception:
-						pass
-				thr_new = thr_prev + int(up_step)
-			else:
-				thr_new = thr_prev - int(down)
-			thr_new = int(max(1, min(65535, thr_new)))
-			setattr(self, thr_key, thr_new)
+				# Decide whether we currently have "detection":
+				# - HOLD means we previously fired and are still in detected/present state.
+				# - exceed_now means current level is above ratio*threshold.
+				exceed_now = bool(float(lvl) >= ratio * float(thr_prev))
+				in_detect = bool(getattr(self, hold_key, False)) or bool(exceed_now)
+				training_noise = bool(in_warmup or in_fast)
+				adapt_as_detect = bool(in_detect and not training_noise)
+				# Step sizes per user requirement:
+				# - detect: +4 / -1
+				# - no detect: +40 / -10
+				# Во время прогрева/быстрого сброса умножаем шаги для ускорения адаптации.
+				up = self._rt_detector_step_to_level_units(5 if adapt_as_detect else 50) * step_mul
+				down = self._rt_detector_step_to_level_units(1 if adapt_as_detect else 5) * step_mul
+				if int(lvl) > thr_prev:
+					up_step = int(up)
+					if training_noise:
+						try:
+							alpha = float(getattr(self, '_det_fast_adapt_alpha', 0.35) or 0.35)
+							if (not np.isfinite(alpha)) or alpha <= 0.0:
+								alpha = 0.35
+							alpha = min(1.0, max(0.01, alpha))
+							up_step = max(up_step, int((int(lvl) - int(thr_prev)) * alpha))
+						except Exception:
+							pass
+					thr_new = thr_prev + int(up_step)
+				else:
+					thr_new = thr_prev - int(down)
+				thr_new = _rt_clamp_detector_level(thr_new, default=1, minimum=1)
+				setattr(self, thr_key, thr_new)
 			# Detect exceed vs previous threshold
 			exceed = bool(exceed_now)
 			cnt = int(getattr(self, ex_key, 0))
@@ -9687,20 +10005,20 @@ class ScopeWindow:
 			if fire1:
 				self._det_hold1 = True
 				self._det_exceed1 = 0
-			# freeze device DC adapt
+			# Keep detector hold bookkeeping, but never freeze device DC adapt.
 			if not bool(getattr(self, '_det_dc_frozen', False)):
-				# snapshot thresholds at the moment of freeze to make later loss detection stable
+				# snapshot thresholds at the moment of detection to make later loss detection stable
 				try:
 					self._det_freeze_thr0 = int(getattr(self, '_det_thr0', 0) or 0)
 					self._det_freeze_thr1 = int(getattr(self, '_det_thr1', 0) or 0)
 				except Exception:
 					pass
-				# Отслеживаем переход 0->1 для счетчика заморозки
+				# Отслеживаем переход 0->1 для счетчика detector hold.
 				if not self._prev_freeze_state:
 					self._freeze_fire_count += 1
-				self._det_dc_frozen = True
+				self._det_dc_frozen = False
 				self._prev_freeze_state = True
-				self._device_set_dc_adapt(False)
+				self._device_set_dc_adapt(True)
 		# also ensure host DC removal is off
 		try:
 			self.dc_removal_enabled = False
@@ -10729,7 +11047,15 @@ class ScopeWindow:
 		except Exception:
 			selected_before = None
 		try:
-			if detected_idx == 3 and selected_before in (1, 2, 3):
+			restore_after_buf_idx = int(getattr(self, '_restore_mode_after_buf_idx', 0) or 0)
+		except Exception:
+			restore_after_buf_idx = 0
+		try:
+			if int(restore_after_buf_idx) >= 6:
+				idx = int(restore_after_buf_idx)
+			elif selected_before is not None and int(selected_before) >= 6:
+				idx = int(selected_before)
+			elif detected_idx == 3 and selected_before in (1, 2, 3):
 				idx = int(selected_before)
 			elif detected_idx == 5 and selected_before is not None and int(selected_before) >= 6:
 				idx = int(selected_before)
@@ -10829,6 +11155,52 @@ class ScopeWindow:
 			msg = f"BUF={sample_count}: transport mode {detected_idx}, display mode {idx}"
 			self._set_status(msg, hold_sec=2.0)
 			print(f"[mode-detect] {msg}" + (f" ({reason})" if reason else ""), flush=True)
+		except Exception:
+			pass
+		try:
+			restore_idx = 0
+			if int(restore_after_buf_idx) >= 6:
+				restore_idx = int(restore_after_buf_idx)
+			elif selected_before is not None and int(selected_before) >= 6 and int(idx) < 6:
+				restore_idx = int(selected_before)
+			if int(restore_idx) >= 6:
+				self._restore_mode_after_buf_idx = 0
+
+				def _restore_saved_detect_mode():
+					need_restore = True
+					try:
+						need_restore = not (
+							int(self.num_group.checkedId()) == int(restore_idx)
+							and int(getattr(self, 'stream_mode', 0) or 0) == 2
+							and int(getattr(self, 'base_buf_len', 0) or 0) == 200
+						)
+					except Exception:
+						need_restore = True
+					if not need_restore:
+						return
+					try:
+						btn = self.num_group.button(int(restore_idx))
+						if btn is not None:
+							btn.setChecked(True)
+					except Exception:
+						pass
+					try:
+						self._num_clicked(int(restore_idx))
+					except Exception:
+						pass
+					try:
+						self._on_num_clicked_extra(int(restore_idx))
+					except Exception:
+						pass
+					try:
+						print(f"[mode-detect] restored saved mode {int(restore_idx)} after BUF={int(sample_count)}", flush=True)
+					except Exception:
+						pass
+
+				try:
+					QtCore.QTimer.singleShot(50, _restore_saved_detect_mode)
+				except Exception:
+					_restore_saved_detect_mode()
 		except Exception:
 			pass
 		try:
@@ -11237,58 +11609,12 @@ class ScopeWindow:
 				except Exception:
 					pass
 
-				# При необходимости можно явно сбросить накопленную очередь ассемблера (независимый режим),
-				# чтобы не было задержки из старых кадров. Выключено по умолчанию, включается env BMI30_FLUSH_ASM_QUEUE=1.
-				if getattr(self, 'flush_asm_queue', False) and getattr(self, 'independent_channels', False):
-					try:
-						asm = getattr(self.stream, 'asm', None)
-						# independent: trim qA/qB; paired: trim q
-						if asm is not None and getattr(asm, 'independent', False):
-							for tag in ('qA', 'qB'):
-								q = getattr(asm, tag, None)
-								if q is None or not hasattr(q, 'qsize'):
-									continue
-								qs = q.qsize()
-								if qs <= 1:
-									continue
-								last_item = None
-								while True:
-									try:
-										item = q.get_nowait()
-										last_item = item
-									except Exception:
-										break
-								if last_item is not None:
-									try:
-										q.put_nowait(last_item)
-									except Exception:
-										pass
-								print(f"[ASM_FLUSH] {tag} trimmed (was {qs}), kept latest. new={q.qsize() if hasattr(q,'qsize') else '?'}", flush=True)
-						else:
-							q = getattr(asm, 'q', None)
-							if q is not None and hasattr(q, 'qsize'):
-								qs = q.qsize()
-								if qs > 0:
-									last_item = None
-									while True:
-										try:
-											item = q.get_nowait()
-											last_item = item
-										except Exception:
-											break
-									if last_item is not None:
-										try:
-											q.put_nowait(last_item)
-										except Exception:
-											pass
-									print(f"[ASM_FLUSH] queue trimmed (was {qs}), kept latest. new_q={q.qsize() if hasattr(q,'qsize') else '?'}", flush=True)
-					except Exception:
-						pass
-
 				ch0 = np.frombuffer(a.payload, dtype='<u2').astype(np.int32) if a is not None else None
 				ch1 = np.frombuffer(b.payload, dtype='<u2').astype(np.int32) if b is not None else None
 				self._trace_frame_integrity('A', ch0, a)
 				self._trace_frame_integrity('B', ch1, b)
+				self._trace_frame_amplitude('A', ch0, a)
+				self._trace_frame_amplitude('B', ch1, b)
 				
 				# --- diagnostics: compute sequence/timestamps early to detect pairing issues ---
 				if a is not None and b is not None:
@@ -11792,27 +12118,30 @@ class ScopeWindow:
 
 					if bool(self._player_realtime_suspended()):
 						rt_block = None
-					elif rt_block is not None and bool(self._rt_detector_needs_sync_fallback()):
+					elif rt_block is not None:
+						rt_submitted = False
 						try:
-							self._rt_detector_process_stop()
+							rt_submitted = bool(self._rt_detector_submit_process_block(rt_block))
+							if rt_submitted and bool(self._rt_detector_needs_sync_fallback()):
+								rt_submitted = False
 						except Exception:
-							pass
-						try:
-							self._rt_det_process_enabled = False
-							print("[RT-DETECT] process fallback: using synchronous detector", flush=True)
-						except Exception:
-							pass
-						rt_block = None
-						for rt_ch, rt_samples, rt_seqv in rt_pending:
+							rt_submitted = False
+						if not rt_submitted:
 							try:
-								self._handle_realtime_prevbuf_input(rt_ch, rt_samples, rt_seqv)
+								self._rt_detector_process_stop()
 							except Exception:
 								pass
-					elif rt_block is not None:
-						try:
-							self._rt_detector_submit_process_block(rt_block)
-						except Exception:
-							pass
+							try:
+								self._rt_det_process_enabled = False
+								print("[RT-DETECT] process fallback: using synchronous detector", flush=True)
+							except Exception:
+								pass
+							rt_block = None
+							for rt_ch, rt_samples, rt_seqv in rt_pending:
+								try:
+									self._handle_realtime_prevbuf_input(rt_ch, rt_samples, rt_seqv)
+								except Exception:
+									pass
 					else:
 						for rt_ch, rt_samples, rt_seqv in rt_pending:
 							try:
@@ -11947,8 +12276,18 @@ class ScopeWindow:
 					self._on_num_clicked_extra(restore_idx)
 				except Exception:
 					pass
+				try:
+					restore_sound = getattr(self, '_auto_reset_restore_sound', None)
+					if restore_sound is not None:
+						self._set_sound_enabled(bool(restore_sound), reason="recovery_restore", announce=False)
+						self._fault_log_line(
+							f"[recovery] ts={self._fault_timestamp()} action=restore_sound enabled={int(bool(restore_sound))}"
+						)
+				except Exception:
+					pass
 				self._auto_reset_just_occurred = False
 				self._auto_reset_restore_idx = None
+				self._auto_reset_restore_sound = None
 				print(f"[GUI] Auto-reset completed, restored mode {restore_idx}", flush=True)
 			except Exception as e:
 				if str(e) not in ("wait reconnect before restoring mode", "wait dc autotune before restoring mode", "mode3_wait_buf600"):
@@ -11979,8 +12318,12 @@ class ScopeWindow:
 					if restore_idx not in (1, 2, 3, 4, 5, 6, 7):
 						restore_idx = 6
 					self._auto_reset_restore_idx = restore_idx
+					try:
+						self._auto_reset_restore_sound = self._sound_restore_target()
+					except Exception:
+						self._auto_reset_restore_sound = None
 					self._auto_reset_just_occurred = True
-				self._note_stream_fault("usb_disconnected")
+					self._note_stream_fault("usb_disconnected")
 				self._mute_detection_after_fault("usb_disconnected")
 				try:
 					try:
@@ -12178,12 +12521,12 @@ class ScopeWindow:
 				if len(self.data0):
 					maxv = max(maxv, int(np.max(self.data0)))
 					maxv = max(maxv, abs(int(np.min(self.data0))))
-				if len(self.data1):
-					maxv = max(maxv, int(np.max(self.data1)))
-					maxv = max(maxv, abs(int(np.min(self.data1))))
-				# небольшая защита от нуля
-				span = max(64, maxv * 1.05)
-				# экспоненциальное сглаживание перепадов амплитуды
+					if len(self.data1):
+						maxv = max(maxv, int(np.max(self.data1)))
+						maxv = max(maxv, abs(int(np.min(self.data1))))
+					# небольшая защита от нуля
+					span = max(64, maxv * 1.05)
+					# экспоненциальное сглаживание перепадов амплитуды
 				alpha = 0.25
 				if self._y_span_smooth is None:
 					self._y_span_smooth = span
@@ -12905,7 +13248,7 @@ class ScopeWindow:
 
 	def _on_toggle_force_pwm(self, enabled: bool = False):
 		"""Включить/выключить разрешение звука."""
-		self._set_sound_enabled(bool(enabled), announce=True)
+		self._set_sound_enabled(bool(enabled), reason="ui", announce=True, persist=True)
 
 	def _copy_legend_from_btn(self, pos):
 		"""Handle right-click on `btn_power`: copy `legend_lbl` text to clipboard."""
@@ -13101,11 +13444,11 @@ class ScopeWindow:
 			adc1_en, adc2_en = self._adc_enable_flags()
 		except Exception:
 			adc1_en, adc2_en = True, True
-		with self.data_lock:
-			n = int(self.base_buf_len or 0)
-			if n <= 0:
-				return {'ready': False, 'reason': 'ожидание буфера'}
-			series = []
+			with self.data_lock:
+				n = int(self.base_buf_len or 0)
+				if n <= 0:
+					return {'ready': False, 'reason': 'ожидание буфера'}
+				series = []
 			if adc1_en:
 				series.append(("ADC1 even", np.asarray(self.data0_even[:n], dtype=np.float64).copy()))
 				series.append(("ADC1 odd", np.asarray(self.data0_odd[:n], dtype=np.float64).copy()))
@@ -13114,44 +13457,44 @@ class ScopeWindow:
 				series.append(("ADC2 odd", np.asarray(self.data1_odd[:n], dtype=np.float64).copy()))
 		if not series:
 			return {'ready': False, 'reason': 'нет активных каналов'}
-		rows = []
-		centered_all = True
-		max_mean_off = 0.0
-		worst_name = ''
-		worst_side_frac = 1.0
-		for name, arr in series:
-			if arr.size == 0:
-				return {'ready': False, 'reason': 'ожидание данных'}
-			try:
-				finite = arr[np.isfinite(arr)]
-			except Exception:
-				finite = arr
-			if finite.size == 0:
-				return {'ready': False, 'reason': 'ожидание данных'}
-			mean_val = float(np.mean(finite))
-			mean_off = abs(mean_val - center)
-			below_frac = float(np.count_nonzero(finite < center)) / float(finite.size)
-			above_frac = float(np.count_nonzero(finite > center)) / float(finite.size)
-			side_frac = min(below_frac, above_frac)
-			span = float(np.max(finite) - np.min(finite))
-			# Если сигнал почти плоский, достаточно попасть средним в центр.
-			if span <= min_span:
-				centered = (mean_off <= center_tol)
-			else:
-				centered = (mean_off <= center_tol) and (side_frac >= min_side_frac)
-			rows.append({
-				'name': name,
-				'centered': bool(centered),
-				'mean_off': float(mean_off),
-				'side_frac': float(side_frac),
-				'span': float(span),
-			})
-			if mean_off >= max_mean_off:
-				max_mean_off = float(mean_off)
-				worst_name = str(name)
-				worst_side_frac = float(side_frac)
-			if not centered:
-				centered_all = False
+			rows = []
+			centered_all = True
+			max_mean_off = 0.0
+			worst_name = ''
+			worst_side_frac = 1.0
+			for name, arr in series:
+				if arr.size == 0:
+					return {'ready': False, 'reason': 'ожидание данных'}
+				try:
+					finite = arr[np.isfinite(arr)]
+				except Exception:
+					finite = arr
+				if finite.size == 0:
+					return {'ready': False, 'reason': 'ожидание данных'}
+				mean_val = float(np.mean(finite))
+				mean_off = abs(mean_val - center)
+				below_frac = float(np.count_nonzero(finite < center)) / float(finite.size)
+				above_frac = float(np.count_nonzero(finite > center)) / float(finite.size)
+				side_frac = min(below_frac, above_frac)
+				span = float(np.max(finite) - np.min(finite))
+				# Если сигнал почти плоский, достаточно попасть средним в центр.
+				if span <= min_span:
+					centered = (mean_off <= center_tol)
+				else:
+					centered = (mean_off <= center_tol) and (side_frac >= min_side_frac)
+				rows.append({
+					'name': name,
+					'centered': bool(centered),
+					'mean_off': float(mean_off),
+					'side_frac': float(side_frac),
+					'span': float(span),
+				})
+				if mean_off >= max_mean_off:
+						max_mean_off = float(mean_off)
+						worst_name = str(name)
+						worst_side_frac = float(side_frac)
+				if not centered:
+					centered_all = False
 		ok_count = sum(1 for row in rows if row.get('centered'))
 		return {
 			'ready': True,
@@ -14760,6 +15103,57 @@ class ScopeWindow:
 					pass
 			return False
 
+	def _send_optic_hold_ds(self, hold_ds, update_ui: bool = True):
+		"""Отправить CMD_SET_OPTIC_HOLD (0x39): длительность удержания оптики в децисекундах (u16 LE, 0..100)."""
+		try:
+			if self.stream is None:
+				return False
+			try:
+				ds = int(hold_ds)
+			except Exception:
+				ds = 0
+			ds = max(0, min(100, ds))
+			payload = int(ds).to_bytes(2, "little")
+			self.stream.send_cmd(CMD_SET_OPTIC_HOLD, payload)
+			return True
+		except Exception as e:
+			if update_ui:
+				try:
+					self._set_status(f"Optic hold: ошибка ({e})", hold_sec=2.0)
+				except Exception:
+					pass
+			return False
+
+	def _set_optic_reaction_enabled(self, enabled: bool):
+		"""Вкл/выкл зависимость оповещения детекции от срабатывания оптического датчика."""
+		self.optic_reaction_enabled = bool(enabled)
+		return True
+
+	def _current_optic_active(self):
+		"""Состояние локального оптического датчика из последнего STAT.
+
+		Returns True/False if a fresh STAT reading is available, otherwise None (unknown/stale).
+		optic_active = flags_runtime (STAT offset 48, u16 LE) bit5 (0x0020).
+		"""
+		try:
+			stream = getattr(self, "stream", None)
+			if stream is None:
+				return None
+			st = getattr(stream, "last_stat", None)
+			t = float(getattr(stream, "last_stat_t", 0.0) or 0.0)
+		except Exception:
+			return None
+		if not isinstance(st, (bytes, bytearray)) or len(st) < 50 or st[:4] != b"STAT":
+			return None
+		try:
+			max_age = float(os.getenv("BMI30_OPTIC_STATE_MAX_AGE", "3.0"))
+		except Exception:
+			max_age = 3.0
+		if t <= 0.0 or (time.time() - t) > max_age:
+			return None
+		flags_rt = int(st[48]) | (int(st[49]) << 8)
+		return bool(flags_rt & 0x0020)
+
 	def _confirm_tim2_by_device_status(self, expected: bool, attempts: int = 3) -> bool:
 		"""Best-effort подтверждение через ответ устройства STAT (GET_STATUS)."""
 		try:
@@ -14880,6 +15274,10 @@ class ScopeWindow:
 		if idx == 0:
 			return
 		try:
+			try:
+				self._restore_mode_after_buf_idx = int(idx) if int(idx) >= 6 else 0
+			except Exception:
+				self._restore_mode_after_buf_idx = 0
 			try:
 				self._remember_desired_mode_for_button(int(idx), reason="autostart")
 			except Exception:

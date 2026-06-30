@@ -32,7 +32,7 @@ import numpy as np  # type: ignore
 SERVICE_VERSION = "001"
 HOST_DIR = Path(__file__).resolve().parent
 REPO_DIR = HOST_DIR.parent
-DEFAULT_ENGINE_FILE = HOST_DIR / "BMI30.200.py.2026-06-28-1457-casino-live-base"
+DEFAULT_ENGINE_FILE = HOST_DIR / "BMI30.200.py.2026-06-29-1138-dc-adapt-state-machine"
 ENGINE_FILE = Path(os.getenv("BMI30_ENGINE_SOURCE", str(DEFAULT_ENGINE_FILE))).expanduser()
 API_HOST = os.getenv("BMI30_SERVICE_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("BMI30_SERVICE_PORT", "8765"))
@@ -48,6 +48,67 @@ DC_SETTLE_MAX_S = 86400.0
 DEVICE_STATE_JSON = Path(os.getenv("BMI30_DEVICE_STATE_JSON", "/tmp/bmi30_device_state.json")).expanduser()
 DEVICE_STATE_MAX_AGE_S = max(1, int(os.getenv("BMI30_DEVICE_STATE_MAX_AGE_S", "300")))
 _LCD_SYNC_CODE_RE = re.compile(r"^[MS][0-9]{2}$")
+_QT_CALL_QUEUE: queue.Queue[Any] = queue.Queue()
+_QT_CALL_PUMP_LOCK = threading.Lock()
+_QT_CALL_PUMP_STARTED = False
+
+
+def _queue_qt_call(fn: Any) -> None:
+    try:
+        _QT_CALL_QUEUE.put(fn)
+    except Exception as exc:
+        print(f"[BMI30.001] queue Qt call failed: {exc}", flush=True)
+
+
+def _call_qt_later_s(delay_s: float, fn: Any) -> None:
+    try:
+        delay = max(0.0, float(delay_s))
+    except Exception:
+        delay = 0.0
+    if delay <= 0.0:
+        _queue_qt_call(fn)
+        return
+    try:
+        timer = threading.Timer(delay, lambda: _queue_qt_call(fn))
+        timer.daemon = True
+        timer.start()
+    except Exception:
+        _queue_qt_call(fn)
+
+
+def _start_qt_call_pump(qtcore: Any) -> None:
+    global _QT_CALL_PUMP_STARTED
+    with _QT_CALL_PUMP_LOCK:
+        if _QT_CALL_PUMP_STARTED:
+            return
+        _QT_CALL_PUMP_STARTED = True
+
+    def _pump() -> None:
+        global _QT_CALL_PUMP_STARTED
+        while True:
+            try:
+                fn = _QT_CALL_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as exc:
+                print(f"[BMI30.001] Qt queued call failed: {exc}", flush=True)
+        try:
+            qtcore.QTimer.singleShot(50, _pump)
+        except Exception as exc:
+            print(f"[BMI30.001] Qt call pump stopped: {exc}", flush=True)
+            with _QT_CALL_PUMP_LOCK:
+                _QT_CALL_PUMP_STARTED = False
+
+    try:
+        qtcore.QTimer.singleShot(50, _pump)
+    except Exception as exc:
+        print(f"[BMI30.001] Qt call pump start failed: {exc}", flush=True)
+        with _QT_CALL_PUMP_LOCK:
+            _QT_CALL_PUMP_STARTED = False
+
+
 _CONFIG_JSON_ENV = os.getenv("BMI30_CONFIG_JSON", "").strip()
 if _CONFIG_JSON_ENV:
     CONFIG_JSON = Path(_CONFIG_JSON_ENV).expanduser()
@@ -275,11 +336,6 @@ def _apply_default_dc_config(scope: Any, mode: int | None = None, reason: str = 
             fast_settle_s=float(expected["fast_settle_s"]),
             fast_duration_s=float(expected["fast_duration_s"]),
         )
-        try:
-            if hasattr(scope, "_device_set_dc_adapt"):
-                scope._device_set_dc_adapt(True)
-        except Exception:
-            pass
         print(
             f"[DC] default config applied mode={expected['mode']} "
             f"W={float(expected['config_work_settle_s']):g}s D={float(expected['config_detect_settle_s']):g}s "
@@ -859,9 +915,20 @@ class ScopeApi:
             selected = int(self.scope.num_group.checkedId())
         except Exception:
             selected = 0
-        profile = _dc_steady_profile_for_mode(selected)
+        try:
+            restore_profile = str(getattr(self.scope, "_host_dc_startup_restore_profile", "") or "").strip().lower()
+        except Exception:
+            restore_profile = ""
+        if restore_profile not in {"work", "acquisition", "detection"}:
+            profile = _dc_steady_profile_for_mode(selected)
+        else:
+            profile = restore_profile
         if profile:
             _apply_default_dc_config(self.scope, reason=f"{reason}:restore_{profile}", profile=profile)
+        try:
+            self.scope._host_dc_startup_restore_profile = ""
+        except Exception:
+            pass
 
     def _start_dc_startup_compensation(self, selected: int, reason: str = "") -> bool:
         try:
@@ -872,13 +939,23 @@ class ScopeApi:
             return False
         delay_s = _dc_startup_restore_delay_s()
         try:
+            restore_profile = str(getattr(self.scope, "_host_dc_desired_profile", "") or "").strip().lower()
+        except Exception:
+            restore_profile = ""
+        if restore_profile not in {"work", "acquisition", "detection"}:
+            restore_profile = _dc_steady_profile_for_mode(selected)
+        try:
+            self.scope._host_dc_startup_restore_profile = restore_profile
+        except Exception:
+            pass
+        try:
             self.scope._host_dc_startup_until = time.time() + max(0.2, delay_s)
         except Exception:
             pass
         ok = _apply_default_dc_config(self.scope, reason=f"{reason}:startup", profile="startup")
         if _dc_steady_profile_for_mode(selected):
             try:
-                self.qtcore.QTimer.singleShot(int(max(0.2, delay_s) * 1000), lambda: self._restore_dc_after_startup(reason))
+                _call_qt_later_s(max(0.2, delay_s), lambda: self._restore_dc_after_startup(reason))
             except Exception:
                 pass
         return bool(ok)
@@ -1460,6 +1537,11 @@ class ScopeApi:
                     "count": int(getattr(scope, "_frame_integrity_count", 0) or 0),
                     "last": getattr(scope, "_frame_integrity_last", None),
                 },
+                "frame_amplitude": {
+                    "enabled": bool(getattr(scope, "frame_amp_trace", False)),
+                    "count": int(getattr(scope, "_frame_amp_count", 0) or 0),
+                    "last": getattr(scope, "_frame_amp_last", None),
+                },
                 "status_text": _text_from_label(getattr(scope, "legend_lbl", None)),
             }
         )
@@ -1704,6 +1786,44 @@ def _send_binary(handler: BaseHTTPRequestHandler, data: bytes, content_type: str
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
+
+
+def _api_command_log_params(params: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key, value in (params or {}).items():
+        name = str(key)
+        lname = name.lower()
+        if any(mark in lname for mark in ("pass", "token", "secret", "cookie", "auth")):
+            safe[name] = "<redacted>"
+            continue
+        if isinstance(value, (bool, int, float)) or value is None:
+            safe[name] = value
+        elif isinstance(value, str):
+            safe[name] = value[:120]
+        elif isinstance(value, (list, tuple)):
+            safe[name] = f"<{type(value).__name__}:{len(value)}>"
+        elif isinstance(value, dict):
+            safe[name] = f"<dict:{len(value)}>"
+        else:
+            safe[name] = f"<{type(value).__name__}>"
+    return safe
+
+
+def _log_api_command(handler: BaseHTTPRequestHandler, action: str, params: dict[str, Any]) -> None:
+    try:
+        peer = handler.client_address[0] if getattr(handler, "client_address", None) else "?"
+        ua = str(handler.headers.get("User-Agent", ""))[:120]
+        ref = str(handler.headers.get("Referer", ""))[:160]
+        src = str(handler.headers.get("X-BMI30-Source", ""))[:80]
+        safe_params = _api_command_log_params(params)
+        print(
+            f"[API-CMD] peer={peer} action={action} source={src or '-'} "
+            f"params={json.dumps(_json_safe(safe_params), ensure_ascii=False, separators=(',', ':'))} "
+            f"ref={ref or '-'} ua={ua or '-'}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[API-CMD] log failed action={action}: {exc}", flush=True)
 
 
 def _player_upload_limit_bytes() -> int:
@@ -1965,6 +2085,7 @@ class ServiceHandler(BaseHTTPRequestHandler):
                 raise ValueError("missing action")
             action_l = action.strip().lower()
             timeout = 60.0 if action_l.startswith(("player_", "player_raw_")) else 8.0
+            _log_api_command(self, action_l, params)
             _send_json(self, api.submit(action, params, timeout=timeout))
         except Exception as exc:
             _send_json(self, {"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -2682,6 +2803,7 @@ def main() -> int:
         print(f"[BMI30.001] engine Qt import failed: {engine.PG_IMPORT_ERR}", flush=True)
         return 2
     scope = engine.ScopeWindow()
+    _start_qt_call_pump(engine.QtCore)
     _install_detector_flash_hooks(scope)
     _apply_default_avg_n(scope)
     _apply_default_detector_settings(scope)
@@ -2720,16 +2842,13 @@ def main() -> int:
                 except Exception:
                     pass
                 try:
-                    engine.QtCore.QTimer.singleShot(
-                        int(max(0.2, delay_s) * 1000),
-                        lambda: _restore_default_dc_after_startup(5, reason),
-                    )
+                    _call_later_s(max(0.2, delay_s), lambda: _restore_default_dc_after_startup(5, reason))
                 except Exception:
                     pass
                 return
             if attempt < 20:
                 try:
-                    engine.QtCore.QTimer.singleShot(300, lambda: _schedule_mode5_startup_dc(reason, attempt + 1))
+                    _call_later_s(0.3, lambda: _schedule_mode5_startup_dc(reason, attempt + 1))
                 except Exception:
                     pass
 
@@ -2748,7 +2867,7 @@ def main() -> int:
                 if stream_mode != 2:
                     if attempt < 12:
                         try:
-                            engine.QtCore.QTimer.singleShot(300, lambda: _schedule_default_dc_apply(reason, attempt + 1))
+                            _call_later_s(0.3, lambda: _schedule_default_dc_apply(reason, attempt + 1))
                         except Exception:
                             pass
                     return
@@ -2761,20 +2880,15 @@ def main() -> int:
                 return
             if attempt < 12:
                 try:
-                    engine.QtCore.QTimer.singleShot(300, lambda: _schedule_default_dc_apply(reason, attempt + 1))
+                    _call_later_s(0.3, lambda: _schedule_default_dc_apply(reason, attempt + 1))
                 except Exception:
                     pass
 
         def _call_later_s(delay_s: float, fn: Any) -> None:
             try:
-                timer = threading.Timer(max(0.0, float(delay_s)), fn)
-                timer.daemon = True
-                timer.start()
+                _call_qt_later_s(delay_s, fn)
             except Exception:
-                try:
-                    fn()
-                except Exception:
-                    pass
+                _queue_qt_call(fn)
 
         def _dc_verify_profile() -> str:
             try:
@@ -2829,6 +2943,13 @@ def main() -> int:
                 if not mismatches:
                     _set_dc_verify_status(True, profile, "ok")
                     return
+                if mismatches == ["unavailable"]:
+                    _set_dc_verify_status(False, profile, "readback_unavailable", mismatches)
+                    print(
+                        f"[DC] verify unavailable profile={profile}; skip reapply",
+                        flush=True,
+                    )
+                    return
                 try:
                     scope._host_dc_verify_fix_count = int(getattr(scope, "_host_dc_verify_fix_count", 0) or 0) + 1
                 except Exception:
@@ -2844,7 +2965,7 @@ def main() -> int:
                 print(f"[DC] verify failed: {exc}", flush=True)
             finally:
                 try:
-                    engine.QtCore.QTimer.singleShot(int(interval_s * 1000), _periodic_dc_verify)
+                    _call_later_s(interval_s, _periodic_dc_verify)
                 except Exception:
                     pass
 
@@ -2885,6 +3006,12 @@ def main() -> int:
             def _det_dc_startup_active() -> bool:
                 try:
                     return time.time() < float(getattr(scope, "_host_dc_startup_until", 0.0) or 0.0)
+                except Exception:
+                    return False
+
+            def _det_dc_dynamic_profiles_enabled() -> bool:
+                try:
+                    return str(os.getenv("BMI30_DC_DYNAMIC_PROFILES", "0")).lower() not in ("0", "false", "no", "off")
                 except Exception:
                     return False
 
@@ -2950,16 +3077,22 @@ def main() -> int:
                 delay_s = max(0.05, min(5.0, float(delay_s)))
                 try:
                     scope._host_dc_pending_profile = "work"
-                    engine.QtCore.QTimer.singleShot(
-                        int(delay_s * 1000),
-                        lambda seq=seq: _det_dc_apply_pending_work(seq, reason),
-                    )
+                    _call_later_s(delay_s, lambda seq=seq: _det_dc_apply_pending_work(seq, reason))
                 except Exception:
                     _det_dc_apply_pending_work(seq, reason)
 
             def _det_dc_pre_fire(channel: Any, count: Any = 0, confirm_count: Any = 0) -> None:
+                if not _det_dc_dynamic_profiles_enabled():
+                    return
                 if not _det_dc_selected_active() or _det_dc_startup_active():
                     return
+                try:
+                    if time.time() < float(getattr(scope, "_host_dc_detection_until", 0.0) or 0.0):
+                        return
+                    if str(getattr(scope, "_host_dc_desired_profile", "") or "") == "detection":
+                        return
+                except Exception:
+                    pass
                 try:
                     count_i = int(count)
                 except Exception:
@@ -2976,13 +3109,28 @@ def main() -> int:
                 _det_dc_schedule_work_restore("pre_fire:restore_work", delay_s, desired_now=False)
 
             def _det_dc_detection_fire(fired0: Any = False, fired1: Any = False, reason: str = "det_fire") -> None:
+                if not _det_dc_dynamic_profiles_enabled():
+                    return
                 if not _det_dc_selected_active() or _det_dc_startup_active():
                     return
                 if not (bool(fired0) or bool(fired1)):
                     return
+                now = time.time()
+                delay_s = _det_dc_restore_delay("BMI30_DC_DETECTION_RESTORE_DELAY_S", 0.2)
+                try:
+                    if str(getattr(scope, "_host_dc_desired_profile", "") or "") == "detection":
+                        if now < float(getattr(scope, "_host_dc_detection_until", 0.0) or 0.0):
+                            return
+                except Exception:
+                    pass
                 _det_dc_cancel_pending()
                 _det_dc_set_desired("detection")
+                try:
+                    scope._host_dc_detection_until = now + delay_s
+                except Exception:
+                    pass
                 _det_dc_apply_profile("detection", reason)
+                _det_dc_schedule_work_restore("detection:restore_work", delay_s, desired_now=False)
 
             def _arg_value(args: tuple[Any, ...], kwargs: dict[str, Any], index: int, name: str, default: Any = None) -> Any:
                 if name in kwargs:
@@ -3017,6 +3165,8 @@ def main() -> int:
 
             def _set_det_gpio_with_dc_profile(a_on: bool, b_on: bool, *args: Any, **kwargs: Any):
                 result = orig_set_det_gpio(a_on, b_on, *args, **kwargs)
+                if not _det_dc_dynamic_profiles_enabled():
+                    return result
                 if _det_dc_selected_active():
                     active = bool(a_on) or bool(b_on)
                     if active:
@@ -3038,10 +3188,10 @@ def main() -> int:
             scope._set_det_gpio = _set_det_gpio_with_dc_profile
         except Exception as exc:
             print(f"[DC] detector profile hook failed: {exc}", flush=True)
-        engine.QtCore.QTimer.singleShot(700, lambda: _schedule_mode5_startup_dc("initial_mode_5", 0))
-        engine.QtCore.QTimer.singleShot(700, lambda: _schedule_default_dc_apply("initial_mode_6plus", 0))
-        engine.QtCore.QTimer.singleShot(2500, lambda: _schedule_default_dc_apply("initial_mode_settle", 0))
-        engine.QtCore.QTimer.singleShot(int(_dc_verify_interval_s() * 1000), _periodic_dc_verify)
+        _call_later_s(0.7, lambda: _schedule_mode5_startup_dc("initial_mode_5", 0))
+        _call_later_s(0.7, lambda: _schedule_default_dc_apply("initial_mode_6plus", 0))
+        _call_later_s(2.5, lambda: _schedule_default_dc_apply("initial_mode_settle", 0))
+        _call_later_s(_dc_verify_interval_s(), _periodic_dc_verify)
     except Exception as exc:
         print(f"[DC] mode restore hook failed: {exc}", flush=True)
     try:
@@ -3053,7 +3203,7 @@ def main() -> int:
     API = ScopeApi(scope, engine.QtCore)
     server = start_http_server()
     try:
-        engine.QtCore.QTimer.singleShot(20, scope._run_deferred_autostart)
+        _call_qt_later_s(0.02, scope._run_deferred_autostart)
     except Exception:
         scope._run_deferred_autostart()
     app = engine.QtWidgets.QApplication.instance()

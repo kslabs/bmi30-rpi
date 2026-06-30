@@ -150,13 +150,18 @@ DC_MODE_NAMES = {
 }
 
 DC_MODE_VALUES = {name: value for value, name in DC_MODE_NAMES.items()}
+AVG_N_VALUES: tuple[int, ...] = (8, 16, 24, 32, 40, 48, 56, 64)
+DEFAULT_AVG_N = 24
+DC_SETTLE_MIN_S = 0.0
+DC_SETTLE_MAX_S = 86400.0
 
 DEFAULT_DC_CONFIG: dict[str, Any] = {
     "mode": "WORK",
     "work_settle_s": 900.0,
+    "detect_settle_s": 60.0,
     "detect_initial_settle_s": 60.0,
-    "detect_final_settle_s": 15.0,
-    "detect_ramp_s": 300.0,
+    "detect_final_settle_s": 60.0,
+    "detect_ramp_s": 0.0,
     "fast_settle_s": 5.0,
     "fast_duration_s": 30.0,
 }
@@ -170,6 +175,41 @@ DEFAULT_TAG_DETECTION_CONFIG: dict[str, Any] = {
     "threshold1": 2.0,
     "auto0": False,
     "auto1": False,
+    "filter_amplitude0": True,
+    "filter_amplitude1": True,
+    "filter_shape0": True,
+    "filter_shape1": True,
+    "filter_phase0": True,
+    "filter_phase1": True,
+    "filter_noise_adapt0": True,
+    "filter_noise_adapt1": True,
+    "noise_up0": 24,
+    "noise_up1": 24,
+    "noise_down0": 3,
+    "noise_down1": 3,
+    "noise_unit0": "adc",
+    "noise_unit1": "adc",
+    "burst_gate0": True,
+    "burst_gate1": True,
+    "burst_blank_s0": 0.08,
+    "burst_blank_s1": 0.08,
+    "burst_max_ratio0": 8.0,
+    "burst_max_ratio1": 8.0,
+    "filter_casino": True,
+    "filter_barkhausen": False,
+    "filter_microwire": False,
+    "filter_paper": False,
+    "phase_max_shift": 12,
+    "phase_shift_penalty": 0.02,
+    "mark_window_start_frac": 0.05,
+    "mark_window_end_frac": 0.45,
+    "mark_gap": 21,
+    "mark_gap_tol": 7,
+    "mark_second_frac": 0.18,
+    "mark_valley_frac": 0.70,
+    "mark_multi_max_humps": 3,
+    "locality_max_outside_peaks": 1,
+    "locality_outside_peak_frac": 0.35,
 }
 
 # PDF документация
@@ -676,15 +716,27 @@ def _find_latest_split_core_path() -> str:
 
 def _split_version_from_core_path(path: str) -> str:
     name = os.path.basename(str(path or "").strip())
-    if not name:
-        return ""
-    if name == "BMI30.001.py":
-        return "dev-current"
-    if name.startswith("BMI30.001.py."):
-        return name[len("BMI30.001.py."):]
-    match = re.search(r"(\d{4}-\d{2}-\d{2}(?:-[A-Za-z0-9_.-]+)?)", name)
+    resolved_path = _resolve_project_path(path)
+    date_part = ""
+    time_part = ""
+
+    match = re.search(r"(\d{4}-\d{2}-\d{2})", name)
     if match:
-        return match.group(1)
+        date_part = match.group(1)
+
+    if os.path.exists(resolved_path):
+        try:
+            mtime = dt.datetime.fromtimestamp(os.path.getmtime(resolved_path))
+            if not date_part:
+                date_part = mtime.strftime("%Y-%m-%d")
+            time_part = mtime.strftime("%H%M")
+        except Exception:
+            pass
+
+    if date_part and time_part:
+        return f"{date_part}-{time_part}"
+    if date_part:
+        return date_part
     return name
 
 
@@ -694,7 +746,10 @@ def _format_split_system_label(version: str, core_path: str = "") -> str:
         version = _split_version_from_core_path(core_path)
     if not version:
         return ""
-    return f"BMI30 split {version}"
+    match = re.match(r"^(\d{4}-\d{2}-\d{2})-([0-9]{2})([0-9]{2})$", version)
+    if match:
+        return f"{match.group(1)} {match.group(2)}:{match.group(3)}"
+    return version
 
 
 def detect_bmi30_split_system_version() -> dict[str, str]:
@@ -849,6 +904,40 @@ def _float_form_value(form: dict[str, str], key: str, default: float, minimum: f
     return max(float(minimum), min(float(maximum), value))
 
 
+def _normalize_avg_n(value: Any, default: int = DEFAULT_AVG_N) -> int:
+    try:
+        avg_n = int(value)
+    except Exception:
+        avg_n = int(default)
+    if avg_n in AVG_N_VALUES:
+        return avg_n
+    return int(default) if int(default) in AVG_N_VALUES else DEFAULT_AVG_N
+
+
+def load_default_avg_n() -> int:
+    payload = _load_config_json()
+    operation = payload.get("operation")
+    operation_avg = operation.get("avg_n") if isinstance(operation, dict) else None
+    return _normalize_avg_n(payload.get("avg_n", operation_avg), DEFAULT_AVG_N)
+
+
+def save_default_avg_n(avg_n: int) -> None:
+    avg_n = _normalize_avg_n(avg_n, DEFAULT_AVG_N)
+    payload = _load_config_json()
+    payload["avg_n"] = avg_n
+    operation = payload.get("operation")
+    if not isinstance(operation, dict):
+        operation = {}
+    operation["avg_n"] = avg_n
+    operation["updated_at"] = int(time.time())
+    payload["operation"] = operation
+    _save_config_json(payload)
+
+
+def avg_n_from_form(form: dict[str, str]) -> int:
+    return _normalize_avg_n(form.get("avg_n"), load_default_avg_n())
+
+
 def _int_form_value(form: dict[str, str], key: str, default: int, minimum: int, maximum: int) -> int:
     try:
         value = int(str(form.get(key, default)).strip())
@@ -860,6 +949,16 @@ def _int_form_value(form: dict[str, str], key: str, default: int, minimum: int, 
 def _bool_form_value(form: dict[str, str], key: str, default: bool = False) -> bool:
     raw = form.get(key, "1" if default else "0")
     return str(raw).strip().lower() in {"1", "true", "yes", "on", "y", "t"}
+
+
+def _noise_unit_value(value: Any, default: str = "adc") -> str:
+    try:
+        unit = str(value or default).strip().lower()
+    except Exception:
+        unit = str(default or "adc")
+    if unit in {"percent", "pct", "%"}:
+        return "percent"
+    return "adc"
 
 
 def _normalize_tag_detection_config(raw: Any = None) -> dict[str, Any]:
@@ -874,14 +973,66 @@ def _normalize_tag_detection_config(raw: Any = None) -> dict[str, Any]:
     cfg["threshold1"] = round(_float_form_value(cfg, "threshold1", 2.0, 1.0, 4.0), 1)
     cfg["auto0"] = bool(cfg.get("auto0", False))
     cfg["auto1"] = bool(cfg.get("auto1", False))
+    cfg["filter_amplitude0"] = bool(cfg.get("filter_amplitude0", True))
+    cfg["filter_amplitude1"] = bool(cfg.get("filter_amplitude1", True))
+    cfg["filter_shape0"] = bool(cfg.get("filter_shape0", True))
+    cfg["filter_shape1"] = bool(cfg.get("filter_shape1", True))
+    cfg["filter_phase0"] = bool(cfg.get("filter_phase0", True))
+    cfg["filter_phase1"] = bool(cfg.get("filter_phase1", True))
+    cfg["filter_noise_adapt0"] = bool(cfg.get("filter_noise_adapt0", True))
+    cfg["filter_noise_adapt1"] = bool(cfg.get("filter_noise_adapt1", True))
+    cfg["noise_up0"] = _int_form_value(cfg, "noise_up0", 24, 1, 65535)
+    cfg["noise_up1"] = _int_form_value(cfg, "noise_up1", 24, 1, 65535)
+    cfg["noise_down0"] = _int_form_value(cfg, "noise_down0", 3, 1, 65535)
+    cfg["noise_down1"] = _int_form_value(cfg, "noise_down1", 3, 1, 65535)
+    cfg["noise_unit0"] = _noise_unit_value(cfg.get("noise_unit0", "adc"), "adc")
+    cfg["noise_unit1"] = _noise_unit_value(cfg.get("noise_unit1", "adc"), "adc")
+    cfg["burst_gate0"] = _bool_form_value(cfg, "burst_gate0", True)
+    cfg["burst_gate1"] = _bool_form_value(cfg, "burst_gate1", True)
+    cfg["burst_blank_s0"] = round(_float_form_value(cfg, "burst_blank_s0", 0.08, 0.0, 1.0), 3)
+    cfg["burst_blank_s1"] = round(_float_form_value(cfg, "burst_blank_s1", 0.08, 0.0, 1.0), 3)
+    cfg["burst_max_ratio0"] = round(_float_form_value(cfg, "burst_max_ratio0", 8.0, 0.0, 100.0), 1)
+    cfg["burst_max_ratio1"] = round(_float_form_value(cfg, "burst_max_ratio1", 8.0, 0.0, 100.0), 1)
+    cfg["filter_casino"] = bool(cfg.get("filter_casino", True))
+    cfg["filter_barkhausen"] = bool(cfg.get("filter_barkhausen", False))
+    cfg["filter_microwire"] = bool(cfg.get("filter_microwire", False))
+    cfg["filter_paper"] = bool(cfg.get("filter_paper", False))
+    cfg["phase_max_shift"] = _int_form_value(cfg, "phase_max_shift", 12, 0, 80)
+    cfg["phase_shift_penalty"] = round(_float_form_value(cfg, "phase_shift_penalty", 0.02, 0.0, 1.0), 4)
+    cfg["mark_window_start_frac"] = round(_float_form_value(cfg, "mark_window_start_frac", 0.05, 0.0, 0.95), 4)
+    cfg["mark_window_end_frac"] = round(_float_form_value(cfg, "mark_window_end_frac", 0.45, 0.01, 1.0), 4)
+    if cfg["mark_window_end_frac"] <= cfg["mark_window_start_frac"]:
+        cfg["mark_window_end_frac"] = min(1.0, round(float(cfg["mark_window_start_frac"]) + 0.01, 4))
+    cfg["mark_gap"] = _int_form_value(cfg, "mark_gap", 21, 1, 160)
+    cfg["mark_gap_tol"] = _int_form_value(cfg, "mark_gap_tol", 7, 0, 80)
+    cfg["mark_second_frac"] = round(_float_form_value(cfg, "mark_second_frac", 0.18, 0.01, 1.0), 3)
+    cfg["mark_valley_frac"] = round(_float_form_value(cfg, "mark_valley_frac", 0.70, 0.01, 0.99), 3)
+    cfg["mark_multi_max_humps"] = _int_form_value(cfg, "mark_multi_max_humps", 3, 1, 12)
+    cfg["locality_max_outside_peaks"] = _int_form_value(cfg, "locality_max_outside_peaks", 1, 0, 20)
+    cfg["locality_outside_peak_frac"] = round(_float_form_value(cfg, "locality_outside_peak_frac", 0.35, 0.01, 1.0), 3)
     return cfg
 
 
 def load_tag_detection_config() -> dict[str, Any]:
-    cfg = _normalize_tag_detection_config(_load_config_json().get("tag_detection"))
-    core_cfg = load_tag_detection_config_from_core()
-    if core_cfg is not None:
-        cfg.update(core_cfg)
+    raw = _load_config_json().get("tag_detection")
+    source = raw if isinstance(raw, dict) else {}
+    cfg = _normalize_tag_detection_config(source)
+    core_backfill_keys = (
+        "noise_up0", "noise_up1", "noise_down0", "noise_down1", "noise_unit0", "noise_unit1",
+        "burst_gate0", "burst_gate1", "burst_blank_s0", "burst_blank_s1", "burst_max_ratio0", "burst_max_ratio1",
+        "filter_casino", "filter_barkhausen", "filter_microwire", "filter_paper",
+        "phase_max_shift", "phase_shift_penalty",
+        "mark_window_start_frac", "mark_window_end_frac",
+        "mark_gap", "mark_gap_tol", "mark_second_frac", "mark_valley_frac", "mark_multi_max_humps",
+        "locality_max_outside_peaks", "locality_outside_peak_frac",
+    )
+    missing_core = any(key not in source for key in core_backfill_keys)
+    if missing_core:
+        core_cfg = load_tag_detection_config_from_core()
+        if core_cfg is not None:
+            for key in core_backfill_keys:
+                if key not in source and key in core_cfg:
+                    cfg[key] = core_cfg[key]
     return _normalize_tag_detection_config(cfg)
 
 
@@ -902,6 +1053,41 @@ def tag_detection_config_from_form(form: dict[str, str]) -> dict[str, Any]:
         "threshold1": _float_form_value(form, "threshold1", 2.0, 1.0, 4.0),
         "auto0": _bool_form_value(form, "auto0", False),
         "auto1": _bool_form_value(form, "auto1", False),
+        "filter_amplitude0": _bool_form_value(form, "filter_amplitude0", True),
+        "filter_amplitude1": _bool_form_value(form, "filter_amplitude1", True),
+        "filter_shape0": _bool_form_value(form, "filter_shape0", True),
+        "filter_shape1": _bool_form_value(form, "filter_shape1", True),
+        "filter_phase0": _bool_form_value(form, "filter_phase0", True),
+        "filter_phase1": _bool_form_value(form, "filter_phase1", True),
+        "filter_noise_adapt0": True,
+        "filter_noise_adapt1": True,
+        "noise_up0": _int_form_value(form, "noise_up0", 24, 1, 65535),
+        "noise_up1": _int_form_value(form, "noise_up1", 24, 1, 65535),
+        "noise_down0": _int_form_value(form, "noise_down0", 3, 1, 65535),
+        "noise_down1": _int_form_value(form, "noise_down1", 3, 1, 65535),
+        "noise_unit0": _noise_unit_value(form.get("noise_unit0", "adc"), "adc"),
+        "noise_unit1": _noise_unit_value(form.get("noise_unit1", "adc"), "adc"),
+        "burst_gate0": _bool_form_value(form, "burst_gate0", True),
+        "burst_gate1": _bool_form_value(form, "burst_gate1", True),
+        "burst_blank_s0": _float_form_value(form, "burst_blank_s0", 0.08, 0.0, 1.0),
+        "burst_blank_s1": _float_form_value(form, "burst_blank_s1", 0.08, 0.0, 1.0),
+        "burst_max_ratio0": _float_form_value(form, "burst_max_ratio0", 8.0, 0.0, 100.0),
+        "burst_max_ratio1": _float_form_value(form, "burst_max_ratio1", 8.0, 0.0, 100.0),
+        "filter_casino": _bool_form_value(form, "filter_casino", True),
+        "filter_barkhausen": _bool_form_value(form, "filter_barkhausen", False),
+        "filter_microwire": _bool_form_value(form, "filter_microwire", False),
+        "filter_paper": _bool_form_value(form, "filter_paper", False),
+        "phase_max_shift": _int_form_value(form, "phase_max_shift", 12, 0, 80),
+        "phase_shift_penalty": _float_form_value(form, "phase_shift_penalty", 0.02, 0.0, 1.0),
+        "mark_window_start_frac": _float_form_value(form, "mark_window_start_frac", 0.05, 0.0, 0.95),
+        "mark_window_end_frac": _float_form_value(form, "mark_window_end_frac", 0.45, 0.01, 1.0),
+        "mark_gap": _int_form_value(form, "mark_gap", 21, 1, 160),
+        "mark_gap_tol": _int_form_value(form, "mark_gap_tol", 7, 0, 80),
+        "mark_second_frac": _float_form_value(form, "mark_second_frac", 0.18, 0.01, 1.0),
+        "mark_valley_frac": _float_form_value(form, "mark_valley_frac", 0.70, 0.01, 0.99),
+        "mark_multi_max_humps": _int_form_value(form, "mark_multi_max_humps", 3, 1, 12),
+        "locality_max_outside_peaks": _int_form_value(form, "locality_max_outside_peaks", 1, 0, 20),
+        "locality_outside_peak_frac": _float_form_value(form, "locality_outside_peak_frac", 0.35, 0.01, 1.0),
     })
 
 
@@ -909,12 +1095,14 @@ def load_tag_detection_config_from_core() -> dict[str, Any] | None:
     try:
         with urlopen(f"{CORE_SERVICE_URL}/api/status", timeout=0.5) as response:
             status = json.loads(response.read().decode("utf-8") or "{}")
-        channels = ((status or {}).get("detector") or {}).get("channels") or {}
+        detector = (status or {}).get("detector") or {}
+        channels = detector.get("channels") or {}
+        detector_settings = detector.get("settings") if isinstance(detector.get("settings"), dict) else {}
         upper = channels.get("upper") or {}
         lower = channels.get("lower") or {}
         if not isinstance(upper, dict) or not isinstance(lower, dict):
             return None
-        return _normalize_tag_detection_config({
+        cfg = {
             "enabled0": bool(upper.get("enabled", True)),
             "enabled1": bool(lower.get("enabled", True)),
             "confirm0": upper.get("confirm_count", 2),
@@ -923,7 +1111,29 @@ def load_tag_detection_config_from_core() -> dict[str, Any] | None:
             "threshold1": lower.get("threshold", 2.0),
             "auto0": bool(upper.get("auto_threshold", False)),
             "auto1": bool(lower.get("auto_threshold", False)),
-        })
+            "noise_up0": upper.get("noise_up", 24),
+            "noise_up1": lower.get("noise_up", 24),
+            "noise_down0": upper.get("noise_down", 3),
+            "noise_down1": lower.get("noise_down", 3),
+            "noise_unit0": upper.get("noise_unit", "adc"),
+            "noise_unit1": lower.get("noise_unit", "adc"),
+            "burst_gate0": bool(upper.get("burst_gate", True)),
+            "burst_gate1": bool(lower.get("burst_gate", True)),
+            "burst_blank_s0": upper.get("burst_blank_s", 0.08),
+            "burst_blank_s1": lower.get("burst_blank_s", 0.08),
+            "burst_max_ratio0": upper.get("burst_max_ratio", 8.0),
+            "burst_max_ratio1": lower.get("burst_max_ratio", 8.0),
+        }
+        for key in (
+            "filter_casino", "filter_barkhausen", "filter_microwire", "filter_paper",
+            "phase_max_shift", "phase_shift_penalty",
+            "mark_window_start_frac", "mark_window_end_frac",
+            "mark_gap", "mark_gap_tol", "mark_second_frac", "mark_valley_frac", "mark_multi_max_humps",
+            "locality_max_outside_peaks", "locality_outside_peak_frac",
+        ):
+            if key in detector_settings:
+                cfg[key] = detector_settings.get(key)
+        return _normalize_tag_detection_config(cfg)
     except Exception:
         return None
 
@@ -941,13 +1151,40 @@ def apply_tag_detection_config_to_core(cfg: dict[str, Any]) -> tuple[bool, str]:
             "threshold1": float(cfg["threshold1"]),
             "auto0": bool(cfg["auto0"]),
             "auto1": bool(cfg["auto1"]),
-        },
-    }
+            "noise_up0": int(cfg["noise_up0"]),
+            "noise_up1": int(cfg["noise_up1"]),
+            "noise_down0": int(cfg["noise_down0"]),
+            "noise_down1": int(cfg["noise_down1"]),
+            "noise_unit0": str(cfg["noise_unit0"]),
+            "noise_unit1": str(cfg["noise_unit1"]),
+            "burst_gate0": bool(cfg["burst_gate0"]),
+            "burst_gate1": bool(cfg["burst_gate1"]),
+            "burst_blank_s0": float(cfg["burst_blank_s0"]),
+			"burst_blank_s1": float(cfg["burst_blank_s1"]),
+			"burst_max_ratio0": float(cfg["burst_max_ratio0"]),
+			"burst_max_ratio1": float(cfg["burst_max_ratio1"]),
+			"filter_casino": bool(cfg["filter_casino"]),
+			"filter_barkhausen": bool(cfg["filter_barkhausen"]),
+			"filter_microwire": bool(cfg["filter_microwire"]),
+			"filter_paper": bool(cfg["filter_paper"]),
+			"phase_max_shift": int(cfg["phase_max_shift"]),
+			"phase_shift_penalty": float(cfg["phase_shift_penalty"]),
+			"mark_window_start_frac": float(cfg["mark_window_start_frac"]),
+			"mark_window_end_frac": float(cfg["mark_window_end_frac"]),
+			"mark_gap": int(cfg["mark_gap"]),
+			"mark_gap_tol": int(cfg["mark_gap_tol"]),
+			"mark_second_frac": float(cfg["mark_second_frac"]),
+			"mark_valley_frac": float(cfg["mark_valley_frac"]),
+			"mark_multi_max_humps": int(cfg["mark_multi_max_humps"]),
+			"locality_max_outside_peaks": int(cfg["locality_max_outside_peaks"]),
+			"locality_outside_peak_frac": float(cfg["locality_outside_peak_frac"]),
+		},
+	}
     try:
         req = Request(
             f"{CORE_SERVICE_URL}/api/command",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-BMI30-Source": "portal_detector_settings"},
             method="POST",
         )
         with urlopen(req, timeout=2.5) as response:
@@ -959,25 +1196,131 @@ def apply_tag_detection_config_to_core(cfg: dict[str, Any]) -> tuple[bool, str]:
     return True, "Tag Detection settings sent to BMI30 core service"
 
 
+def apply_group_optic_to_core(reaction_enabled: bool, hold_seconds: int) -> tuple[bool, str]:
+    """Send local optic settings (trigger hold duration and detection reaction) to the core."""
+    hold_seconds = max(0, min(10, int(hold_seconds)))
+    hold_ds = hold_seconds * 10
+    messages: list[str] = []
+    ok_all = True
+    for action, params, src in (
+        ("optic_hold", {"hold_ds": hold_ds}, "portal_optic_hold"),
+        ("optic_reaction", {"enabled": bool(reaction_enabled)}, "portal_optic_reaction"),
+    ):
+        payload = {"action": action, "params": params}
+        try:
+            req = Request(
+                f"{CORE_SERVICE_URL}/api/command",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-BMI30-Source": src},
+                method="POST",
+            )
+            with urlopen(req, timeout=2.5) as response:
+                result = json.loads(response.read().decode("utf-8") or "{}")
+        except Exception as exc:
+            return False, f"Unable to contact BMI30 core service: {exc}"
+        if not bool(result.get("ok", False)):
+            ok_all = False
+            messages.append(str(result.get("error") or f"{action} rejected"))
+    if not ok_all:
+        return False, "; ".join(messages) or "BMI30 core rejected optic settings"
+    return True, "Optic settings sent to BMI30 core service"
+
+
+_CORE_OPTIC_CACHE: dict[str, Any] = {"t": 0.0, "data": {"reaction_enabled": False}}
+
+
+def _read_core_optic_settings() -> dict[str, Any]:
+    """Best-effort read of the optic reaction flag from the BMI30 core status (cached ~1.5s)."""
+    now = time.time()
+    if (now - float(_CORE_OPTIC_CACHE.get("t", 0.0))) < 1.5:
+        return dict(_CORE_OPTIC_CACHE.get("data") or {"reaction_enabled": False})
+    out: dict[str, Any] = {"reaction_enabled": False}
+    try:
+        with urlopen(f"{CORE_SERVICE_URL}/api/status", timeout=0.6) as response:
+            status = json.loads(response.read().decode("utf-8") or "{}")
+        optic = status.get("optic") if isinstance(status.get("optic"), dict) else {}
+        out["reaction_enabled"] = bool(optic.get("reaction_enabled", False))
+    except Exception:
+        pass
+    _CORE_OPTIC_CACHE["t"] = now
+    _CORE_OPTIC_CACHE["data"] = dict(out)
+    return out
+
+
+def apply_avg_n_to_core(avg_n: int) -> tuple[bool, str]:
+    avg_n = _normalize_avg_n(avg_n, DEFAULT_AVG_N)
+    payload = {
+        "action": "avg",
+        "params": {"avg_n": avg_n},
+    }
+    try:
+        req = Request(
+            f"{CORE_SERVICE_URL}/api/command",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-BMI30-Source": "portal_avg"},
+            method="POST",
+        )
+        with urlopen(req, timeout=2.5) as response:
+            result = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception as exc:
+        return False, f"Unable to contact BMI30 core service: {exc}"
+    if not bool(result.get("ok", False)):
+        return False, str(result.get("error") or "BMI30 core service rejected averaging settings")
+    return True, f"Averaging set to {avg_n}"
+
+
 def _normalize_dc_config(raw: Any = None) -> dict[str, Any]:
     source = raw if isinstance(raw, dict) else {}
     cfg = dict(DEFAULT_DC_CONFIG)
     cfg.update({k: source.get(k, v) for k, v in DEFAULT_DC_CONFIG.items()})
+    if "mode" not in source and "mode_value" in source:
+        try:
+            cfg["mode"] = DC_MODE_NAMES.get(int(source.get("mode_value", 1) or 1), "WORK")
+        except Exception:
+            cfg["mode"] = "WORK"
     mode = str(cfg.get("mode", "WORK")).strip().upper().replace("-", "_")
     if mode not in DC_MODE_VALUES:
         mode = "WORK"
     cfg["mode"] = mode
-    cfg["work_settle_s"] = _float_form_value(cfg, "work_settle_s", 900.0, 1.0, 86400.0)
-    cfg["detect_initial_settle_s"] = _float_form_value(cfg, "detect_initial_settle_s", 60.0, 0.1, 86400.0)
-    cfg["detect_final_settle_s"] = _float_form_value(cfg, "detect_final_settle_s", 15.0, 0.1, 86400.0)
-    cfg["detect_ramp_s"] = _float_form_value(cfg, "detect_ramp_s", 300.0, 0.0, 86400.0)
-    cfg["fast_settle_s"] = _float_form_value(cfg, "fast_settle_s", 5.0, 0.1, 3600.0)
-    cfg["fast_duration_s"] = _float_form_value(cfg, "fast_duration_s", 30.0, 0.0, 86400.0)
+    cfg["work_settle_s"] = _float_form_value(cfg, "work_settle_s", 900.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S)
+    detect_settle_default = source.get("detect_settle_s", source.get("detect_initial_settle_s", 60.0))
+    cfg["detect_settle_s"] = _float_form_value({"detect_settle_s": detect_settle_default}, "detect_settle_s", 60.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S)
+    cfg["detect_initial_settle_s"] = _float_form_value(
+        {"detect_initial_settle_s": source.get("detect_initial_settle_s", cfg["detect_settle_s"])},
+        "detect_initial_settle_s",
+        cfg["detect_settle_s"],
+        DC_SETTLE_MIN_S,
+        DC_SETTLE_MAX_S,
+    )
+    cfg["detect_final_settle_s"] = _float_form_value(
+        {"detect_final_settle_s": source.get("detect_final_settle_s", cfg["detect_settle_s"])},
+        "detect_final_settle_s",
+        cfg["detect_settle_s"],
+        DC_SETTLE_MIN_S,
+        DC_SETTLE_MAX_S,
+    )
+    cfg["detect_ramp_s"] = _float_form_value({"detect_ramp_s": source.get("detect_ramp_s", 0.0)}, "detect_ramp_s", 0.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S)
+    cfg["fast_settle_s"] = _float_form_value(cfg, "fast_settle_s", 5.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S)
+    cfg["fast_duration_s"] = _float_form_value(cfg, "fast_duration_s", 30.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S)
     return cfg
 
 
 def load_dc_config() -> dict[str, Any]:
     return _normalize_dc_config(_load_config_json().get("dc_config"))
+
+
+def load_dc_config_from_core() -> dict[str, Any] | None:
+    try:
+        with urlopen(f"{CORE_SERVICE_URL}/api/dc-config", timeout=1.2) as response:
+            result = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception:
+        return None
+    if not isinstance(result, dict) or not bool(result.get("ok", False)):
+        return None
+    cfg = result.get("dc_config")
+    if not isinstance(cfg, dict):
+        return None
+    return _normalize_dc_config(cfg)
 
 
 def save_dc_config(cfg: dict[str, Any]) -> None:
@@ -1099,52 +1442,68 @@ def save_wifi_internet_metadata(ssid: str, connected: bool, message: str = "") -
 
 def dc_config_from_form(form: dict[str, str]) -> dict[str, Any]:
     mode = form.get("mode", "WORK").strip().upper().replace("-", "_")
+    detect_settle_s = _float_form_value(
+        form,
+        "detect_settle_s",
+        _float_form_value(form, "detect_initial_settle_s", 60.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
+        DC_SETTLE_MIN_S,
+        DC_SETTLE_MAX_S,
+    )
     return _normalize_dc_config({
         "mode": mode,
-        "work_settle_s": _float_form_value(form, "work_settle_s", 900.0, 1.0, 86400.0),
-        "detect_initial_settle_s": _float_form_value(form, "detect_initial_settle_s", 60.0, 0.1, 86400.0),
-        "detect_final_settle_s": _float_form_value(form, "detect_final_settle_s", 15.0, 0.1, 86400.0),
-        "detect_ramp_s": _float_form_value(form, "detect_ramp_s", 300.0, 0.0, 86400.0),
-        "fast_settle_s": _float_form_value(form, "fast_settle_s", 5.0, 0.1, 3600.0),
-        "fast_duration_s": _float_form_value(form, "fast_duration_s", 30.0, 0.0, 86400.0),
+        "work_settle_s": _float_form_value(form, "work_settle_s", 900.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
+        "detect_settle_s": detect_settle_s,
+        "detect_initial_settle_s": detect_settle_s,
+        "detect_final_settle_s": detect_settle_s,
+        "detect_ramp_s": 0.0,
+        "fast_settle_s": _float_form_value(form, "fast_settle_s", 5.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
+        "fast_duration_s": _float_form_value(form, "fast_duration_s", 30.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
     })
+
+
+def dc_timing_config_from_form(form: dict[str, str], base: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = _normalize_dc_config(base)
+    cfg["mode"] = "WORK"
+    detect_settle_s = _float_form_value(form, "detect_settle_s", cfg["detect_settle_s"], DC_SETTLE_MIN_S, DC_SETTLE_MAX_S)
+    cfg.update({
+        "work_settle_s": _float_form_value(form, "work_settle_s", cfg["work_settle_s"], DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
+        "detect_settle_s": detect_settle_s,
+        "detect_initial_settle_s": detect_settle_s,
+        "detect_final_settle_s": detect_settle_s,
+        "fast_settle_s": _float_form_value(form, "fast_settle_s", cfg["fast_settle_s"], DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
+        "fast_duration_s": _float_form_value(form, "fast_duration_s", cfg["fast_duration_s"], DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
+    })
+    return _normalize_dc_config(cfg)
 
 
 def apply_dc_config_to_device(cfg: dict[str, Any]) -> tuple[bool, str]:
     cfg = _normalize_dc_config(cfg)
     mode_value = DC_MODE_VALUES.get(str(cfg["mode"]), 1)
-    detect_settle_s = cfg["detect_initial_settle_s"]
-    script = (
-        "import sys;"
-        "sys.path.insert(0, '/home/techaid/Documents/host');"
-        "from usb_vendor.usb_stream import USBStream;"
-        f"s=USBStream(profile=1, full=True, fast_mode=True);"
-        "\n"
-        "try:\n"
-        f" s.set_dc_config_seconds(mode={mode_value}, work_settle_s={cfg['work_settle_s']!r}, detect_settle_s={detect_settle_s!r}, fast_settle_s={cfg['fast_settle_s']!r}, fast_duration_s={cfg['fast_duration_s']!r})\n"
-        " print('SET_DC_CONFIG sent')\n"
-        " try:\n"
-        "  print(s.get_dc_config())\n"
-        " except Exception as e:\n"
-        "  print('readback unavailable: %s' % e)\n"
-        "finally:\n"
-        " s._running=False\n"
-    )
+    payload = {
+        "action": "dc_config",
+        "params": {
+            "mode": mode_value,
+            "work_settle_s": float(cfg["work_settle_s"]),
+            "detect_settle_s": float(cfg["detect_settle_s"]),
+            "fast_settle_s": float(cfg["fast_settle_s"]),
+            "fast_duration_s": float(cfg["fast_duration_s"]),
+        },
+    }
     try:
-        proc = subprocess.run(
-            ["python3", "-c", script],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=4.0,
+        req = Request(
+            f"{CORE_SERVICE_URL}/api/command",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-BMI30-Source": "portal_dc_config"},
+            method="POST",
         )
+        with urlopen(req, timeout=4.0) as response:
+            result = json.loads(response.read().decode("utf-8") or "{}")
     except Exception as exc:
-        return False, f"Unable to contact device: {exc}"
+        return False, f"Unable to contact BMI30 core service: {exc}"
 
-    output = (proc.stdout or proc.stderr or "").strip()
-    if proc.returncode != 0:
-        return False, output or f"USB apply failed with exit code {proc.returncode}"
-    return True, output or "SET_DC_CONFIG sent"
+    if not isinstance(result, dict) or not bool(result.get("ok", False)):
+        return False, str((result or {}).get("error") or "BMI30 core service rejected DC configuration")
+    return True, "DC configuration sent to BMI30 core service"
 
 
 def _load_ui_sync_mode_from_config() -> str:
@@ -1316,14 +1675,20 @@ def _sync_mode_from_device_cache(cache: dict[str, Any]) -> dict[str, Any] | None
             value = {0: "master", 1: "slave", 2: "off"}.get(int(raw_mode), "---")
         except Exception:
             value = "---"
-    display_char = str(sync.get("display_char") or "").strip()
+    display_char = str(sync.get("display_char") or "").strip().upper()
     display_value = sync.get("display_value")
     code = ""
+    stored_code = str(sync.get("code") or sync.get("lcd_code") or "").strip().upper()
+    if _LCD_SYNC_CODE_RE.fullmatch(stored_code):
+        code = stored_code
     try:
-        if display_char:
+        if not code and display_char:
             code = f"{display_char}{int(display_value):02d}"
     except Exception:
         code = display_char
+    role_from_code = _sync_role_from_lcd_code(code)
+    if role_from_code:
+        value = role_from_code
     return {
         "value": value or "---",
         "code": code,
@@ -1366,6 +1731,7 @@ def _sync_role_from_lcd_status(lcd: bytes | None) -> str:
 
 
 def _sync_role_from_lcd_code(code: str) -> str:
+    code = str(code or "").strip().upper()
     if code.startswith("M"):
         return "master"
     if code.startswith("S"):
@@ -3734,6 +4100,41 @@ def render_portal_page(
     tag_auto1_checked = " checked" if tag_cfg["auto1"] else ""
     tag_threshold0_readonly = " readonly" if tag_cfg["auto0"] else ""
     tag_threshold1_readonly = " readonly" if tag_cfg["auto1"] else ""
+    tag_filter_amplitude0_checked = " checked" if tag_cfg["filter_amplitude0"] else ""
+    tag_filter_amplitude1_checked = " checked" if tag_cfg["filter_amplitude1"] else ""
+    tag_filter_shape0_checked = " checked" if tag_cfg["filter_shape0"] else ""
+    tag_filter_shape1_checked = " checked" if tag_cfg["filter_shape1"] else ""
+    tag_filter_phase0_checked = " checked" if tag_cfg["filter_phase0"] else ""
+    tag_filter_phase1_checked = " checked" if tag_cfg["filter_phase1"] else ""
+    tag_filter_casino_checked = " checked" if tag_cfg["filter_casino"] else ""
+    tag_filter_barkhausen_checked = " checked" if tag_cfg["filter_barkhausen"] else ""
+    tag_filter_microwire_checked = " checked" if tag_cfg["filter_microwire"] else ""
+    tag_filter_paper_checked = " checked" if tag_cfg["filter_paper"] else ""
+    tag_phase_max_shift_value = int(tag_cfg["phase_max_shift"])
+    tag_phase_shift_penalty_value = f'{float(tag_cfg["phase_shift_penalty"]):.4f}'.rstrip("0").rstrip(".")
+    tag_mark_window_start_frac_value = f'{float(tag_cfg["mark_window_start_frac"]):.4f}'.rstrip("0").rstrip(".")
+    tag_mark_window_end_frac_value = f'{float(tag_cfg["mark_window_end_frac"]):.4f}'.rstrip("0").rstrip(".")
+    tag_mark_gap_value = int(tag_cfg["mark_gap"])
+    tag_mark_gap_tol_value = int(tag_cfg["mark_gap_tol"])
+    tag_mark_second_frac_value = f'{float(tag_cfg["mark_second_frac"]):.3f}'.rstrip("0").rstrip(".")
+    tag_mark_valley_frac_value = f'{float(tag_cfg["mark_valley_frac"]):.3f}'.rstrip("0").rstrip(".")
+    tag_mark_multi_max_humps_value = int(tag_cfg["mark_multi_max_humps"])
+    tag_locality_max_outside_peaks_value = int(tag_cfg["locality_max_outside_peaks"])
+    tag_locality_outside_peak_frac_value = f'{float(tag_cfg["locality_outside_peak_frac"]):.3f}'.rstrip("0").rstrip(".")
+    tag_noise_up0_value = int(tag_cfg["noise_up0"])
+    tag_noise_up1_value = int(tag_cfg["noise_up1"])
+    tag_noise_down0_value = int(tag_cfg["noise_down0"])
+    tag_noise_down1_value = int(tag_cfg["noise_down1"])
+    tag_noise_unit0_adc_selected = " selected" if tag_cfg["noise_unit0"] == "adc" else ""
+    tag_noise_unit0_percent_selected = " selected" if tag_cfg["noise_unit0"] == "percent" else ""
+    tag_noise_unit1_adc_selected = " selected" if tag_cfg["noise_unit1"] == "adc" else ""
+    tag_noise_unit1_percent_selected = " selected" if tag_cfg["noise_unit1"] == "percent" else ""
+    tag_burst_gate0_checked = " checked" if tag_cfg["burst_gate0"] else ""
+    tag_burst_gate1_checked = " checked" if tag_cfg["burst_gate1"] else ""
+    tag_burst_blank_s0_value = f'{float(tag_cfg["burst_blank_s0"]):.3f}'.rstrip("0").rstrip(".")
+    tag_burst_blank_s1_value = f'{float(tag_cfg["burst_blank_s1"]):.3f}'.rstrip("0").rstrip(".")
+    tag_burst_max_ratio0_value = f'{float(tag_cfg["burst_max_ratio0"]):.1f}'
+    tag_burst_max_ratio1_value = f'{float(tag_cfg["burst_max_ratio1"]):.1f}'
     tag_confirm0_options = "\n".join(
         f'<option value="{i}"{" selected" if int(tag_cfg["confirm0"]) == i else ""}>{i}</option>'
         for i in range(1, 7)
@@ -3751,6 +4152,13 @@ def render_portal_page(
     hotspot_ssid = html.escape(hotspot_cfg.get("ssid") or hotspot_cfg.get("connection_id") or "BMI30-Hotspot")
     hotspot_profile = html.escape(hotspot_cfg.get("connection_id") or "NetworkManager")
     config_payload = _load_config_json()
+    operation_cfg = config_payload.get("operation")
+    operation_avg = operation_cfg.get("avg_n") if isinstance(operation_cfg, dict) else None
+    default_avg_n = _normalize_avg_n(config_payload.get("avg_n", operation_avg), DEFAULT_AVG_N)
+    avg_n_options = "\n".join(
+        f'<option value="{value}"{" selected" if default_avg_n == value else ""}>{value}</option>'
+        for value in AVG_N_VALUES
+    )
     wifi_meta_raw = config_payload.get("wifi_internet")
     wifi_meta = wifi_meta_raw if isinstance(wifi_meta_raw, dict) else {}
     wifi_active = detect_wifi_internet_connection(WIFI_STA_IFACE)
@@ -3815,15 +4223,6 @@ def render_portal_page(
     if notice:
         cls = "notice notice-error" if notice_kind == "error" else "notice"
         notice_html = f'<p class="{cls}" role="status">{html.escape(notice)}</p>'
-    mode_options = "\n".join(
-        f'<label class="mode-option" title="{html.escape(desc)}"><input type="radio" name="mode" value="{name}" {"checked" if cfg["mode"] == name else ""}><span>{label}</span></label>'
-        for name, label, desc in (
-            ("WORK", "Work", "Slow continuous DC learning for long unattended operation."),
-            ("DETECT", "Detect", "Medium tracking during detection; host settings define how it ramps faster over time."),
-            ("BOOT_FAST", "Boot-fast", "Fast DC adaptation after a host-controlled forced reboot, then firmware returns to Work."),
-            ("FREEZE", "Freeze", "Keep subtracting the stored DC value but stop learning new DC."),
-        )
-    )
     doc_order = ["operation", "safety", "network"]
     doc_tabs_parts: list[str] = []
     doc_pages_parts: list[str] = []
@@ -4056,6 +4455,32 @@ def render_portal_page(
       border:1px solid var(--line);border-radius:6px;background:var(--note-bg);
       color:var(--text);font-size:11px;line-height:1.2;padding:5px 7px;overflow-wrap:anywhere}}
     #panel-antenna .sensor-chip b,#panel-operation .sensor-chip b,#panel-group .sensor-chip b{{font-size:11px;color:var(--accent)}}
+    #panel-group .group-head{{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}}
+    #panel-group .group-update{{font-size:12px;color:var(--muted,#888)}}
+    #panel-group .group-legend{{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:10px 0 2px;font-size:12px;color:var(--text)}}
+    #panel-group .group-legend .group-dot{{margin-right:5px}}
+    #panel-group .group-matrix-wrap{{overflow-x:auto;margin-top:12px;border-radius:10px}}
+    #panel-group .group-matrix{{border-collapse:collapse;width:auto;min-width:100%;font-size:13px}}
+    #panel-group .group-matrix th,#panel-group .group-matrix td{{border:1px solid var(--line);padding:8px 14px;text-align:center;white-space:nowrap}}
+    #panel-group .group-matrix .group-param{{text-align:left;font-weight:600;color:var(--text);background:var(--note-bg);position:sticky;left:0;z-index:1}}
+    #panel-group .group-matrix .group-dev-head{{font-weight:700;vertical-align:bottom}}
+    #panel-group .group-matrix .group-dev-code{{display:block;font-size:15px;color:var(--accent);letter-spacing:.5px}}
+    #panel-group .group-matrix .group-dev-badge{{display:block;margin-top:3px;font-size:10px;font-weight:600;color:var(--text);opacity:.7;text-transform:uppercase}}
+    #panel-group .group-matrix .group-dev-cell.is-local{{background:color-mix(in srgb, var(--accent) 14%, transparent)}}
+    #panel-group .group-matrix .group-dev-head.is-local{{box-shadow:inset 0 3px 0 var(--accent)}}
+    #panel-group .group-dot{{display:inline-block;width:14px;height:14px;border-radius:50%;background:#9aa0a6;vertical-align:middle}}
+    #panel-group .group-dot.is-green{{background:#2ecc71;box-shadow:0 0 7px rgba(46,204,113,.7)}}
+    #panel-group .group-dot.is-red{{background:#e74c3c;box-shadow:0 0 7px rgba(231,76,60,.7)}}
+    #panel-group .group-dot.is-off{{background:#9aa0a6}}
+    #panel-group .group-flag{{font-weight:600}}
+    #panel-group .group-flag.is-on{{color:#2ecc71}}
+    #panel-group .group-flag.is-off,#panel-group .group-flag.is-unknown{{color:var(--muted,#888)}}
+    #panel-group .group-empty{{margin-top:12px;font-size:12px;color:var(--muted,#888)}}
+    #panel-group .group-note{{margin-top:10px;font-size:11px;color:var(--muted,#888)}}
+    #panel-group .group-matrix .group-dev-ctl{{padding:6px 10px}}
+    #panel-group .group-matrix .group-ctl-select{{font-size:12px;padding:2px 4px}}
+    #panel-group .group-matrix .group-dev-ctl input[type=checkbox]{{width:16px;height:16px;cursor:pointer}}
+    #panel-group .group-matrix .group-dev-ctl input[type=checkbox]:disabled,#panel-group .group-matrix .group-ctl-select:disabled{{opacity:.4;cursor:not-allowed}}
     .security-note{{display:none;margin-top:18px;border:1px solid var(--note-border);background:var(--note-bg);
                     color:var(--note-text);border-radius:8px;padding:12px 14px;font-size:12px;line-height:1.55;
                     box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
@@ -4075,16 +4500,55 @@ def render_portal_page(
                   color:var(--text);font:inherit;padding:9px 11px;box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
     .field select{{appearance:auto}}
     .field small{{font-size:12px;line-height:1.45;color:var(--muted)}}
-    .tag-settings{{width:100%;border-collapse:collapse;margin-top:14px;border-top:1px solid var(--line)}}
-    .tag-settings th,.tag-settings td{{padding:12px 10px;border-bottom:1px solid var(--line);vertical-align:middle;text-align:left}}
-    .tag-settings th{{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}}
-    .tag-settings .tag-desc{{width:48%;min-width:220px;color:var(--text)}}
-    .tag-settings .tag-desc small{{display:block;margin-top:3px;color:var(--muted);font-size:12px;line-height:1.4}}
-    .tag-settings .tag-channel{{width:26%;text-align:center}}
-    .tag-control{{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:42px}}
+    #panel-detection .config-form{{margin-top:-8px;gap:14px}}
+    #panel-detection .section{{padding-top:12px}}
+    #panel-detection .section:first-child{{border-top:none;padding-top:0}}
+    #panel-detection .section h2{{margin-bottom:8px}}
+    #panel-detection .notice{{margin-top:0}}
+    .operation-config-form{{gap:12px;margin-top:0;margin-bottom:0}}
+    .operation-topline{{display:grid;gap:8px;min-width:0;padding:12px 0;
+                        border-top:1px solid var(--line);border-bottom:1px solid var(--line)}}
+    .operation-topline h3{{margin:0;font-size:13px;color:var(--muted);white-space:nowrap}}
+    .dc-timing-row{{display:flex;align-items:flex-start;gap:6px;min-width:0;flex-wrap:wrap}}
+    .dc-timing-field{{display:grid;grid-template-rows:auto auto;gap:5px;flex:1 1 88px;min-width:64px;min-height:58px}}
+    .dc-timing-label{{display:flex;align-items:center;gap:5px;min-width:0;flex:1 1 auto;color:var(--text);
+                      width:100%;max-width:100%;font-size:12px;font-weight:700;line-height:1.2}}
+    .dc-timing-text{{display:block;min-width:0;flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+    .dc-timing-field .help{{flex:0 0 auto;width:16px;height:16px;font-size:11px}}
+    .dc-timing-field input{{width:100%;min-width:0;min-height:38px;border:1px solid var(--line);
+                            border-radius:8px;background:var(--note-bg);color:var(--text);font:inherit;
+                            font-variant-numeric:tabular-nums;padding:8px 5px;text-align:right;
+                            box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
+    .operation-lowerline{{display:flex;align-items:end;gap:12px;flex-wrap:wrap}}
+    .operation-avg-field{{flex:1 1 220px;max-width:320px}}
+    .operation-actions{{width:100%;justify-content:flex-end;padding-top:12px;border-top:1px solid var(--line)}}
+    .tag-settings{{width:100%;border-collapse:collapse;margin-top:10px;border-top:1px solid var(--line)}}
+    .tag-settings th,.tag-settings td{{padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:middle;text-align:left}}
+    .tag-settings th{{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}}
+    .tag-settings .tag-desc{{width:40%;min-width:190px;color:var(--text)}}
+    .tag-param{{display:inline-flex;align-items:center;gap:6px;min-width:0;font-size:13px;font-weight:800;line-height:1.2}}
+    .tag-help{{position:relative;flex:0 0 auto;cursor:help}}
+    .tag-help[data-tip]::after{{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 8px);
+                 width:max-content;max-width:min(300px,72vw);padding:7px 9px;border:1px solid var(--line);
+                 border-radius:6px;background:var(--panel-fallback);color:var(--text);
+                 box-shadow:0 12px 28px rgba(0,0,0,.18),inset 0 1px 0 rgba(255,255,255,.18);
+                 font-size:12px;font-weight:600;line-height:1.35;text-transform:none;letter-spacing:0;text-align:left;
+                 white-space:normal;opacity:0;visibility:hidden;pointer-events:none;z-index:80;
+                 transform:translate(-50%,4px);transition:opacity .12s ease,visibility .12s ease,transform .12s ease}}
+    .tag-help[data-tip]:hover::after,.tag-help[data-tip]:focus-visible::after{{opacity:1;visibility:visible;transform:translate(-50%,0)}}
+    .tag-settings .tag-channel{{width:30%;text-align:center}}
+    .tag-control{{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:32px;font-size:13px}}
     .tag-control input[type="checkbox"]{{width:16px;height:16px;accent-color:var(--accent)}}
-    .tag-control input[type="number"],.tag-control select{{width:min(100%,120px);min-height:40px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg);
-                  color:var(--text);font:inherit;padding:8px 10px;box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
+    .tag-control input[type="number"],.tag-control select{{width:min(100%,112px);min-height:32px;border:1px solid var(--line);border-radius:6px;background:var(--note-bg);
+                  color:var(--text);font:inherit;padding:5px 8px;box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
+    .tag-noise-control{{flex-wrap:wrap;justify-content:center;gap:7px 8px}}
+    .tag-noise-pair{{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}}
+    .tag-settings td[colspan] .tag-noise-pair{{flex-wrap:wrap;white-space:normal;justify-content:flex-start}}
+    .tag-inline-check{{margin-right:12px;justify-content:flex-start}}
+    .tag-mini-field{{display:inline-flex;align-items:center;gap:4px;color:var(--muted);font-size:11px;font-weight:800}}
+    .tag-mini-field input{{width:54px!important;min-height:28px!important;padding:4px 6px!important;text-align:right;font-variant-numeric:tabular-nums}}
+    .tag-mini-field.tag-mini-check input[type="checkbox"]{{width:16px!important;min-height:16px!important;padding:0!important;text-align:initial}}
+    .tag-mini-field select{{width:94px!important;min-height:28px!important;padding:4px 6px!important;font-size:12px}}
     .tag-control input[readonly]{{opacity:.46;cursor:not-allowed}}
     .privacy-status-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,170px),1fr));gap:10px;margin:0 0 14px}}
     .privacy-status{{border:1px solid var(--line);border-radius:8px;background:var(--note-bg);padding:11px 12px;
@@ -4185,16 +4649,29 @@ def render_portal_page(
       html[data-ui-style="neumorph"] .menu-btn[aria-selected="true"]{{box-shadow:inset 4px 4px 8px var(--neumo-lo),inset -4px -4px 8px var(--neumo-hi)}}
       .summary-grid{{grid-template-columns:1fr}}
       .mode-grid,.fields{{grid-template-columns:1fr}}
+      .operation-config-form{{padding:0 6px;margin-bottom:10px}}
+      .operation-topline{{gap:6px;padding:8px 0}}
+      .operation-topline h3{{font-size:12px}}
+      .dc-timing-row{{gap:4px;flex-basis:500px}}
+      .dc-timing-field{{gap:4px;flex-basis:72px;min-width:58px;min-height:54px}}
+      .dc-timing-label{{font-size:11px}}
+      .dc-timing-field input{{width:100%;min-width:0;min-height:36px;padding:7px 4px;font-size:12px}}
+      .operation-lowerline{{gap:8px}}
+      .operation-actions{{justify-content:flex-start;padding-top:8px}}
       .tag-settings,.tag-settings tbody,.tag-settings tr,.tag-settings td{{display:block;width:100%}}
       .tag-settings thead{{display:none}}
-      .tag-settings tr{{padding:10px 0;border-bottom:1px solid var(--line)}}
-      .tag-settings th,.tag-settings td{{border-bottom:none;padding:7px 4px}}
+      .tag-settings tr{{padding:6px 0;border-bottom:1px solid var(--line)}}
+      .tag-settings th,.tag-settings td{{border-bottom:none;padding:5px 4px}}
       .tag-settings .tag-desc{{min-width:0;width:100%;font-weight:700}}
+      .tag-help[data-tip]::after{{left:0;max-width:min(320px,86vw);transform:translate(0,4px)}}
+      .tag-help[data-tip]:hover::after,.tag-help[data-tip]:focus-visible::after{{transform:translate(0,0)}}
       .tag-settings .tag-channel{{width:100%;text-align:left}}
       .tag-settings .tag-channel::before{{display:block;margin-bottom:4px;color:var(--muted);font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.04em}}
       .tag-settings .tag-channel:nth-child(2)::before{{content:"Upper Channel"}}
       .tag-settings .tag-channel:nth-child(3)::before{{content:"Lower Channel"}}
+      .tag-settings .tag-channel[data-channel-label]::before{{content:attr(data-channel-label)}}
       .tag-control{{justify-content:flex-start}}
+      .tag-noise-control{{justify-content:flex-start}}
       .privacy-status-grid{{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}}
       .privacy-status{{padding:8px 7px}}
       .privacy-status h3{{font-size:12px}}
@@ -4303,12 +4780,11 @@ def render_portal_page(
         <button class="menu-btn" type="button" data-panel="detection" aria-selected="false" title="Shows detection algorithm, thresholds, filtering settings, and tag type selection."><span class="menu-index">2</span>Tag Detection</button>
         <button class="menu-btn" type="button" data-panel="operation" aria-selected="false" title="Shows radar connection state, transmitter schedule, and runtime behavior settings."><span class="menu-index">3</span>Operating Mode</button>
         <button class="menu-btn" type="button" data-panel="group" aria-selected="false" title="Shows master/slave role, synchronization status, and group operation settings."><span class="menu-index">4</span>Group Mode</button>
-        <button class="menu-btn" type="button" data-panel="dc" aria-selected="false" title="Configures firmware DC subtraction mode and adaptation timing."><span class="menu-index">5</span>DC Compensation</button>
-        <button class="menu-btn" type="button" data-panel="privacy" aria-selected="false" title="Change portal credentials, HotSpot access, and Wi-Fi internet connection."><span class="menu-index">6</span>Privacy</button>
-        <button class="menu-btn" type="button" data-panel="statistics" aria-selected="false" title="Shows runtime counters, detection history, communication quality, and service statistics."><span class="menu-index">7</span>Statistics</button>
-        <button class="menu-btn" type="button" data-panel="documentation" aria-selected="false"><span class="menu-index">8</span>Documentation</button>
-        <button class="menu-btn" type="button" data-panel="about" aria-selected="false" title="Shows device identity, firmware version, host software version, serial number, and hardware info."><span class="menu-index">9</span>About Device</button>
-        <a class="menu-btn" href="{core_oscilloscope_url}" target="_blank" rel="noopener noreferrer" title="Open BMI30 core oscilloscope page in a new tab."><span class="menu-index">10</span>Oscilloscope</a>
+        <button class="menu-btn" type="button" data-panel="privacy" aria-selected="false" title="Change portal credentials, HotSpot access, and Wi-Fi internet connection."><span class="menu-index">5</span>Privacy</button>
+        <button class="menu-btn" type="button" data-panel="statistics" aria-selected="false" title="Shows runtime counters, detection history, communication quality, and service statistics."><span class="menu-index">6</span>Statistics</button>
+        <button class="menu-btn" type="button" data-panel="documentation" aria-selected="false"><span class="menu-index">7</span>Documentation</button>
+        <button class="menu-btn" type="button" data-panel="about" aria-selected="false" title="Shows device identity, firmware version, host software version, serial number, and hardware info."><span class="menu-index">8</span>About Device</button>
+        <a class="menu-btn" href="{core_oscilloscope_url}" target="_blank" rel="noopener noreferrer" title="Open BMI30 core oscilloscope page in a new tab."><span class="menu-index">9</span>Oscilloscope</a>
         <a class="menu-btn" href="/portal-logout" aria-label="Sign Out"><span class="menu-index" aria-hidden="true">&#x21AA;</span>Sign Out</a>
       </nav>
       <div class="portal-content">
@@ -4333,7 +4809,9 @@ def render_portal_page(
                 </thead>
                 <tbody>
                   <tr>
-                    <td class="tag-desc">Detection channel enable<small>Disabled channels do not participate in the tag decision.</small></td>
+                    <td class="tag-desc">
+                      <span class="tag-param">Detection channel enable <b class="help tag-help" tabindex="0" aria-label="Disabled channels do not participate in the tag decision." data-tip="Disabled channels do not participate in the tag decision.">?</b></span>
+                    </td>
                     <td class="tag-channel">
                       <label class="tag-control"><input type="hidden" name="enabled0" value="0"><input type="checkbox" name="enabled0" value="1"{tag_enabled0_checked}>Enabled</label>
                     </td>
@@ -4342,12 +4820,16 @@ def render_portal_page(
                     </td>
                   </tr>
                   <tr>
-                    <td class="tag-desc">Detection confirmations<small>Number of detections before accepting the decision. Range 1-6, default 2.</small></td>
+                    <td class="tag-desc">
+                      <span class="tag-param">Detection confirmations <b class="help tag-help" tabindex="0" aria-label="Number of detections before accepting the decision. Range 1-6, default 2." data-tip="Number of detections before accepting the decision. Range 1-6, default 2.">?</b></span>
+                    </td>
                     <td class="tag-channel"><label class="tag-control"><select name="confirm0">{tag_confirm0_options}</select></label></td>
                     <td class="tag-channel"><label class="tag-control"><select name="confirm1">{tag_confirm1_options}</select></label></td>
                   </tr>
                   <tr>
-                    <td class="tag-desc">Automatic threshold<small>When enabled, the manual threshold field is inactive.</small></td>
+                    <td class="tag-desc">
+                      <span class="tag-param">Automatic threshold <b class="help tag-help" tabindex="0" aria-label="When enabled, the manual threshold field is inactive." data-tip="When enabled, the manual threshold field is inactive.">?</b></span>
+                    </td>
                     <td class="tag-channel">
                       <label class="tag-control"><input type="hidden" name="auto0" value="0"><input type="checkbox" name="auto0" value="1" data-tag-auto="upper"{tag_auto0_checked}>Auto</label>
                     </td>
@@ -4356,14 +4838,175 @@ def render_portal_page(
                     </td>
                   </tr>
                   <tr>
-                    <td class="tag-desc">Manual trigger threshold<small>Range 1.0-4.0 with 0.1 step.</small></td>
+                    <td class="tag-desc">
+                      <span class="tag-param">Manual trigger threshold <b class="help tag-help" tabindex="0" aria-label="Range 1.0-4.0 with 0.1 step." data-tip="Range 1.0-4.0 with 0.1 step.">?</b></span>
+                    </td>
                     <td class="tag-channel"><label class="tag-control"><input name="threshold0" data-tag-threshold="upper" type="number" min="1" max="4" step="0.1" value="{tag_threshold0_value}"{tag_threshold0_readonly}></label></td>
                     <td class="tag-channel"><label class="tag-control"><input name="threshold1" data-tag-threshold="lower" type="number" min="1" max="4" step="0.1" value="{tag_threshold1_value}"{tag_threshold1_readonly}></label></td>
                   </tr>
                 </tbody>
               </table>
-              <p class="notice">Upper and Lower channels are independent. Shared detector behavior remains controlled by the core service and DC compensation settings.</p>
             </div>
+            <div class="section">
+              <h2>Detection Filtering</h2>
+              <table class="tag-settings">
+                <tbody>
+                  <tr>
+                    <td class="tag-desc">
+                      <span class="tag-param">Amplitude detection <b class="help tag-help" tabindex="0" aria-label="Enables or disables amplitude-based signal checking for the selected antenna." data-tip="Enables or disables amplitude-based signal checking for the selected antenna.">?</b></span>
+                    </td>
+                    <td class="tag-channel" data-channel-label="Upper Channel">
+                      <label class="tag-control"><input type="hidden" name="filter_amplitude0" value="0"><input type="checkbox" name="filter_amplitude0" value="1"{tag_filter_amplitude0_checked}>Enabled</label>
+                    </td>
+                    <td class="tag-channel" data-channel-label="Lower Channel">
+                      <label class="tag-control"><input type="hidden" name="filter_amplitude1" value="0"><input type="checkbox" name="filter_amplitude1" value="1"{tag_filter_amplitude1_checked}>Enabled</label>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td class="tag-desc">
+                      <span class="tag-param">Shape detection <b class="help tag-help" tabindex="0" aria-label="Enables or disables signal-shape checking for the selected antenna." data-tip="Enables or disables signal-shape checking for the selected antenna.">?</b></span>
+                    </td>
+                    <td class="tag-channel" data-channel-label="Upper Channel">
+                      <label class="tag-control"><input type="hidden" name="filter_shape0" value="0"><input type="checkbox" name="filter_shape0" value="1"{tag_filter_shape0_checked}>Enabled</label>
+                    </td>
+                    <td class="tag-channel" data-channel-label="Lower Channel">
+                      <label class="tag-control"><input type="hidden" name="filter_shape1" value="0"><input type="checkbox" name="filter_shape1" value="1"{tag_filter_shape1_checked}>Enabled</label>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td class="tag-desc">
+                      <span class="tag-param">Phase detection <b class="help tag-help" tabindex="0" aria-label="Enables or disables phase-based signal checking for the selected antenna." data-tip="Enables or disables phase-based signal checking for the selected antenna.">?</b></span>
+                    </td>
+                    <td class="tag-channel" data-channel-label="Upper Channel">
+                      <label class="tag-control"><input type="hidden" name="filter_phase0" value="0"><input type="checkbox" name="filter_phase0" value="1"{tag_filter_phase0_checked}>Enabled</label>
+                    </td>
+                    <td class="tag-channel" data-channel-label="Lower Channel">
+                      <label class="tag-control"><input type="hidden" name="filter_phase1" value="0"><input type="checkbox" name="filter_phase1" value="1"{tag_filter_phase1_checked}>Enabled</label>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td class="tag-desc">
+                      <span class="tag-param">Burst noise gate <b class="help tag-help" tabindex="0" aria-label="Suppresses very short noisy bursts and overrange spikes before the detector can accept them or adapt the noise baseline to them." data-tip="Suppresses very short noisy bursts and overrange spikes before the detector can accept them or adapt the noise baseline to them.">?</b></span>
+                    </td>
+                    <td class="tag-channel" data-channel-label="Upper Channel">
+                      <label class="tag-control tag-noise-control">
+                        <span class="tag-noise-pair">
+                          <span class="tag-mini-field tag-mini-check">Gate <input type="hidden" name="burst_gate0" value="0"><input type="checkbox" name="burst_gate0" value="1"{tag_burst_gate0_checked}></span>
+                          <span class="tag-mini-field">Blank <input name="burst_blank_s0" type="number" min="0" max="1" step="0.01" inputmode="decimal" value="{tag_burst_blank_s0_value}" aria-label="Upper burst gate blank seconds"></span>
+                          <span class="tag-mini-field">Max x <input name="burst_max_ratio0" type="number" min="0" max="100" step="0.1" inputmode="decimal" value="{tag_burst_max_ratio0_value}" aria-label="Upper burst gate maximum ratio"></span>
+                        </span>
+                      </label>
+                    </td>
+                    <td class="tag-channel" data-channel-label="Lower Channel">
+                      <label class="tag-control tag-noise-control">
+                        <span class="tag-noise-pair">
+                          <span class="tag-mini-field tag-mini-check">Gate <input type="hidden" name="burst_gate1" value="0"><input type="checkbox" name="burst_gate1" value="1"{tag_burst_gate1_checked}></span>
+                          <span class="tag-mini-field">Blank <input name="burst_blank_s1" type="number" min="0" max="1" step="0.01" inputmode="decimal" value="{tag_burst_blank_s1_value}" aria-label="Lower burst gate blank seconds"></span>
+                          <span class="tag-mini-field">Max x <input name="burst_max_ratio1" type="number" min="0" max="100" step="0.1" inputmode="decimal" value="{tag_burst_max_ratio1_value}" aria-label="Lower burst gate maximum ratio"></span>
+                        </span>
+                      </label>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td class="tag-desc">
+                      <span class="tag-param">Noise-level adaptation <b class="help tag-help" tabindex="0" aria-label="Noise adaptation is always enabled. Up and Down are interpreted as ADC-level units or as percent of the current noise baseline." data-tip="Noise adaptation is always enabled. Up and Down are interpreted as ADC-level units or as percent of the current noise baseline.">?</b></span>
+                    </td>
+                    <td class="tag-channel" data-channel-label="Upper Channel">
+                      <label class="tag-control tag-noise-control">
+                        <span class="tag-noise-pair">
+                          <span class="tag-mini-field">Unit <select name="noise_unit0" aria-label="Upper noise adaptation units"><option value="adc"{tag_noise_unit0_adc_selected}>ADC units</option><option value="percent"{tag_noise_unit0_percent_selected}>Percent</option></select></span>
+                          <span class="tag-mini-field">Up <input name="noise_up0" type="number" min="1" max="65535" step="1" inputmode="numeric" value="{tag_noise_up0_value}" aria-label="Upper noise adaptation up step"></span>
+                          <span class="tag-mini-field">Down <input name="noise_down0" type="number" min="1" max="65535" step="1" inputmode="numeric" value="{tag_noise_down0_value}" aria-label="Upper noise adaptation down step"></span>
+                        </span>
+                      </label>
+                    </td>
+                    <td class="tag-channel" data-channel-label="Lower Channel">
+                      <label class="tag-control tag-noise-control">
+                        <span class="tag-noise-pair">
+                          <span class="tag-mini-field">Unit <select name="noise_unit1" aria-label="Lower noise adaptation units"><option value="adc"{tag_noise_unit1_adc_selected}>ADC units</option><option value="percent"{tag_noise_unit1_percent_selected}>Percent</option></select></span>
+                          <span class="tag-mini-field">Up <input name="noise_up1" type="number" min="1" max="65535" step="1" inputmode="numeric" value="{tag_noise_up1_value}" aria-label="Lower noise adaptation up step"></span>
+                          <span class="tag-mini-field">Down <input name="noise_down1" type="number" min="1" max="65535" step="1" inputmode="numeric" value="{tag_noise_down1_value}" aria-label="Lower noise adaptation down step"></span>
+                        </span>
+                      </label>
+                    </td>
+	                  </tr>
+	                </tbody>
+	              </table>
+	            </div>
+	            <div class="section">
+	              <h2>Named Detection Filters</h2>
+	              <table class="tag-settings">
+	                <tbody>
+	                  <tr>
+	                    <td class="tag-desc">
+	                      <span class="tag-param">Tag response filters <b class="help tag-help" tabindex="0" aria-label="Enabled filters are combined as alternatives. A signal is accepted when any enabled named filter matches, then the common noise and locality gates are applied." data-tip="Enabled filters are combined as alternatives. A signal is accepted when any enabled named filter matches, then the common noise and locality gates are applied.">?</b></span>
+	                    </td>
+	                    <td class="tag-channel" colspan="2">
+	                      <label class="tag-control tag-inline-check"><input type="hidden" name="filter_casino" value="0"><input type="checkbox" name="filter_casino" value="1"{tag_filter_casino_checked}>Casino</label>
+	                      <label class="tag-control tag-inline-check"><input type="hidden" name="filter_barkhausen" value="0"><input type="checkbox" name="filter_barkhausen" value="1"{tag_filter_barkhausen_checked}>Barkhausen</label>
+	                      <label class="tag-control tag-inline-check"><input type="hidden" name="filter_microwire" value="0"><input type="checkbox" name="filter_microwire" value="1"{tag_filter_microwire_checked}>Microwire</label>
+	                      <label class="tag-control tag-inline-check"><input type="hidden" name="filter_paper" value="0"><input type="checkbox" name="filter_paper" value="1"{tag_filter_paper_checked}>Paper</label>
+	                    </td>
+	                  </tr>
+	                  <tr>
+	                    <td class="tag-desc">
+	                      <span class="tag-param">Adaptive phase <b class="help tag-help" tabindex="0" aria-label="Searches the even/odd time shift only inside the expected tag response window. Penalty suppresses unnecessary large phase jumps." data-tip="Searches the even/odd time shift only inside the expected tag response window. Penalty suppresses unnecessary large phase jumps.">?</b></span>
+	                    </td>
+	                    <td class="tag-channel" colspan="2">
+	                      <label class="tag-control tag-noise-control">
+	                        <span class="tag-noise-pair">
+	                          <span class="tag-mini-field">Max shift <input name="phase_max_shift" type="number" min="0" max="80" step="1" inputmode="numeric" value="{tag_phase_max_shift_value}" aria-label="Adaptive phase maximum shift"></span>
+	                          <span class="tag-mini-field">Penalty <input name="phase_shift_penalty" type="number" min="0" max="1" step="0.005" inputmode="decimal" value="{tag_phase_shift_penalty_value}" aria-label="Adaptive phase shift penalty"></span>
+	                        </span>
+	                      </label>
+	                    </td>
+	                  </tr>
+	                  <tr>
+	                    <td class="tag-desc">
+	                      <span class="tag-param">Response window <b class="help tag-help" tabindex="0" aria-label="Fraction of the waveform where the tag response is expected. Peaks outside this window are rejected before shape matching." data-tip="Fraction of the waveform where the tag response is expected. Peaks outside this window are rejected before shape matching.">?</b></span>
+	                    </td>
+	                    <td class="tag-channel" colspan="2">
+	                      <label class="tag-control tag-noise-control">
+	                        <span class="tag-noise-pair">
+	                          <span class="tag-mini-field">Start <input name="mark_window_start_frac" type="number" min="0" max="0.95" step="0.01" inputmode="decimal" value="{tag_mark_window_start_frac_value}" aria-label="Response window start fraction"></span>
+	                          <span class="tag-mini-field">End <input name="mark_window_end_frac" type="number" min="0.01" max="1" step="0.01" inputmode="decimal" value="{tag_mark_window_end_frac_value}" aria-label="Response window end fraction"></span>
+	                        </span>
+	                      </label>
+	                    </td>
+	                  </tr>
+	                  <tr>
+	                    <td class="tag-desc">
+	                      <span class="tag-param">Casino shape <b class="help tag-help" tabindex="0" aria-label="Two or three compact humps. Weak Casino responses usually have two humps, strong responses can add a middle hump." data-tip="Two or three compact humps. Weak Casino responses usually have two humps, strong responses can add a middle hump.">?</b></span>
+	                    </td>
+	                    <td class="tag-channel" colspan="2">
+	                      <label class="tag-control tag-noise-control">
+	                        <span class="tag-noise-pair">
+	                          <span class="tag-mini-field">Gap <input name="mark_gap" type="number" min="1" max="160" step="1" inputmode="numeric" value="{tag_mark_gap_value}" aria-label="Casino hump gap"></span>
+	                          <span class="tag-mini-field">Tol <input name="mark_gap_tol" type="number" min="0" max="80" step="1" inputmode="numeric" value="{tag_mark_gap_tol_value}" aria-label="Casino hump gap tolerance"></span>
+	                          <span class="tag-mini-field">Min frac <input name="mark_second_frac" type="number" min="0.01" max="1" step="0.01" inputmode="decimal" value="{tag_mark_second_frac_value}" aria-label="Casino secondary hump fraction"></span>
+	                          <span class="tag-mini-field">Valley <input name="mark_valley_frac" type="number" min="0.01" max="0.99" step="0.01" inputmode="decimal" value="{tag_mark_valley_frac_value}" aria-label="Casino valley fraction"></span>
+	                          <span class="tag-mini-field">Humps <input name="mark_multi_max_humps" type="number" min="1" max="12" step="1" inputmode="numeric" value="{tag_mark_multi_max_humps_value}" aria-label="Casino maximum humps"></span>
+	                        </span>
+	                      </label>
+	                    </td>
+	                  </tr>
+	                  <tr>
+	                    <td class="tag-desc">
+	                      <span class="tag-param">Locality <b class="help tag-help" tabindex="0" aria-label="Limits extra high-energy humps outside the local tag response area." data-tip="Limits extra high-energy humps outside the local tag response area.">?</b></span>
+	                    </td>
+	                    <td class="tag-channel" colspan="2">
+	                      <label class="tag-control tag-noise-control">
+	                        <span class="tag-noise-pair">
+	                          <span class="tag-mini-field">Outside peaks <input name="locality_max_outside_peaks" type="number" min="0" max="20" step="1" inputmode="numeric" value="{tag_locality_max_outside_peaks_value}" aria-label="Maximum outside peaks"></span>
+	                          <span class="tag-mini-field">Peak frac <input name="locality_outside_peak_frac" type="number" min="0.01" max="1" step="0.01" inputmode="decimal" value="{tag_locality_outside_peak_frac_value}" aria-label="Outside peak fraction"></span>
+	                        </span>
+	                      </label>
+	                    </td>
+	                  </tr>
+	                </tbody>
+	              </table>
+	            </div>
+	            <p class="notice">Upper and Lower channels are independent. Shared detector behavior remains controlled by the core service and DC compensation settings.</p>
             <div class="actions actions-inline">
               <button class="link" type="submit" name="apply" value="1">Save and Apply to Core</button>
               <button class="link link-secondary" type="submit" name="apply" value="0">Save Only</button>
@@ -4371,62 +5014,80 @@ def render_portal_page(
           </form>
         </section>
         <section class="portal-panel" id="panel-operation">
-          <div class="summary-grid">
-            <div class="summary-item"><h3>Radar</h3><div class="metric"><span>Connection</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Transmission</h3><div class="metric"><span>Work time</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Profile</h3><div class="metric"><span>Active</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Optic</h3>{operation_optic_metrics}</div>
-          </div>
-        </section>
-        <section class="portal-panel" id="panel-group">
-          <div class="summary-grid">
-            <div class="summary-item"><h3>Role</h3><div class="metric"><span>Mode</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Sync</h3><div class="metric"><span>Status</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Peers</h3><div class="metric"><span>Count</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>RS485 Status</h3>{group_rs485_metrics}</div>
-          </div>
-        </section>
-        <section class="portal-panel" id="panel-dc">
-          <form class="config-form" method="post" action="/portal-dc-config">
-            <div class="section">
-              <h3>Mode</h3>
-              <div class="mode-grid">{mode_options}</div>
-            </div>
-            <div class="section">
+          <form class="config-form operation-config-form" method="post" action="/portal-operation-config">
+            <div class="operation-topline">
               <h3>Adaptation timing</h3>
-              <div class="fields">
-                <label class="field">
-                  <span>Work settle time, seconds <b class="help" title="Slow permanent DC tracking. Recommended default is 900 seconds for long operation.">?</b></span>
-                  <input name="work_settle_s" type="number" min="1" max="86400" step="1" value="{cfg['work_settle_s']:g}">
+              <div class="dc-timing-row">
+                <label class="dc-timing-field" title="Background DC compensation settle time in seconds. Range 0..86400 sec; 0 = fastest.">
+                  <span class="dc-timing-label"><span class="dc-timing-text">Work, sec.</span><b class="help" title="Background DC compensation settle time in seconds. Range 0..86400 sec; 0 = fastest.">?</b></span>
+                  <input name="work_settle_s" type="number" min="0" max="86400" step="1" inputmode="decimal" value="{cfg['work_settle_s']:g}">
                 </label>
-                <label class="field">
-                  <span>Detect initial settle time, seconds <b class="help" title="Starting Detect adaptation speed. Larger values adapt more slowly at the beginning of detection.">?</b></span>
-                  <input name="detect_initial_settle_s" type="number" min="0.1" max="86400" step="0.1" value="{cfg['detect_initial_settle_s']:g}">
+                <label class="dc-timing-field" title="DC compensation settle time while acquiring a signal before detection. Range 0..86400 sec; 0 = fastest.">
+                  <span class="dc-timing-label"><span class="dc-timing-text">Acquisition, sec.</span><b class="help" title="DC compensation settle time while acquiring a signal before detection. Range 0..86400 sec; 0 = fastest.">?</b></span>
+                  <input name="detect_settle_s" type="number" min="0" max="86400" step="1" inputmode="decimal" value="{cfg['detect_settle_s']:g}">
                 </label>
-                <label class="field">
-                  <span>Detect final settle time, seconds <b class="help" title="Final Detect adaptation speed after the ramp. Smaller values adapt faster.">?</b></span>
-                  <input name="detect_final_settle_s" type="number" min="0.1" max="86400" step="0.1" value="{cfg['detect_final_settle_s']:g}">
+                <label class="dc-timing-field" title="DC compensation settle time during detection. Range 0..86400 sec; 0 = fastest.">
+                  <span class="dc-timing-label"><span class="dc-timing-text">Detection, sec.</span><b class="help" title="DC compensation settle time during detection. Range 0..86400 sec; 0 = fastest.">?</b></span>
+                  <input name="fast_settle_s" type="number" min="0" max="86400" step="1" inputmode="decimal" value="{cfg['fast_settle_s']:g}">
                 </label>
-                <label class="field">
-                  <span>Detect ramp time, seconds <b class="help" title="How long the host should take to move from initial Detect speed to final Detect speed. Use 0 for immediate final speed.">?</b></span>
-                  <input name="detect_ramp_s" type="number" min="0" max="86400" step="1" value="{cfg['detect_ramp_s']:g}">
-                </label>
-                <label class="field">
-                  <span>Boot-fast settle time, seconds <b class="help" title="Fast DC learning speed used after a host-controlled forced reboot. Recommended default is 5 seconds.">?</b></span>
-                  <input name="fast_settle_s" type="number" min="0.1" max="3600" step="0.1" value="{cfg['fast_settle_s']:g}">
-                </label>
-                <label class="field">
-                  <span>Boot-fast duration, seconds <b class="help" title="How long firmware stays in BOOT_FAST before automatically switching to WORK. Recommended default is 30 seconds.">?</b></span>
-                  <input name="fast_duration_s" type="number" min="0" max="86400" step="1" value="{cfg['fast_duration_s']:g}">
+                <label class="dc-timing-field" title="Startup DC compensation settle time during switching and boot. Range 0..86400 sec; 0 = fastest.">
+                  <span class="dc-timing-label"><span class="dc-timing-text">Start, sec.</span><b class="help" title="Startup DC compensation settle time during switching and boot. Range 0..86400 sec; 0 = fastest.">?</b></span>
+                  <input name="fast_duration_s" type="number" min="0" max="86400" step="1" inputmode="decimal" value="{cfg['fast_duration_s']:g}">
                 </label>
               </div>
-              <p class="notice">Detect ramp values are saved for the host. The immediate firmware command uses the Detect initial settle time as the current detect_settle_s.</p>
             </div>
-            <div class="actions actions-inline">
-              <button class="link" type="submit" name="apply" value="1">Save and Apply to Device</button>
+            <div class="operation-lowerline">
+              <label class="field operation-avg-field">
+                <span>Default averaging</span>
+                <select name="avg_n">{avg_n_options}</select>
+                <small>Used by BMI30 core on startup; live apply updates the running core.</small>
+              </label>
+            </div>
+            <div class="summary-grid">
+              <div class="summary-item"><h3>Radar</h3><div class="metric"><span>Connection</span><strong>---</strong></div></div>
+              <div class="summary-item"><h3>Transmission</h3><div class="metric"><span>Work time</span><strong>---</strong></div></div>
+              <div class="summary-item"><h3>Profile</h3><div class="metric"><span>Active</span><strong>---</strong></div></div>
+              <div class="summary-item"><h3>Optic</h3>{operation_optic_metrics}</div>
+            </div>
+            <div class="actions actions-inline operation-actions">
+              <button class="link" type="submit" name="apply" value="1">Save and Apply</button>
               <button class="link link-secondary" type="submit" name="apply" value="0">Save Only</button>
             </div>
           </form>
+        </section>
+        <section class="portal-panel" id="panel-group">
+          <div class="section group-section">
+            <div class="group-head">
+              <h2>Synchronized Devices</h2>
+              <span class="group-update">Last status update: <strong data-sensor-text="group-cache">---</strong></span>
+            </div>
+            <p class="group-legend">
+              <span><span class="group-dot is-green"></span>Optic triggered</span>
+              <span><span class="group-dot is-red"></span>Modulation signal, not triggered</span>
+              <span><span class="group-dot is-off"></span>No signal</span>
+            </p>
+            <div class="group-matrix-wrap">
+              <table class="group-matrix" id="group-matrix">
+                <thead>
+                  <tr data-group-row="head"><th class="group-param">Device</th></tr>
+                </thead>
+                <tbody>
+                  <tr data-group-row="indicator"><th class="group-param">State</th></tr>
+                  <tr data-group-row="role"><th class="group-param">Role</th></tr>
+                  <tr data-group-row="node"><th class="group-param">Node ID</th></tr>
+                  <tr data-group-row="optic"><th class="group-param">Optic sensor</th></tr>
+                  <tr data-group-row="detadc1"><th class="group-param">DetADC1 (modulation)</th></tr>
+                  <tr data-group-row="detadc2"><th class="group-param">DetADC2 (modulation)</th></tr>
+                  <tr data-group-row="tx"><th class="group-param">TX</th></tr>
+                  <tr data-group-row="online"><th class="group-param">RS485 online</th></tr>
+                  <tr data-group-row="reaction"><th class="group-param">Detection reaction on optic</th></tr>
+                  <tr data-group-row="hold"><th class="group-param">Optic trigger hold (sec)</th></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="group-empty" data-group-empty hidden>No synchronized devices reported yet.</p>
+            <p class="group-note">Reaction switch and hold delay apply to <b>this device</b>. Per-device control of other devices over RS485 is not available yet.</p>
+          </div>
         </section>
         <section class="portal-panel" id="panel-privacy">
           <div class="privacy-status-grid">
@@ -4983,6 +5644,316 @@ def render_portal_page(
       add('optic_age', _eventAgeLabel(device, 'optic_state'), '');
       return items;
     }}
+    var _groupMatrix = document.getElementById('group-matrix');
+    var _groupEmpty = document.querySelector('[data-group-empty]');
+    var _groupRows = {{}};
+    if (_groupMatrix) {{
+      _groupMatrix.querySelectorAll('[data-group-row]').forEach(function (tr) {{
+        _groupRows[tr.getAttribute('data-group-row')] = tr;
+      }});
+    }}
+    function _padNode2(n) {{
+      var v = (typeof n === 'number' && isFinite(n)) ? Math.max(0, Math.round(n)) : 0;
+      return ('0' + v).slice(-2);
+    }}
+    function _roleChar(role) {{
+      if (role === 'master') {{ return 'M'; }}
+      if (role === 'slave') {{ return 'S'; }}
+      return '?';
+    }}
+    function _capitalizeRole(s) {{
+      s = String(s || '');
+      return s ? (s.charAt(0).toUpperCase() + s.slice(1)) : '---';
+    }}
+    function _localSyncRole(sync) {{
+      var role = String(sync.role || '').toLowerCase();
+      if (role !== 'master' && role !== 'slave' && role !== 'off') {{
+        var map = {{0: 'master', 1: 'slave', 2: 'off'}};
+        role = map[sync.raw_mode] || '---';
+      }}
+      return role;
+    }}
+    function _buildGroupDevices(device) {{
+      var sync = device.sync || {{}};
+      var events = device.events || {{}};
+      var syncEvt = events.sync_state || {{}};
+      var local = device.local || {{}};
+      var remote = device.remote || [];
+      var optic = events.optic_state || {{}};
+      function _pick(a, b) {{ return (a !== undefined && a !== null) ? a : b; }}
+      var rawMode = _pick(syncEvt.raw_mode, sync.raw_mode);
+      var localRole = String(_pick(syncEvt.role, sync.role) || '').toLowerCase();
+      if (localRole !== 'master' && localRole !== 'slave' && localRole !== 'off') {{
+        var rmap = {{0: 'master', 1: 'slave', 2: 'off'}};
+        localRole = rmap[rawMode] || '---';
+      }}
+      var localNode = _pick(syncEvt.local_node_id, _pick(sync.local_node_id, local.node_id));
+      if (typeof localNode !== 'number') {{ localNode = 0; }}
+      var seenMask = _pick(syncEvt.sync_seen_mask, sync.sync_seen_mask);
+      if (typeof seenMask !== 'number') {{ seenMask = 0; }}
+      // Authoritative present-node set comes from sync_seen_mask (bit i -> node_id i+1).
+      // The raw remote[] list from the STAT packet is unreliable in this firmware, so it
+      // is only used to look up per-node state for nodes that are actually present.
+      var remoteById = {{}};
+      remote.forEach(function (item) {{
+        if (item && typeof item.node_id === 'number') {{ remoteById[item.node_id] = item; }}
+      }});
+      var presentIds = [];
+      for (var i = 0; i < 32; i++) {{
+        if (seenMask & (1 << i)) {{ presentIds.push(i + 1); }}
+      }}
+      if (localNode > 0 && presentIds.indexOf(localNode) === -1) {{
+        presentIds.push(localNode);
+      }} else if (presentIds.length === 0 && (localRole === 'master' || localRole === 'slave')) {{
+        presentIds.push(localNode);
+      }}
+      var remoteCount = 0;
+      presentIds.forEach(function (n) {{ if (n !== localNode) {{ remoteCount++; }} }});
+      // A synchronized slave implies a master exists even when the firmware does not
+      // list it in sync_seen_mask. If no peer is present to be that master, add an
+      // implied master column (M00) so the group always shows the master first.
+      var impliedMaster = null;
+      if ((localRole === 'slave' || localRole === 'off') && remoteCount === 0) {{
+        impliedMaster = {{
+          code: 'M' + _padNode2(0),
+          role: 'master',
+          node_id: 0,
+          optic_active: null,
+          detadc1: null,
+          detadc2: null,
+          tx_enabled: null,
+          online: true,
+          is_local: false
+        }};
+      }}
+      var devices = presentIds.map(function (nid) {{
+        var isLocal = (nid === localNode);
+        var role;
+        if (isLocal) {{
+          role = localRole;
+        }} else if (localRole === 'master') {{
+          role = 'slave';
+        }} else if ((localRole === 'slave' || localRole === 'off') && remoteCount === 1) {{
+          role = 'master';
+        }} else {{
+          role = 'slave';
+        }}
+        var st = isLocal ? local : (remoteById[nid] || {{}});
+        var code;
+        if (isLocal) {{
+          var localChar = String(_pick(syncEvt.display_char, sync.display_char) || '').toUpperCase() || _roleChar(role);
+          var localVal = _pick(syncEvt.display_value, sync.display_value);
+          if (typeof localVal !== 'number') {{ localVal = nid; }}
+          var sc = String(_pick(syncEvt.code, sync.code) || '').toUpperCase();
+          code = (/^[MS][0-9]{{2}}$/.test(sc)) ? sc : (localChar + _padNode2(localVal));
+        }} else {{
+          code = _roleChar(role) + _padNode2(nid);
+        }}
+        return {{
+          code: code,
+          role: role,
+          node_id: nid,
+          optic_active: st.optic_active,
+          detadc1: st.detadc1,
+          detadc2: st.detadc2,
+          tx_enabled: isLocal ? ((st.tx_enabled !== undefined) ? st.tx_enabled : optic.tx_enabled) : st.tx_enabled,
+          online: true,
+          is_local: isLocal
+        }};
+      }});
+      if (impliedMaster) {{ devices.push(impliedMaster); }}
+      // The master is always single and shows how many slaves are connected to it
+      // (1 slave -> M01, 2 slaves -> M02). Slaves keep their own S0N numbering.
+      var slaveN = devices.filter(function (d) {{ return d.role === 'slave'; }}).length;
+      devices.forEach(function (d) {{
+        if (d.role === 'master' && !d.is_local) {{ d.code = 'M' + _padNode2(slaveN); }}
+      }});
+      devices.sort(function (a, b) {{
+        var ar = (a.role === 'master') ? 0 : 1;
+        var br = (b.role === 'master') ? 0 : 1;
+        if (ar !== br) {{ return ar - br; }}
+        return (a.node_id || 0) - (b.node_id || 0);
+      }});
+      var opticStateLocal = (device.events || {{}}).optic_state || {{}};
+      var opticSettings = device.optic_settings || {{}};
+      var localHoldSec = 3;
+      var _hd = parseInt(opticStateLocal.optic_hold_ds, 10);
+      if (isFinite(_hd)) {{ localHoldSec = Math.max(0, Math.min(10, Math.round(_hd / 10))); }}
+      var localReaction = !!opticSettings.reaction_enabled;
+      devices.forEach(function (d) {{ if (d.is_local) {{ d._holdSec = localHoldSec; d._reaction = localReaction; }} }});
+      return devices;
+    }}
+    function _groupStateClass(d) {{
+      if (d.optic_active === true) {{ return 'is-green'; }}
+      if (d.detadc1 === true || d.detadc2 === true) {{ return 'is-red'; }}
+      return 'is-off';
+    }}
+    function _groupStateTitle(d) {{
+      if (d.optic_active === true) {{ return 'Optic sensor triggered'; }}
+      if (d.detadc1 === true || d.detadc2 === true) {{ return 'Not triggered, modulation signal present'; }}
+      return 'No signal';
+    }}
+    var _groupSig = null;
+    var _groupCols = [];
+    var _groupLocalReaction = null;
+    var _groupLocalHold = null;
+    var _groupLocalApplyT = 0;
+    function _groupApplyOptic() {{
+      var reaction = _groupLocalReaction ? !!_groupLocalReaction.checked : false;
+      var holdSec = _groupLocalHold ? (parseInt(_groupLocalHold.value, 10) || 0) : 0;
+      _groupLocalApplyT = Date.now();
+      fetch('/api/group-optic-config', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        cache: 'no-store',
+        body: JSON.stringify({{reaction: reaction, hold_seconds: holdSec}})
+      }}).then(function (r) {{ return r.ok ? r.json() : null; }}).catch(function () {{}});
+    }}
+    function _groupMakeHead(d) {{
+      var th = document.createElement('th');
+      th.className = 'group-dev-cell group-dev-head' + (d.is_local ? ' is-local' : '');
+      var code = document.createElement('span');
+      code.className = 'group-dev-code';
+      code.textContent = d.code || '??';
+      th.appendChild(code);
+      if (d.is_local) {{
+        var badge = document.createElement('span');
+        badge.className = 'group-dev-badge';
+        badge.textContent = 'this device';
+        th.appendChild(badge);
+      }}
+      return th;
+    }}
+    function _groupMakeStateCell(d) {{
+      var td = document.createElement('td');
+      td.className = 'group-dev-cell group-dev-state' + (d.is_local ? ' is-local' : '');
+      td.appendChild(document.createElement('span'));
+      return td;
+    }}
+    function _groupSetState(td, d) {{
+      var dot = td.firstChild;
+      if (!dot) {{ return; }}
+      dot.className = 'group-dot ' + _groupStateClass(d);
+      dot.title = _groupStateTitle(d);
+    }}
+    function _groupMakeTextCell(d) {{
+      var td = document.createElement('td');
+      td.className = 'group-dev-cell' + (d.is_local ? ' is-local' : '');
+      return td;
+    }}
+    function _groupSetText(td, text) {{
+      td.textContent = (text === null || text === undefined || text === '') ? '---' : text;
+    }}
+    function _groupMakeBoolCell(d) {{
+      var td = document.createElement('td');
+      td.className = 'group-dev-cell' + (d.is_local ? ' is-local' : '');
+      td.appendChild(document.createElement('span'));
+      return td;
+    }}
+    function _groupSetBool(td, value) {{
+      var span = td.firstChild;
+      if (!span) {{ return; }}
+      span.className = 'group-flag ' + (value === true ? 'is-on' : (value === false ? 'is-off' : 'is-unknown'));
+      span.textContent = _formatBool(value);
+    }}
+    function _groupMakeReactionCell(d) {{
+      var td = document.createElement('td');
+      td.className = 'group-dev-cell group-dev-ctl' + (d.is_local ? ' is-local' : '');
+      var label = document.createElement('label');
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      if (d.is_local) {{
+        cb.checked = !!d._reaction;
+        cb.addEventListener('change', _groupApplyOptic);
+        _groupLocalReaction = cb;
+      }} else {{
+        cb.disabled = true;
+        cb.title = 'Remote control not available yet';
+      }}
+      label.appendChild(cb);
+      td.appendChild(label);
+      td._ctlInput = cb;
+      return td;
+    }}
+    function _groupMakeHoldCell(d) {{
+      var td = document.createElement('td');
+      td.className = 'group-dev-cell group-dev-ctl' + (d.is_local ? ' is-local' : '');
+      if (d.is_local) {{
+        var sel = document.createElement('select');
+        sel.className = 'group-ctl-select';
+        for (var s = 0; s <= 10; s++) {{
+          var opt = document.createElement('option');
+          opt.value = String(s);
+          opt.textContent = String(s);
+          if (s === d._holdSec) {{ opt.selected = true; }}
+          sel.appendChild(opt);
+        }}
+        sel.addEventListener('change', _groupApplyOptic);
+        td.appendChild(sel);
+        td._ctlSelect = sel;
+        _groupLocalHold = sel;
+      }} else {{
+        td.textContent = '\u2014';
+      }}
+      return td;
+    }}
+    function _groupRebuildColumns(devices) {{
+      Object.keys(_groupRows).forEach(function (key) {{
+        var cells = _groupRows[key].querySelectorAll('.group-dev-cell');
+        for (var i = 0; i < cells.length; i++) {{ cells[i].remove(); }}
+      }});
+      _groupCols = [];
+      _groupLocalReaction = null;
+      _groupLocalHold = null;
+      devices.forEach(function (d) {{
+        var col = {{is_local: d.is_local, cells: {{}}}};
+        if (_groupRows.head) {{ var h = _groupMakeHead(d); _groupRows.head.appendChild(h); col.head = h; }}
+        if (_groupRows.indicator) {{ var stc = _groupMakeStateCell(d); _groupSetState(stc, d); _groupRows.indicator.appendChild(stc); col.cells.indicator = stc; }}
+        if (_groupRows.role) {{ var rc = _groupMakeTextCell(d); _groupSetText(rc, _capitalizeRole(d.role)); _groupRows.role.appendChild(rc); col.cells.role = rc; }}
+        if (_groupRows.node) {{ var nc = _groupMakeTextCell(d); _groupSetText(nc, String(d.node_id)); _groupRows.node.appendChild(nc); col.cells.node = nc; }}
+        if (_groupRows.optic) {{ var oc = _groupMakeBoolCell(d); _groupSetBool(oc, d.optic_active); _groupRows.optic.appendChild(oc); col.cells.optic = oc; }}
+        if (_groupRows.detadc1) {{ var c1 = _groupMakeBoolCell(d); _groupSetBool(c1, d.detadc1); _groupRows.detadc1.appendChild(c1); col.cells.detadc1 = c1; }}
+        if (_groupRows.detadc2) {{ var c2 = _groupMakeBoolCell(d); _groupSetBool(c2, d.detadc2); _groupRows.detadc2.appendChild(c2); col.cells.detadc2 = c2; }}
+        if (_groupRows.tx) {{ var tc = _groupMakeBoolCell(d); _groupSetBool(tc, d.tx_enabled); _groupRows.tx.appendChild(tc); col.cells.tx = tc; }}
+        if (_groupRows.online) {{ var lc = _groupMakeBoolCell(d); _groupSetBool(lc, d.online); _groupRows.online.appendChild(lc); col.cells.online = lc; }}
+        if (_groupRows.reaction) {{ var rcl = _groupMakeReactionCell(d); _groupRows.reaction.appendChild(rcl); col.cells.reaction = rcl; }}
+        if (_groupRows.hold) {{ var hcl = _groupMakeHoldCell(d); _groupRows.hold.appendChild(hcl); col.cells.hold = hcl; }}
+        _groupCols.push(col);
+      }});
+    }}
+    function _groupUpdateColumns(devices) {{
+      var recent = (Date.now() - _groupLocalApplyT) < 6000;
+      devices.forEach(function (d, idx) {{
+        var col = _groupCols[idx];
+        if (!col) {{ return; }}
+        if (col.cells.indicator) {{ _groupSetState(col.cells.indicator, d); }}
+        if (col.cells.role) {{ _groupSetText(col.cells.role, _capitalizeRole(d.role)); }}
+        if (col.cells.node) {{ _groupSetText(col.cells.node, String(d.node_id)); }}
+        if (col.cells.optic) {{ _groupSetBool(col.cells.optic, d.optic_active); }}
+        if (col.cells.detadc1) {{ _groupSetBool(col.cells.detadc1, d.detadc1); }}
+        if (col.cells.detadc2) {{ _groupSetBool(col.cells.detadc2, d.detadc2); }}
+        if (col.cells.tx) {{ _groupSetBool(col.cells.tx, d.tx_enabled); }}
+        if (col.cells.online) {{ _groupSetBool(col.cells.online, d.online); }}
+        if (d.is_local && !recent) {{
+          var rc = col.cells.reaction;
+          if (rc && rc._ctlInput && document.activeElement !== rc._ctlInput) {{ rc._ctlInput.checked = !!d._reaction; }}
+          var hc = col.cells.hold;
+          if (hc && hc._ctlSelect && document.activeElement !== hc._ctlSelect) {{ hc._ctlSelect.value = String(d._holdSec); }}
+        }}
+      }});
+    }}
+    function _updateGroupMatrix(device) {{
+      if (!_groupMatrix) {{ return; }}
+      var devices = _buildGroupDevices(device || {{}});
+      if (_groupEmpty) {{ _groupEmpty.hidden = devices.length > 0; }}
+      var sig = devices.map(function (d) {{ return d.code + (d.is_local ? '*' : ''); }}).join('|');
+      if (sig !== _groupSig) {{
+        _groupRebuildColumns(devices);
+        _groupSig = sig;
+      }} else {{
+        _groupUpdateColumns(devices);
+      }}
+    }}
     function _updateDeviceSensors(device) {{
       device = device || {{}};
       var local = device.local || {{}};
@@ -4999,6 +5970,7 @@ def render_portal_page(
       _setRemoteSensors(device.remote || []);
       _setSensorChips('stm32-raw-sensors', 'STM32 raw', _stm32RawSensorItems(device));
       _setSensorChips('optic-sensors', 'Optic raw', _opticSensorItems(device));
+      _updateGroupMatrix(device);
     }}
     function _pollSensors() {{
       if (_activePanel !== 'antenna' && _activePanel !== 'operation' && _activePanel !== 'group') {{ return; }}
@@ -5517,8 +6489,14 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             '"/api/status"': '"/portal-core/api/status"',
             "'/api/command'": "'/portal-core/api/command'",
             '"/api/command"': '"/portal-core/api/command"',
+            "'/api/frame.bin?": "'/portal-core/api/frame.bin?",
+            '"/api/frame.bin?': '"/portal-core/api/frame.bin?',
             "'/api/frame?": "'/portal-core/api/frame?",
             '"/api/frame?': '"/portal-core/api/frame?',
+            "'/api/player-recording-upload?": "'/portal-core/api/player-recording-upload?",
+            '"/api/player-recording-upload?': '"/portal-core/api/player-recording-upload?',
+            "'/api/player-recording-download?": "'/portal-core/api/player-recording-download?",
+            '"/api/player-recording-download?': '"/portal-core/api/player-recording-download?',
         }
         for old, new in replacements.items():
             text = text.replace(old, new)
@@ -5541,17 +6519,22 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
         if content_type:
             headers["Content-Type"] = content_type
         try:
+            timeout_s = 60.0 if (core_path.startswith("/api/player-recording-") or core_path == "/api/command") else 4.0
             request = Request(url, data=body if method.upper() != "GET" else None, headers=headers, method=method.upper())
-            with urlopen(request, timeout=4.0) as response:
+            with urlopen(request, timeout=timeout_s) as response:
                 payload = response.read()
                 response_type = response.headers.get("Content-Type", "application/octet-stream")
+                content_disposition = response.headers.get("Content-Disposition", "")
                 status = HTTPStatus(response.status)
         except Exception as exc:
             payload = json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8")
             response_type = "application/json; charset=utf-8"
+            content_disposition = ""
             status = HTTPStatus.BAD_GATEWAY
         self.send_response(status)
         self.send_header("Content-Type", response_type)
+        if content_disposition:
+            self.send_header("Content-Disposition", content_disposition)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -5692,11 +6675,13 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             rpi_hwmon = _read_rpi_hwmon_readings()
             device_cache = _read_device_state_cache()
             stm32_temp = _device_cache_temperature(device_cache)
+            device_sensors = _device_cache_sensors(device_cache)
+            device_sensors["optic_settings"] = _read_core_optic_settings()
             sensors_data: dict = {
                 "rpi": rpi_data,
                 "rpi_hwmon": rpi_hwmon,
                 "stm32": round(stm32_temp, 1) if isinstance(stm32_temp, (int, float)) else None,
-                "device": _device_cache_sensors(device_cache),
+                "device": device_sensors,
             }
             payload = json.dumps(sensors_data, ensure_ascii=False).encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -5742,6 +6727,18 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
                 notice = "Tag Detection settings saved and sent to BMI30 core."
             if query.get("tag_error", [""])[0] == "1":
                 notice = "Tag Detection settings saved, but BMI30 core did not accept the live apply. Check core service and try again."
+                notice_kind = "error"
+            if query.get("group_applied", [""])[0] == "1":
+                notice = "Optic settings saved and sent to BMI30 core."
+            if query.get("group_error", [""])[0] == "1":
+                notice = "Optic settings could not be applied. Check the BMI30 core service and USB connection."
+                notice_kind = "error"
+            if query.get("operation_saved", [""])[0] == "1":
+                notice = "Operating mode defaults and DC adaptation timing saved."
+            if query.get("operation_applied", [""])[0] == "1":
+                notice = "Operating mode defaults and DC adaptation timing saved and sent to BMI30 core."
+            if query.get("operation_error", [""])[0] == "1":
+                notice = "Operating mode settings saved, but BMI30 core did not accept the live apply. Check core service and try again."
                 notice_kind = "error"
             if query.get("account", [""])[0] == "1":
                 notice = "Portal login and password saved."
@@ -6224,6 +7221,88 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/portal-operation-config":
+            session = self._get_portal_session()
+            if session is None:
+                self._send_redirect(
+                    self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
+                    status=HTTPStatus.SEE_OTHER,
+                    set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
+                )
+                return
+
+            form = self._read_post_form()
+            avg_n = avg_n_from_form(form)
+            dc_cfg = dc_timing_config_from_form(form, load_dc_config())
+            try:
+                save_default_avg_n(avg_n)
+                save_dc_config(dc_cfg)
+            except Exception:
+                payload = render_portal_page(
+                    collect_remote_access_targets(preferred_ip=extract_request_host_ip(self.headers.get("Host", "")))["hostname"],
+                    session_username=str(session.get("u", "")),
+                    session_role=str(session.get("r", "user")),
+                    notice="Unable to save Operating Mode settings.",
+                    notice_kind="error",
+                    request_host=self.headers.get("Host", ""),
+                )
+                self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
+            apply_now = form.get("apply", "1").strip().lower() not in {"0", "false", "off", "no"}
+            if apply_now:
+                avg_ok, _avg_message = apply_avg_n_to_core(avg_n)
+                dc_ok, _dc_message = apply_dc_config_to_device(dc_cfg)
+                ok = avg_ok and dc_ok
+                suffix = "?operation_applied=1#operation" if ok else "?operation_error=1#operation"
+            else:
+                suffix = "?operation_saved=1#operation"
+            self._send_redirect(
+                self._absolute_url(f"/portal{suffix}", scheme=self._preferred_scheme()),
+                status=HTTPStatus.SEE_OTHER,
+            )
+            return
+
+        if path == "/api/group-optic-config":
+            if self._get_portal_session() is None:
+                self.send_response(HTTPStatus.FORBIDDEN)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except Exception:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b""
+            reaction_enabled = False
+            hold_seconds = 3
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+                reaction_enabled = bool(body.get("reaction", body.get("reaction_enabled", False)))
+                hold_seconds = int(body.get("hold_seconds", body.get("seconds", 3)))
+            except Exception:
+                pass
+            hold_seconds = max(0, min(10, hold_seconds))
+            ok, message = apply_group_optic_to_core(reaction_enabled, hold_seconds)
+            payload = json.dumps({
+                "ok": bool(ok),
+                "message": message,
+                "reaction_enabled": bool(reaction_enabled),
+                "hold_seconds": hold_seconds,
+            }).encode("utf-8")
+            self.send_response(HTTPStatus.OK if ok else HTTPStatus.BAD_GATEWAY)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
         if path == "/portal-tag-detection-config":
             session = self._get_portal_session()
             if session is None:
@@ -6301,9 +7380,9 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             apply_now = form.get("apply", "1").strip().lower() not in {"0", "false", "off", "no"}
             if apply_now:
                 ok, _message = apply_dc_config_to_device(cfg)
-                suffix = "?applied=1#dc" if ok else "?error=1#dc"
+                suffix = "?applied=1#operation" if ok else "?error=1#operation"
             else:
-                suffix = "?saved=1#dc"
+                suffix = "?saved=1#operation"
             self._send_redirect(
                 self._absolute_url(f"/portal{suffix}", scheme=self._preferred_scheme()),
                 status=HTTPStatus.SEE_OTHER,

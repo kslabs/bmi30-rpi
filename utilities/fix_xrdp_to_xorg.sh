@@ -10,6 +10,12 @@ xrdp_ini="/etc/xrdp/xrdp.ini"
 backup="/etc/xrdp/xrdp.ini.codex-backup.$(date +%Y%m%d-%H%M%S)"
 tmpfile="$(mktemp /tmp/xrdp.ini.codex.XXXXXX)"
 
+format_copy_bytes() {
+    local bytes="${1:-0}"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    numfmt --to=iec --suffix=B "$bytes" 2>/dev/null || printf '%sB' "$bytes"
+}
+
 cleanup() {
     rm -f "$tmpfile"
 }
@@ -20,7 +26,17 @@ if [[ ! -f "$xrdp_ini" ]]; then
     exit 1
 fi
 
+copy_start_ts="$(date +%s)"
 cp -a "$xrdp_ini" "$backup"
+copy_end_ts="$(date +%s)"
+copy_elapsed_s=$((copy_end_ts - copy_start_ts))
+if (( copy_elapsed_s <= 0 )); then
+    copy_elapsed_s=1
+fi
+copy_bytes="$(stat -c '%s' "$backup" 2>/dev/null || printf '0')"
+[[ "$copy_bytes" =~ ^[0-9]+$ ]] || copy_bytes=0
+copy_rate=$((copy_bytes / copy_elapsed_s))
+echo "Backup copy: duration ${copy_elapsed_s}s, average speed $(format_copy_bytes "$copy_rate")/s, size $(format_copy_bytes "$copy_bytes")" >&2
 
 awk '
     function emit_xorg_sections() {
@@ -148,7 +164,17 @@ awk '
     }
 ' "$xrdp_ini" > "$tmpfile"
 
+copy_start_ts="$(date +%s)"
 install -m 644 "$tmpfile" "$xrdp_ini"
+copy_end_ts="$(date +%s)"
+copy_elapsed_s=$((copy_end_ts - copy_start_ts))
+if (( copy_elapsed_s <= 0 )); then
+    copy_elapsed_s=1
+fi
+copy_bytes="$(stat -c '%s' "$xrdp_ini" 2>/dev/null || printf '0')"
+[[ "$copy_bytes" =~ ^[0-9]+$ ]] || copy_bytes=0
+copy_rate=$((copy_bytes / copy_elapsed_s))
+echo "Config install: duration ${copy_elapsed_s}s, average speed $(format_copy_bytes "$copy_rate")/s, size $(format_copy_bytes "$copy_bytes")" >&2
 
 if [[ -e /usr/share/ovscsetup.sh ]]; then
     chmod 755 /usr/share/ovscsetup.sh

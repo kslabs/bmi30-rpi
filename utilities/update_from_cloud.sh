@@ -254,6 +254,7 @@ legacy_project_signature() {
 
 download_latest_marker() {
     local marker_path remote_marker
+    local start_ts end_ts elapsed_s marker_bytes
     mkdir -p "$STATE_DIR"
     marker_path="$STATE_DIR/remote_$REMOTE_LATEST_FILE"
     remote_marker="$(remote_join "$REMOTE_TARGET" "$REMOTE_LATEST_FILE")"
@@ -270,9 +271,14 @@ download_latest_marker() {
         return
     fi
 
+    start_ts="$(date +%s)"
     if ! "${cmd[@]}"; then
         fail "Не удалось скачать указатель последнего архива: $remote_marker"
     fi
+    end_ts="$(date +%s)"
+    elapsed_s=$((end_ts - start_ts))
+    marker_bytes="$(bmi30_file_size_bytes "$marker_path")"
+    bmi30_log_copy_result "Скачивание указателя архива" "$marker_bytes" "$elapsed_s"
 
     printf '%s' "$marker_path"
 }
@@ -305,6 +311,7 @@ create_pre_update_snapshot() {
     [[ "$PRE_UPDATE_SNAPSHOT" == "1" ]] || return
 
     local source_abs source_parent source_name backup_abs archive_path timestamp device_suffix
+    local start_ts end_ts elapsed_s archive_bytes
     source_abs="$(cd -- "$SOURCE_DIR" && pwd)"
     source_parent="$(dirname -- "$source_abs")"
     source_name="$(basename -- "$source_abs")"
@@ -328,13 +335,19 @@ create_pre_update_snapshot() {
         -C "$source_parent"
         "$source_name"
     )
+    start_ts="$(date +%s)"
     tar "${tar_args[@]}"
+    end_ts="$(date +%s)"
+    elapsed_s=$((end_ts - start_ts))
+    archive_bytes="$(bmi30_file_size_bytes "$archive_path")"
 
     log "Снимок перед обновлением создан: $archive_path"
+    bmi30_log_copy_result "Создание снимка перед обновлением" "$archive_bytes" "$elapsed_s"
 }
 
 download_archive() {
     local incoming_dir archive_path remote_archive actual_hash
+    local start_ts end_ts elapsed_s archive_bytes
     incoming_dir="$STATE_DIR/incoming"
     mkdir -p "$incoming_dir"
     archive_path="$incoming_dir/$ARCHIVE_NAME"
@@ -361,9 +374,14 @@ download_archive() {
         cmd+=(--drive-root-folder-id "$REMOTE_FOLDER_ID")
     fi
 
+    start_ts="$(date +%s)"
     if ! "${cmd[@]}"; then
         fail "Не удалось скачать архив: $remote_archive"
     fi
+    end_ts="$(date +%s)"
+    elapsed_s=$((end_ts - start_ts))
+    archive_bytes="$(bmi30_file_size_bytes "$archive_path")"
+    bmi30_log_copy_result "Скачивание архива" "$archive_bytes" "$elapsed_s"
 
     actual_hash="$(sha256sum "$archive_path" | awk '{print $1}')"
     [[ "${actual_hash,,}" == "${ARCHIVE_SHA256,,}" ]] || fail "SHA-256 архива не совпадает: $archive_path"
@@ -375,6 +393,7 @@ download_archive() {
 apply_archive() {
     local archive_path="$1"
     local extracted source_name
+    local start_ts end_ts elapsed_s archive_bytes apply_bytes
 
     APPLY_TEMP_DIR="$(mktemp -d)"
 
@@ -383,7 +402,13 @@ apply_archive() {
         return
     fi
 
+    archive_bytes="$(bmi30_file_size_bytes "$archive_path")"
+    start_ts="$(date +%s)"
     tar -xzf "$archive_path" -C "$APPLY_TEMP_DIR"
+    end_ts="$(date +%s)"
+    elapsed_s=$((end_ts - start_ts))
+    bmi30_log_copy_result "Распаковка архива" "$archive_bytes" "$elapsed_s"
+
     source_name="${SOURCE_BASENAME:-$(basename -- "$(cd -- "$SOURCE_DIR" && pwd)")}"
 
     if [[ -d "$APPLY_TEMP_DIR/$source_name" ]]; then
@@ -398,7 +423,10 @@ apply_archive() {
     rsync_args=(-a --delete)
     bmi30_add_project_rsync_excludes rsync_args
     rsync_args+=("$extracted/" "$SOURCE_DIR/")
-    rsync "${rsync_args[@]}"
+    apply_bytes="$(bmi30_dir_size_bytes "$extracted")"
+    if ! bmi30_run_timed_copy "Применение архива к проекту" "$apply_bytes" rsync "${rsync_args[@]}"; then
+        fail "Не удалось применить архив к проекту"
+    fi
 
     log "Проект обновлён из облачного архива: $ARCHIVE_NAME"
 }

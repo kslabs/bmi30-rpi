@@ -20,6 +20,32 @@ log() {
     printf '[%s] %s\n' "$level" "$*"
 }
 
+format_copy_bytes() {
+    local bytes="${1:-0}"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    numfmt --to=iec --suffix=B "$bytes" 2>/dev/null || printf '%sB' "$bytes"
+}
+
+install_with_copy_stats() {
+    local label="$1"
+    local source_path="$2"
+    local mode="$3"
+    local target_path="$4"
+    local start_ts end_ts elapsed_s bytes rate
+
+    start_ts="$(date +%s)"
+    install -m "$mode" "$source_path" "$target_path"
+    end_ts="$(date +%s)"
+    elapsed_s=$((end_ts - start_ts))
+    if (( elapsed_s <= 0 )); then
+        elapsed_s=1
+    fi
+    bytes="$(stat -c '%s' "$target_path" 2>/dev/null || printf '0')"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    rate=$((bytes / elapsed_s))
+    log INFO "$label: длительность ${elapsed_s}с, средняя скорость $(format_copy_bytes "$rate")/с, объем $(format_copy_bytes "$bytes")"
+}
+
 require_root() {
     if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
         return
@@ -132,7 +158,7 @@ install_systemd_service() {
 
     log INFO "Устанавливаю постоянное обновление сетевой идентичности: $SERVICE_NAME"
     mkdir -p "$(dirname "$INSTALL_PATH")" "$(dirname "$SERVICE_PATH")"
-    install -m 755 "$source_path" "$INSTALL_PATH"
+    install_with_copy_stats "Копирование скрипта сетевой идентичности" "$source_path" 755 "$INSTALL_PATH"
 
     cat > "$SERVICE_PATH" <<EOF
 [Unit]

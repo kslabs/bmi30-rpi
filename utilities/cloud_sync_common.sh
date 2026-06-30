@@ -7,6 +7,129 @@
 
 BMI30_PROJECT_SIGNATURE_VERSION="2"
 
+bmi30_copy_format_duration() {
+    local total_s="${1:-0}"
+    [[ "$total_s" =~ ^[0-9]+$ ]] || total_s=0
+
+    local hours minutes seconds
+    hours=$((total_s / 3600))
+    minutes=$(((total_s % 3600) / 60))
+    seconds=$((total_s % 60))
+
+    if (( hours > 0 )); then
+        printf '%dч %02dм %02dс' "$hours" "$minutes" "$seconds"
+    elif (( minutes > 0 )); then
+        printf '%dм %02dс' "$minutes" "$seconds"
+    else
+        printf '%dс' "$seconds"
+    fi
+}
+
+bmi30_copy_format_bytes() {
+    local bytes="${1:-0}"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    numfmt --to=iec --suffix=B "$bytes" 2>/dev/null || printf '%sB' "$bytes"
+}
+
+bmi30_copy_format_rate() {
+    local bytes="${1:-0}"
+    local elapsed_s="${2:-0}"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    [[ "$elapsed_s" =~ ^[0-9]+$ ]] || elapsed_s=0
+
+    if (( bytes <= 0 )); then
+        printf 'н/д'
+        return
+    fi
+    if (( elapsed_s <= 0 )); then
+        elapsed_s=1
+    fi
+
+    numfmt --to=iec --suffix=B/s "$((bytes / elapsed_s))" 2>/dev/null || printf '%sB/s' "$((bytes / elapsed_s))"
+}
+
+bmi30_file_size_bytes() {
+    local path="$1"
+    if [[ -f "$path" ]]; then
+        stat -c '%s' "$path" 2>/dev/null || printf '0'
+    else
+        printf '0'
+    fi
+}
+
+bmi30_dir_size_bytes() {
+    local path="$1"
+    local bytes
+    bytes="$(du -sb "$path" 2>/dev/null | awk 'NR == 1 {print $1}' || true)"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    printf '%s' "$bytes"
+}
+
+bmi30_copy_summary_message() {
+    local label="$1"
+    local bytes="${2:-0}"
+    local elapsed_s="${3:-0}"
+
+    printf '%s: длительность %s, средняя скорость %s' \
+        "$label" \
+        "$(bmi30_copy_format_duration "$elapsed_s")" \
+        "$(bmi30_copy_format_rate "$bytes" "$elapsed_s")"
+    if [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes > 0 )); then
+        printf ', объем %s' "$(bmi30_copy_format_bytes "$bytes")"
+    fi
+}
+
+bmi30_copy_log_info() {
+    if declare -F log >/dev/null 2>&1; then
+        log "$*"
+    else
+        printf '[INFO] %s\n' "$*" >&2
+    fi
+}
+
+bmi30_copy_log_warn() {
+    if declare -F warn >/dev/null 2>&1; then
+        warn "$*"
+    else
+        printf '[WARN] %s\n' "$*" >&2
+    fi
+}
+
+bmi30_log_copy_result() {
+    local label="$1"
+    local bytes="${2:-0}"
+    local elapsed_s="${3:-0}"
+    local level="${4:-info}"
+    local message
+
+    message="$(bmi30_copy_summary_message "$label" "$bytes" "$elapsed_s")"
+    if [[ "$level" == "warn" ]]; then
+        bmi30_copy_log_warn "$message"
+    else
+        bmi30_copy_log_info "$message"
+    fi
+}
+
+bmi30_run_timed_copy() {
+    local label="$1"
+    local bytes="${2:-0}"
+    shift 2
+
+    local start_ts end_ts elapsed_s rc
+    start_ts="$(date +%s)"
+    rc=0
+    "$@" || rc=$?
+    end_ts="$(date +%s)"
+    elapsed_s=$((end_ts - start_ts))
+
+    if (( rc == 0 )); then
+        bmi30_log_copy_result "$label" "$bytes" "$elapsed_s"
+    else
+        bmi30_log_copy_result "$label завершилось с кодом $rc" "$bytes" "$elapsed_s" warn
+    fi
+    return "$rc"
+}
+
 bmi30_project_find_files0() {
     local source_abs="$1"
     shift || true

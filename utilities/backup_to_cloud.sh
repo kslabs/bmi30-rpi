@@ -360,9 +360,15 @@ create_archive() {
             printf '\n'
         } >&2
     else
+        local start_ts end_ts elapsed_s archive_bytes
+        start_ts="$(date +%s)"
         tar "${tar_args[@]}"
+        end_ts="$(date +%s)"
+        elapsed_s=$((end_ts - start_ts))
+        archive_bytes="$(bmi30_file_size_bytes "$archive_path")"
         log "Архив создан: $archive_path"
         du -h "$archive_path" | awk '{print "[INFO] Размер архива:", $1}' >&2
+        bmi30_log_copy_result "Создание архива" "$archive_bytes" "$elapsed_s"
     fi
 
     printf '%s' "$archive_path"
@@ -393,6 +399,7 @@ upload_archive() {
     [[ -n "$legacy_signature" ]] || legacy_signature="$(legacy_project_signature)"
 
     local archive_name archive_hash created_at device_suffix marker_path remote_marker
+    local archive_bytes marker_bytes
     archive_name="$(basename -- "$archive_path")"
     created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     device_suffix="$(detect_serial_suffix)"
@@ -415,7 +422,8 @@ upload_archive() {
 
     archive_hash="$(sha256sum "$archive_path" | awk '{print $1}')"
 
-    if ! "${cmd[@]}"; then
+    archive_bytes="$(bmi30_file_size_bytes "$archive_path")"
+    if ! bmi30_run_timed_copy "Выгрузка архива в облако" "$archive_bytes" "${cmd[@]}"; then
         return 3
     fi
 
@@ -437,7 +445,8 @@ upload_archive() {
         marker_cmd+=(--drive-root-folder-id "$REMOTE_FOLDER_ID")
     fi
 
-    if ! "${marker_cmd[@]}"; then
+    marker_bytes="$(bmi30_file_size_bytes "$marker_path")"
+    if ! bmi30_run_timed_copy "Выгрузка указателя в облако" "$marker_bytes" "${marker_cmd[@]}"; then
         return 4
     fi
 

@@ -1326,7 +1326,7 @@ class ScopeWindow:
 		self.desired_freq = load_freq()
 		# По умолчанию — DC-вычитание не применяется в GUI (встроено в устройство)
 		self.dc_removal_enabled = False
-		# Переключатель нормализации XCorr (привязан к кнопке "звук")
+		# Переключатель нормализации XCorr.
 		# True  -> авто-масштаб/центрированный продукт (текущая логика)
 		# False -> фиксированная шкала 0..65535 для просмотра слабых сигналов
 		self.xcorr_norm_enabled = False  # По умолчанию выключена (фиксированная шкала)
@@ -1486,7 +1486,7 @@ class ScopeWindow:
 		# Диагностика: делаем кнопку переключаемой и используем её для
 		# включения/выключения DC-вычитания (фиксация состояния).
 		self.btn_diag = QtWidgets.QPushButton("🩺")
-		self.btn_diag.setToolTip("XCorr: нормализация/автомасштаб (кнопка звука)")
+		self.btn_diag.setToolTip("XCorr: нормализация/автомасштаб")
 		self.btn_diag.setCheckable(True)
 		# отобразим текущее состояние нормализации XCorr
 		try:
@@ -2000,6 +2000,34 @@ class ScopeWindow:
 			self.monitor_index = 300
 		self._last_mon_a = None
 		self._last_mon_b = None
+		# Observation-only integrity trace for firmware snapshot diagnostics.
+		try:
+			self.frame_integrity_trace = str(os.getenv('BMI30_FRAME_INTEGRITY_TRACE', '1')).lower() not in ('0','false','no')
+		except Exception:
+			self.frame_integrity_trace = True
+		try:
+			self.frame_integrity_jump = int(os.getenv('BMI30_FRAME_INTEGRITY_JUMP', '7000'))
+		except Exception:
+			self.frame_integrity_jump = 7000
+		try:
+			self.frame_integrity_mid_min = int(os.getenv('BMI30_FRAME_INTEGRITY_MID_MIN', '8000'))
+		except Exception:
+			self.frame_integrity_mid_min = 8000
+		try:
+			self.frame_integrity_mid_max = int(os.getenv('BMI30_FRAME_INTEGRITY_MID_MAX', '57000'))
+		except Exception:
+			self.frame_integrity_mid_max = 57000
+		try:
+			self.frame_integrity_limit = int(os.getenv('BMI30_FRAME_INTEGRITY_LIMIT', '200'))
+		except Exception:
+			self.frame_integrity_limit = 200
+		try:
+			self.frame_integrity_min_interval_s = float(os.getenv('BMI30_FRAME_INTEGRITY_MIN_INTERVAL_S', '0.10'))
+		except Exception:
+			self.frame_integrity_min_interval_s = 0.10
+		self._frame_integrity_count = 0
+		self._frame_integrity_last_t = 0.0
+		self._frame_integrity_last = None
 		# Опционально: срезать хвост внутренней очереди ассемблера (независимые каналы) чтобы не было лага
 		try:
 			self.flush_asm_queue = str(os.getenv('BMI30_FLUSH_ASM_QUEUE', '0')).lower() not in ('0','false','no')
@@ -3196,6 +3224,117 @@ class ScopeWindow:
 		except Exception:
 			pass
 
+	def _snapshot_diag_from_frame(self, frame) -> dict:
+		try:
+			r2 = int(getattr(frame, 'reserved2', 0) or 0) & 0xFFFF
+		except Exception:
+			r2 = 0
+		try:
+			reserved = int(getattr(frame, 'reserved', 0) or 0) & 0xFFFFFFFF
+		except Exception:
+			reserved = 0
+		return {
+			"reserved": reserved,
+			"reserved2": r2,
+			"buffer_index": r2 & 0x0007,
+			"source_slot": (r2 >> 3) & 0x001F,
+			"snapshot_used": bool(r2 & 0x0100),
+			"generation_changed": bool(r2 & 0x0200),
+			"fifo_guard_near_reuse": bool(r2 & 0x0400),
+			"source_consumed_after_snapshot": bool(r2 & 0x0800),
+			"txcplt_low": (r2 >> 12) & 0x000F,
+		}
+
+	def _trace_frame_integrity(self, channel: str, samples, frame):
+		"""Log physically unlikely in-frame jumps with firmware snapshot diagnostics.
+
+		This is observation-only: it never drops, smooths, or modifies a frame.
+		"""
+		try:
+			if not bool(getattr(self, 'frame_integrity_trace', True)):
+				return
+			limit = int(getattr(self, 'frame_integrity_limit', 200) or 0)
+			if limit >= 0 and int(getattr(self, '_frame_integrity_count', 0) or 0) >= limit:
+				return
+			if samples is None:
+				return
+			arr = np.asarray(samples, dtype=np.int32)
+			if arr.size < 2:
+				return
+			jump_thr = max(1, int(getattr(self, 'frame_integrity_jump', 7000) or 7000))
+			mid_min = int(getattr(self, 'frame_integrity_mid_min', 8000) or 8000)
+			mid_max = int(getattr(self, 'frame_integrity_mid_max', 57000) or 57000)
+			a0 = arr[:-1]
+			a1 = arr[1:]
+			d = a1 - a0
+			mask = (np.abs(d) >= jump_thr) & (a0 > mid_min) & (a0 < mid_max) & (a1 > mid_min) & (a1 < mid_max)
+			if not bool(np.any(mask)):
+				return
+			idxs = np.nonzero(mask)[0]
+			if idxs.size <= 0:
+				return
+			absd = np.abs(d[idxs])
+			idx = int(idxs[int(np.argmax(absd))])
+			v0 = int(a0[idx])
+			v1 = int(a1[idx])
+			dv = int(v1 - v0)
+			now = time.time()
+			# Keep the log readable if a bad firmware build produces many identical frames.
+			last_t = float(getattr(self, '_frame_integrity_last_t', 0.0) or 0.0)
+			if (now - last_t) < max(0.0, float(getattr(self, 'frame_integrity_min_interval_s', 0.10) or 0.0)):
+				return
+			self._frame_integrity_last_t = now
+			self._frame_integrity_count = int(getattr(self, '_frame_integrity_count', 0) or 0) + 1
+			lo = max(0, idx - 8)
+			hi = min(int(arr.size), idx + 9)
+			window = [int(x) for x in arr[lo:hi].tolist()]
+			diag = self._snapshot_diag_from_frame(frame)
+			try:
+				seq = int(getattr(frame, 'seq', -1))
+			except Exception:
+				seq = -1
+			try:
+				ts = int(getattr(frame, 'timestamp', -1))
+			except Exception:
+				ts = -1
+			try:
+				flags = int(getattr(frame, 'flags', 0) or 0)
+			except Exception:
+				flags = 0
+			try:
+				crc_bad = int(getattr(getattr(self, 'stream', None), 'crc_bad', 0) or 0)
+			except Exception:
+				crc_bad = 0
+			info = {
+				"channel": str(channel),
+				"seq": seq,
+				"timestamp": ts,
+				"flags": flags,
+				"samples": int(arr.size),
+				"idx": idx,
+				"prev": v0,
+				"curr": v1,
+				"jump": dv,
+				"window_start": lo,
+				"window": window,
+				"crc_bad": crc_bad,
+				**diag,
+			}
+			self._frame_integrity_last = info
+			self._fault_log_line(
+				f"[frame_integrity] ts={self._fault_timestamp()} ch={channel} seq={seq} dev_ts={ts} "
+				f"flags=0x{flags & 0xFF:02X} samples={int(arr.size)} idx={idx} "
+				f"{v0}->{v1} jump={dv} reserved={diag['reserved']} reserved2=0x{diag['reserved2']:04X} "
+				f"buf_idx={diag['buffer_index']} src_slot={diag['source_slot']} "
+				f"snapshot={int(diag['snapshot_used'])} gen_changed={int(diag['generation_changed'])} "
+				f"fifo_guard={int(diag['fifo_guard_near_reuse'])} consumed_after={int(diag['source_consumed_after_snapshot'])} "
+				f"txcplt_low={diag['txcplt_low']} crc_bad={crc_bad} win_start={lo} win={window}"
+			)
+			if bool(getattr(self, 'reader_debug', False)):
+				print(f"[frame_integrity] {channel} seq={seq} idx={idx} {v0}->{v1} r2=0x{diag['reserved2']:04X}", flush=True)
+		except Exception:
+			pass
+
 	def _cmd_name(self, cmd: int) -> str:
 		try:
 			cmd_i = int(cmd) & 0xFF
@@ -3206,18 +3345,33 @@ class ScopeWindow:
 			0x11: "SET_BLOCK_HZ",
 			0x13: "SET_FULL_MODE",
 			0x14: "SET_PROFILE",
+			0x15: "SET_ROI_US",
+			0x16: "SET_TRUNC_SAMPLES",
+			0x17: "SET_FRAME_SAMPLES",
 			0x18: "SET_ASYNC_MODE",
 			0x19: "SET_CHMODE",
 			0x1A: "SET_STREAM_MODE",
+			0x1B: "SET_DC_ADAPT",
+			0x1C: "SET_BUF_RATE_FINE",
 			0x1D: "SET_SYNC_MODE",
+			0x1E: "CALIB_DC_FAST",
+			0x1F: "SET_DC_CONFIG",
 			0x20: "START_STREAM",
 			0x21: "STOP_STREAM",
+			0x22: "DEVICE_RESET",
+			0x2B: "SAVE_DC_TO_FLASH",
 			0x30: "GET_STATUS",
+			0x32: "TOGGLE_TIM2CH3_INV",
 			0x33: "SET_TX_ENABLE",
 			0x34: "SET_OPTIC_POWER",
+			0x35: "LED_EVENT",
 			0x36: "HOST_RX_ACK",
+			0x37: "HOST_RX_CLEAR",
+			0x38: "GET_LCD_STATUS",
 			0x39: "SET_OPTIC_HOLD",
+			0x3A: "GET_DC_CONFIG",
 			0x3B: "SET_LED_PATTERN",
+			0x3C: "SET_DET_ADC",
 			0x7E: "SOFT_RESET",
 			0x7F: "DEEP_RESET",
 		}
@@ -7901,10 +8055,6 @@ class ScopeWindow:
 			# Кнопка 6: не переключаем STREAM_MODE — включаем/выключаем корреляцию (overlay).
 			# Реальная корреляция управляется в `_on_num_clicked_extra` (подключена к клику кнопки).
 			self.avg20_enabled = False
-			try:
-				self._set_sound_enabled(True, reason='mode_6', announce=False)
-			except Exception:
-				pass
 			# Разморозка уже выполнена выше в начале _num_clicked
 			# Адаптивные пороги продолжают работать, не сбрасываются
 			self._set_status("XCorr: toggle (no stream mode change)", hold_sec=1.5)
@@ -8562,6 +8712,8 @@ class ScopeWindow:
 
 				ch0 = np.frombuffer(a.payload, dtype='<u2').astype(np.int32) if a is not None else None
 				ch1 = np.frombuffer(b.payload, dtype='<u2').astype(np.int32) if b is not None else None
+				self._trace_frame_integrity('A', ch0, a)
+				self._trace_frame_integrity('B', ch1, b)
 				
 				# --- diagnostics: compute sequence/timestamps early to detect pairing issues ---
 				if a is not None and b is not None:
@@ -9313,7 +9465,7 @@ class ScopeWindow:
 				had_frames = float(getattr(self, 'last_frame_t', 0.0) or 0.0) > 0.0
 			except Exception:
 				had_frames = False
-			if (not skip_hw_once) and (not had_frames) and connect_age <= 10.0:
+			if (not skip_hw_once) and (not had_frames) and connect_age <= 10.0 and last_verdict in ("stm32_tx_stalled", "stm32_adc_stalled"):
 				need_hw = True
 			if need_hw:
 				try:
@@ -9652,8 +9804,12 @@ class ScopeWindow:
 				self._maybe_auto_reset_on_stall("нет новых кадров", now2 - float(self.last_frame_t))
 			except Exception:
 				pass
+			try:
+				last_verdict = str((getattr(self, "_last_fault_probe_result", {}) or {}).get("verdict") or "")
+			except Exception:
+				last_verdict = ""
 			# Попробуем мягко пнуть поток (без STOP), но не чаще чем раз в diag_interval
-			if (not bool(getattr(self, '_stream_user_stopped', False))) and self.auto_soft_kick and (now2 - self.last_soft_kick_t) > max(2.0, self.diag_interval):
+			if last_verdict != "host_bulk_lost" and (not bool(getattr(self, '_stream_user_stopped', False))) and self.auto_soft_kick and (now2 - self.last_soft_kick_t) > max(2.0, self.diag_interval):
 				try:
 					self._set_status("Мягкий рестарт потока…", hold_sec=1.0)
 					self._soft_kick_stream()
@@ -10889,19 +11045,10 @@ class ScopeWindow:
 			raise RuntimeError("нет активного потока")
 		if bool(getattr(self, '_stream_user_stopped', False)):
 			return
-		# Повторим текущий профиль и Ns и отправим START
+		# Повторим текущие параметры и отправим START. Reset здесь не делаем:
+		# по новому контракту прошивки сброс допустим только после fault-probe verdict
+		# stm32_tx_stalled/stm32_adc_stalled или вручную.
 		try:
-			# Попробуем новый SOFT_RESET, если прошивка его поддерживает
-			try:
-				if hasattr(self.stream, 'soft_reset'):
-					self.stream.soft_reset()
-					try:
-						import time as _t
-						_t.sleep(0.05)
-					except Exception:
-						pass
-			except Exception:
-				pass
 			# профиль
 			self.stream.send_cmd(CMD_SET_PROFILE, bytes([self.desired_profile]))
 			try:

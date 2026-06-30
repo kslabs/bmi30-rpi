@@ -187,8 +187,26 @@ while true; do
             run_action "README утилит" sed -n '1,260p' "$SCRIPT_DIR/README.md"
             ;;
         12)
-            run_action "Деплой hotspot_info_server.py" sudo bash -c \
-                "install -m 755 '$WORKSPACE_DIR/hotspot_info_server.py' /usr/local/bin/bmi30-hotspot-info-server.py && systemctl restart bmi30-hotspot-info.service && echo OK: строк: \$(wc -l < /usr/local/bin/bmi30-hotspot-info-server.py)"
+            run_action "Деплой hotspot_info_server.py" sudo env BMI30_PORTAL_SRC="$WORKSPACE_DIR/hotspot_info_server.py" bash -c '
+                set -euo pipefail
+                src="$BMI30_PORTAL_SRC"
+                dst="/usr/local/bin/bmi30-hotspot-info-server.py"
+                start_ts="$(date +%s)"
+                install -m 755 "$src" "$dst"
+                end_ts="$(date +%s)"
+                elapsed_s=$((end_ts - start_ts))
+                if (( elapsed_s <= 0 )); then
+                    elapsed_s=1
+                fi
+                bytes="$(stat -c "%s" "$dst" 2>/dev/null || printf "0")"
+                [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+                rate=$((bytes / elapsed_s))
+                size="$(numfmt --to=iec --suffix=B "$bytes" 2>/dev/null || printf "%sB" "$bytes")"
+                speed="$(numfmt --to=iec --suffix=B/s "$rate" 2>/dev/null || printf "%sB/s" "$rate")"
+                printf "Copy: duration %ss, average speed %s, size %s\n" "$elapsed_s" "$speed" "$size"
+                systemctl restart bmi30-hotspot-info.service
+                printf "OK: строк: %s\n" "$(wc -l < "$dst")"
+            '
             ;;
         13)
             run_action "Backup проекта в облако" bash "$SCRIPT_DIR/backup_to_cloud.sh"

@@ -96,6 +96,43 @@ Vendor OUT с data stage:
 
 ## 3. Форматы получаемых данных
 
+### 3.0 ADC frame (`0xA55A`)
+
+ADC кадр начинается с 32-байтного заголовка, little-endian:
+
+```text
+offset  size  field
+0       2     magic = 0xA55A  ; bytes 5A A5
+2       1     version = 1
+3       1     flags: bit0=ADC0, bit1=ADC1, bit2=CRC16 present, bit7=TEST
+4       4     seq
+8       4     device_tick_ms
+12      2     total_samples
+14      2     zone_count
+16      4     zone1_offset
+20      4     zone1_length
+24      4     reserved = dma_seq/source generation
+28      2     reserved2
+30      2     crc16
+32      N     payload: total_samples little-endian u16 samples
+```
+
+CRC16 для ADC frame: CRC16-CCITT-FALSE (`poly=0x1021`, `init=0xFFFF`) считается по первым 30 байтам заголовка как они пришли в frame, затем по payload. Поле `crc16` на offset 30..31 не включается. Бит `flags & 0x04` уже установлен в заголовке, который участвует в расчете CRC.
+
+Для `STREAM_MODE=0 LATEST`, `full_mode=1`, `async_mode=1` firmware формирует immutable TX snapshot: сначала копирует полный completed ADC buffer/window в локальный snapshot, затем строит payload, финализирует CRC и только после этого передает frame в USB TX. Host не должен сглаживать или отбрасывать кадры с физически невозможными разрывами; такие кадры надо логировать вместе с header diagnostics.
+
+`reserved2` временно несет диагностику целостности source snapshot. Нижние 3 бита остаются совместимым `buffer_index`:
+
+```text
+bits 0..2   buffer_index / phase index (как раньше)
+bits 3..7   source_slot = dma_seq % FIFO_FRAMES
+bit  8      snapshot_used
+bit  9      generation_changed_during_snapshot
+bit  10     fifo_guard_near_reuse
+bit  11     source_consumed_after_snapshot
+bits 12..15 TxCplt counter low nibble at frame build
+```
+
 ### 3.1 STAT (GET_STATUS, 0x30)
 
 - Сигнатура: STAT
@@ -626,14 +663,6 @@ dev.write(EP_OUT, bytes([0x2B]), timeout=1000)
 - Если хосту нужно строгое подтверждение `SAVE OK/SAVE FAIL`, надо расширить USB-статус отдельными полями результата сохранения. В текущем протоколе команда является одноразовым запросом без ответа.
 
 ## 7. Быстрые команды для host-скриптов
-
-Версии BMI30 split-системы
-- В VS Code: `Terminal -> Run Task -> Выбор версий BMI30 split-системы`.
-- Вчерашняя split-версия сохранена как core-файл `host/BMI30.001.py.2026-06-17-yesterday`.
-- Рабочая split-версия на сегодня: `BMI30 split 2026-06-18-today` с core-файлом `host/BMI30.001.py.2026-06-18-today`.
-- Активная/autostart версия хранится в `host/bmi30_split_active_version.env` вместе с core/gui/web путями.
-- Портал показывает активную split-версию в шапке, разделе About и JSON API `/api/status`.
-- В этом же меню есть запуск, остановка, перезапуск и подробный статус работающей split-системы.
 
 Основной reader
 - python HostTools/vendor_stream_read.py --vid 0xCAFE --pid 0x4001 --intf 2 --ep-in 0x83 --ep-out 0x03 --profile 2 --block-hz 200 --frame-samples 10 --frames 80 --ab-strict

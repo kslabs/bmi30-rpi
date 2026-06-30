@@ -6144,17 +6144,7 @@ class ScopeWindow:
 		try:
 			if self.stream is None:
 				return
-			requested = bool(enabled)
-			try:
-				allow_off = _env_bool("BMI30_ALLOW_DC_ADAPT_OFF", False)
-			except Exception:
-				allow_off = False
-			# DC compensation is firmware-side and should keep running; timing
-			# profiles control its speed. Legacy detector paths may still request
-			# OFF on a hold/freeze event, so keep the device armed by default.
-			if not requested and not allow_off:
-				requested = True
-			payload = b"\x01" if requested else b"\x00"
+			payload = b"\x01" if bool(enabled) else b"\x00"
 			self.stream.send_cmd(CMD_SET_DC_ADAPT, payload)
 		except Exception:
 			pass

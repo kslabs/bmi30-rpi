@@ -65,7 +65,7 @@ require_root() {
 require_cmds() {
     local missing=()
     local cmd
-    for cmd in lsblk findmnt blkid mountpoint rsync sfdisk wipefs partprobe udevadm mkfs.vfat mkfs.ext4 awk sed grep sync sort df numfmt; do
+    for cmd in lsblk findmnt blkid mountpoint rsync sfdisk wipefs partprobe udevadm mkfs.vfat mkfs.ext4 awk sed grep sync sort df du numfmt timeout; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing+=("$cmd")
         fi
@@ -104,6 +104,134 @@ run_precopy_backup() {
 step() {
     CURRENT_STEP=$((CURRENT_STEP + 1))
     printf "\n%b[%d/%d]%b %s\n" "$GRN" "$CURRENT_STEP" "$TOTAL_STEPS" "$NC" "$*"
+}
+
+format_copy_duration() {
+    local total_s="${1:-0}"
+    [[ "$total_s" =~ ^[0-9]+$ ]] || total_s=0
+
+    local hours minutes seconds
+    hours=$((total_s / 3600))
+    minutes=$(((total_s % 3600) / 60))
+    seconds=$((total_s % 60))
+
+    if (( hours > 0 )); then
+        printf '%dч %02dм %02dс' "$hours" "$minutes" "$seconds"
+    elif (( minutes > 0 )); then
+        printf '%dм %02dс' "$minutes" "$seconds"
+    else
+        printf '%dс' "$seconds"
+    fi
+}
+
+format_copy_bytes() {
+    local bytes="${1:-0}"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    numfmt --to=iec --suffix=B "$bytes" 2>/dev/null || printf '%sB' "$bytes"
+}
+
+format_copy_rate() {
+    local bytes="${1:-0}"
+    local elapsed_s="${2:-0}"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    [[ "$elapsed_s" =~ ^[0-9]+$ ]] || elapsed_s=0
+
+    if (( bytes <= 0 )); then
+        printf 'н/д'
+        return
+    fi
+    if (( elapsed_s <= 0 )); then
+        elapsed_s=1
+    fi
+
+    numfmt --to=iec --suffix=B/s "$((bytes / elapsed_s))" 2>/dev/null || printf '%sB/s' "$((bytes / elapsed_s))"
+}
+
+copy_source_size_bytes() {
+    local path="$1"
+    local bytes
+
+    bytes="$(du -sbx "$path" 2>/dev/null | awk 'NR == 1 {print $1}' || true)"
+    if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+        bytes="$(du -sb "$path" 2>/dev/null | awk 'NR == 1 {print $1}' || true)"
+    fi
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    printf '%s' "$bytes"
+}
+
+copy_result_message() {
+    local label="$1"
+    local bytes="${2:-0}"
+    local elapsed_s="${3:-0}"
+
+    printf 'Копирование %s: длительность %s, средняя скорость %s' \
+        "$label" \
+        "$(format_copy_duration "$elapsed_s")" \
+        "$(format_copy_rate "$bytes" "$elapsed_s")"
+    if [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes > 0 )); then
+        printf ', объем %s' "$(format_copy_bytes "$bytes")"
+    fi
+}
+
+install_with_copy_stats() {
+    local label="$1"
+    local source_path="$2"
+    local mode="$3"
+    local target_path="$4"
+    local start_ts end_ts elapsed_s bytes
+
+    start_ts="$(date +%s)"
+    install -m "$mode" "$source_path" "$target_path"
+    end_ts="$(date +%s)"
+    elapsed_s=$((end_ts - start_ts))
+    bytes="$(copy_source_size_bytes "$target_path")"
+    ok "$(copy_result_message "$label" "$bytes" "$elapsed_s")"
+}
+
+run_rsync_with_heartbeat() {
+    local label="$1"
+    local target_mount="$2"
+    local expected_bytes="${3:-0}"
+    shift 3
+
+    local hb_interval=20
+    local start_ts now_ts end_ts elapsed used_bytes used_human rsync_status
+
+    start_ts="$(date +%s)"
+
+    "$@" &
+    local rsync_pid=$!
+
+    while kill -0 "$rsync_pid" 2>/dev/null; do
+        sleep "$hb_interval"
+        if ! kill -0 "$rsync_pid" 2>/dev/null; then
+            break
+        fi
+
+        now_ts="$(date +%s)"
+        elapsed=$((now_ts - start_ts))
+        used_bytes="$(df -B1 --output=used "$target_mount" 2>/dev/null | awk 'NR==2 {print $1}' || true)"
+
+        if [[ -n "$used_bytes" ]]; then
+            used_human="$(numfmt --to=iec "$used_bytes" 2>/dev/null || printf "%s" "$used_bytes")"
+            info "[heartbeat] $label: процесс активен, прошло ${elapsed}с, занято на цели ${used_human}"
+        else
+            info "[heartbeat] $label: процесс активен, прошло ${elapsed}с"
+        fi
+    done
+
+    rsync_status=0
+    wait "$rsync_pid" || rsync_status=$?
+    end_ts="$(date +%s)"
+    elapsed=$((end_ts - start_ts))
+
+    if (( rsync_status == 0 )); then
+        ok "$(copy_result_message "$label" "$expected_bytes" "$elapsed")"
+    else
+        warn "$(copy_result_message "$label завершилось с кодом $rsync_status" "$expected_bytes" "$elapsed")"
+    fi
+
+    return "$rsync_status"
 }
 
 partition_path() {
@@ -355,15 +483,32 @@ configure_bootloader() {
 
 unmount_target_partitions() {
     local part mountpoint
+    local umount_rc
 
     while read -r part; do
         [[ -n "$part" ]] || continue
         while read -r mountpoint; do
             [[ -n "$mountpoint" ]] || continue
             info "Отмонтирую $mountpoint"
-            umount "$mountpoint"
+            umount_rc=0
+            timeout 10s umount "$mountpoint" || umount_rc=$?
+            if (( umount_rc == 124 )); then
+                warn "umount завис на $mountpoint, пробую lazy umount"
+                umount -l "$mountpoint" || die "Не удалось отмонтировать $mountpoint"
+            elif (( umount_rc != 0 )); then
+                die "Не удалось отмонтировать $mountpoint"
+            fi
         done < <(findmnt -rn -S "$part" -o TARGET | sort -r)
     done < <(lsblk -lnpo NAME,TYPE "$TARGET_DISK" | awk '$2 == "part" {print $1}')
+}
+
+check_stale_uninterruptible_rsync() {
+    local stale
+
+    stale="$(ps -eo pid,stat,cmd | awk '$2 ~ /^D/ && $3 ~ /rsync/ && $0 ~ /bmi30-disk-migrate/ && $0 ~ /target-root/ {print $1":"$2":"$3; exit}')"
+    if [[ -n "$stale" ]]; then
+        die "Обнаружен зависший rsync в состоянии D ($stale). Перезагрузите систему для очистки I/O и повторите миграцию"
+    fi
 }
 
 partition_and_format_target() {
@@ -379,6 +524,7 @@ ${TARGET_DISK}1 : start=4MiB, size=${BOOT_SIZE_MIB}MiB, type=c, bootable
 ${TARGET_DISK}2 : start=${root_start_mib}MiB, type=83
 EOF
 
+    check_stale_uninterruptible_rsync
     unmount_target_partitions
     wipefs -af "$TARGET_DISK"
     sfdisk --wipe always "$TARGET_DISK" < "$sfdisk_script"
@@ -462,17 +608,25 @@ detach_source_virtual_mounts() {
 }
 
 copy_boot_files() {
+    local source_bytes
+
     info "Копирую boot-файлы"
-    rsync -aHAX --delete --human-readable --info=progress2 "$SOURCE_BOOT_COPY_MNT/" "$TARGET_BOOT_MNT/"
+    source_bytes="$(copy_source_size_bytes "$SOURCE_BOOT_COPY_MNT")"
+    run_rsync_with_heartbeat "boot" "$TARGET_BOOT_MNT" "$source_bytes" \
+        rsync -aHAX --delete --human-readable --outbuf=L --info=progress2,stats1 \
+        "$SOURCE_BOOT_COPY_MNT/" "$TARGET_BOOT_MNT/"
 }
 
 copy_root_files() {
     local rsync_status
+    local source_bytes
 
     info "Копирую rootfs. Это самая долгая часть"
     detach_source_virtual_mounts
+    source_bytes="$(copy_source_size_bytes "$SOURCE_ROOT_COPY_MNT")"
     rsync_status=0
-    rsync -aHAXx --numeric-ids --delete --human-readable --info=progress2 \
+    run_rsync_with_heartbeat "rootfs" "$TARGET_ROOT_MNT" "$source_bytes" \
+        rsync -aHAXx --numeric-ids --delete --human-readable --outbuf=L --info=progress2,stats1 \
         --exclude=/boot/firmware/* \
         --exclude=/dev/* \
         --exclude=/proc/* \
@@ -599,7 +753,7 @@ install_boot_network_identity_refresh() {
 
     info "Устанавливаю постоянное обновление hostname и сетевых имен на каждом старте цели"
     mkdir -p "$(dirname "$refresh_dst")" "$(dirname "$service_path")" "$wants_dir"
-    install -m 755 "$refresh_src" "$refresh_dst"
+    install_with_copy_stats "скрипта сетевой идентичности" "$refresh_src" 755 "$refresh_dst"
 
     cat > "$service_path" <<'EOF'
 [Unit]
@@ -641,8 +795,8 @@ install_boot_ethernet_portal_enable() {
 
     info "Устанавливаю автоподнятие Ethernet portal на каждом старте цели"
     mkdir -p "$(dirname "$portal_dst")" "$(dirname "$portal_server_dst")" "$(dirname "$service_path")" "$wants_dir"
-    install -m 755 "$portal_src" "$portal_dst"
-    install -m 755 "$portal_server_src" "$portal_server_dst"
+    install_with_copy_stats "скрипта Ethernet portal" "$portal_src" 755 "$portal_dst"
+    install_with_copy_stats "сервера Ethernet portal" "$portal_server_src" 755 "$portal_server_dst"
 
     cat > "$service_path" <<'EOF'
 [Unit]
