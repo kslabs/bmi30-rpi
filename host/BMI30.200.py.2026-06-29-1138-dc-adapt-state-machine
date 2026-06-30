@@ -7262,12 +7262,43 @@ class ScopeWindow:
 			return 'paper'
 		return ''
 
+	def _player_label_meta_value(self, value, default: str = '') -> str:
+		try:
+			raw = str(value or '').strip().lower()
+		except Exception:
+			raw = ''
+		if not raw:
+			try:
+				raw = str(default or '').strip().lower()
+			except Exception:
+				raw = ''
+		raw = raw.replace(' ', '_').replace('-', '_').replace('/', '_')
+		out = []
+		for ch in raw:
+			if ch.isalnum() or ch == '_':
+				out.append(ch)
+		return ''.join(out)[:32]
+
+	def _player_label_channel_value(self, value) -> str:
+		try:
+			raw = str(value or '').strip().lower()
+		except Exception:
+			raw = ''
+		if raw in ('upper', 'u', '0', 'adc0', 'ch0'):
+			return 'upper'
+		if raw in ('lower', 'l', '1', 'adc1', 'ch1'):
+			return 'lower'
+		return ''
+
 	def _player_normalize_user_labels_payload(self, payload):
 		marks = {}
 		mark_types = {}
+		mark_channels = {}
+		mark_scopes = {}
+		mark_positions = {}
 		ranges_by_packet = {}
 		if not isinstance(payload, dict):
-			return {'marks': marks, 'mark_types': mark_types, 'ranges': ranges_by_packet}
+			return {'marks': marks, 'mark_types': mark_types, 'mark_channels': mark_channels, 'mark_scopes': mark_scopes, 'mark_positions': mark_positions, 'ranges': ranges_by_packet}
 		try:
 			for item in payload.get('marks', []) or []:
 				if not isinstance(item, dict):
@@ -7288,10 +7319,23 @@ class ScopeWindow:
 				if mark in ('casino', 'barkhausen', 'microwire', 'paper'):
 					tag_type = self._player_tag_type_value(mark, tag_type)
 					mark = 'tag'
+				channel = ''
+				if mark == 'tag':
+					channel = self._player_label_channel_value(item.get('channel', item.get('tag_channel', '')))
+					if not channel:
+						continue
 				if mark:
 					marks[packet_idx] = mark[:32]
 					if mark == 'tag' and tag_type:
 						mark_types[packet_idx] = tag_type
+					if mark == 'tag':
+						mark_channels[packet_idx] = channel
+						scope = self._player_label_meta_value(item.get('scope', item.get('tag_scope', '')), 'frame')
+						position = self._player_label_meta_value(item.get('position', item.get('tag_position', '')), 'unknown')
+						if scope:
+							mark_scopes[packet_idx] = scope
+						if position:
+							mark_positions[packet_idx] = position
 			for item in payload.get('ranges', []) or []:
 				if not isinstance(item, dict):
 					continue
@@ -7327,8 +7371,8 @@ class ScopeWindow:
 					marker['tag_type'] = tag_type
 				ranges_by_packet.setdefault(packet_idx, []).append(marker)
 		except Exception:
-			return {'marks': {}, 'mark_types': {}, 'ranges': {}}
-		return {'marks': marks, 'mark_types': mark_types, 'ranges': ranges_by_packet}
+			return {'marks': {}, 'mark_types': {}, 'mark_channels': {}, 'mark_scopes': {}, 'mark_positions': {}, 'ranges': {}}
+		return {'marks': marks, 'mark_types': mark_types, 'mark_channels': mark_channels, 'mark_scopes': mark_scopes, 'mark_positions': mark_positions, 'ranges': ranges_by_packet}
 
 	def _player_load_user_labels(self, recording_path: str):
 		labels_path = self._player_labels_path(recording_path)
@@ -7406,6 +7450,17 @@ class ScopeWindow:
 				tag_type = self._player_tag_type_value(item.get('tag_type', item.get('type', item.get('label_type', ''))), 'casino' if mark == 'tag' else '')
 				if mark == 'tag' and tag_type:
 					out_mark['tag_type'] = tag_type
+				if mark == 'tag':
+					channel = self._player_label_channel_value(item.get('channel', item.get('tag_channel', '')))
+					if not channel:
+						continue
+					out_mark['channel'] = channel
+					scope = self._player_label_meta_value(item.get('scope', item.get('tag_scope', '')), 'frame')
+					position = self._player_label_meta_value(item.get('position', item.get('tag_position', '')), 'unknown')
+					if scope:
+						out_mark['scope'] = scope
+					if position:
+						out_mark['position'] = position
 				clean.append(out_mark)
 		if ranges is None:
 			ranges = []
@@ -7751,6 +7806,9 @@ class ScopeWindow:
 				user_labels = self._player_load_embedded_user_labels(data)
 			user_marks = user_labels.get('marks', {}) if isinstance(user_labels, dict) else {}
 			user_mark_types = user_labels.get('mark_types', {}) if isinstance(user_labels, dict) else {}
+			user_mark_channels = user_labels.get('mark_channels', {}) if isinstance(user_labels, dict) else {}
+			user_mark_scopes = user_labels.get('mark_scopes', {}) if isinstance(user_labels, dict) else {}
+			user_mark_positions = user_labels.get('mark_positions', {}) if isinstance(user_labels, dict) else {}
 			user_ranges_by_packet = user_labels.get('ranges', {}) if isinstance(user_labels, dict) else {}
 			for pkt, ranges in (user_ranges_by_packet or {}).items():
 				try:
@@ -7988,6 +8046,9 @@ class ScopeWindow:
 					},
 					'mark': str(user_marks.get(int(i), '') or ''),
 					'tag_type': str(user_mark_types.get(int(i), '') or ''),
+					'tag_channel': str(user_mark_channels.get(int(i), '') or ''),
+					'tag_scope': str(user_mark_scopes.get(int(i), '') or ''),
+					'tag_position': str(user_mark_positions.get(int(i), '') or ''),
 					'markers': markers_by_packet.get(i, []),
 				})
 			try:
