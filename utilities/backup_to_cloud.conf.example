@@ -1,4 +1,4 @@
-# Example config for utilities/backup_to_cloud.sh.
+# Example config for BMI30 firmware release/update scripts.
 # Copy to utilities/backup_to_cloud.conf and edit for this device.
 
 # What to archive.
@@ -13,15 +13,35 @@ REMOTE_TARGET="gdrive:"
 # Optional Google Drive folder ID.
 REMOTE_FOLDER_ID="1q7nYpi-rXyjx5XOgZ_G0rfQ2xyrLh-BC"
 
+# Keep Google Drive uploads observable and bounded. A larger chunk uses fewer
+# API requests; the timeout prevents a quota retry loop from blocking the menu.
+CLOUD_RCLONE_DRIVE_CHUNK_SIZE="64M"
+CLOUD_RCLONE_TPS_LIMIT="2"
+CLOUD_RCLONE_STATS_INTERVAL="10s"
+CLOUD_RCLONE_TIMEOUT_SECONDS="480"
+
 # Local archive retention.
 LOCAL_RETENTION_DAYS="30"
+LOCAL_ARCHIVE_RETENTION_COUNT="5"
+
+# Keep old cloud archives for rollback unless you intentionally want latest-only storage.
+PRUNE_REMOTE_ARCHIVES="0"
 
 # Per-user systemd timer schedules.
 PUBLISH_ON_CALENDAR="*-*-* 22:00:00"
 UPDATE_ON_CALENDAR="*-*-* 23:00:00"
 
-# Cloud marker that points every device to the newest archive.
+# Cloud marker that points every device to the newest firmware release.
 REMOTE_LATEST_FILE="bmi30_latest.env"
+
+# Firmware release archive prefix.
+ARCHIVE_PREFIX="bmi30_backup"
+
+# Keep this 0 on normal devices. Set to 1 only for an intentional release source
+# if you want --if-changed / publish timer behavior.
+ALLOW_AUTO_PUBLISH="0"
 
 # Create a local snapshot before applying an update from cloud.
 PRE_UPDATE_SNAPSHOT="1"
+PRE_UPDATE_RETENTION_COUNT="3"
+INCOMING_RETENTION_COUNT="2"

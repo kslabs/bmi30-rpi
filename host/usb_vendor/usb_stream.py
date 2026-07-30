@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import usb.core, usb.util, struct, time, threading, queue, sys, os, json
+import usb.core, usb.util, struct, time, threading, queue, sys, os, json, math, re
 from collections import deque
 
 VID=0xCAFE  # Автопоиск если не найдено
@@ -15,7 +15,46 @@ EVT1_EVENT_NAMES = {
     0x11: "sync_state",
     0x12: "mode_state",
     0x13: "error_state",
+    0x14: "sensor_map",
 }
+EVT1_PAYLOAD_LENGTHS = {
+    0x00: 47,
+    0x01: 2,
+    0x02: 16,
+    0x10: 8,
+    0x11: 16,
+    0x12: 16,
+    0x13: 16,
+    0x14: 40,
+}
+STAT_PACKET_MIN_LEN = 64
+STAT_PACKET_V4_LEN = 95
+STAT_PACKET_V5_LEN = 136
+STAT_PACKET_V6_LEN = 137
+RS485_IDENT_V1_LEN = 32
+RS485_IDENT_V2_LEN = 40
+RS485_SENSOR_V1_LEN = 16
+RPI_ID_RE = re.compile(r"^[0-9A-F]{9}$")
+
+
+def _stat_packet_len_from_header(data, offset: int = 0) -> int:
+    """Return the wire length for the STAT layout advertised by its version byte.
+
+    Firmware v4 emits 95 bytes, v5 emits 136 bytes, and v6 emits 137 bytes.
+    The extra v6 byte makes sync_status_bytes directly addressable by every
+    persistent RS485 device_id in the complete 0..31 range.
+    """
+    try:
+        version = int(data[int(offset) + 4]) & 0xFF
+    except Exception:
+        return STAT_PACKET_V6_LEN
+    if version >= 6:
+        return STAT_PACKET_V6_LEN
+    if version == 5:
+        return STAT_PACKET_V5_LEN
+    if version == 4:
+        return STAT_PACKET_V4_LEN
+    return STAT_PACKET_MIN_LEN
 
 def _float_env(name: str, dflt: float) -> float:
     try:
@@ -33,27 +72,26 @@ CMD_SET_ROI_US    = 0x15
 CMD_START_STREAM  = 0x20
 CMD_STOP_STREAM   = 0x21
 CMD_GET_STATUS    = 0x30
+CMD_SET_TX_ENABLE = 0x33
 CMD_HOST_RX_ACK   = 0x36
 CMD_SET_FRAME_SAMPLES = 0x17
 CMD_ASYNC         = 0x18  # 0=strict pairs A/B, 1=independent A/B
 CMD_SET_WINDOWS    = 0x10  # payload: <HHHH> start0,len0,start1,len1
 CMD_SET_STREAM_MODE = 0x1A  # payload: <B> 0=LATEST(600), 1=LOSSLESS_ROI(200)
-CMD_SET_DC_CONFIG = 0x1F
+CMD_SET_DC_SPEED = 0x1F
+DC_SETTLE_MAX_MS = 86_400_000
 CMD_DEVICE_RESET = 0x22
 CMD_SAVE_DC_TO_FLASH = 0x2B
 CMD_TOGGLE_TIM2CH3_INV = 0x32
 CMD_HOST_RX_CLEAR = 0x37
 CMD_SET_DET_ADC = 0x3C
 CMD_GET_DC_CONFIG = 0x3A
-# Device-side DC adaptation toggle (firmware-dependent). Override via env if needed.
-try:
-    CMD_SET_DC_ADAPT = int(os.getenv("BMI30_CMD_SET_DC_ADAPT", "0x1B"), 0)
-except Exception:
-    CMD_SET_DC_ADAPT = 0x1B
-try:
-    CMD_CALIB_DC_FAST = int(os.getenv("BMI30_CMD_CALIB_DC_FAST", "0x1E"), 0)
-except Exception:
-    CMD_CALIB_DC_FAST = 0x1E
+CMD_SET_RS485_ID = 0x3D
+CMD_SET_RS485_IP = 0x3E
+CMD_REQUEST_RS485_IDENT = 0x3F
+CMD_GET_RS485_IDENT = 0x40
+CMD_SET_RPI_INFO = 0x42
+CMD_GET_RS485_SENSOR = 0x43
 CMD_SET_ALT       = 0x31  # optional vendor EP0 control OUT to set alt
 CMD_SOFT_RESET   = 0x7E  # EP0 vendor control OUT, no data
 CMD_DEEP_RESET   = 0x7F  # EP0 vendor control OUT, no data
@@ -104,11 +142,14 @@ def _status_byte_fields(value, label: str = "", node_id: int | None = None) -> d
         b = int(value) & 0xFF
     except Exception:
         b = 0
+    public_node_id = b & 0x1F
     out = {
         "status_byte": b,
         "status_hex": f"0x{b:02X}",
-        "selector": b & 0x1F,
+        "selector": public_node_id,
+        "status_node_id": public_node_id,
         "optic_active": bool(b & 0x20),
+        "optic_indication_allow": bool(b & 0x20),
         "detadc1": bool(b & 0x40),
         "detadc2": bool(b & 0x80),
     }
@@ -116,7 +157,171 @@ def _status_byte_fields(value, label: str = "", node_id: int | None = None) -> d
         out["label"] = label
     if node_id is not None:
         out["node_id"] = int(node_id)
+        out["node_id_matches_status"] = (public_node_id == 0 or public_node_id == int(node_id))
     return out
+
+def _parse_ipv4(value) -> tuple[int, int, int, int] | None:
+    if isinstance(value, (bytes, bytearray, list, tuple)) and len(value) == 4:
+        try:
+            parts = tuple(int(x) & 0xFF for x in value)
+            return parts if len(parts) == 4 else None
+        except Exception:
+            return None
+    try:
+        text = str(value or "").strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    parts_s = text.split(".")
+    if len(parts_s) != 4:
+        return None
+    try:
+        parts = tuple(int(p) for p in parts_s)
+    except Exception:
+        return None
+    if any(p < 0 or p > 255 for p in parts):
+        return None
+    return parts  # type: ignore[return-value]
+
+def _normalize_rpi_id(value) -> str:
+    text = str(value or "").strip().upper()
+    return text if RPI_ID_RE.fullmatch(text) else ""
+
+
+def _parse_rs485_ident_packet(packet: bytes, requested_node_id: int = 0xFF) -> dict | None:
+    bs = bytes(packet or b"")
+    if len(bs) < RS485_IDENT_V1_LEN or bs[:4] not in {b"RID1", b"RID2"}:
+        return None
+    try:
+        wire_version = int(bs[4]) & 0xFF
+        v2 = len(bs) >= RS485_IDENT_V2_LEN and (bs[:4] == b"RID2" or wire_version >= 2)
+        node_id = int(bs[5]) & 0xFF
+        if node_id > 31:
+            return None
+        requested_id = int(requested_node_id) & 0xFFFF
+        if 0 <= requested_id <= 31 and node_id != requested_id:
+            return None
+        flags = int.from_bytes(bs[6:8], "little")
+        if (flags & 0x07FF) == 0:
+            return None
+        short_raw = bytes(bs[8:18]).split(b"\x00", 1)[0]
+        short_id = short_raw.decode("ascii", "ignore").strip().upper()
+        short_id = short_id.replace("?", "").strip() or ""
+        if v2:
+            rpi_raw = bytes(bs[18:28]).split(b"\x00", 1)[0]
+            rpi_id = _normalize_rpi_id(rpi_raw.decode("ascii", "ignore"))
+            ip_parts = [int(x) & 0xFF for x in bs[28:32]]
+            seen_page_mask = int.from_bytes(bs[32:36], "little")
+            last_ms = int.from_bytes(bs[36:40], "little")
+            legacy_rpi_number = None
+        else:
+            rpi_id = ""
+            ip_parts = [int(x) & 0xFF for x in bs[18:22]]
+            seen_page_mask = int.from_bytes(bs[22:26], "little")
+            last_ms = int.from_bytes(bs[26:30], "little")
+            legacy_rpi_number = int.from_bytes(bs[30:32], "little")
+        ip = ".".join(str(x) for x in ip_parts)
+        ip_valid = bool(flags & 0x0002) and any(ip_parts)
+        is_master = bool(flags & 0x0080)
+        now = time.time()
+        entry = {
+            "node_id": node_id,
+            "requested_node_id": requested_id,
+            "node_id_matches_status": bool(requested_id > 31 or node_id == requested_id),
+            "version": wire_version,
+            "wire_format": "RID2" if v2 else "RID1",
+            "flags": flags,
+            "flags_hex": f"0x{flags:04X}",
+            "short_id": short_id,
+            "host_id": short_id,
+            "short_valid": bool(flags & 0x0001),
+            "ip": ip if ip_valid else "",
+            "ip4": ip_parts,
+            "ip_valid": ip_valid,
+            "ip_last": str(ip_parts[-1]) if ip_valid else "",
+            "rpi_id": rpi_id if (flags & 0x0200) else "",
+            "rpi_id_valid": bool(flags & 0x0200) and bool(rpi_id),
+            "rpi_number": legacy_rpi_number if (not v2 and (flags & 0x0200)) else None,
+            "rpi_number_valid": bool(not v2 and (flags & 0x0200)),
+            "device_id_assigned": bool(flags & 0x0400),
+            "master": is_master,
+            "role": "master" if is_master else "slave",
+            "node_conflict": bool(flags & 0x0100),
+            "complete": bool(flags & 0x0004),
+            "local": bool(flags & 0x0008),
+            "recent": bool(flags & 0x0010),
+            "scan_active": bool(flags & 0x0020),
+            "seen_page_mask": seen_page_mask,
+            "last_ms": last_ms,
+            "host_updated_at": now,
+            "host_updated_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)),
+        }
+        label_id = str(entry.get("rpi_id") or short_id or "")
+        if ip_valid:
+            entry["group_label"] = f"{label_id}/{ip_parts[-1]}" if label_id else str(ip_parts[-1])
+        elif label_id:
+            entry["group_label"] = label_id
+        return entry
+    except Exception:
+        return None
+
+def _parse_rs485_sensor_packet(packet: bytes, requested_node_id: int = 0xFF) -> dict | None:
+    """Parse the fixed SNS1 snapshot returned by GET_RS485_SENSOR (0x43)."""
+    bs = bytes(packet or b"")
+    if len(bs) != RS485_SENSOR_V1_LEN or bs[:4] != b"SNS1":
+        return None
+    try:
+        version = int(bs[4]) & 0xFF
+        node_id = int(bs[5]) & 0xFF
+        flags = int.from_bytes(bs[6:8], "little")
+        sensor_bits = int.from_bytes(bs[8:10], "little")
+        requested_id = int(requested_node_id) & 0xFFFF
+        if version != 1 or node_id > 31 or not bool(flags & 0x0001):
+            return None
+        if 0 <= requested_id <= 31 and node_id != requested_id:
+            return None
+        if 0 <= requested_id <= 31 and bool(flags & 0x0002):
+            return None
+        master = bool(flags & 0x0008)
+        detadc1 = bool(sensor_bits & 0x0002)
+        detadc2 = bool(sensor_bits & 0x0004)
+        optic_raw = bool(sensor_bits & 0x0001)
+        # Firmware 1.2.13 publishes the same processed physical optic state for
+        # master and slave rows. DetADC bits are independent controlled sensors.
+        optic_physical = optic_raw
+        now = time.time()
+        return {
+            "node_id": node_id,
+            "status_node_id": node_id,
+            "requested_node_id": requested_id,
+            "node_id_matches_status": bool(requested_id > 31 or node_id == requested_id),
+            "packet_validated": True,
+            "version": version,
+            "wire_format": "SNS1",
+            "flags": flags,
+            "flags_hex": f"0x{flags:04X}",
+            "sensor_bits": sensor_bits,
+            "sensor_bits_hex": f"0x{sensor_bits:04X}",
+            "optic_active_raw": optic_raw,
+            "optic_active": optic_physical,
+            "optic_active_physical": optic_physical,
+            "optic_indication_allow": optic_raw,
+            "optic_reject_reason": "",
+            "detadc1": detadc1,
+            "detadc2": detadc2,
+            "last_sensor_index": int(bs[10]) & 0xFF,
+            "last_change_ms": int.from_bytes(bs[12:16], "little"),
+            "local": bool(flags & 0x0002),
+            "recent": bool(flags & 0x0004),
+            "seen": bool(flags & 0x0004),
+            "master": master,
+            "online": bool(flags & 0x0004),
+            "sensor_updated_at": now,
+            "sensor_updated_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)),
+        }
+    except Exception:
+        return None
 
 def _merge_dict(base: dict, patch: dict) -> dict:
     out = dict(base) if isinstance(base, dict) else {}
@@ -159,7 +364,7 @@ class StereoAssembler:
                 return max(1, v)
             except Exception:
                 return dflt
-        self.q = queue.Queue(maxsize=_int_env('BMI30_ASM_Q_MAX', 2048))
+        self.q = queue.Queue(maxsize=_int_env('BMI30_ASM_Q_MAX', 128))
         self.drop_pairs = 0
         self.drop_a = 0
         self.drop_b = 0
@@ -211,8 +416,8 @@ class StereoAssembler:
             self.independent = False
         if self.independent:
             # queues for each channel (A=0,B=1)
-            self.qA = queue.Queue(maxsize=_int_env('BMI30_ASM_QA_MAX', 2048))
-            self.qB = queue.Queue(maxsize=_int_env('BMI30_ASM_QB_MAX', 2048))
+            self.qA = queue.Queue(maxsize=_int_env('BMI30_ASM_QA_MAX', 128))
+            self.qB = queue.Queue(maxsize=_int_env('BMI30_ASM_QB_MAX', 128))
     def _emit_pair(self, a: 'Frame', b: 'Frame'):
         try:
             self.q.put_nowait((a, b))
@@ -381,14 +586,23 @@ class StereoAssembler:
             self.bufB.clear()
 
 class USBStream:
-    def __init__(self, profile=1, full=True, vid=VID, pid=PID, interactive=False, allow_any=False, iface_prefer=None, test_as_data: bool=False, frame_samples: int | None = None, fast_mode: bool | None = None, assembler_relaxed: bool | None = None, assembler_relaxed_order: bool | None = None, assembler_ts_pairing: bool | None = None, assembler_ts_tol: float | None = None, assembler_independent: bool | None = None):
+    def __init__(self, profile=1, full=True, vid=VID, pid=PID, interactive=False, allow_any=False, iface_prefer=None, test_as_data: bool=False, frame_samples: int | None = None, fast_mode: bool | None = None, assembler_relaxed: bool | None = None, assembler_relaxed_order: bool | None = None, assembler_ts_pairing: bool | None = None, assembler_ts_tol: float | None = None, assembler_independent: bool | None = None, tx_enabled: bool | None = None):
         self._running = True
+        # OUT serialization is needed during constructor-time startup too.
+        self._ep_out_lock = threading.Lock()
+        self._ep0_lock = threading.RLock()
+        self._close_lock = threading.Lock()
+        self._rs485_ident_lock = threading.Lock()
         self.dev=None
         self.intf=None
         self.profile = profile
         self.full = full
         self.test_as_data = test_as_data
         self.frame_samples = frame_samples
+        # Persistent host request supplied by the owning engine.  STOP_STREAM
+        # clears the device-side request, so every transport START must restore
+        # this value afterwards.
+        self.desired_tx_enabled = bool(tx_enabled) if tx_enabled is not None else False
         # Быстрый режим: жёстко задаём FULL/PROFILE/NS перед START и включаем keepalive/restart пороги
         try:
             fm_env = os.getenv('BMI30_FAST_MODE', None)
@@ -770,7 +984,7 @@ class USBStream:
                 # Профиль 1 требует больше времени на инициализацию
                 delay = 0.3 if (int(self.profile if self.profile is not None else 2) == 1) else 0.05
                 time.sleep(delay)
-                self.send_cmd(CMD_START_STREAM, b"")
+                self._start_stream_with_tx(reason="constructor")
                 time.sleep(0.05)
                 # EP0 статус-пинг сразу после старта — выключен по умолчанию
                 try:
@@ -871,13 +1085,11 @@ class USBStream:
         except Exception:
             pass
         self.stat_t = time.time()
-        self._close_lock = threading.Lock()
         self._closed = False
         self._fallback_done = False
         self._working_seen = False
         self.keepalive_last = self.connected_t
         self.restart_attempts = 0
-        self._ep_out_lock = threading.Lock()
         try:
             self.host_rx_ack_enabled = str(os.getenv('BMI30_HOST_RX_ACK', '1')).lower() not in ('0', 'false', 'no')
         except Exception:
@@ -900,6 +1112,9 @@ class USBStream:
         self._rate_mismatch_fixed = False
         self.th = threading.Thread(target=self._rx_loop, daemon=True)
         self.th.start()
+        self._rs485_sensor_stop = threading.Event()
+        self._rs485_sensor_th = threading.Thread(target=self._rs485_sensor_loop, daemon=True)
+        self._rs485_sensor_th.start()
 
     def set_block_rate(self, rate_hz: int):
         """Задать частоту блока (в Гц) через вендорский пакет 0x11."""
@@ -917,6 +1132,30 @@ class USBStream:
                 print('[tx] set_block_rate failed:', e)
             except Exception:
                 pass
+
+    def set_tx_enable(self, enabled: bool):
+        """Save and apply the explicit Tx200 request through Vendor command 0x33."""
+        self.desired_tx_enabled = bool(enabled)
+        self.send_cmd(CMD_SET_TX_ENABLE, b"\x01" if self.desired_tx_enabled else b"\x00")
+        return True
+
+    def _start_stream_with_tx(self, reason: str = "start"):
+        """START first, then restore Tx200 as the final TX-control command."""
+        self.send_cmd(CMD_START_STREAM, b"")
+        time.sleep(0.02)
+        self.set_tx_enable(bool(getattr(self, "desired_tx_enabled", False)))
+        try:
+            print(
+                f"[tx-state] reason={reason} start=1 desired_tx={int(bool(self.desired_tx_enabled))}",
+                flush=True,
+            )
+        except Exception:
+            pass
+        return True
+
+    def start_stream(self):
+        """Public START helper that preserves the owning engine's Tx200 request."""
+        return self._start_stream_with_tx(reason="public_start")
 
     def _parse_stat_ready(self, st: bytes) -> tuple[bool, bool]:
         """Парсим STAT, возвращаем (alt1, out_armed). Безопасно при любом буфере."""
@@ -973,25 +1212,34 @@ class USBStream:
 
     def _status_len(self):
         try:
-            return max(64, min(192, int(os.getenv('BMI30_STAT_LEN', '136'))))
+            return max(64, min(192, int(os.getenv('BMI30_STAT_LEN', '137'))))
         except Exception:
-            return 136
+            return STAT_PACKET_V6_LEN
 
-    def _get_status_ep0(self):
+    def _ep0_ctrl_transfer(self, *args, **kwargs):
+        """Serialize EP0 requests; overlapping libusb control reads corrupt responses."""
+        lock = getattr(self, "_ep0_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._ep0_lock = lock
+        with lock:
+            return self.dev.ctrl_transfer(*args, **kwargs)
+
+    def _get_status_ep0(self, quiet: bool = False):
         """Попробовать прочитать статус через EP0 (vendor control IN, recipient: device)."""
         try:
             # bmRequestType: 0xC0 (Device to Host, Vendor, Device)
             # bRequest: CMD_GET_STATUS
             # wValue: 0
             # wIndex: 0 (device)
-            # wLength: 136 for current STAT v5; older firmware may return a short 64B packet.
+            # Firmware 1.2.13 exposes authoritative direct-ID STAT v6 at 137 bytes.
             data = None
             try:
-                data = self.dev.ctrl_transfer(0xC0, CMD_GET_STATUS, 0, 0, self._status_len(), timeout=300)
+                data = self._ep0_ctrl_transfer(0xC0, CMD_GET_STATUS, 0, 0, self._status_len(), timeout=300)
             except usb.core.USBError as e:
                 # Время от времени устройство может NAK/STALL — это нормально
                 try:
-                    if e.errno not in (110,):
+                    if not quiet and e.errno not in (110,):
                         print('[ep0] GET_STATUS usb err:', e)
                 except Exception:
                     pass
@@ -1006,10 +1254,13 @@ class USBStream:
                     self._write_device_state_cache(patch)
                 except Exception:
                     pass
-                print('[ep0] status len=', len(bs))
+                if not quiet:
+                    print('[ep0] status len=', len(bs))
+                return bs
         except Exception as e:
             try:
-                print('[ep0] GET_STATUS failed:', e)
+                if not quiet:
+                    print('[ep0] GET_STATUS failed:', e)
             except Exception:
                 pass
 
@@ -1171,6 +1422,9 @@ class USBStream:
                 try:
                     _ = self.dev.write(cdc_out, bytes([CMD_START_STREAM]), timeout=300)
                     print("[kick] CDC START sent")
+                    # CDC START is still a START_STREAM path.  Restore the
+                    # explicit Tx200 request afterwards through Vendor OUT.
+                    self.set_tx_enable(bool(getattr(self, "desired_tx_enabled", False)))
                 except Exception as e:
                     print("[kick] CDC write failed:", e)
                 try:
@@ -1197,7 +1451,7 @@ class USBStream:
             self.request_rx_flush()
             if full:
                 self.send_cmd(CMD_SET_FULL_MODE, bytes([1])); time.sleep(0.02)
-            self.send_cmd(CMD_START_STREAM, b""); time.sleep(0.02)
+            self._start_stream_with_tx(reason="restart_stream"); time.sleep(0.02)
             self._prime_get_status()
             self._kick_cdc_start()
             self.last_restart_t = time.time()
@@ -1233,7 +1487,7 @@ class USBStream:
         except Exception:
             pass
         try:
-            self.send_cmd(CMD_START_STREAM, b""); time.sleep(0.02)
+            self._start_stream_with_tx(reason="fallback_start"); time.sleep(0.02)
         except Exception:
             pass
         # Попробуем дополнительно CDC START (если есть CDC Data интерфейс)
@@ -1256,6 +1510,15 @@ class USBStream:
             except Exception:
                 skip_stop = False
             self._host_rx_ack_stop = True
+            try:
+                sensor_stop = getattr(self, "_rs485_sensor_stop", None)
+                if sensor_stop is not None:
+                    sensor_stop.set()
+                sensor_th = getattr(self, "_rs485_sensor_th", None)
+                if sensor_th is not None and sensor_th.is_alive() and sensor_th is not threading.current_thread():
+                    sensor_th.join(timeout=0.35)
+            except Exception:
+                pass
             try:
                 th_ack = getattr(self, '_host_rx_ack_th', None)
                 if th_ack is not None and th_ack.is_alive() and th_ack is not threading.current_thread():
@@ -1311,7 +1574,7 @@ class USBStream:
     def soft_reset(self):
         """Отправить EP0 SOFT_RESET (0x7E) вендорским control OUT без данных."""
         try:
-            self.dev.ctrl_transfer(0x40, CMD_SOFT_RESET, 0, 0, None, timeout=500)
+            self._ep0_ctrl_transfer(0x40, CMD_SOFT_RESET, 0, 0, None, timeout=500)
             print('[ep0] SOFT_RESET sent')
         except Exception as e:
             print('[ep0] SOFT_RESET failed:', e)
@@ -1319,7 +1582,7 @@ class USBStream:
     def deep_reset(self):
         """Отправить EP0 DEEP_RESET (0x7F) вендорским control OUT без данных."""
         try:
-            self.dev.ctrl_transfer(0x40, CMD_DEEP_RESET, 0, 0, None, timeout=800)
+            self._ep0_ctrl_transfer(0x40, CMD_DEEP_RESET, 0, 0, None, timeout=800)
             print('[ep0] DEEP_RESET sent')
         except Exception as e:
             print('[ep0] DEEP_RESET failed:', e)
@@ -1395,7 +1658,7 @@ class USBStream:
         try:
             bm = 0x01  # Host-to-Device, Standard, Interface
             REQ_SET_INTERFACE = 0x0B
-            self.dev.ctrl_transfer(bm, REQ_SET_INTERFACE, int(desired_alt), int(intf_num), None, timeout=300)
+            self._ep0_ctrl_transfer(bm, REQ_SET_INTERFACE, int(desired_alt), int(intf_num), None, timeout=300)
             self.current_alt = int(desired_alt)
             print(f"[alt] ctrl SET_INTERFACE (0x0B/0x01) alt={desired_alt} ok")
             try:
@@ -1413,7 +1676,7 @@ class USBStream:
         try:
             # Device (0x40) с wIndex=2 — согласно спецификации прошивки
             try:
-                self.dev.ctrl_transfer(0x40, CMD_SET_ALT, int(desired_alt), int(intf_num), None, timeout=300)
+                self._ep0_ctrl_transfer(0x40, CMD_SET_ALT, int(desired_alt), int(intf_num), None, timeout=300)
                 self.current_alt = int(desired_alt)
                 print(f"[alt] vendor SET_ALT(0x40) alt={desired_alt} ok")
                 try:
@@ -1426,7 +1689,7 @@ class USBStream:
                 pass
             # Interface (0x41) с wIndex=2 как дополнительная попытка
             try:
-                self.dev.ctrl_transfer(0x41, CMD_SET_ALT, int(desired_alt), int(intf_num), None, timeout=300)
+                self._ep0_ctrl_transfer(0x41, CMD_SET_ALT, int(desired_alt), int(intf_num), None, timeout=300)
                 self.current_alt = int(desired_alt)
                 print(f"[alt] vendor SET_ALT(0x41) alt={desired_alt} ok")
                 try:
@@ -1531,6 +1794,445 @@ class USBStream:
             bits = (1 if detadc1 else 0) | (2 if detadc2 else 0)
         self.send_cmd(CMD_SET_DET_ADC, bytes([int(bits) & 0x03]))
 
+    def set_rs485_id(self, node_id: int) -> bool:
+        """Persist the local RS485 device ID; zero is a valid assigned ID."""
+        try:
+            nid = int(node_id)
+        except Exception as exc:
+            raise ValueError("RS485 device ID must be an integer from 0 to 31") from exc
+        if not 0 <= nid <= 31:
+            raise ValueError("RS485 device ID must be from 0 to 31")
+        try:
+            self.send_cmd(CMD_SET_RS485_ID, bytes([nid & 0x1F]))
+            return True
+        except Exception:
+            return False
+
+    def set_rs485_ip(self, ip) -> bool:
+        """Publish only the local RPI IPv4 address (legacy command 0x3E)."""
+        parts = _parse_ipv4(ip)
+        if parts is None:
+            return False
+        payload = bytes(parts)
+        try:
+            self._ep0_ctrl_transfer(0x40, CMD_SET_RS485_IP, 0, 0, payload, timeout=300)
+            return True
+        except Exception:
+            try:
+                self.send_cmd(CMD_SET_RS485_IP, payload)
+                return True
+            except Exception:
+                return False
+
+    def set_rpi_info(self, rpi_id, ip) -> bool:
+        """Publish the 9-hex hostname suffix and IPv4 address (command 0x42 v2)."""
+        parts = _parse_ipv4(ip)
+        if parts is None:
+            raise ValueError("RPI IPv4 address must contain four octets")
+        identifier = _normalize_rpi_id(rpi_id)
+        if not identifier:
+            raise ValueError("RPI ID must be the 9-hex suffix from hostname BMI30-XXXXXXXXX")
+        payload = identifier.encode("ascii") + bytes(parts)
+        published = False
+        try:
+            self._ep0_ctrl_transfer(0x40, CMD_SET_RPI_INFO, 0, 0, payload, timeout=300)
+            published = True
+        except Exception:
+            try:
+                self.send_cmd(CMD_SET_RPI_INFO, payload)
+                published = True
+            except Exception:
+                published = False
+        # Command 0x3E remains valid in RID2 firmware and preserves correct IP
+        # publication on older RID1 firmware that cannot store the full RPI ID.
+        try:
+            self.set_rs485_ip(ip)
+        except Exception:
+            pass
+        return published
+
+    def request_rs485_ident(self) -> bool:
+        """Ask the current RS485 master to run one identity/IP scan pass."""
+        try:
+            self._ep0_ctrl_transfer(0x40, CMD_REQUEST_RS485_IDENT, 0, 0, None, timeout=300)
+            return True
+        except Exception:
+            try:
+                self.send_cmd(CMD_REQUEST_RS485_IDENT, b"")
+                return True
+            except Exception:
+                return False
+
+    def get_rs485_ident(self, node_id: int | None = None) -> dict | None:
+        """Read RID2/RID1 via EP0; None selects local, while 0 is device ID 00."""
+        if node_id is None:
+            selector = 0xFF
+        else:
+            try:
+                selector = int(node_id)
+            except Exception:
+                return None
+            if not 0 <= selector <= 31:
+                return None
+        try:
+            data = self._ep0_ctrl_transfer(
+                0xC0,
+                CMD_GET_RS485_IDENT,
+                selector,
+                0,
+                RS485_IDENT_V2_LEN,
+                timeout=250,
+            )
+            entry = _parse_rs485_ident_packet(bytes(data or b""), requested_node_id=selector)
+            return entry
+        except Exception:
+            return None
+
+    def get_rs485_sensor(self, node_id: int | None = None) -> dict | None:
+        """Read one direct local/neighbor sensor snapshot through EP0 SNS1."""
+        if node_id is None:
+            selector = 0xFF
+        else:
+            try:
+                selector = int(node_id)
+            except Exception:
+                return None
+            if not 0 <= selector <= 31:
+                return None
+        try:
+            data = self._ep0_ctrl_transfer(
+                0xC0,
+                CMD_GET_RS485_SENSOR,
+                selector,
+                0,
+                RS485_SENSOR_V1_LEN,
+                timeout=120,
+            )
+            return _parse_rs485_sensor_packet(bytes(data or b""), requested_node_id=selector)
+        except Exception:
+            return None
+
+    def poll_rs485_sensors(self) -> list[dict]:
+        """Refresh trusted per-device optic/DetADC states from direct-ID STAT v6."""
+        lock = getattr(self, "_rs485_ident_lock", None)
+        if lock is None or not lock.acquire(blocking=False):
+            return []
+        try:
+            now = time.time()
+            try:
+                stat_refresh_s = max(
+                    0.2,
+                    min(5.0, float(os.getenv("BMI30_RS485_STAT_V6_POLL_S", "2.00"))),
+                )
+            except Exception:
+                stat_refresh_s = 2.00
+            last_stat_poll = float(getattr(self, "_rs485_stat_v6_poll_t", 0.0) or 0.0)
+            if (now - last_stat_poll) >= stat_refresh_s:
+                self._rs485_stat_v6_poll_t = now
+                try:
+                    self._get_status_ep0(quiet=True)
+                except Exception:
+                    pass
+
+            cache = getattr(self, "device_state_cache", {}) or {}
+            events = cache.get("events") if isinstance(cache.get("events"), dict) else {}
+            sensor_map = (
+                events.get("sensor_map")
+                if isinstance(events.get("sensor_map"), dict)
+                else {}
+            )
+            sync = events.get("sync_state") if isinstance(events.get("sync_state"), dict) else {}
+            if not sync:
+                sync = cache.get("sync") if isinstance(cache.get("sync"), dict) else {}
+            stat = cache.get("stat") if isinstance(cache.get("stat"), dict) else {}
+            direct_layout_valid = bool(
+                stat.get("sync_layout_valid") is True
+                and stat.get("direct_device_id_layout") is True
+            )
+            authority_validation = ""
+            if sensor_map.get("valid") is True:
+                try:
+                    seen_mask = int(sensor_map.get("sync_seen_mask", 0) or 0) & 0xFFFFFFFF
+                    local_node_id = int(sensor_map.get("local_node_id", -1))
+                    authority_validation = "evt1_sensor_map"
+                except Exception:
+                    seen_mask = 0
+                    local_node_id = -1
+            elif direct_layout_valid:
+                try:
+                    seen_mask = int(stat.get("sync_seen_mask", 0) or 0) & 0xFFFFFFFF
+                    local_node_id = int(sync.get("local_node_id", sync.get("device_id", -1)))
+                    authority_validation = "stat_v6_direct_id_layout"
+                except Exception:
+                    seen_mask = 0
+                    local_node_id = -1
+            else:
+                self._write_device_state_cache({
+                    "_host_only": True,
+                    "source": "ep0_sns1_rejected",
+                    "sensors": {
+                        "remote": [],
+                        "remote_count": 0,
+                        "remote_updated_at": now,
+                        "remote_valid": False,
+                        "remote_validation": "requires_sensor_map_or_stat_v6",
+                        "remote_seen_mask": 0,
+                    },
+                })
+                return []
+            node_ids = [
+                node_id
+                for node_id in range(32)
+                if bool(seen_mask & (1 << node_id)) and node_id != local_node_id
+            ]
+            if not node_ids:
+                self._write_device_state_cache({
+                    "_host_only": True,
+                    "source": "ep0_sns1",
+                    "sensors": {
+                        "remote": [],
+                        "remote_count": 0,
+                        "remote_updated_at": now,
+                        "remote_valid": True,
+                        "remote_validation": authority_validation,
+                        "remote_seen_mask": seen_mask,
+                    },
+                })
+                return []
+            remote = []
+            for node_id in node_ids:
+                if not bool(getattr(self, "_running", False)) or bool(getattr(self, "disconnected", False)):
+                    break
+                item = self.get_rs485_sensor(node_id)
+                if not isinstance(item, dict):
+                    continue
+                if item.get("packet_validated") is not True:
+                    continue
+                if item.get("node_id_matches_status") is not True:
+                    continue
+                if int(item.get("node_id", -1)) != node_id:
+                    continue
+                if item.get("local") is True:
+                    continue
+                if item.get("seen") is not True or item.get("recent") is not True or item.get("online") is not True:
+                    continue
+                remote.append(item)
+            self._write_device_state_cache({
+                "_host_only": True,
+                "source": "ep0_sns1",
+                "sensors": {
+                    "remote": remote,
+                    "remote_count": len(remote),
+                    "remote_updated_at": now,
+                    "remote_valid": True,
+                    "remote_validation": authority_validation,
+                    "remote_seen_mask": seen_mask,
+                },
+            })
+            return remote
+        finally:
+            lock.release()
+
+    def _rs485_sensor_loop(self):
+        """Keep group sensor columns and optic gating current at sub-second cadence."""
+        try:
+            interval = max(0.10, min(2.0, float(os.getenv("BMI30_RS485_SENSOR_POLL_S", "0.20"))))
+        except Exception:
+            interval = 0.20
+        stop_event = getattr(self, "_rs485_sensor_stop", None)
+        if stop_event is None:
+            return
+        stop_event.wait(min(0.5, interval))
+        while bool(getattr(self, "_running", False)) and not bool(getattr(self, "disconnected", False)):
+            try:
+                self.poll_rs485_sensors()
+            except Exception:
+                pass
+            if stop_event.wait(interval):
+                break
+
+    def _write_rs485_ident_cache(
+        self,
+        entries: list[dict],
+        requested_scan: bool = False,
+        local_ip: str | None = None,
+        authoritative: bool = False,
+    ) -> dict:
+        def _entry_valid(entry) -> bool:
+            if not isinstance(entry, dict):
+                return False
+            try:
+                flags = int(entry.get("flags", 0) or 0)
+            except Exception:
+                flags = 0
+            try:
+                node_id = int(entry.get("node_id", -1))
+            except Exception:
+                node_id = -1
+            return (
+                0 <= node_id <= 31
+                and bool(flags & 0x07FF)
+                and entry.get("node_id_matches_status") is not False
+            )
+
+        now = time.time()
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
+        current = getattr(self, "device_state_cache", {}) or {}
+        previous = current.get("rs485_ident") if isinstance(current.get("rs485_ident"), dict) else {}
+        previous_nodes = previous.get("nodes") if isinstance(previous.get("nodes"), dict) else {}
+        nodes = {} if authoritative else {
+            str(k): v for k, v in dict(previous_nodes or {}).items() if _entry_valid(v)
+        }
+        local = {} if authoritative else (
+            previous.get("local") if isinstance(previous.get("local"), dict) else {}
+        )
+        if not _entry_valid(local):
+            local = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                node_id = int(entry.get("node_id", 0) or 0)
+            except Exception:
+                node_id = 0
+            if node_id < 0 or node_id > 31:
+                continue
+            key = str(node_id)
+            merged = _merge_dict(nodes.get(key) if isinstance(nodes.get(key), dict) else {}, entry)
+            nodes[key] = merged
+            try:
+                requested_selector = int(entry.get("requested_node_id", -1))
+            except Exception:
+                requested_selector = -1
+            if bool(entry.get("local")) or requested_selector == 0xFF:
+                local = merged
+        node_list = []
+        for key, value in nodes.items():
+            if isinstance(value, dict):
+                node_list.append(value)
+        node_list.sort(key=lambda item: int(item.get("node_id", 0) or 0))
+        cache_source = (
+            "ep0_rid2"
+            if any(str(item.get("wire_format") or "") == "RID2" for item in entries if isinstance(item, dict))
+            else "ep0_rid1"
+        )
+        ident = _merge_dict({} if authoritative else previous, {
+            "source": cache_source,
+            "updated_at": now,
+            "updated_iso": now_iso,
+            "requested_scan": bool(requested_scan),
+            "authoritative": bool(authoritative),
+            "local_ip": (
+                ""
+                if str(local_ip or "").strip() == "0.0.0.0"
+                else str(local_ip or previous.get("local_ip") or "")
+            ),
+            "nodes": nodes,
+            "node_list": node_list,
+            "node_count": len(node_list),
+        })
+        if local:
+            ident["local"] = local
+        elif authoritative:
+            ident.pop("local", None)
+        if authoritative:
+            ident["authoritative_updated_at"] = now
+            ident["authoritative_updated_iso"] = now_iso
+        if requested_scan:
+            ident["last_master_request_at"] = now
+            ident["last_master_request_iso"] = now_iso
+        self._write_device_state_cache({"source": cache_source, "rs485_ident": ident, "_host_only": True})
+        return ident
+
+    def poll_rs485_ident(
+        self,
+        node_ids=None,
+        request_scan: bool = False,
+        local_ip: str | None = None,
+        rpi_id: str | None = None,
+    ) -> dict:
+        """Serialize identity scans so multiple Portal clients cannot overlap EP0 reads."""
+        lock = getattr(self, "_rs485_ident_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._rs485_ident_lock = lock
+        if not lock.acquire(blocking=False):
+            current = getattr(self, "device_state_cache", {}) or {}
+            ident = current.get("rs485_ident") if isinstance(current.get("rs485_ident"), dict) else {}
+            return ident if isinstance(ident, dict) else {}
+        try:
+            return self._poll_rs485_ident_unlocked(
+                node_ids=node_ids,
+                request_scan=request_scan,
+                local_ip=local_ip,
+                rpi_id=rpi_id,
+            )
+        finally:
+            lock.release()
+
+    def _poll_rs485_ident_unlocked(
+        self,
+        node_ids=None,
+        request_scan: bool = False,
+        local_ip: str | None = None,
+        rpi_id: str | None = None,
+    ) -> dict:
+        """Best-effort RS485 identity/IP polling. Keeps the previous rows until refreshed."""
+        if local_ip:
+            try:
+                if not rpi_id:
+                    self.set_rs485_ip(local_ip)
+                else:
+                    self.set_rpi_info(rpi_id, local_ip)
+            except Exception:
+                pass
+        requested = False
+        if request_scan:
+            requested = bool(self.request_rs485_ident())
+            if requested:
+                try:
+                    settle_s = max(
+                        0.0,
+                        min(0.5, float(os.getenv("BMI30_RS485_IDENT_SCAN_SETTLE_S", "0.08"))),
+                    )
+                except Exception:
+                    settle_s = 0.08
+                if settle_s > 0.0:
+                    time.sleep(settle_s)
+        ids = set(range(32)) if node_ids is None else set()
+        try:
+            for node_id in node_ids or []:
+                node_i = int(node_id)
+                if 0 <= node_i <= 31:
+                    ids.add(node_i)
+        except Exception:
+            pass
+        entries = []
+        local_entry = self.get_rs485_ident(None)
+        if local_entry:
+            entries.append(local_entry)
+        try:
+            local_entry_id = int(local_entry.get("node_id", -1)) if isinstance(local_entry, dict) else -1
+        except Exception:
+            local_entry_id = -1
+        for node_id in sorted(ids):
+            if node_id == local_entry_id:
+                continue
+            entry = self.get_rs485_ident(node_id)
+            if entry:
+                entries.append(entry)
+        if not entries and not requested:
+            current = getattr(self, "device_state_cache", {}) or {}
+            ident = current.get("rs485_ident") if isinstance(current.get("rs485_ident"), dict) else {}
+            return ident if isinstance(ident, dict) else {}
+        authoritative = bool(node_ids is None and isinstance(local_entry, dict))
+        return self._write_rs485_ident_cache(
+            entries,
+            requested_scan=requested,
+            local_ip=local_ip,
+            authoritative=authoritative,
+        )
+
     def host_rx_clear(self):
         """Tell firmware to clear host RX/accounting state when recovering reader state."""
         self.send_cmd(CMD_HOST_RX_CLEAR, b"")
@@ -1547,51 +2249,44 @@ class USBStream:
         """Request firmware-side DEVICE_RESET. Reset mode depends on firmware build."""
         self.send_cmd(CMD_DEVICE_RESET, b"")
 
-    def set_dc_config_seconds(self, mode: int = 1, work_settle_s: float = 1.0, detect_settle_s: float = 0.25, fast_settle_s: float = 0.001, fast_duration_s: float = 6.0):
-        """Configure STM32-side DC adaptation timing (SET_DC_CONFIG v1)."""
-        def _ms(value, default):
-            try:
-                v = float(value)
-                if not (v >= 0.0):
-                    v = float(default)
-            except Exception:
-                v = float(default)
-            return max(1, min(0xFFFFFFFF, int(round(v * 1000.0))))
+    def set_dc_speed_ms(self, settle_ms: int):
+        """Set the only STM32 DC control value; zero stops DC learning."""
+        try:
+            value = int(settle_ms)
+        except Exception as exc:
+            raise ValueError("settle_ms must be an integer") from exc
+        if value < 0 or value > DC_SETTLE_MAX_MS:
+            raise ValueError(f"settle_ms must be 0..{DC_SETTLE_MAX_MS}")
+        payload = struct.pack('<I', value)
+        self.send_cmd(CMD_SET_DC_SPEED, payload)
+        return payload
 
-        mode_u8 = max(0, min(255, int(mode)))
-        flags = 0
-        payload = struct.pack(
-            '<BBHIIII',
-            1,
-            mode_u8,
-            flags,
-            _ms(work_settle_s, 1.0),
-            _ms(detect_settle_s, 0.25),
-            _ms(fast_settle_s, 0.001),
-            _ms(fast_duration_s, 6.0),
-        )
-        self.send_cmd(CMD_SET_DC_CONFIG, payload)
+    def set_dc_speed_seconds(self, settle_s: float):
+        """Set DC correction time in seconds; 0 disables DC learning."""
+        try:
+            value = float(settle_s)
+        except Exception as exc:
+            raise ValueError("settle_s must be a number") from exc
+        if not math.isfinite(value) or value < 0.0 or value > (DC_SETTLE_MAX_MS / 1000.0):
+            raise ValueError(f"settle_s must be 0..{DC_SETTLE_MAX_MS / 1000.0:g}")
+        return self.set_dc_speed_ms(int(round(value * 1000.0)))
 
     def get_dc_config(self):
         """Read STM32-side DC adaptation config via EP0 when firmware supports it."""
-        data = self.dev.ctrl_transfer(0xC0, CMD_GET_DC_CONFIG, 0, 0, 40, timeout=500)
+        data = self._ep0_ctrl_transfer(0xC0, CMD_GET_DC_CONFIG, 0, 0, 40, timeout=500)
         bs = bytes(data) if data is not None else b''
         if len(bs) < 40 or bs[:4] != b'DCCF':
             return {'raw': bs.hex()}
-        sig, ver, mode, flags, work_ms, detect_ms, fast_settle_ms, fast_duration_ms, active_ms, mode_enter_ms, fast_until_ms, adapt_updates = struct.unpack('<4sBBHIIIIIIII', bs[:40])
+        sig, ver, enabled, flags, settle_ms, set_at_ms, adapt_updates, reserved0, reserved1, reserved2, reserved3, reserved4 = struct.unpack('<4sBBHIII5I', bs[:40])
         return {
             'version': int(ver),
-            'mode': int(mode),
+            'enabled': bool(enabled),
             'flags': int(flags),
-            'work_settle_ms': int(work_ms),
-            'detect_settle_ms': int(detect_ms),
-            'fast_settle_ms': int(fast_settle_ms),
-            'fast_duration_ms': int(fast_duration_ms),
-            'active_settle_ms': int(active_ms),
-            'mode_enter_ms': int(mode_enter_ms),
-            'fast_until_ms': int(fast_until_ms),
+            'settle_ms': int(settle_ms),
+            'set_at_ms': int(set_at_ms),
             'adapt_updates': int(adapt_updates),
             'dirty': bool(int(flags) & 0x0004),
+            'reserved': [int(reserved0), int(reserved1), int(reserved2), int(reserved3), int(reserved4)],
         }
 
     def _device_state_path(self) -> str:
@@ -1652,7 +2347,7 @@ class USBStream:
             path = self._device_state_path()
             directory = os.path.dirname(path) or "."
             os.makedirs(directory, exist_ok=True)
-            tmp = f"{path}.{os.getpid()}.tmp"
+            tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, sort_keys=True)
                 f.write("\n")
@@ -1662,35 +2357,125 @@ class USBStream:
 
     def _parse_stat_device_state(self, packet: bytes) -> dict:
         bs = bytes(packet or b"")
+        stat_version = _u8_at(bs, 4)
+        full_v5 = bool((stat_version or 0) >= 5 and len(bs) >= STAT_PACKET_V5_LEN)
+        full_v6 = bool((stat_version or 0) >= 6 and len(bs) >= STAT_PACKET_V6_LEN)
         flags_rt = _u16_at(bs, 48)
         flags2 = _u16_at(bs, 50)
-        sync_local_status = _u8_at(bs, 99)
-        sync_seen_mask = _u32_at(bs, 100) or 0
-        sync_node_count = _u8_at(bs, 104)
+        sync_local_status_raw = _u8_at(bs, 99) if full_v5 else None
+        sync_seen_mask_raw = (_u32_at(bs, 100) or 0) if full_v5 else 0
+        sync_node_count_raw = _u8_at(bs, 104) if full_v5 else None
+        previous = getattr(self, "device_state_cache", {}) or {}
+        previous_events = previous.get("events") if isinstance(previous.get("events"), dict) else {}
+        sensor_map_event = (
+            previous_events.get("sensor_map")
+            if isinstance(previous_events.get("sensor_map"), dict)
+            else {}
+        )
+        sync_state_event = (
+            previous_events.get("sync_state")
+            if isinstance(previous_events.get("sync_state"), dict)
+            else {}
+        )
+        expected_mask = None
+        if sensor_map_event.get("valid") is True:
+            expected_mask = sensor_map_event.get("sync_seen_mask")
+        elif isinstance(sync_state_event.get("sync_seen_mask"), int):
+            expected_mask = sync_state_event.get("sync_seen_mask")
+        expected_local_node_id = sensor_map_event.get(
+            "local_node_id",
+            sync_state_event.get("local_node_id"),
+        )
+        sync_layout_valid = False
+        if full_v6:
+            bit_count = int(sync_seen_mask_raw).bit_count()
+            sync_layout_valid = bool(
+                sync_node_count_raw is not None
+                and int(sync_node_count_raw) == bit_count
+                and 0 <= bit_count <= 32
+            )
+            if sync_layout_valid and isinstance(expected_mask, int) and expected_mask >= 0:
+                sync_layout_valid = int(sync_seen_mask_raw) == (int(expected_mask) & 0xFFFFFFFF)
+            local_node_id_raw = (
+                (int(sync_local_status_raw) & 0x1F)
+                if sync_local_status_raw is not None
+                else -1
+            )
+            if sync_layout_valid and isinstance(expected_local_node_id, int):
+                sync_layout_valid = local_node_id_raw == int(expected_local_node_id)
+            if sync_layout_valid:
+                sync_layout_valid = bool(sync_seen_mask_raw & (1 << local_node_id_raw))
+            if sync_layout_valid:
+                status_bytes_v6 = bytes(bs[105:137])
+                sync_layout_valid = len(status_bytes_v6) == 32 and all(
+                    (int(status_bytes_v6[node_id]) & 0x1F) == node_id
+                    for node_id in range(32)
+                    if bool(sync_seen_mask_raw & (1 << node_id))
+                )
+        if full_v5 and not full_v6:
+            bit_count = int(sync_seen_mask_raw).bit_count()
+            sync_layout_valid = bool(
+                sync_node_count_raw is not None
+                and 0 <= int(sync_node_count_raw) <= 32
+                and int(sync_node_count_raw) in {bit_count, max(0, bit_count - 1)}
+            )
+            if isinstance(expected_mask, int) and expected_mask >= 0:
+                sync_layout_valid = sync_layout_valid and int(sync_seen_mask_raw) == int(expected_mask)
+        sync_local_status = sync_local_status_raw if sync_layout_valid else None
+        sync_seen_mask = sync_seen_mask_raw if sync_layout_valid else 0
+        sync_node_count = sync_node_count_raw if sync_layout_valid else None
         local = _status_byte_fields(sync_local_status or 0, "Local") if sync_local_status is not None else {}
+        local_node_id = (int(sync_local_status) & 0x1F) if sync_local_status is not None else -1
+        local_optic_active = bool((flags_rt or 0) & 0x0020)
+        master_optic_active = bool((flags_rt or 0) & 0x0080)
+        any_optic_active = bool((flags_rt or 0) & 0x0100)
         if local:
+            try:
+                if int(local.get("status_node_id", 0) or 0) > 0:
+                    local["node_id"] = int(local.get("status_node_id", 0) or 0)
+            except Exception:
+                pass
             local["optic_active_sync"] = bool((sync_local_status or 0) & 0x20)
             if flags_rt is not None:
-                local["optic_active_flags_runtime"] = bool(flags_rt & 0x0020)
-                local["optic_active"] = bool(local["optic_active_sync"] or (flags_rt & 0x0020))
+                local["optic_active_flags_runtime"] = local_optic_active
+                local["optic_master_flags_runtime"] = master_optic_active
+                local["optic_any_flags_runtime"] = any_optic_active
+                local["optic_active"] = local_optic_active
+                local["optic_indication_allow"] = bool(local_optic_active or master_optic_active or any_optic_active)
                 local["tx_enabled"] = bool(flags_rt & 0x0010)
         remote = []
-        if len(bs) > 105:
-            status_bytes = bytes(bs[105:min(len(bs), 136)])
+        if full_v5:
+            status_end = 137 if full_v6 else 136
+            status_bytes = bytes(bs[105:min(len(bs), status_end)])
             for idx, value in enumerate(status_bytes):
-                node_id = idx + 1
-                seen = bool(sync_seen_mask & (1 << idx))
-                if not seen and value == 0:
+                node_id = idx if full_v6 else idx + 1
+                mask_bit = node_id if full_v6 else idx
+                seen = bool(sync_seen_mask & (1 << mask_bit))
+                if not seen:
+                    continue
+                if node_id == local_node_id:
                     continue
                 item = _status_byte_fields(value, f"Node {node_id}", node_id)
-                item["seen"] = seen
+                item.update({
+                    "seen": seen,
+                    "recent": seen,
+                    "online": seen,
+                    "packet_validated": bool(full_v6),
+                    "optic_active_raw": bool(item.get("optic_active")),
+                    "optic_active_physical": bool(item.get("optic_active")),
+                    "source": "stat_v6_direct" if full_v6 else "stat_v5_compat",
+                })
                 remote.append(item)
         result = {
             "source": "bulk_stat",
             "device_responded": True,
             "stat": {
                 "len": len(bs),
-                "version": _u8_at(bs, 4),
+                "raw_packet_hex": bs.hex(),
+                "version": stat_version,
+                "layout_complete": full_v5,
+                "direct_device_id_layout": bool(full_v6 and sync_layout_valid),
+                "sync_layout_valid": sync_layout_valid,
                 "cur_samples": _u16_at(bs, 6),
                 "frame_bytes": _u16_at(bs, 8),
                 "flags_runtime": flags_rt,
@@ -1699,19 +2484,33 @@ class USBStream:
                 "stream_active": bool((flags_rt or 0) & 0x0008),
                 "host_rx_alive": bool((flags_rt or 0) & 0x0040),
                 "tx_enabled": bool((flags_rt or 0) & 0x0010),
-                "optic_active": bool((flags_rt or 0) & 0x0020),
-                "optic_hold_ds": _u16_at(bs, 96),
-                "led_pattern": _u8_at(bs, 98),
+                "optic_active": local_optic_active,
+                "master_optic_active": master_optic_active,
+                "any_optic_active": any_optic_active,
+                "optic_gate_active": bool(local_optic_active or master_optic_active or any_optic_active),
+                "optic_hold_ds": _u16_at(bs, 96) if full_v5 else None,
+                "led_pattern": _u8_at(bs, 98) if full_v5 else None,
                 "sync_local_status": sync_local_status,
                 "sync_seen_mask": sync_seen_mask,
                 "sync_node_count": sync_node_count,
+                "sync_local_status_raw": sync_local_status_raw,
+                "sync_seen_mask_raw": sync_seen_mask_raw,
+                "sync_node_count_raw": sync_node_count_raw,
             },
         }
-        if local or remote:
+        # Bulk streaming deliberately stays STAT v5 (136 bytes) on firmware
+        # 1.2.13.  Its compatibility tail is not authoritative and must not
+        # overwrite a validated EVT1 SENSOR_MAP between map events.
+        if full_v6 and sync_layout_valid:
+            remote_updated_at = time.time()
             result["sensors"] = {
                 "local": local,
                 "remote": remote,
                 "remote_count": len(remote),
+                "remote_updated_at": remote_updated_at,
+                "remote_valid": True,
+                "remote_validation": "stat_v6_direct_id_layout",
+                "remote_seen_mask": sync_seen_mask,
             }
         return result
 
@@ -1726,6 +2525,7 @@ class USBStream:
         evt = {
             "version": version,
             "event_type": event_type,
+            "event_name": EVT1_EVENT_NAMES.get(event_type, f"evt1_{event_type:02x}"),
             "event_seq": _u32_at(bs, 8),
             "device_tick_ms": _u32_at(bs, 12),
             "payload_len": payload_len,
@@ -1794,6 +2594,7 @@ class USBStream:
                 "payload_version": _u8_at(payload, 0),
                 "flags": flags,
                 "optic_active": bool(flags & 0x01),
+                "optic_indication_allow": bool(flags & 0x01),
                 "tx_enabled": bool(flags & 0x02),
                 "optic_power": _u8_at(payload, 2),
                 "led_pattern": _u8_at(payload, 3),
@@ -1803,6 +2604,7 @@ class USBStream:
             patch["sensors"] = {"local": {
                 "label": "Local",
                 "optic_active": optic["optic_active"],
+                "optic_indication_allow": optic["optic_indication_allow"],
                 "tx_enabled": optic["tx_enabled"],
                 "optic_power": optic["optic_power"],
                 "led_pattern": optic["led_pattern"],
@@ -1815,7 +2617,12 @@ class USBStream:
                 display_char = chr(display_char_i) if 32 <= display_char_i < 127 else ""
             except Exception:
                 display_char = ""
-            local_status = _u8_at(payload, 13) or 0
+            local_node_id = _u8_at(payload, 4) or 0
+            assignment_status = _u8_at(payload, 13) or 0
+            saved_role_code = assignment_status & 0x03
+            assigned_role = {1: "master", 2: "slave"}.get(saved_role_code, "")
+            device_id_assigned = bool(assignment_status & 0x04)
+            local_status = (assignment_status & 0xE0) | (local_node_id & 0x1F)
             sync_seen_mask = _u32_at(payload, 8) or 0
             sync = {
                 "payload_version": _u8_at(payload, 0),
@@ -1823,16 +2630,41 @@ class USBStream:
                 "role": {0: "master", 1: "slave", 2: "off"}.get(raw_mode, "---"),
                 "display_mode": _u8_at(payload, 2),
                 "display_char": display_char,
-                "local_node_id": _u8_at(payload, 4),
+                "local_node_id": local_node_id,
+                "device_id": local_node_id,
+                "device_id_assigned": device_id_assigned,
+                "assignment_status": assignment_status,
+                "saved_role_code": saved_role_code,
+                "assigned_role": assigned_role,
+                "role_persisted": bool((_u8_at(payload, 7) or 0) & 0x20),
                 "active_status_count": _u8_at(payload, 5),
                 "total_devices": _u8_at(payload, 6),
                 "flags": _u8_at(payload, 7),
                 "sync_seen_mask": sync_seen_mask,
+                "sync_seen_mask_hex": f"0x{sync_seen_mask:08X}",
                 "display_value": _u8_at(payload, 12),
                 "local_status_flags": local_status,
+                "local_status_raw": assignment_status,
                 "sync_age_ds": _u16_at(payload, 14),
+                "raw_payload_hex": bytes(payload).hex(),
+                "raw_packet_hex": bs.hex(),
             }
             local = _status_byte_fields(local_status, "Local")
+            try:
+                local_sync_active = bool(local.get("optic_active", False))
+                local["optic_active_sync"] = local_sync_active
+                local["optic_indication_allow_sync"] = local_sync_active
+                local.pop("optic_active", None)
+                local.pop("optic_indication_allow", None)
+            except Exception:
+                pass
+            try:
+                local_node_id = int(sync.get("local_node_id", 0) or 0)
+                if device_id_assigned and 0 <= local_node_id <= 31:
+                    local["node_id"] = local_node_id
+                    local["device_id_assigned"] = True
+            except Exception:
+                pass
             patch["sync"] = sync
             patch["events"] = {"sync_state": sync}
             patch["sensors"] = {"local": local}
@@ -1874,7 +2706,150 @@ class USBStream:
                 "tx_drop_recovery_count": _u32_at(payload, 12),
             }
             patch["events"] = {"error_state": err}
+        elif event_type == 0x14 and len(payload) >= 40:
+            payload_version = _u8_at(payload, 0) or 0
+            local_node_id = _u8_at(payload, 1) or 0
+            flags = _u8_at(payload, 2) or 0
+            node_count = _u8_at(payload, 3) or 0
+            seen_mask = _u32_at(payload, 4) or 0
+            id_assigned = bool(flags & 0x01)
+            local_master = bool(flags & 0x02)
+            valid = bool(
+                payload_version == 1
+                and 0 <= local_node_id <= 31
+                and node_count == int(seen_mask).bit_count()
+                and (not id_assigned or bool(seen_mask & (1 << local_node_id)))
+            )
+            now = time.time()
+            local = {}
+            remote = []
+            if valid:
+                for node_id in range(32):
+                    if not bool(seen_mask & (1 << node_id)):
+                        continue
+                    item = _status_byte_fields(
+                        int(payload[8 + node_id]) & 0xFF,
+                        "Local" if id_assigned and node_id == local_node_id else f"Node {node_id}",
+                        node_id,
+                    )
+                    if (int(payload[8 + node_id]) & 0x1F) != node_id:
+                        valid = False
+                        local = {}
+                        remote = []
+                        break
+                    item.update({
+                        "seen": True,
+                        "recent": True,
+                        "online": True,
+                        "packet_validated": True,
+                        "optic_active_raw": bool(item.get("optic_active")),
+                        "optic_active_physical": bool(item.get("optic_active")),
+                        "source": "evt1_sensor_map",
+                        "sensor_updated_at": now,
+                        "sensor_updated_iso": time.strftime(
+                            "%Y-%m-%dT%H:%M:%S%z",
+                            time.localtime(now),
+                        ),
+                    })
+                    if id_assigned and node_id == local_node_id:
+                        item["local"] = True
+                        item["master"] = local_master
+                        local = item
+                    else:
+                        item["local"] = False
+                        remote.append(item)
+            sensor_map = {
+                "payload_version": payload_version,
+                "local_node_id": local_node_id,
+                "device_id": local_node_id,
+                "device_id_assigned": id_assigned,
+                "local_master": local_master,
+                "node_count": node_count,
+                "sync_seen_mask": seen_mask,
+                "sync_seen_mask_hex": f"0x{seen_mask:08X}",
+                "valid": valid,
+                "raw_payload_hex": bytes(payload).hex(),
+                "raw_packet_hex": bs.hex(),
+            }
+            patch["events"] = {"sensor_map": sensor_map}
+            patch["sync"] = {
+                "sync_seen_mask": seen_mask if valid else 0,
+                "sync_seen_mask_hex": f"0x{seen_mask if valid else 0:08X}",
+                "active_status_count": node_count if valid else 0,
+                "total_devices": node_count if valid else 0,
+                "sensor_map_valid": valid,
+            }
+            patch["sensors"] = {
+                "local": local,
+                "remote": remote,
+                "remote_count": len(remote),
+                "remote_updated_at": now,
+                "remote_valid": valid,
+                "remote_validation": "evt1_sensor_map" if valid else "evt1_sensor_map_invalid",
+                "remote_seen_mask": seen_mask if valid else 0,
+            }
         return patch
+
+    def _evt1_payload_sane(self, packet: bytes) -> bool:
+        try:
+            bs = bytes(packet or b"")
+            if len(bs) < 16 or bs[:4] != b"EVT1":
+                return False
+            event_type = int(bs[5]) & 0xFF
+            payload_len = int.from_bytes(bs[6:8], "little")
+            expected_len = EVT1_PAYLOAD_LENGTHS.get(event_type)
+            if expected_len is None or payload_len != expected_len or len(bs) != 16 + expected_len:
+                return False
+            payload = bs[16:]
+            payload_version = int(payload[0]) & 0xFF if payload else 0
+            if payload_version == 0 or payload_version > 10:
+                return False
+            if event_type == 0x11:
+                raw_mode = int(payload[1]) & 0xFF
+                display_char = int(payload[3]) & 0xFF
+                local_node = int(payload[4]) & 0xFF
+                active_count = int(payload[5]) & 0xFF
+                total_devices = int(payload[6]) & 0xFF
+                display_value = int(payload[12]) & 0xFF
+                if raw_mode not in (0, 1, 2):
+                    return False
+                if display_char not in (0, ord("M"), ord("S"), ord("O")):
+                    return False
+                if local_node > 31 or active_count > 31 or total_devices > 32 or display_value > 31:
+                    return False
+            elif event_type == 0x14:
+                local_node = int(payload[1]) & 0xFF
+                flags = int(payload[2]) & 0xFF
+                node_count = int(payload[3]) & 0xFF
+                seen_mask = int.from_bytes(payload[4:8], "little")
+                if local_node > 31 or node_count > 32 or node_count != seen_mask.bit_count():
+                    return False
+                if bool(flags & 0x01) and not bool(seen_mask & (1 << local_node)):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _stat_packet_sane(self, packet: bytes) -> bool:
+        try:
+            bs = bytes(packet or b"")
+            if len(bs) < STAT_PACKET_MIN_LEN or bs[:4] != b"STAT":
+                return False
+            expected_len = _stat_packet_len_from_header(bs)
+            if len(bs) != expected_len:
+                return False
+            version = _u8_at(bs, 4) or 0
+            cur_samples = _u16_at(bs, 6) or 0
+            frame_bytes = _u16_at(bs, 8) or 0
+            if version <= 0 or version > 10:
+                return False
+            if cur_samples <= 0 or cur_samples > 8192:
+                return False
+            if frame_bytes <= 0 or frame_bytes > 65535:
+                return False
+            return True
+        except Exception:
+            return False
 
     def _service_next_known(self, mv, off: int, end: int) -> bool:
         if off >= end:
@@ -1895,22 +2870,29 @@ class USBStream:
             if pos + 4 <= end and bytes(mv[pos:pos + 4]) == b"EVT1":
                 if pos + 16 > end:
                     return None
+                event_type = int(mv[pos + 5]) & 0xFF
                 payload_len = int.from_bytes(bytes(mv[pos + 6:pos + 8]), "little")
+                expected_len = EVT1_PAYLOAD_LENGTHS.get(event_type)
+                if expected_len is None or payload_len != expected_len:
+                    return -1
                 total = 16 + payload_len
-                if total >= 16 and pos + total <= end:
+                if pos + total <= end:
+                    packet = bytes(mv[pos:pos + total])
+                    if not self._evt1_payload_sane(packet):
+                        return -1
                     return total
                 return None
             if pos + 4 <= end and bytes(mv[pos:pos + 4]) == b"STAT":
+                if pos + 5 > end:
+                    return None
+                packet_len = _stat_packet_len_from_header(mv, pos)
                 rem = end - pos
-                for stat_len in (136, 112, 64):
-                    if rem >= stat_len and self._service_next_known(mv, pos + stat_len, end):
-                        return stat_len
-                if 64 <= rem <= 192:
-                    return rem
-                if rem >= 136:
-                    return 136
-                if rem >= 64:
-                    return 64
+                if rem < packet_len:
+                    return None
+                packet = bytes(mv[pos:pos + packet_len])
+                if not self._stat_packet_sane(packet):
+                    return -1
+                return packet_len
             if pos < end and int(mv[pos]) == 0x31 and (end - pos) <= 16:
                 return end - pos
         except Exception:
@@ -2072,7 +3054,7 @@ class USBStream:
                                     time.sleep(0.02)
                                 except Exception:
                                     pass
-                            self.send_cmd(CMD_START_STREAM, b""); time.sleep(0.02)
+                            self._start_stream_with_tx(reason="gentle_restart"); time.sleep(0.02)
                             # После рестарта устаревшие данные в buf — мусор.
                             # Запрашиваем очистку в начале следующей итерации.
                             self._rx_flush_requested = True
@@ -2120,8 +3102,11 @@ class USBStream:
                 n = len(mv)
                 while pos < n:
                     pkt_len = self._service_packet_len(mv, pos, n)
-                    if not pkt_len:
+                    if pkt_len is None:
                         break
+                    if pkt_len <= 0:
+                        pos += 1
+                        continue
                     self._handle_service_packet(bytes(mv[pos:pos + pkt_len]))
                     pos += int(pkt_len)
                 if pos < n:
@@ -2133,11 +3118,15 @@ class USBStream:
                 if (len(buf) >= 4 and bytes(buf[:4]) in (b"STAT", b"EVT1")) or (buf and buf[0] == 0x31 and len(buf) <= 16):
                     buf_view = memoryview(bytes(buf))
                     pkt_len = self._service_packet_len(buf_view, 0, len(buf_view))
+                    if pkt_len is None:
+                        break
+                    if pkt_len <= 0:
+                        del buf[0]
+                        continue
                     if pkt_len:
                         self._handle_service_packet(bytes(buf[:pkt_len]))
                         del buf[:pkt_len]
                         continue
-                    break
                 if len(buf) < HDR_SIZE:
                     idx = self._find_next_known_packet(buf)
                     if idx > 0:
@@ -2264,7 +3253,7 @@ class USBStream:
                             except Exception:
                                 pass
                             try:
-                                self.send_cmd(CMD_START_STREAM, b""); time.sleep(0.02)
+                                self._start_stream_with_tx(reason="rate_mismatch"); time.sleep(0.02)
                             except Exception:
                                 pass
                 except Exception:
@@ -2601,6 +3590,52 @@ class USBStream:
                     except Exception:
                         pass
                     self.frames = 0; self.bytes = 0; self.stat_t = now
+
+    def _live_drop_old_frames_enabled(self) -> bool:
+        try:
+            return str(os.getenv("BMI30_LIVE_DROP_OLD_FRAMES", "1")).strip().lower() not in ("0", "false", "no", "off")
+        except Exception:
+            return True
+
+    def _live_queue_target(self) -> int:
+        try:
+            return max(1, int(os.getenv("BMI30_LIVE_QUEUE_TARGET", "4")))
+        except Exception:
+            return 4
+
+    def _live_queue_drain_max(self) -> int:
+        try:
+            return max(1, int(os.getenv("BMI30_LIVE_QUEUE_DRAIN_MAX", "512")))
+        except Exception:
+            return 512
+
+    def _trim_live_queue(self, q, drop_attr: str | None = None) -> int:
+        if q is None or not self._live_drop_old_frames_enabled():
+            return 0
+        try:
+            extra = int(q.qsize()) - int(self._live_queue_target())
+        except Exception:
+            return 0
+        if extra <= 0:
+            return 0
+        dropped = 0
+        limit = min(extra, self._live_queue_drain_max())
+        for _ in range(limit):
+            try:
+                q.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                break
+            except Exception:
+                break
+        if dropped and drop_attr:
+            try:
+                asm = getattr(self, "asm", None)
+                setattr(asm, drop_attr, int(getattr(asm, drop_attr, 0) or 0) + dropped)
+            except Exception:
+                pass
+        return dropped
+
     def get_stereo(self, timeout=0.0):
         try:
             if getattr(self.asm, 'independent', False):
@@ -2631,6 +3666,11 @@ class USBStream:
 
                 first = ('A', getattr(self.asm, 'qA', None)) if rr == 0 else ('B', getattr(self.asm, 'qB', None))
                 second = ('B', getattr(self.asm, 'qB', None)) if rr == 0 else ('A', getattr(self.asm, 'qA', None))
+                try:
+                    self._trim_live_queue(getattr(self.asm, 'qA', None), 'drop_a')
+                    self._trim_live_queue(getattr(self.asm, 'qB', None), 'drop_b')
+                except Exception:
+                    pass
                 # Fast path: check both queues without blocking first.
                 # This avoids spending the whole timeout on an empty preferred queue
                 # while data is already waiting in the other queue.
@@ -2661,6 +3701,10 @@ class USBStream:
                     rem = _remaining()
                 return None
             else:
+                try:
+                    self._trim_live_queue(getattr(self.asm, 'q', None), 'drop_pairs')
+                except Exception:
+                    pass
                 return self.asm.q.get(timeout=timeout)
         except queue.Empty:
             return None
@@ -2674,8 +3718,16 @@ class USBStream:
             if not getattr(self.asm, 'independent', False):
                 return None
             if int(adc_id) == 0:
+                try:
+                    self._trim_live_queue(getattr(self.asm, 'qA', None), 'drop_a')
+                except Exception:
+                    pass
                 return self.asm.qA.get(timeout=timeout)
             else:
+                try:
+                    self._trim_live_queue(getattr(self.asm, 'qB', None), 'drop_b')
+                except Exception:
+                    pass
                 return self.asm.qB.get(timeout=timeout)
         except queue.Empty:
             return None
@@ -2902,7 +3954,7 @@ if __name__=='__main__':
                         async_mode = 0
                     us.send_cmd(CMD_ASYNC, bytes([async_mode]))
                     time.sleep(0.02)
-                    us.send_cmd(CMD_START_STREAM, b"")
+                    us.start_stream()
                     time.sleep(0.05)
                     print(f'[demo] LOSSLESS_ROI enabled: windows({roi_start},{roi_len},0,0) stream_mode=1 async={async_mode}', flush=True)
                 else:
@@ -2918,7 +3970,7 @@ if __name__=='__main__':
                         async_mode = 1
                     us.send_cmd(CMD_ASYNC, bytes([async_mode]))
                     time.sleep(0.02)
-                    us.send_cmd(CMD_START_STREAM, b"")
+                    us.start_stream()
                     time.sleep(0.05)
                     print(f'[demo] LATEST enabled: windows(0,0,0,0) stream_mode=0 async={async_mode}', flush=True)
         except Exception as e:

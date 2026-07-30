@@ -14,6 +14,12 @@ CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/backup_to_cloud.conf}"
 UPDATE_ON_CALENDAR="${UPDATE_ON_CALENDAR:-*-*-* 23:00:00}"
 ON_CALENDAR="${ON_CALENDAR:-}"
 PRE_UPDATE_SNAPSHOT="${PRE_UPDATE_SNAPSHOT:-1}"
+PRE_UPDATE_RETENTION_COUNT="${PRE_UPDATE_RETENTION_COUNT:-3}"
+INCOMING_RETENTION_COUNT="${INCOMING_RETENTION_COUNT:-2}"
+RESTART_AFTER_UPDATE="${RESTART_AFTER_UPDATE:-1}"
+BMI30_CORE_SERVICE="${BMI30_CORE_SERVICE:-bmi30-core.service}"
+BMI30_PORTAL_SERVICE="${BMI30_PORTAL_SERVICE:-bmi30-hotspot-info.service}"
+BMI30_PORTAL_DST="${BMI30_PORTAL_DST:-/usr/local/bin/bmi30-hotspot-info-server.py}"
 COMMON_LIB="$SCRIPT_DIR/cloud_sync_common.sh"
 
 if [[ -f "$COMMON_LIB" ]]; then
@@ -30,6 +36,7 @@ FORCE_UPDATE=0
 REQUIRE_TODAY=0
 
 APPLY_TEMP_DIR=""
+PREVIOUS_ACTIVE_ENV_BACKUP=""
 
 usage() {
     cat <<'EOF'
@@ -45,6 +52,7 @@ Options:
   --on-calendar <expr>       Timer schedule (default: *-*-* 23:00:00)
   --config <path>            Config file (default: ./utilities/backup_to_cloud.conf)
   --today-only               Update only from an archive published today
+  --no-restart               Do not restart BMI30 runtime after applying an update
   --force                    Apply latest cloud archive even if signatures match
   --dry-run                  Show actions without changing files
   -h, --help                 Show this help
@@ -129,6 +137,8 @@ validate_settings() {
     [[ -n "$REMOTE_TARGET" ]] || fail "REMOTE_TARGET не задан"
     command -v rclone >/dev/null 2>&1 || fail "rclone не установлен"
     command -v rsync >/dev/null 2>&1 || fail "rsync не установлен"
+    [[ "$PRE_UPDATE_RETENTION_COUNT" =~ ^[0-9]+$ ]] || fail "PRE_UPDATE_RETENTION_COUNT должен быть целым числом"
+    [[ "$INCOMING_RETENTION_COUNT" =~ ^[0-9]+$ ]] || fail "INCOMING_RETENTION_COUNT должен быть целым числом"
 }
 
 install_user_timer() {
@@ -145,7 +155,7 @@ install_user_timer() {
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
         log "[dry-run] Сгенерировал бы unit-файлы: $service_file и $timer_file"
-        log "[dry-run] Service: ExecStart=$script_path --today-only, CONFIG_FILE=$config_abs"
+        log "[dry-run] Service: ExecStart=$script_path, CONFIG_FILE=$config_abs"
         log "[dry-run] Timer: OnCalendar=$ON_CALENDAR"
         return
     fi
@@ -154,19 +164,19 @@ install_user_timer() {
 
     cat > "$service_file" <<EOF
 [Unit]
-Description=BMI30 cloud project update
+Description=BMI30 cloud firmware update
 
 [Service]
 Type=oneshot
 WorkingDirectory=$WORKSPACE_DIR
 Environment=CONFIG_FILE=$config_abs
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=$script_path --today-only
+ExecStart=$script_path
 EOF
 
     cat > "$timer_file" <<EOF
 [Unit]
-Description=Update BMI30 project from latest cloud archive
+Description=Install latest BMI30 firmware release
 
 [Timer]
 OnCalendar=$ON_CALENDAR
@@ -229,6 +239,10 @@ parse_args() {
                 REQUIRE_TODAY=1
                 shift
                 ;;
+            --no-restart)
+                RESTART_AFTER_UPDATE=0
+                shift
+                ;;
             --dry-run)
                 DRY_RUN=1
                 shift
@@ -285,13 +299,13 @@ download_latest_marker() {
 
 load_latest_marker() {
     local marker_path="$1"
-    unset ARCHIVE_NAME ARCHIVE_SHA256 PROJECT_SIGNATURE PROJECT_CONTENT_SIGNATURE PROJECT_SIGNATURE_VERSION DEVICE_SUFFIX CREATED_AT SOURCE_BASENAME
+    unset RELEASE_KIND ARCHIVE_NAME ARCHIVE_SHA256 PROJECT_SIGNATURE PROJECT_CONTENT_SIGNATURE PROJECT_SIGNATURE_VERSION FIRMWARE_VERSION FIRMWARE_BUNDLE_ID DEVICE_SUFFIX CREATED_AT SOURCE_BASENAME
 
     [[ -f "$marker_path" ]] || fail "Указатель архива не найден: $marker_path"
     # shellcheck source=/dev/null
     source "$marker_path"
 
-    [[ "${ARCHIVE_NAME:-}" == bmi30_backup_*.tar.gz ]] || fail "Некорректное имя архива в $marker_path"
+    [[ "${ARCHIVE_NAME:-}" == bmi30_backup_*.tar.gz || "${ARCHIVE_NAME:-}" == bmi30_firmware_*.tar.gz ]] || fail "Некорректное имя архива в $marker_path"
     [[ "${ARCHIVE_SHA256:-}" =~ ^[0-9a-fA-F]{64}$ ]] || fail "Некорректный SHA-256 архива в $marker_path"
     bmi30_signature_is_valid "${PROJECT_SIGNATURE:-}" || fail "Некорректная совместимая подпись проекта в $marker_path"
     if [[ -n "${PROJECT_CONTENT_SIGNATURE:-}" ]]; then
@@ -308,7 +322,7 @@ marker_is_today() {
 }
 
 create_pre_update_snapshot() {
-    [[ "$PRE_UPDATE_SNAPSHOT" == "1" ]] || return
+    [[ "$PRE_UPDATE_SNAPSHOT" == "1" ]] || return 0
 
     local source_abs source_parent source_name backup_abs archive_path timestamp device_suffix
     local start_ts end_ts elapsed_s archive_bytes
@@ -419,9 +433,27 @@ apply_archive() {
 
     [[ -n "$extracted" && -d "$extracted" ]] || fail "Не удалось найти корень проекта в архиве"
 
+    local archive_bundle_id bundle_dir current_active_env
+    archive_bundle_id="$(bmi30_active_bundle_id "$extracted" || true)"
+    bundle_dir="$extracted/host/bmi30_split_bundles/$archive_bundle_id"
+    if [[ -n "${FIRMWARE_BUNDLE_ID:-}" ]]; then
+        [[ "$archive_bundle_id" == "$FIRMWARE_BUNDLE_ID" ]] \
+            || fail "Bundle ID в архиве не совпадает с marker: ${archive_bundle_id:-<empty>} != $FIRMWARE_BUNDLE_ID"
+        [[ -d "$bundle_dir" ]] || fail "Активный полный bundle отсутствует в firmware-архиве: $FIRMWARE_BUNDLE_ID"
+    elif [[ ! -d "$bundle_dir" ]]; then
+        archive_bundle_id=""
+    fi
+
+    current_active_env="$SOURCE_DIR/host/bmi30_split_active_version.env"
+    if [[ -f "$current_active_env" ]]; then
+        mkdir -p "$STATE_DIR"
+        PREVIOUS_ACTIVE_ENV_BACKUP="$STATE_DIR/active_env.before_update"
+        install -m 0644 "$current_active_env" "$PREVIOUS_ACTIVE_ENV_BACKUP"
+    fi
+
     local -a rsync_args
     rsync_args=(-a --delete)
-    bmi30_add_project_rsync_excludes rsync_args
+    bmi30_add_project_rsync_excludes rsync_args "$archive_bundle_id"
     rsync_args+=("$extracted/" "$SOURCE_DIR/")
     apply_bytes="$(bmi30_dir_size_bytes "$extracted")"
     if ! bmi30_run_timed_copy "Применение архива к проекту" "$apply_bytes" rsync "${rsync_args[@]}"; then
@@ -429,6 +461,349 @@ apply_archive() {
     fi
 
     log "Проект обновлён из облачного архива: $ARCHIVE_NAME"
+}
+
+run_privileged() {
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        "$@"
+        return
+    fi
+    if command -v sudo >/dev/null 2>&1; then
+        if [[ -t 0 && -t 1 ]]; then
+            sudo "$@"
+        else
+            sudo -n "$@"
+        fi
+        return
+    fi
+    return 127
+}
+
+resolve_release_path() {
+    local rel="${1:-}"
+    [[ -n "$rel" ]] || return 1
+
+    if [[ "$rel" = /* ]]; then
+        printf '%s' "$rel"
+    else
+        printf '%s/%s' "$SOURCE_DIR" "$rel"
+    fi
+}
+
+extract_default_engine_file() {
+    local core_file="$1"
+    local engine_file
+    engine_file="$(sed -n -E "s/^[[:space:]]*DEFAULT_ENGINE_FILE[[:space:]]*=.*[\"']([^\"']+)[\"'].*/\1/p" "$core_file" | sed -n '1p')"
+    [[ -n "$engine_file" ]] || return 1
+    if [[ "$engine_file" == */* ]]; then
+        printf '%s' "$engine_file"
+    else
+        printf 'host/%s' "$engine_file"
+    fi
+}
+
+verify_manifest_component() {
+    local label="$1"
+    local manifest_rel="$2"
+    local expected_hash="$3"
+    local active_rel="$4"
+    local path actual_hash
+
+    [[ -n "$manifest_rel" && -n "$expected_hash" ]] || fail "Release manifest не содержит $label path/hash"
+    [[ "$manifest_rel" == "$active_rel" ]] || fail "Release manifest $label path не совпадает с active env: $manifest_rel != $active_rel"
+    path="$(resolve_release_path "$manifest_rel")"
+    [[ -f "$path" ]] || fail "Release manifest $label file не найден: $path"
+    actual_hash="$(sha256sum "$path" | awk '{print $1}')"
+    [[ "${actual_hash,,}" == "${expected_hash,,}" ]] || fail "Release manifest $label SHA-256 не совпадает: $manifest_rel"
+}
+
+verify_firmware_manifest() {
+    local core_rel="$1"
+    local engine_rel="$2"
+    local gui_rel="$3"
+    local portal_rel="$4"
+    local bundle_id="${5:-}"
+    local manifest="$SOURCE_DIR/host/bmi30_firmware_release.env"
+
+    if [[ ! -f "$manifest" ]]; then
+        [[ -z "${FIRMWARE_VERSION:-}" ]] || fail "В marker указана firmware version, но release manifest отсутствует"
+        warn "Release manifest отсутствует: это допустимо только для старого облачного архива"
+        return
+    fi
+
+    unset BMI30_FIRMWARE_VERSION BMI30_FIRMWARE_LABEL BMI30_FIRMWARE_CREATED_AT BMI30_FIRMWARE_BUNDLE_ID
+    unset BMI30_FIRMWARE_CONTENT_SIGNATURE BMI30_FIRMWARE_SIGNATURE_VERSION
+    unset BMI30_FIRMWARE_CORE_PATH BMI30_FIRMWARE_CORE_SHA256
+    unset BMI30_FIRMWARE_ENGINE_PATH BMI30_FIRMWARE_ENGINE_SHA256
+    unset BMI30_FIRMWARE_GUI_PATH BMI30_FIRMWARE_GUI_SHA256
+    unset BMI30_FIRMWARE_PORTAL_PATH BMI30_FIRMWARE_PORTAL_SHA256
+    unset BMI30_FIRMWARE_VENDOR_DOC_PATH BMI30_FIRMWARE_VENDOR_DOC_SHA256
+    unset BMI30_FIRMWARE_HOST_DOC_PATH BMI30_FIRMWARE_HOST_DOC_SHA256
+    # shellcheck source=/dev/null
+    source "$manifest"
+
+    [[ -n "${BMI30_FIRMWARE_VERSION:-}" ]] || fail "Release manifest не содержит BMI30_FIRMWARE_VERSION"
+    if [[ -n "${FIRMWARE_VERSION:-}" ]]; then
+        [[ "$BMI30_FIRMWARE_VERSION" == "$FIRMWARE_VERSION" ]] || fail "Firmware version marker/manifest не совпадает"
+    fi
+    if [[ -n "${PROJECT_CONTENT_SIGNATURE:-}" ]]; then
+        [[ "${BMI30_FIRMWARE_CONTENT_SIGNATURE,,}" == "${PROJECT_CONTENT_SIGNATURE,,}" ]] || fail "Content signature marker/manifest не совпадает"
+    fi
+    if [[ -n "${FIRMWARE_BUNDLE_ID:-}" ]]; then
+        [[ "${BMI30_FIRMWARE_BUNDLE_ID:-}" == "$FIRMWARE_BUNDLE_ID" ]] || fail "Bundle ID marker/manifest не совпадает"
+    fi
+    if [[ -n "${BMI30_FIRMWARE_BUNDLE_ID:-}" ]]; then
+        [[ "$BMI30_FIRMWARE_BUNDLE_ID" == "$bundle_id" ]] || fail "Bundle ID manifest/active env не совпадает"
+    fi
+
+    verify_manifest_component "core" "${BMI30_FIRMWARE_CORE_PATH:-}" "${BMI30_FIRMWARE_CORE_SHA256:-}" "$core_rel"
+    verify_manifest_component "engine" "${BMI30_FIRMWARE_ENGINE_PATH:-}" "${BMI30_FIRMWARE_ENGINE_SHA256:-}" "$engine_rel"
+    verify_manifest_component "GUI" "${BMI30_FIRMWARE_GUI_PATH:-}" "${BMI30_FIRMWARE_GUI_SHA256:-}" "$gui_rel"
+    verify_manifest_component "portal" "${BMI30_FIRMWARE_PORTAL_PATH:-}" "${BMI30_FIRMWARE_PORTAL_SHA256:-}" "$portal_rel"
+    if [[ "${BMI30_FIRMWARE_SIGNATURE_VERSION:-}" =~ ^[0-9]+$ ]] \
+        && (( BMI30_FIRMWARE_SIGNATURE_VERSION >= 5 )); then
+        verify_manifest_component "vendor documentation" \
+            "${BMI30_FIRMWARE_VENDOR_DOC_PATH:-}" "${BMI30_FIRMWARE_VENDOR_DOC_SHA256:-}" \
+            "host/README_VENDOR_HOST.md"
+        verify_manifest_component "host documentation" \
+            "${BMI30_FIRMWARE_HOST_DOC_PATH:-}" "${BMI30_FIRMWARE_HOST_DOC_SHA256:-}" \
+            "host/HOST_RPI.md"
+    fi
+    log "Release manifest проверен: $BMI30_FIRMWARE_VERSION"
+}
+
+verify_active_release_files() {
+    local active_env bundle_id core_rel gui_rel portal_rel engine_rel
+    local core_path gui_path portal_path engine_path missing
+
+    active_env="$SOURCE_DIR/host/bmi30_split_active_version.env"
+    [[ -f "$active_env" ]] || fail "Активный websplit env не найден после обновления: $active_env"
+
+    unset BMI30_SPLIT_BUNDLE_ID BMI30_CORE_PATH BMI30_GUI_PATH BMI30_PORTAL_PATH BMI30_ENGINE_SOURCE
+    # shellcheck source=/dev/null
+    source "$active_env"
+
+    bundle_id="${BMI30_SPLIT_BUNDLE_ID:-}"
+    core_rel="${BMI30_CORE_PATH:-}"
+    gui_rel="${BMI30_GUI_PATH:-}"
+    portal_rel="${BMI30_PORTAL_PATH:-}"
+    engine_rel="${BMI30_ENGINE_SOURCE:-}"
+
+    missing=0
+
+    if ! core_path="$(resolve_release_path "$core_rel")" || [[ ! -f "$core_path" ]]; then
+        warn "Core file из активной прошивки не найден: ${core_rel:-<empty>}"
+        missing=1
+    fi
+    if ! gui_path="$(resolve_release_path "$gui_rel")" || [[ ! -f "$gui_path" ]]; then
+        warn "GUI file из активной прошивки не найден: ${gui_rel:-<empty>}"
+        missing=1
+    fi
+    if ! portal_path="$(resolve_release_path "$portal_rel")" || [[ ! -f "$portal_path" ]]; then
+        warn "Portal file из активной прошивки не найден: ${portal_rel:-<empty>}"
+        missing=1
+    fi
+
+    if [[ -z "$engine_rel" && -n "${core_path:-}" && -f "$core_path" ]]; then
+        engine_rel="$(extract_default_engine_file "$core_path" || true)"
+    fi
+    if ! engine_path="$(resolve_release_path "$engine_rel")" || [[ ! -f "$engine_path" ]]; then
+        warn "Engine file из активной прошивки не найден: ${engine_rel:-<empty>}"
+        missing=1
+    fi
+
+    [[ "$missing" -eq 0 ]] || fail "Release неполный: не все активные websplit-файлы доступны"
+
+    verify_firmware_manifest "$core_rel" "$engine_rel" "$gui_rel" "$portal_rel" "$bundle_id"
+
+    log "Активная прошивка проверена: core=$(basename -- "$core_path"), engine=$(basename -- "$engine_path")"
+}
+
+active_runtime_matches_release() {
+    local active_env manifest core_path engine_path gui_path portal_path runtime_manifest
+    active_env="$SOURCE_DIR/host/bmi30_split_active_version.env"
+    manifest="$SOURCE_DIR/host/bmi30_firmware_release.env"
+    [[ -f "$active_env" && -f "$manifest" ]] || return 1
+
+    unset BMI30_FIRMWARE_VERSION BMI30_FIRMWARE_BUNDLE_ID
+    unset BMI30_FIRMWARE_CORE_PATH BMI30_FIRMWARE_CORE_SHA256
+    unset BMI30_FIRMWARE_ENGINE_PATH BMI30_FIRMWARE_ENGINE_SHA256
+    unset BMI30_FIRMWARE_GUI_PATH BMI30_FIRMWARE_GUI_SHA256
+    unset BMI30_FIRMWARE_PORTAL_PATH BMI30_FIRMWARE_PORTAL_SHA256
+    # shellcheck source=/dev/null
+    source "$manifest"
+    [[ -n "${BMI30_FIRMWARE_VERSION:-}" ]] || return 1
+    [[ -z "${FIRMWARE_VERSION:-}" || "$BMI30_FIRMWARE_VERSION" == "$FIRMWARE_VERSION" ]] || return 1
+
+    unset BMI30_SPLIT_BUNDLE_ID BMI30_CORE_PATH BMI30_ENGINE_SOURCE BMI30_GUI_PATH BMI30_PORTAL_PATH BMI30_FIRMWARE_MANIFEST
+    # shellcheck source=/dev/null
+    source "$active_env"
+    [[ -z "${BMI30_FIRMWARE_BUNDLE_ID:-}" || "${BMI30_SPLIT_BUNDLE_ID:-}" == "$BMI30_FIRMWARE_BUNDLE_ID" ]] || return 1
+
+    core_path="$(resolve_release_path "${BMI30_CORE_PATH:-}")" || return 1
+    engine_path="$(resolve_release_path "${BMI30_ENGINE_SOURCE:-}")" || return 1
+    gui_path="$(resolve_release_path "${BMI30_GUI_PATH:-}")" || return 1
+    portal_path="$(resolve_release_path "${BMI30_PORTAL_PATH:-}")" || return 1
+    [[ -f "$core_path" && -f "$engine_path" && -f "$gui_path" && -f "$portal_path" ]] || return 1
+    [[ "$(sha256sum "$core_path" | awk '{print $1}')" == "${BMI30_FIRMWARE_CORE_SHA256:-}" ]] || return 1
+    [[ "$(sha256sum "$engine_path" | awk '{print $1}')" == "${BMI30_FIRMWARE_ENGINE_SHA256:-}" ]] || return 1
+    [[ "$(sha256sum "$gui_path" | awk '{print $1}')" == "${BMI30_FIRMWARE_GUI_SHA256:-}" ]] || return 1
+    [[ "$(sha256sum "$portal_path" | awk '{print $1}')" == "${BMI30_FIRMWARE_PORTAL_SHA256:-}" ]] || return 1
+
+    runtime_manifest="${BMI30_FIRMWARE_MANIFEST:-}"
+    [[ -n "$runtime_manifest" ]] || return 1
+    [[ "$runtime_manifest" = /* ]] || runtime_manifest="$SOURCE_DIR/$runtime_manifest"
+    [[ -f "$runtime_manifest" ]] || return 1
+    cmp -s "$manifest" "$runtime_manifest" || return 1
+    [[ -f "$BMI30_PORTAL_DST" ]] || return 1
+    cmp -s "$portal_path" "$BMI30_PORTAL_DST" || return 1
+    [[ "$(systemctl is-active "$BMI30_CORE_SERVICE" 2>/dev/null || true)" == "active" ]] || return 1
+    [[ "$(systemctl is-active "$BMI30_PORTAL_SERVICE" 2>/dev/null || true)" == "active" ]] || return 1
+}
+
+install_systemd_units_after_update() {
+    local unit_dir unit dst installed
+    unit_dir="$SOURCE_DIR/ops/systemd"
+    [[ -d "$unit_dir" ]] || return 0
+
+    installed=0
+    for unit in "$unit_dir"/*.service "$unit_dir"/*.timer; do
+        [[ -f "$unit" ]] || continue
+        dst="/etc/systemd/system/$(basename -- "$unit")"
+        if run_privileged install -m 644 "$unit" "$dst"; then
+            log "Systemd unit обновлён: $dst"
+            installed=1
+        else
+            warn "Не удалось установить systemd unit: $unit -> $dst"
+            warn "Проверь sudo/NOPASSWD или запусти: sudo install -m 644 \"$unit\" \"$dst\""
+        fi
+    done
+
+    if [[ "$installed" -eq 1 ]]; then
+        if run_privileged systemctl daemon-reload; then
+            log "systemd daemon-reload выполнен"
+        else
+            warn "Не удалось выполнить systemctl daemon-reload"
+        fi
+    fi
+}
+
+enforce_cloud_timer_policy() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if ! systemctl --user list-unit-files >/dev/null 2>&1; then
+        warn "systemd --user недоступен: политика cloud-таймеров не изменена"
+        return 0
+    fi
+
+    if install_user_timer; then
+        log "Автоматическая проверка и установка последнего release включена"
+    else
+        warn "Не удалось обновить user timer автоматической установки"
+    fi
+
+    if [[ -f "$HOME/.config/systemd/user/bmi30-cloud-backup.timer" ]]; then
+        if systemctl --user disable --now bmi30-cloud-backup.timer >/dev/null 2>&1; then
+            log "Автоматическая публикация отключена; выпуск release остаётся ручным"
+        else
+            warn "Не удалось отключить bmi30-cloud-backup.timer"
+        fi
+    fi
+    return 0
+}
+
+restart_runtime_after_update() {
+    [[ "$RESTART_AFTER_UPDATE" == "1" ]] || return 0
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        log "[dry-run] Активировал бы полный release bundle, проверил manifest и службы $BMI30_CORE_SERVICE / $BMI30_PORTAL_SERVICE"
+        return
+    fi
+
+    install_systemd_units_after_update
+
+    local active_env bundle_id switcher release_manifest
+    active_env="$SOURCE_DIR/host/bmi30_split_active_version.env"
+    bundle_id="$(bmi30_active_bundle_id "$(cd -- "$SOURCE_DIR" && pwd)" || true)"
+    switcher="$SOURCE_DIR/switch_bmi30_split_versions.sh"
+    release_manifest="$SOURCE_DIR/host/bmi30_firmware_release.env"
+
+    if [[ -n "$bundle_id" ]]; then
+        [[ -d "$SOURCE_DIR/host/bmi30_split_bundles/$bundle_id" ]] \
+            || fail "Release bundle не установлен в проект: $bundle_id"
+        [[ -x "$switcher" ]] || fail "Переключатель полного runtime не найден: $switcher"
+        [[ -f "$release_manifest" ]] || fail "Release manifest не найден перед активацией: $release_manifest"
+        log "Активирую полный runtime bundle из облачного release: $bundle_id"
+        if ! BMI30_ACTIVATE_PRESERVE_CONFIG=1 \
+            BMI30_RELEASE_MANIFEST_OVERRIDE="$release_manifest" \
+            BMI30_PREVIOUS_ACTIVE_ENV_OVERRIDE="$PREVIOUS_ACTIVE_ENV_BACKUP" \
+            BMI30_SPLIT_SELECTED_BY_OVERRIDE=cloud-update \
+            "$switcher" --activate "$bundle_id"
+        then
+            fail "Не удалось активировать полный runtime bundle: $bundle_id"
+        fi
+        verify_active_release_files
+        active_runtime_matches_release || fail "Активированный runtime не совпадает с облачным release"
+        enforce_cloud_timer_policy
+        log "Облачный release активирован и отвечает: $bundle_id"
+        return
+    fi
+
+    verify_active_release_files
+
+    local portal_src portal_rel
+    portal_src="${BMI30_PORTAL_SRC:-}"
+
+    if [[ -f "$active_env" ]]; then
+        unset BMI30_PORTAL_PATH
+        # shellcheck source=/dev/null
+        source "$active_env"
+        portal_rel="${BMI30_PORTAL_PATH:-}"
+        if [[ -n "$portal_rel" ]]; then
+            if [[ "$portal_rel" = /* ]]; then
+                portal_src="$portal_rel"
+            else
+                portal_src="$SOURCE_DIR/$portal_rel"
+            fi
+        fi
+    fi
+
+    if [[ -z "$portal_src" ]]; then
+        portal_src="$SOURCE_DIR/hotspot_info_server.py"
+    fi
+
+    if [[ -f "$portal_src" ]]; then
+        if run_privileged install -p -m 755 "$portal_src" "$BMI30_PORTAL_DST"; then
+            log "Portal runtime copy обновлена: $BMI30_PORTAL_DST"
+            local portal_src_hash portal_dst_hash
+            portal_src_hash="$(sha256sum "$portal_src" | awk '{print $1}')"
+            portal_dst_hash="$(sha256sum "$BMI30_PORTAL_DST" 2>/dev/null | awk '{print $1}')"
+            [[ -n "$portal_dst_hash" && "${portal_src_hash,,}" == "${portal_dst_hash,,}" ]] \
+                || fail "Установленная portal runtime copy не совпадает с release source"
+        else
+            warn "Не удалось установить portal runtime copy: $portal_src -> $BMI30_PORTAL_DST"
+            warn "Проверь sudo/NOPASSWD или запусти: sudo install -m 755 \"$portal_src\" \"$BMI30_PORTAL_DST\""
+        fi
+    else
+        warn "Portal source не найден, runtime copy не обновлена: $portal_src"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if run_privileged systemctl restart "$BMI30_CORE_SERVICE"; then
+            log "Перезапущен сервис: $BMI30_CORE_SERVICE"
+        else
+            warn "Не удалось перезапустить $BMI30_CORE_SERVICE"
+            warn "Проверь sudo/NOPASSWD или запусти: sudo systemctl restart $BMI30_CORE_SERVICE"
+        fi
+
+        if run_privileged systemctl restart "$BMI30_PORTAL_SERVICE"; then
+            log "Перезапущен сервис: $BMI30_PORTAL_SERVICE"
+        else
+            warn "Не удалось перезапустить $BMI30_PORTAL_SERVICE"
+            warn "Проверь sudo/NOPASSWD или запусти: sudo systemctl restart $BMI30_PORTAL_SERVICE"
+        fi
+    else
+        warn "systemctl недоступен, runtime после обновления не перезапущен"
+    fi
 }
 
 write_update_state() {
@@ -439,9 +814,12 @@ write_update_state() {
     mkdir -p "$STATE_DIR"
 
     {
+        printf 'RELEASE_KIND=%q\n' "${RELEASE_KIND:-firmware}"
         printf 'REMOTE_PROJECT_SIGNATURE=%q\n' "$PROJECT_SIGNATURE"
         printf 'REMOTE_PROJECT_CONTENT_SIGNATURE=%q\n' "${PROJECT_CONTENT_SIGNATURE:-$local_content_signature}"
         printf 'PROJECT_SIGNATURE_VERSION=%q\n' "${PROJECT_SIGNATURE_VERSION:-legacy}"
+        printf 'FIRMWARE_VERSION=%q\n' "${FIRMWARE_VERSION:-}"
+        printf 'FIRMWARE_BUNDLE_ID=%q\n' "${FIRMWARE_BUNDLE_ID:-}"
         printf 'ARCHIVE_NAME=%q\n' "$ARCHIVE_NAME"
         printf 'ARCHIVE_SHA256=%q\n' "$ARCHIVE_SHA256"
         printf 'REMOTE_DEVICE_SUFFIX=%q\n' "${DEVICE_SUFFIX:-}"
@@ -450,14 +828,43 @@ write_update_state() {
     } > "$update_state"
 
     {
+        printf 'RELEASE_KIND=%q\n' "${RELEASE_KIND:-firmware}"
         printf 'PROJECT_SIGNATURE=%q\n' "$PROJECT_SIGNATURE"
         printf 'PROJECT_CONTENT_SIGNATURE=%q\n' "${PROJECT_CONTENT_SIGNATURE:-$local_content_signature}"
         printf 'PROJECT_SIGNATURE_VERSION=%q\n' "${PROJECT_SIGNATURE_VERSION:-legacy}"
+        printf 'FIRMWARE_VERSION=%q\n' "${FIRMWARE_VERSION:-}"
+        printf 'FIRMWARE_BUNDLE_ID=%q\n' "${FIRMWARE_BUNDLE_ID:-}"
         printf 'ARCHIVE_NAME=%q\n' "$ARCHIVE_NAME"
         printf 'ARCHIVE_SHA256=%q\n' "$ARCHIVE_SHA256"
         printf 'DEVICE_SUFFIX=%q\n' "$(detect_serial_suffix)"
         printf 'PUBLISHED_AT=%q\n' "${CREATED_AT:-}"
     } > "$publish_state"
+}
+
+prune_files_by_count() {
+    local directory="$1"
+    local keep_count="$2"
+    shift 2
+    [[ -d "$directory" ]] || return 0
+
+    local count=0 file
+    while IFS= read -r file; do
+        count=$((count + 1))
+        if (( count > keep_count )); then
+            rm -f -- "$file"
+        fi
+    done < <(
+        find "$directory" -maxdepth 1 -type f \( "$@" \) -printf '%T@ %p\n' \
+            | sort -nr \
+            | sed -E 's/^[^ ]+ //'
+    )
+}
+
+cleanup_update_artifacts() {
+    prune_files_by_count "$BACKUP_ROOT" "$PRE_UPDATE_RETENTION_COUNT" \
+        -name 'pre_update_*.tar.gz'
+    prune_files_by_count "$STATE_DIR/incoming" "$INCOMING_RETENTION_COUNT" \
+        -name 'bmi30_backup_*.tar.gz' -o -name 'bmi30_firmware_*.tar.gz'
 }
 
 main() {
@@ -472,12 +879,25 @@ main() {
     validate_settings
 
     local marker_path current_signature archive_path new_signature remote_signature signature_kind
+    local previous_archive previous_archive_hash marker_changed
     marker_path="$(download_latest_marker)"
     load_latest_marker "$marker_path"
 
     if [[ "$REQUIRE_TODAY" -eq 1 ]] && ! marker_is_today; then
-        log "Сегодняшнего облачного архива нет, обновление пропущено: ${CREATED_AT:-unknown}"
-        return
+        local installed_archive=""
+        if [[ -f "$STATE_DIR/update_state.env" ]]; then
+            installed_archive="$(
+                unset ARCHIVE_NAME
+                # shellcheck source=/dev/null
+                source "$STATE_DIR/update_state.env" 2>/dev/null
+                printf '%s' "${ARCHIVE_NAME:-}"
+            )"
+        fi
+        if [[ "$installed_archive" == "$ARCHIVE_NAME" ]]; then
+            log "Сегодняшнего облачного архива нет, уже установленный release оставлен без изменений: ${CREATED_AT:-unknown}"
+            return
+        fi
+        log "Обнаружен ещё не установленный облачный release; продолжаю обновление независимо от даты публикации"
     fi
 
     if [[ -n "${PROJECT_CONTENT_SIGNATURE:-}" ]]; then
@@ -492,7 +912,40 @@ main() {
 
     if [[ "$FORCE_UPDATE" -eq 0 && "${current_signature,,}" == "${remote_signature,,}" ]]; then
         log "Проект уже соответствует последнему облачному архиву: $ARCHIVE_NAME"
-        write_update_state
+        previous_archive=""
+        previous_archive_hash=""
+        if [[ -f "$STATE_DIR/update_state.env" ]]; then
+            previous_archive="$(unset ARCHIVE_NAME; source "$STATE_DIR/update_state.env" 2>/dev/null; printf '%s' "${ARCHIVE_NAME:-}")"
+            previous_archive_hash="$(unset ARCHIVE_SHA256; source "$STATE_DIR/update_state.env" 2>/dev/null; printf '%s' "${ARCHIVE_SHA256:-}")"
+        fi
+        marker_changed=0
+        if [[ "$previous_archive" != "$ARCHIVE_NAME" || "${previous_archive_hash,,}" != "${ARCHIVE_SHA256,,}" ]]; then
+            marker_changed=1
+        fi
+        if [[ "$marker_changed" -eq 1 ]]; then
+            log "Указатель облачного архива изменился при той же подписи; применяю новый release manifest"
+            archive_path="$(download_archive)"
+            apply_archive "$archive_path"
+            if [[ "$DRY_RUN" -eq 1 ]]; then
+                return
+            fi
+            if [[ -n "${PROJECT_CONTENT_SIGNATURE:-}" ]]; then
+                new_signature="$(project_signature)"
+            else
+                new_signature="$(legacy_project_signature)"
+            fi
+            [[ "${new_signature,,}" == "${remote_signature,,}" ]] \
+                || fail "После применения release manifest изменилась подпись проекта"
+            restart_runtime_after_update
+            write_update_state
+        else
+            if [[ "$RESTART_AFTER_UPDATE" == "1" ]] && ! active_runtime_matches_release; then
+                log "Проект обновлён, но active runtime не соответствует release; выполняю активацию"
+                restart_runtime_after_update
+            fi
+            write_update_state
+        fi
+        cleanup_update_artifacts
         return
     fi
 
@@ -517,7 +970,9 @@ main() {
         return 5
     fi
 
+    restart_runtime_after_update
     write_update_state
+    cleanup_update_artifacts
     log "Готово"
 }
 

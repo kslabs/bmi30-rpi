@@ -71,11 +71,16 @@ show_timer_status() {
 printf "BMI30 Cloud Sync Status\n"
 printf "=======================\n\n"
 printf "Config:      %s\n" "$CONFIG_FILE"
-printf "Mode:        dynamic leader by today's project changes\n"
+printf "Mode:        one firmware release; auto update only, publish explicit\n"
 printf "Backup dir:  %s\n" "$BACKUP_ROOT"
 printf "Remote:      %s\n" "${REMOTE_TARGET:-local only}"
 printf "Folder ID:   %s\n" "${REMOTE_FOLDER_ID:-not set}"
 printf "Marker:      %s\n" "${REMOTE_LATEST_FILE:-bmi30_latest.env}"
+printf "Auto publish:%s\n" " ${ALLOW_AUTO_PUBLISH:-0}"
+if [[ -f "$WORKSPACE_DIR/host/bmi30_firmware_release.env" ]]; then
+    firmware_version="$(sed -n -E 's/^BMI30_FIRMWARE_VERSION=(.*)$/\1/p' "$WORKSPACE_DIR/host/bmi30_firmware_release.env" | sed -n '1p')"
+    printf "Firmware:    %s\n" "${firmware_version:-unknown}"
+fi
 printf "\n"
 
 if command -v rclone >/dev/null 2>&1; then
@@ -94,7 +99,7 @@ printf "\n"
 if [[ -d "$BACKUP_ROOT" ]]; then
     printf "Последние локальные архивы:\n"
     find "$BACKUP_ROOT" -maxdepth 1 -type f \
-        \( -name 'bmi30_backup_*.tar.gz' -o -name 'pre_update_*.tar.gz' -o -name '20????????_*.tar.gz' \) \
+        \( -name 'bmi30_backup_*.tar.gz' -o -name 'bmi30_firmware_*.tar.gz' -o -name 'pre_update_*.tar.gz' -o -name '20????????_*.tar.gz' \) \
         -printf '%TY-%Tm-%Td %TH:%TM  %9s  %p\n' 2>/dev/null \
         | sort -r \
         | sed -n '1,8p'
@@ -104,5 +109,5 @@ fi
 
 printf "\n"
 
-show_timer_status "Publish timer 22:00" "$PUBLISH_TIMER_NAME" "$PUBLISH_SERVICE_NAME"
-show_timer_status "Update timer 23:00" "$UPDATE_TIMER_NAME" "$UPDATE_SERVICE_NAME"
+show_timer_status "Publish timer (optional/manual source)" "$PUBLISH_TIMER_NAME" "$PUBLISH_SERVICE_NAME"
+show_timer_status "Update timer" "$UPDATE_TIMER_NAME" "$UPDATE_SERVICE_NAME"

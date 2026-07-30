@@ -8,8 +8,12 @@ TARGET_ROLE=""
 ASSUME_YES=0
 SKIP_EEPROM=0
 SYNC_ONLY=0
+FORCE_FORMAT_AND_RETRY=0
+PAUSE_SOURCE_SERVICES=1
+BMI30_CORE_SERVICE="${BMI30_CORE_SERVICE:-bmi30-core.service}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 WORKSPACE_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+declare -a PAUSED_SOURCE_SERVICES=()
 
 SCRIPT_NAME="$(basename "$0")"
 TOTAL_STEPS=13
@@ -41,15 +45,22 @@ die() {
 usage() {
     cat <<EOF
 Использование:
-  sudo ./$SCRIPT_NAME --source-role internal|usb --target-role internal|usb [--yes] [--skip-eeprom] [--sync-only]
+  sudo ./$SCRIPT_NAME --source-role internal|usb --target-role internal|usb [--yes] [--skip-eeprom] [--sync-only] [--force-format-and-retry] [--no-pause-services]
 
 Скрипт выполняет файловую миграцию системы между eMMC и USB:
   1. Определяет исходный и целевой диски по ролям.
-  2. Перед полным копированием сохраняет изменения проекта в облако.
+  2. Перед полным копированием создаёт локальный safety snapshot проекта.
   3. По умолчанию переразбивает целевой диск.
   4. С флагом --sync-only использует существующие разделы цели без переразметки.
   5. Копирует boot и root через rsync с прогрессом.
+     При копировании живого rootfs временно останавливает bmi30-core.service.
   6. Записывает новые PARTUUID в cmdline.txt и fstab на целевом диске.
+
+Опция --force-format-and-retry предназначена для полного копирования на USB:
+  - ошибки необязательного local snapshot и настройки EEPROM не блокируют копирование;
+  - при первой ошибке rsync USB повторно размечается и форматируется, затем boot/root
+    копируются ещё один раз;
+  - ошибка повторной попытки остаётся фатальной и возвращает ненулевой код.
 
 Примеры:
   sudo ./$SCRIPT_NAME --source-role internal --target-role usb
@@ -76,28 +87,36 @@ require_cmds() {
 }
 
 run_precopy_backup() {
-    local backup_script backup_user user_home
+    local backup_script backup_user user_home manifest
 
     if (( SYNC_ONLY == 1 )); then
-        info "Sync-only режим: pre-copy cloud backup не требуется"
+        info "Sync-only режим: pre-copy local snapshot не требуется"
         return
     fi
 
     backup_script="$SCRIPT_DIR/backup_to_cloud.sh"
     [[ -x "$backup_script" ]] || die "Не найден исполняемый backup-скрипт: $backup_script"
 
-    info "Перед полным копированием проверяю и сохраняю изменения проекта в облако"
+    info "Перед полным копированием создаю локальный safety snapshot проекта"
 
     backup_user="${SUDO_USER:-}"
     if [[ -n "$backup_user" && "$backup_user" != "root" ]]; then
         user_home="$(getent passwd "$backup_user" | awk -F: '{print $6}')"
         [[ -n "$user_home" ]] || die "Не удалось определить HOME пользователя $backup_user"
+        # Backup запускается от имени обычного пользователя. Если release manifest
+        # остался во владении root после прошлого запуска напрямую под root, вернём
+        # его владельцу, иначе перезапись manifest упадёт с Permission denied.
+        manifest="$WORKSPACE_DIR/host/bmi30_firmware_release.env"
+        if [[ -e "$manifest" && "$(stat -c %U "$manifest" 2>/dev/null)" != "$backup_user" ]]; then
+            warn "Manifest $manifest принадлежит не $backup_user, возвращаю владельца"
+            chown "$backup_user" "$manifest" || warn "Не удалось сменить владельца manifest: $manifest"
+        fi
         sudo -u "$backup_user" env \
             HOME="$user_home" \
             CONFIG_FILE="$SCRIPT_DIR/backup_to_cloud.conf" \
-            bash "$backup_script" --if-changed
+            bash "$backup_script" --local-only
     else
-        env CONFIG_FILE="$SCRIPT_DIR/backup_to_cloud.conf" bash "$backup_script" --if-changed
+        env CONFIG_FILE="$SCRIPT_DIR/backup_to_cloud.conf" bash "$backup_script" --local-only
     fi
 }
 
@@ -163,14 +182,29 @@ copy_result_message() {
     local label="$1"
     local bytes="${2:-0}"
     local elapsed_s="${3:-0}"
+    local bytes_label="${4:-объем}"
 
     printf 'Копирование %s: длительность %s, средняя скорость %s' \
         "$label" \
         "$(format_copy_duration "$elapsed_s")" \
         "$(format_copy_rate "$bytes" "$elapsed_s")"
     if [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes > 0 )); then
-        printf ', объем %s' "$(format_copy_bytes "$bytes")"
+        printf ', %s %s' "$bytes_label" "$(format_copy_bytes "$bytes")"
     fi
+}
+
+rsync_result_message() {
+    local label="$1"
+    local expected_bytes="${2:-0}"
+    local elapsed_s="${3:-0}"
+
+    printf 'Копирование %s: длительность %s' \
+        "$label" \
+        "$(format_copy_duration "$elapsed_s")"
+    if [[ "$expected_bytes" =~ ^[0-9]+$ ]] && (( expected_bytes > 0 )); then
+        printf ', оценочный размер источника %s' "$(format_copy_bytes "$expected_bytes")"
+    fi
+    printf ' (rsync передает только отличающиеся данные)'
 }
 
 install_with_copy_stats() {
@@ -214,7 +248,7 @@ run_rsync_with_heartbeat() {
 
         if [[ -n "$used_bytes" ]]; then
             used_human="$(numfmt --to=iec "$used_bytes" 2>/dev/null || printf "%s" "$used_bytes")"
-            info "[heartbeat] $label: процесс активен, прошло ${elapsed}с, занято на цели ${used_human}"
+            info "[heartbeat] $label: процесс активен, прошло ${elapsed}с, всего занято на цели ${used_human}"
         else
             info "[heartbeat] $label: процесс активен, прошло ${elapsed}с"
         fi
@@ -226,9 +260,9 @@ run_rsync_with_heartbeat() {
     elapsed=$((end_ts - start_ts))
 
     if (( rsync_status == 0 )); then
-        ok "$(copy_result_message "$label" "$expected_bytes" "$elapsed")"
+        ok "$(rsync_result_message "$label" "$expected_bytes" "$elapsed")"
     else
-        warn "$(copy_result_message "$label завершилось с кодом $rsync_status" "$expected_bytes" "$elapsed")"
+        warn "$(rsync_result_message "$label завершилось с кодом $rsync_status" "$expected_bytes" "$elapsed")"
     fi
 
     return "$rsync_status"
@@ -245,8 +279,62 @@ partition_path() {
     fi
 }
 
+pause_source_services() {
+    local service
+
+    (( PAUSE_SOURCE_SERVICES == 1 )) || return 0
+    [[ "${SOURCE_ROOT_COPY_MNT:-}" == "/" ]] || return 0
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "systemctl недоступен, сервисы перед rootfs-копией не останавливаю"
+        return
+    fi
+
+    service="$BMI30_CORE_SERVICE"
+    [[ -n "$service" ]] || return 0
+
+    if ! systemctl cat "$service" >/dev/null 2>&1; then
+        info "Сервис $service не найден, пауза перед rootfs-копией не требуется"
+        return
+    fi
+
+    if ! systemctl is-active --quiet "$service"; then
+        info "Сервис $service не был запущен, после копирования стартовать не буду"
+        return
+    fi
+
+    info "Останавливаю $service на время копирования rootfs"
+    if timeout 30s systemctl stop "$service"; then
+        PAUSED_SOURCE_SERVICES+=("$service")
+        info "Сбрасываю файловые буферы перед rootfs-копией"
+        sync
+    else
+        warn "Не удалось остановить $service за 30 секунд; продолжаю копирование живой системы"
+    fi
+}
+
+resume_source_services() {
+    local service
+
+    (( ${#PAUSED_SOURCE_SERVICES[@]} > 0 )) || return 0
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "systemctl недоступен, не могу вернуть сервисы после rootfs-копии: ${PAUSED_SOURCE_SERVICES[*]}"
+        PAUSED_SOURCE_SERVICES=()
+        return
+    fi
+
+    for service in "${PAUSED_SOURCE_SERVICES[@]}"; do
+        info "Запускаю $service после копирования rootfs"
+        timeout 30s systemctl start "$service" || warn "Не удалось запустить $service автоматически"
+    done
+
+    PAUSED_SOURCE_SERVICES=()
+}
+
 cleanup() {
     set +e
+    resume_source_services
     if mountpoint -q "$TARGET_BOOT_MNT" 2>/dev/null; then
         umount "$TARGET_BOOT_MNT"
     fi
@@ -287,6 +375,14 @@ parse_args() {
                 SYNC_ONLY=1
                 shift
                 ;;
+            --force-format-and-retry)
+                FORCE_FORMAT_AND_RETRY=1
+                shift
+                ;;
+            --no-pause-services)
+                PAUSE_SOURCE_SERVICES=0
+                shift
+                ;;
             --help|-h)
                 usage
                 exit 0
@@ -300,6 +396,10 @@ parse_args() {
     [[ "$SOURCE_ROLE" == "internal" || "$SOURCE_ROLE" == "usb" ]] || die "Нужен --source-role internal|usb"
     [[ "$TARGET_ROLE" == "internal" || "$TARGET_ROLE" == "usb" ]] || die "Нужен --target-role internal|usb"
     [[ "$SOURCE_ROLE" != "$TARGET_ROLE" ]] || die "Источник и цель должны быть разными ролями"
+    if (( FORCE_FORMAT_AND_RETRY == 1 )); then
+        [[ "$TARGET_ROLE" == "usb" ]] || die "--force-format-and-retry разрешён только для целевого USB"
+        (( SYNC_ONLY == 0 )) || die "--force-format-and-retry несовместим с --sync-only"
+    fi
 }
 
 detect_current_devices() {
@@ -496,7 +596,12 @@ unmount_target_partitions() {
                 warn "umount завис на $mountpoint, пробую lazy umount"
                 umount -l "$mountpoint" || die "Не удалось отмонтировать $mountpoint"
             elif (( umount_rc != 0 )); then
-                die "Не удалось отмонтировать $mountpoint"
+                if (( FORCE_FORMAT_AND_RETRY == 1 )); then
+                    warn "Обычный umount не сработал для $mountpoint, пробую lazy umount"
+                    umount -l "$mountpoint" || die "Не удалось отмонтировать $mountpoint"
+                else
+                    die "Не удалось отмонтировать $mountpoint"
+                fi
             fi
         done < <(findmnt -rn -S "$part" -o TARGET | sort -r)
     done < <(lsblk -lnpo NAME,TYPE "$TARGET_DISK" | awk '$2 == "part" {print $1}')
@@ -581,9 +686,32 @@ mount_filesystems() {
         SOURCE_ROOT_COPY_MNT="$SOURCE_ROOT_MNT"
     fi
 
+    mount_target_filesystems
+}
+
+mount_target_filesystems() {
     mount "$TARGET_ROOT_DEV" "$TARGET_ROOT_MNT"
     mkdir -p "$TARGET_ROOT_MNT/boot/firmware"
     mount "$TARGET_BOOT_DEV" "$TARGET_BOOT_MNT"
+}
+
+unmount_target_filesystems() {
+    local mount_path umount_rc
+
+    for mount_path in "$TARGET_BOOT_MNT" "$TARGET_ROOT_MNT"; do
+        mountpoint -q "$mount_path" 2>/dev/null || continue
+        umount_rc=0
+        timeout 15s umount "$mount_path" || umount_rc=$?
+        if (( umount_rc != 0 )); then
+            if (( FORCE_FORMAT_AND_RETRY == 1 )); then
+                warn "Не удалось штатно отмонтировать $mount_path, выполняю lazy umount"
+                umount -l "$mount_path" || die "Не удалось отмонтировать $mount_path"
+            else
+                die "Не удалось отмонтировать $mount_path"
+            fi
+        fi
+    done
+    udevadm settle || true
 }
 
 detach_source_virtual_mounts() {
@@ -662,6 +790,37 @@ copy_root_files() {
     elif (( rsync_status != 0 )); then
         return "$rsync_status"
     fi
+}
+
+copy_boot_and_root_files() {
+    local copy_status=0
+
+    copy_boot_files || copy_status=$?
+    if (( copy_status == 0 )); then
+        pause_source_services
+        copy_root_files || copy_status=$?
+        resume_source_services
+    fi
+
+    return "$copy_status"
+}
+
+retry_copy_after_fresh_format() {
+    local copy_status=0
+
+    warn "Первая попытка копирования завершилась ошибкой. Повторно форматирую $TARGET_DISK и начинаю boot/root заново"
+    resume_source_services
+    unmount_target_filesystems
+    partition_and_format_target
+    mount_target_filesystems
+    verify_target_capacity
+    copy_boot_and_root_files || copy_status=$?
+
+    if (( copy_status != 0 )); then
+        die "Повторное копирование после форматирования завершилось с кодом $copy_status"
+    fi
+
+    ok "Повторное копирование после форматирования завершено успешно"
 }
 
 verify_target_capacity() {
@@ -979,11 +1138,19 @@ main() {
     step "Проверка исходного и целевого диска"
     confirm_plan
 
-    step "Cloud backup перед полным копированием"
-    run_precopy_backup
+    step "Local project snapshot перед полным копированием"
+    if (( FORCE_FORMAT_AND_RETRY == 1 )); then
+        (run_precopy_backup) || warn "Local safety snapshot завершился ошибкой; продолжаю принудительное форматирование и копирование на USB"
+    else
+        run_precopy_backup
+    fi
 
     step "Настройка BOOT_ORDER при необходимости"
-    configure_bootloader
+    if (( FORCE_FORMAT_AND_RETRY == 1 )); then
+        (configure_bootloader) || warn "Настройка EEPROM завершилась ошибкой; копирование на USB всё равно будет выполнено"
+    else
+        configure_bootloader
+    fi
 
     if (( SYNC_ONLY == 1 )); then
         step "Проверка существующих разделов на целевом диске"
@@ -1000,10 +1167,23 @@ main() {
     verify_target_capacity
 
     step "Копирование boot-раздела"
-    copy_boot_files
+    copy_status=0
+    copy_boot_files || copy_status=$?
 
     step "Копирование rootfs с прогрессом"
-    copy_root_files
+    if (( copy_status == 0 )); then
+        pause_source_services
+        copy_root_files || copy_status=$?
+        resume_source_services
+    fi
+
+    if (( copy_status != 0 )); then
+        if (( FORCE_FORMAT_AND_RETRY == 1 )); then
+            retry_copy_after_fresh_format
+        else
+            die "Копирование завершилось с кодом $copy_status"
+        fi
+    fi
 
     step "Обновление cmdline.txt и fstab на цели"
     rewrite_target_config

@@ -5,7 +5,7 @@
 # Runtime state, local device settings, logs, caches, captures, and learned data
 # are intentionally ignored so running devices do not become false leaders.
 
-BMI30_PROJECT_SIGNATURE_VERSION="2"
+BMI30_PROJECT_SIGNATURE_VERSION="8"
 
 bmi30_copy_format_duration() {
     local total_s="${1:-0}"
@@ -145,8 +145,13 @@ bmi30_project_find_files0() {
         -o -path "$source_abs/.mypy_cache" \
         -o -path "$source_abs/backups" \
         -o -path "$source_abs/.bmi30_cloud_sync" \
-        -o -path "$source_abs/docs" \
+        -o -path "$source_abs/secrets" \
         -o -path "$source_abs/History" \
+        -o -path "$source_abs/host/player_recordings" \
+        -o -path "$source_abs/host/bmi30_active_runtime" \
+        -o -path "$source_abs/host/.bmi30_active_runtime.stage.*" \
+        -o -path "$source_abs/host/.bmi30_active_runtime.rollback.*" \
+        -o -path "$source_abs/host/bmi30_split_bundles" \
         -o -path "$source_abs/captures" \
         -o -path "$source_abs/noise_calibration_data" \
         -o -path "$source_abs/adaptive_data" \
@@ -162,6 +167,7 @@ bmi30_project_find_files0() {
         -o -name "__pycache__" \) -prune \
         -o -type f \
         ! -path "$source_abs/utilities/backup_to_cloud.conf" \
+        ! -path "$source_abs/host/bmi30_firmware_release.env" \
         ! -path "$source_abs/host/bmi30_config.json" \
         ! -path "$source_abs/host/bmi30_sel.json" \
         ! -path "$source_abs/host/plot_config.json" \
@@ -170,14 +176,8 @@ bmi30_project_find_files0() {
         ! -path "$source_abs/host/usb_vendor/usb_stream_demo" \
         ! -name "backup_output.txt" \
         ! -name "status.json" \
-        ! -name "*.conf" \
-        ! -name "*.env" \
-        ! -name "*.json" \
         ! -name "*.log" \
-        ! -name "*.md" \
-        ! -name "*.txt" \
-        ! -name "*.pdf" \
-        ! -name "*.rst" \
+        ! -name "*.log.*" \
         ! -name "*.pyc" \
         ! -name "*.pyo" \
         ! -name "*.npz" \
@@ -200,6 +200,40 @@ bmi30_project_find_files0() {
         -print0
 }
 
+bmi30_active_bundle_id() {
+    local source_abs="$1"
+    local active_env="$source_abs/host/bmi30_split_active_version.env"
+
+    [[ -f "$active_env" ]] || return 1
+    (
+        unset BMI30_SPLIT_BUNDLE_ID
+        # shellcheck source=/dev/null
+        source "$active_env"
+        [[ "${BMI30_SPLIT_BUNDLE_ID:-}" =~ ^[A-Za-z0-9._-]+$ ]] || exit 1
+        printf '%s' "$BMI30_SPLIT_BUNDLE_ID"
+    )
+}
+
+bmi30_firmware_project_find_files0() {
+    local source_abs="$1"
+    shift || true
+
+    # The switcher rewrites this generated file during every successful
+    # activation (selected_at/selected_by).  The selected bundle still affects
+    # the signature through its path and contents below, so excluding the env
+    # prevents endless reinstall loops without hiding firmware changes.
+    bmi30_project_find_files0 "$source_abs" \
+        ! -path "$source_abs/host/bmi30_split_active_version.env" \
+        "$@"
+
+    local bundle_id bundle_dir
+    bundle_id="$(bmi30_active_bundle_id "$source_abs" || true)"
+    [[ -n "$bundle_id" ]] || return 0
+    bundle_dir="$source_abs/host/bmi30_split_bundles/$bundle_id"
+    [[ -d "$bundle_dir" ]] || return 0
+    find "$bundle_dir" -type f "$@" -print0
+}
+
 bmi30_legacy_project_find_files0() {
     local source_abs="$1"
     shift || true
@@ -213,12 +247,18 @@ bmi30_legacy_project_find_files0() {
         -o -path "$source_abs/.mypy_cache" \
         -o -path "$source_abs/backups" \
         -o -path "$source_abs/.bmi30_cloud_sync" \
+        -o -path "$source_abs/host/bmi30_active_runtime" \
+        -o -path "$source_abs/host/.bmi30_active_runtime.stage.*" \
+        -o -path "$source_abs/host/.bmi30_active_runtime.rollback.*" \
+        -o -path "$source_abs/host/bmi30_split_bundles" \
         -o -name "__pycache__" \) -prune \
         -o -type f \
         ! -path "$source_abs/utilities/backup_to_cloud.conf" \
+        ! -path "$source_abs/host/bmi30_firmware_release.env" \
         ! -name "backup_output.txt" \
         ! -name "status.json" \
         ! -name "*.log" \
+        ! -name "*.log.*" \
         ! -name "full_mismatch_*" \
         "$@" \
         -print0
@@ -244,7 +284,7 @@ bmi30_project_signature() {
     local source_dir="$1"
     local source_abs
     source_abs="$(cd -- "$source_dir" && pwd)"
-    bmi30_signature_from_find0 "$source_abs" bmi30_project_find_files0
+    bmi30_signature_from_find0 "$source_abs" bmi30_firmware_project_find_files0
 }
 
 bmi30_legacy_project_signature() {
@@ -260,7 +300,7 @@ bmi30_project_changed_today() {
     source_abs="$(cd -- "$source_dir" && pwd)"
     today_start="$(date +%Y-%m-%d) 00:00:00"
 
-    if IFS= read -r -d '' first_file < <(bmi30_project_find_files0 "$source_abs" -newermt "$today_start"); then
+    if IFS= read -r -d '' first_file < <(bmi30_firmware_project_find_files0 "$source_abs" -newermt "$today_start"); then
         [[ -n "$first_file" ]]
         return
     fi
@@ -279,7 +319,6 @@ bmi30_add_project_tar_excludes() {
     local -n _tar_args="$array_name"
 
     _tar_args+=(
-        --exclude-vcs
         --exclude="$source_name/.git"
         --exclude="$source_name/.venv"
         --exclude="$source_name/.usbvenv"
@@ -291,8 +330,13 @@ bmi30_add_project_tar_excludes() {
         --exclude="$source_name/__pycache__"
         --exclude="$source_name/backups"
         --exclude="$source_name/.bmi30_cloud_sync"
-        --exclude="$source_name/docs"
+        --exclude="$source_name/secrets"
         --exclude="$source_name/History"
+        --exclude="$source_name/host/player_recordings"
+        --exclude="$source_name/host/bmi30_active_runtime"
+        --exclude="$source_name/host/.bmi30_active_runtime.stage.*"
+        --exclude="$source_name/host/.bmi30_active_runtime.rollback.*"
+        --exclude="$source_name/host/bmi30_split_bundles"
         --exclude="$source_name/captures"
         --exclude="$source_name/noise_calibration_data"
         --exclude="$source_name/adaptive_data"
@@ -314,14 +358,8 @@ bmi30_add_project_tar_excludes() {
         --exclude="$source_name/host/usb_vendor/usb_stream_demo"
         --exclude="backup_output.txt"
         --exclude="status.json"
-        --exclude="*.conf"
-        --exclude="*.env"
-        --exclude="*.json"
         --exclude="*.log"
-        --exclude="*.md"
-        --exclude="*.txt"
-        --exclude="*.pdf"
-        --exclude="*.rst"
+        --exclude="*.log.*"
         --exclude="*.pyc"
         --exclude="*.pyo"
         --exclude="*.npz"
@@ -345,6 +383,7 @@ bmi30_add_project_tar_excludes() {
 
 bmi30_add_project_rsync_excludes() {
     local array_name="$1"
+    local active_bundle_id="${2:-}"
     local -n _rsync_args="$array_name"
 
     _rsync_args+=(
@@ -359,8 +398,12 @@ bmi30_add_project_rsync_excludes() {
         --exclude='/__pycache__/'
         --exclude='/backups/'
         --exclude='/.bmi30_cloud_sync/'
-        --exclude='/docs/'
+        --exclude='/secrets/'
         --exclude='/History/'
+        --exclude='/host/player_recordings/'
+        --exclude='/host/bmi30_active_runtime/'
+        --exclude='/host/.bmi30_active_runtime.stage.*/'
+        --exclude='/host/.bmi30_active_runtime.rollback.*/'
         --exclude='/captures/'
         --exclude='/noise_calibration_data/'
         --exclude='/adaptive_data/'
@@ -382,14 +425,8 @@ bmi30_add_project_rsync_excludes() {
         --exclude='/host/usb_vendor/usb_stream_demo'
         --exclude='/backup_output.txt'
         --exclude='/status.json'
-        --exclude='*.conf'
-        --exclude='*.env'
-        --exclude='*.json'
         --exclude='*.log'
-        --exclude='*.md'
-        --exclude='*.txt'
-        --exclude='*.pdf'
-        --exclude='*.rst'
+        --exclude='*.log.*'
         --exclude='*.pyc'
         --exclude='*.pyo'
         --exclude='*.npz'
@@ -409,4 +446,16 @@ bmi30_add_project_rsync_excludes() {
         --exclude='/full_mismatch_*'
         --exclude='/udo netstat*'
     )
+
+    if [[ "$active_bundle_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        _rsync_args=(
+            --include='/host/bmi30_split_bundles/'
+            --include="/host/bmi30_split_bundles/$active_bundle_id/"
+            --include="/host/bmi30_split_bundles/$active_bundle_id/***"
+            --exclude='/host/bmi30_split_bundles/***'
+            "${_rsync_args[@]}"
+        )
+    else
+        _rsync_args=(--exclude='/host/bmi30_split_bundles/' "${_rsync_args[@]}")
+    fi
 }

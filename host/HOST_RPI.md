@@ -54,6 +54,18 @@ python3 HostTools/list_usb_interfaces.py
 
 Режим full mode (реальные ADC кадры, last-buffer-wins уже включён в прошивке). Скрипт читает A/B‑пары, проверяет строгий порядок, STAT только между парами, в конце печатает FPS.
 
+Критично: что именно запускает bulk-поток
+
+- Для старта Vendor bulk-потока недостаточно команд DC-компенсации.
+- Рабочая последовательность запуска на RPI должна включать:
+  - `SetInterface(IF#2, alt=1)`
+  - `SET_WINDOWS (0x10)`
+  - `SET_STREAM_MODE (0x1A)`
+  - при необходимости `SET_PROFILE (0x14)` и `SET_ASYNC (0x18)`
+  - `START_STREAM (0x20)`
+- Команда `SET_DC_SPEED (0x1F)` и чтение `GET_DC_CONFIG` по EP0 сами по себе bulk-поток не запускают.
+- Если в логе есть только `0x1F` и EP0 status, STM32 отвечает на управление, но host-side код не выполнил полноценный запуск bulk stream.
+
 ```bash
 python3 HostTools/vendor_stream_read.py \
   --vid 0xCAFE --pid 0x4001 --intf 2 --ep-in 0x83 --ep-out 0x03 \
@@ -144,6 +156,213 @@ send_host_rx_clear(dev, 0x03)
 
 - если ваш RPI-скрипт реально читает и парсит поток, но не шлёт `0x36`, LED на STM32 будет `синим`, а не `зелёным`
 - это теперь ожидаемое поведение
+
+## 4.2) Оптика: установка мощности, времени удержания и чтение optic_active
+
+В прошивке используются команды Vendor OUT:
+
+- `0x34 = VND_CMD_SET_OPTIC_POWER`
+- `0x39 = VND_CMD_SET_OPTIC_HOLD`
+- `0x3C = VND_CMD_SET_DET_ADC`
+- payload `0x34`: `u8` в диапазоне `0..255`
+  - `0` = минимальная мощность/чувствительность
+  - `255` = максимальная
+- payload `0x39`: новый формат `u16 hold_ds` little-endian, где единица = `0.1 сек`
+  - `0` = вернуть значение по умолчанию `30` (`3.0 сек`)
+  - `1..600` = удерживать `optic_active=1` ещё `0.1..60.0 сек`
+    после последнего принятого высокого уровня
+  - старый формат `u8 seconds` тоже принимается для совместимости
+- payload `0x3C`: `u8`, bit0=`DetADC1`, bit1=`DetADC2`, остальные биты игнорируются; по умолчанию оба бита равны `0`
+
+Пример установки через ваш host-код (bulk OUT `0x03`):
+
+```python
+VND_CMD_SET_OPTIC_POWER = 0x34
+VND_CMD_SET_OPTIC_HOLD = 0x39
+VND_CMD_SET_DET_ADC = 0x3C
+
+optic_power = 255     # 0..255, максимум для проверки 38 kHz TX/приемника
+optic_hold_s = 1.5    # 0=default(3.0), step 0.1, max 60.0
+optic_hold_ds = int(round(optic_hold_s * 10.0))
+det_adc = 0x03        # bit0=DetADC1, bit1=DetADC2
+
+dev.write(0x03, bytes([VND_CMD_SET_OPTIC_POWER, optic_power & 0xFF]), timeout=1000)
+dev.write(0x03, bytes([VND_CMD_SET_OPTIC_HOLD]) + optic_hold_ds.to_bytes(2, "little"), timeout=1000)
+dev.write(0x03, bytes([VND_CMD_SET_DET_ADC, det_adc & 0x03]), timeout=1000)
+```
+
+Единая логика оптического датчика:
+
+1. `PD0=1` немедленно устанавливает `optic_active=1`.
+2. Пока `PD0=1`, таймер удержания постоянно повторно запускается.
+3. После перехода `PD0` в `0` обработанный `optic_active` остаётся равен `1`
+   ещё `optic_hold_ds * 0.1` секунд.
+4. Уровень `PD0=0` не запускает и не продлевает таймер. После истечения времени
+   `optic_active` переходит в `0`.
+5. Один и тот же `optic_active` используется системным адресным светодиодом,
+   USB `STAT/EVT1`, RS485 status bit5 и картой всей группы.
+6. На системном WS2812 локальный `optic_active=1` немедленно меняет только цвет.
+   Если TX включен, обычный TX-breathe продолжает модулировать яркость этого цвета.
+
+Как прочитать «что установлено сейчас» и обработанный сигнал:
+
+1. Запросите `STAT` через `GET_STATUS` (`0x30`, лучше по EP0 vendor IN).
+2. В пакете `STAT` используйте поля:
+   - `reserved3[15:8]` = `optic_power` (текущее установленное значение 0..255)
+   - `reserved3[7:2]` = legacy `optic_hold_seconds`, округлённое вверх до секунд
+   - `reserved3[0]` = локальный удержанный `optic_active`
+   - `flags_runtime bit5 (0x0020)` = дублирующий флаг локального `optic_active`
+   - `flags_runtime bit7 (0x0080)` = master optic активен: локально на master или принят по RS485 на slave
+   - `flags_runtime bit8 (0x0100)` = активен любой локальный/RS485 optic в группе
+   - `flags_runtime bit9 (0x0200)` = в группе назначен выбранный sensor-slave
+   - `flags_runtime bit10 (0x0400)` = это USB-устройство является выбранным sensor-slave
+   - `flags_runtime bit11 (0x0800)` = от выбранного sensor-slave получен свежий активный `optic`, `DetADC1` или `DetADC2`
+   - в полном `STAT v6` длиной `137` байт: offset `96`, `u16 optic_hold_ds` = точное время удержания в шагах `0.1 сек`
+
+В `STAT v6` также отдаются состояния фотоприёмников всей sync-системы:
+
+- offset `99`: `u8 sync_local_status`
+- offset `100`: `u32 sync_seen_mask`, bit N=device_id N, N=0..31
+- offset `104`: `u8 sync_node_count`
+- offset `105..136`: `u8 sync_status_bytes[32]`, прямой индекс `device_id`
+- формат status byte: bits `0..4=selector` у local master или `node_id` у slave/remote, bit `5=photoreceiver active`, bit `6=DetADC1`, bit `7=DetADC2`
+- master optic на slave-host читается из `flags_runtime & 0x0080`; этот флаг выставляется из свежего `master_status0 bit5`, который уже передается master по RS485.
+- Полный прямой формат требует `STAT v6` длиной 137 байт. Асинхронный `STAT` длиной
+  136 байт сохраняет legacy v5: index/bit `0..30` означает `device_id 1..31`;
+  `device_id 0` в v5 не представлен.
+- При любом изменении controlled sensor firmware немедленно ставит в Bulk IN
+  совместимый 136-байтовый `STAT` и `EVT1 type=0x14 SENSOR_MAP`. Payload `SENSOR_MAP`
+  имеет 40 байт: `version, local_id, flags, node_count, seen_mask LE,
+  status_bytes[32]` с прямым индексом `device_id 0..31`.
+
+В проекте это уже декодируют скрипты:
+
+- `python3 HostTools/vendor_get_status.py --ctrl --repeat 5`
+- `python3 HostTools/vendor_quick_status.py --secs 5`
+- `python3 HostTools/vendor_stream_read.py --optic-power 120 --optic-hold-s 1.5 ...`
+
+В выводе будут поля:
+
+- `optic_power=...` (какой параметр реально установлен сейчас)
+- `optic_hold_ds=...` (точное время удержания в шагах 0.1 сек)
+- `optic_active=0/1` (обработанный вход с удержанием после последней `1`)
+- `tx_enable=0/1` (состояние внешнего TX-gate, если используется)
+
+## 4.3) Как прочитать sync-индикатор LCD (`M/S/O`, число и цвет)
+
+Добавлена отдельная vendor-команда:
+
+- `0x38 = VND_CMD_GET_LCD_STATUS`
+- рекомендуемый транспорт: `EP0 vendor IN`
+- ответ: короткая структура `LCDS` длиной `24` байта
+
+Самый простой способ:
+
+```bash
+python3 HostTools/read_lcd_status.py
+```
+
+Скрипт выводит:
+
+- `raw_mode`
+  это реальный режим sync-логики: `MASTER`, `SLAVE` или `OFF`
+- `display_mode`
+  это именно то, что сейчас рисует LCD
+- `display_char`
+  буква индикатора: `M`, `S` или `O`
+- `display_value`
+  число рядом с буквой
+- `color`
+  цвет индикатора на LCD
+- `signal_alive`
+  LCD считает, что sync сейчас жив
+- `sync_ok_visual`
+  LCD считает sync корректным
+- `color_locked`
+  зелёный уже защёлкнут антидребезгом LCD state machine
+- `display_fallback`
+  LCD перешёл в fallback и принудительно показывает `M00`
+
+Что означает число:
+
+- если `display_mode=MASTER`, `display_value` = число обнаруженных slave
+- если `display_mode=SLAVE`, `display_value` = локальный номер слота/узла
+- если `display_mode=OFF`, цифры на LCD пустые, а в пакете `display_value` остаётся `0`
+
+Что означает цвет:
+
+- `GREEN`
+  sync есть и он прошёл визуальный lock
+- `RED`
+  sync живой, но lock ещё не набран или качество sync пока плохое
+- `CYAN`
+  сигнала sync нет, LCD показывает fallback `M00`
+
+Минимальный пример на Python без готового скрипта:
+
+```python
+import struct
+import usb.core
+import usb.util
+
+VID, PID = 0xCAFE, 0x4001
+INTF = 2
+CMD_GET_LCD_STATUS = 0x38
+
+dev = usb.core.find(idVendor=VID, idProduct=PID)
+if dev is None:
+    raise SystemExit("Device not found")
+
+try:
+    dev.set_configuration()
+except Exception:
+    pass
+
+try:
+    usb.util.claim_interface(dev, INTF)
+except Exception:
+    pass
+
+raw = dev.ctrl_transfer(0xC1, CMD_GET_LCD_STATUS, 0, INTF, 24, timeout=1000)
+sig, ver, raw_mode, display_mode, display_value, slave_count, node_id, color_id, display_char, color_rgb565, flags, sync_age_ms, text = \
+    struct.unpack("<4sBBBBBBBBHHI4s", bytes(raw))
+
+print(sig, ver, display_mode, display_value, chr(display_char), hex(color_rgb565), hex(flags), text)
+```
+
+Практическое правило:
+
+- для UI ориентируйтесь на `display_mode`, `display_value`, `display_char`, `color`
+- для диагностики и логики управления ориентируйтесь на `raw_mode`, `slave_count`, `node_id`, `signal_alive`, `sync_ok_visual`
+
+## 4.4) Назначение роли/ID и список устройств RS485
+
+Автоматического голосования и нумерации нет. Каждый RPI через локальный USB отдельно задаёт:
+
+- роль `MASTER/SLAVE`: `0x1D + mode + u64 unix_ms LE`;
+- `device_id 0..31`: `0x3D + u8 device_id`;
+- номер RPI и IP: `0x42 + u16 rpi_number LE + ip[4]`.
+
+Роль и `device_id` сохраняются во Flash. Значение ID 0 допустимо и отображается как M00/S00;
+неназначенность хранится отдельным флагом. Пока ID не назначен, STM32 не передаёт в общую RS485,
+но ADC/DMA и USB продолжают работать. Команда назначения не идёт по RS485: несколько новых плат
+разделяются их собственными локальными USB/RPI.
+
+Специального sensor-slave нет. Состояния каждого устройства находятся по прямому адресу
+`sync_status_bytes[device_id]`. Любое изменение контролируемого sensor bit отправляется срочно
+в ближайшем цикле 200 Hz и повторяется трижды.
+
+Карта читается так:
+
+- `0x3F REQUEST_RS485_IDENT` запускает scan на master;
+- `0x40 GET_RS485_IDENT`, `wValue=0..31` читает конкретный device ID;
+- `wValue=0xFF` читает локальную плату;
+- `RID1` содержит UID STM32, отдельный `rpi_number`, IP и роль.
+
+```bash
+python3 HostTools/vendor_rs485_device_list.py --serial <USB_SERIAL> \
+  --device-id 0 --rpi-number 12 --ip 192.168.1.12
+```
 
 ## 5) DIAG режим (максимальный FPS, тестовые кадры)
 
@@ -242,140 +461,161 @@ python3 HostTools/vendor_stream_read.py --vid 0xCAFE --pid 0x4001 --intf 2 --ep-
 # GUI осциллограф (оптимизированный)
 python3 HostTools/gui_oscilloscope_optimized.py --ns 0 --profile 0 --watchdog
 
-## 9.1) Включение/выключение внешнего передатчика (без остановки потока)
+## 9.1) Управление 200 Hz marker/TX командами хоста
 
-Команда 0x33 управляет внешним передатчиком:
-- payload 0x01 — включить (PA1=0, PA2 разрешён)
-- payload 0x00 — выключить (PA1=1, PA2=0)
+Команда `0x33 SET_TX_ENABLE` разрешает или запрещает передачу `TX200`.
+Она не управляет отдельной 38 kHz оптической несущей (`0x34 SET_OPTIC_POWER`).
 
-Пример (через bulk OUT 0x03):
+- payload `0x01` — включить TX;
+- payload `0x00` — выключить TX;
+- физический TX следует правилу `tx_request AND streaming`;
+- `HOST_RX_ACK` и `HOST_RX_CLEAR` не имеют права менять TX request;
+- краткий пропуск SOF/heartbeat не меняет TX;
+- `STOP_STREAM` гасит физический TX, но сохраняет request для следующего START.
 
-```bash
-python3 - <<'PY'
-import usb.core, usb.util
-VID, PID = 0xCAFE, 0x4001
-INTF, EP_OUT = 2, 0x03
-dev = usb.core.find(idVendor=VID, idProduct=PID)
-dev.set_configuration()
-try:
-  dev.set_interface_altsetting(interface=INTF, alternate_setting=1)
-except Exception:
-  pass
-# TX enable
-dev.write(EP_OUT, bytes([0x33, 0x01]), timeout=1000)
-# TX disable
-# dev.write(EP_OUT, bytes([0x33, 0x00]), timeout=1000)
-PY
-```
+Обязательный порядок при запуске или переподключении:
+
+```text
+HOST_RX_CLEAR
+STOP_STREAM
+SET_* configuration
+START_STREAM
+SET_TX_ENABLE 0/1    # рекомендуемый явный apply + последующий readback
 ```
 
-## 9.2) 2026-03-31 — RPI: инструкция по исправлению кнопки управления передачей (TX)
+`SET_TX_ENABLE=1`, отправленный перед STOP, сохраняется как request; во время STOP
+физический TX выключен, а после START восстанавливается автоматически. Host всё
+равно должен делать readback после финального START.
 
-Это инструкция именно для реального RPI host script, если кнопка `TX OFF` выключает передачу только на короткое время, а потом передача сама включается снова.
+## 9.2) 2026-07-13 — TX request не должен самопроизвольно сбрасываться
 
-- Найти все места, где отправляется `START_STREAM` (`0x20`).
-- После каждого `START_STREAM` не должно быть безусловной отправки `0x33 0x01`.
-- После `START_STREAM` должно отправляться `0x33 <текущее состояние кнопки TX>`.
-- Найти все места, где отправляется `0x33`.
-- Проверить, что `0x33 0x01` отправляется только тогда, когда индикатор/кнопка TX реально в состоянии `ON`.
-- Проверить все ветки `reconnect`, `retry`, `timer`, `watchdog`, `soft reset`, `init sequence`, `mode switch`, `frequency change`.
-- Во всех этих ветках не должно быть принудительного `TX=ON`.
-- Кнопка `TX OFF` должна делать только три вещи: сохранить `tx_enabled_desired = False`, отправить `0x33 0x00`, обновить индикатор.
-- Кнопка `TX OFF` не должна закрывать USB stream, запускать reconnect или снова отправлять `START_STREAM`.
-- При старте GUI/скрипта состояние по умолчанию должно быть таким: индикатор TX = `OFF`, внутреннее состояние `tx_enabled_desired = False`.
-- После первого подключения к устройству хост должен явно отправить `0x33 0x00`, если кнопка TX показывает `OFF`.
-- Если состояние режима восстанавливается из файла/config, восстановление режима не должно автоматически включать TX, если сохранённый индикатор TX был `OFF`.
+Прошивка хранит host-request отдельно от подтверждённого состояния TX:
+`physical_tx = tx_request AND streaming`. Поэтому состояние `streaming=1,
+tx_req=1, tx200=0` является ошибкой, а при `streaming=0, tx_req=1` ожидается
+`tx200=0`. Переход `tx_req: 1 -> 0` означает, что пришёл `SET_TX_ENABLE=0`
+или reset; `STOP_STREAM` request не стирает.
 
-Быстрая проверка на устройстве:
+- `START_STREAM` и heartbeat-команды не заменяют явную команду хоста `0x33`.
+- Исправленная прошивка больше не сбрасывает TX request на `HOST_RX_CLEAR`.
+- После `STOP_STREAM` host может повторно отправить желаемое `0x33`, но достаточно сохранённого request: физическое разрешение вернётся на следующем START.
+- Reconnect/retry/watchdog не должны отправлять `0x33 0x00`, если пользователь оставил TX включенным.
+- Проверка: `STAT.flags_runtime & 0x0010` показывает подтверждённое состояние TX;
+  COM-команда `OPTIC` дополнительно печатает `tx_req`, `tx200`, `tx_cmd_count` и `tx_cmd_val`.
+- В `HostTools/vendor_stream_read.py` параметр `--tx-enable` применяется после START,
+  потому что прежний порядок `TX_ENABLE -> CLEAR -> STOP -> START` всегда терял включение.
 
-- После нажатия `TX OFF` выполнить `python3 HostTools/read_status_v3.py`.
-- Если `tx_enabled: no`, прошивка приняла запрет TX.
-- Если потом снова становится `tx_enabled: yes`, значит реальный RPI host script повторно отправляет включение TX.
-
-Ключевые строки для поиска по коду на RPI:
-
-- `0x33`
-- `CMD_SET_TX_ENABLE`
-- `START_STREAM`
-- `send_cmd`
-- `reconnect`
-- `retry`
-- `timer`
-- `watchdog`
-- `soft reset`
+Ключевые строки для проверки в стороннем host-коде: `0x33`, `CMD_SET_TX_ENABLE`,
+`START_STREAM`, `STOP_STREAM`, `HOST_RX_CLEAR`, `reconnect`, `retry`, `watchdog`.
 - `init sequence`
 
 ---
 
-## 9.3) Прямое управление WS2812 лентой с RPI host
+## 9.3) Управление WS2812 паттернами с RPI host
 
-Теперь у Raspberry Pi есть отдельный режим прямого управления лентой:
+Сейчас у Raspberry Pi host есть два разных способа влиять на адресные светодиоды:
 
-- RPI сам формирует кадр из `20` светодиодов
-- для каждого светодиода задаются свои `R/G/B` значения `0..255`
-- яркость задаётся теми же значениями `RGB`
-- STM32 не делит ленту на зоны и не решает, как её красить
-
-Это удобно для индикации уровней, шумов, градиентов, маркеров и любых других схем, которые считает сам RPI.
+- постоянный паттерн 20 динамических светодиодов можно выбрать с RPI через Vendor USB команду `0x3B`
+- временный визуальный паттерн можно запустить с RPI через Vendor USB команду `0x35`
 
 Важно:
+- первый onboard/system LED остаётся под управлением STM32; прошивка накладывает на него системный статус независимо от выбранного host-паттерна
+- команда `0x3B` выбирает базовый паттерн для 20 динамических LED
+- команда `0x35` запускает временное событие поверх текущего базового паттерна
+- внешняя лента optic-gated: команды `0x3B`/`0x35` сохраняют выбранный паттерн/событие, но 20 динамических LED реально светятся только пока активен локальный или свежий принятый по RS485 `optic_active`; без активной оптики лента рендерится как `OFF`
+- оптический 38 kHz TX не gated по приемнику; для проверки приемника поставьте `0x34=255` (`OPTP 255` через COM). `0x33/TX200` относится только к 200 Hz marker/TX и при активном stream следует явной команде хоста.
+- host на slave читает срабатывание master через `STAT v5`: `flags_runtime & 0x0080`.
 
-- это отдельный USB-режим, он не добавлен в цикл кнопки `PC13`
-- режим `PC13` с локальными тестовыми паттернами остаётся как был
-- встроенный onboard LED на плате остаётся под служебной индикацией STM32
-- управляется только внешняя лента из `20` адресных светодиодов
-
-### Команда `0x38` (`VND_CMD_SET_LED_STRIP`)
+### Команда `0x3B` (`VND_CMD_SET_LED_PATTERN`)
 
 Формат payload:
 
 ```text
-byte0  = 0x38
-byte1  = LED0_R
-byte2  = LED0_G
-byte3  = LED0_B
-byte4  = LED1_R
-byte5  = LED1_G
-byte6  = LED1_B
-...
-byte58 = LED19_R
-byte59 = LED19_G
-byte60 = LED19_B
+byte0 = 0x3B
+byte1 = pattern_id
 ```
 
-Итого:
+Поддерживаемые `pattern_id`:
 
-- длина пакета `61` байт
-- порядок светодиодов: `LED0 .. LED19`
-- на каждый светодиод идёт ровно `3` байта: `R, G, B`
+- `0` = `OFF`
+- `1` = `IDLE_BREATHE`
+- `2` = `STREAMING`
+- `3` = `SYNC_PULSE`
+- `4` = `UART_RX`
+- `5` = `TUNE`
+- `6` = `RECOVERY`
+- `7` = `HARD_RESET`
+- `8` = `EVENT_B_UP`
+- `9` = `EVENT_A_DOWN`
+- `10` = `EVENT_BOTH_ALT`
+- `11` = `EVENT_SPLIT_IN`
+- `12` = `EVENT_SPLIT_OUT`
+- `13` = `TEST_DRIP`
+- `14` = `TEST_SCOPE_RGB`
+- `15` = `TEST_BLUE`
+- `16` = `TEST_COLOR_CYCLE`
 
-Отключение direct-mode:
+Пример:
 
-- если отправить только один байт `0x38`, direct-mode выключается
-- после этого устройство возвращается к обычному локальному паттерну, который был выбран на STM32
+```python
+VND_CMD_SET_LED_PATTERN = 0x3B
+dev.write(0x03, bytes([VND_CMD_SET_LED_PATTERN, 13]), timeout=1000)  # TEST_DRIP
+dev.write(0x03, bytes([VND_CMD_SET_LED_PATTERN, 0]), timeout=1000)   # OFF
+```
+
+Готовый helper:
+
+```bash
+python3 HostTools/send_led_event.py --pattern TEST_DRIP
+python3 HostTools/send_led_event.py --pattern OFF
+```
+
+Текущий выбранный паттерн читается из `STAT v5`: offset `98`, `u8 led_pattern`.
+
+### Команда `0x35` (`VND_CMD_LED_EVENT`)
+
+Формат payload:
+
+```text
+byte0 = 0x35
+byte1 = event_id
+byte2 = duration_ms low byte
+byte3 = duration_ms high byte
+```
+
+Поддерживаемые `event_id`:
+
+- `0x01` = `CHANNEL_B` = красный паттерн вверх (`RED_UP`)
+- `0x02` = `CHANNEL_A` = красный паттерн вниз (`RED_DOWN`)
+- `0x03` = `BOTH` = попеременное движение вниз/вверх четырёх красных сегментов (`RED_DOWN_UP_ALT`)
+- `0x04` = `SPLIT_IN` = верхняя половина вниз, нижняя вверх (`RED_SPLIT_IN`, движение к центру)
+- `0x05` = `SPLIT_OUT` = верхняя половина вверх, нижняя вниз (`RED_SPLIT_OUT`, движение от центра)
+
+Если `duration_ms = 0`, прошивка автоматически использует `1600 ms`.
 
 ### Самый простой способ на RPi: готовый скрипт
 
-В репозитории есть [send_led_strip.py](/d:/Users/Admin/Documents/Work/BMI20/STM32/BMI30.stm32h7/HostTools/send_led_strip.py).
+В репозитории есть [send_led_event.py](/d:/Users/Admin/Documents/Work/BMI20/STM32/BMI30.stm32h7/HostTools/send_led_event.py), который уже отправляет эту команду через Vendor IF#2.
 
 Примеры:
 
 ```bash
-# Залить всю ленту красным
-python3 HostTools/send_led_strip.py --fill 255 0 0
+# Красный паттерн вверх
+python3 HostTools/send_led_event.py --event B --duration-ms 1600
 
-# Погасить всю ленту, но оставить direct-mode активным
-python3 HostTools/send_led_strip.py --fill 0 0 0
+# Красный паттерн вниз
+python3 HostTools/send_led_event.py --event A --duration-ms 1600
 
-# Вся лента тускло-синяя, а отдельные светодиоды подсветить
-python3 HostTools/send_led_strip.py \
-  --fill 0 0 16 \
-  --set 0 255 0 0 \
-  --set 1 255 64 0 \
-  --set 19 0 255 0
+# Одновременное срабатывание двух каналов: попеременно вниз/вверх
+python3 HostTools/send_led_event.py --event BOTH --duration-ms 1600
 
-# Полностью выйти из direct-mode и вернуть обычный паттерн STM32
-python3 HostTools/send_led_strip.py --off
+# Движение к центру: верхняя половина вниз, нижняя вверх
+python3 HostTools/send_led_event.py --event SPLIT_IN --duration-ms 1600
+
+# Движение от центра: верхняя половина вверх, нижняя вниз
+python3 HostTools/send_led_event.py --event SPLIT_OUT --duration-ms 1600
+
+# Демонстрация: вверх, затем вниз
+python3 HostTools/send_led_event.py --event demo --duration-ms 1600 --gap-ms 500
 ```
 
 Параметры по умолчанию у скрипта:
@@ -389,13 +629,18 @@ python3 HostTools/send_led_strip.py --off
 
 ```bash
 python3 - <<'PY'
+import struct
 import usb.core
 import usb.util
 
 VID, PID = 0xCAFE, 0x4001
 INTF, EP_OUT = 2, 0x03
-VND_CMD_SET_LED_STRIP = 0x38
-LED_COUNT = 20
+VND_CMD_LED_EVENT = 0x35
+VND_LED_EVENT_CHANNEL_B = 0x01   # RED_UP
+VND_LED_EVENT_CHANNEL_A = 0x02   # RED_DOWN
+VND_LED_EVENT_BOTH = 0x03        # RED_DOWN_UP_ALT
+VND_LED_EVENT_SPLIT_IN = 0x04    # RED_SPLIT_IN
+VND_LED_EVENT_SPLIT_OUT = 0x05   # RED_SPLIT_OUT
 
 dev = usb.core.find(idVendor=VID, idProduct=PID)
 if dev is None:
@@ -422,33 +667,23 @@ try:
 except Exception:
     pass
 
-pixels = [[0, 0, 0] for _ in range(LED_COUNT)]
-
-# Пример: плавный градиент от красного к зелёному
-for i in range(LED_COUNT):
-    red = max(0, 255 - i * 12)
-    green = min(255, i * 12)
-    blue = 0
-    pixels[i] = [red, green, blue]
-
-payload = bytearray([VND_CMD_SET_LED_STRIP])
-for red, green, blue in pixels:
-    payload.extend((red, green, blue))
-
+payload = struct.pack("<BBH", VND_CMD_LED_EVENT, VND_LED_EVENT_CHANNEL_B, 1600)
 dev.write(EP_OUT, payload, timeout=1000)
-print("Sent direct WS2812 strip frame")
+print("Sent RED_UP for 1600 ms")
 PY
 ```
 
-### Пример отключения direct-mode из своего кода
+Пример именно для события "оба канала одновременно":
 
 ```bash
 python3 - <<'PY'
+import struct
 import usb.core
 
 VID, PID = 0xCAFE, 0x4001
-EP_OUT = 0x03
-VND_CMD_SET_LED_STRIP = 0x38
+INTF, EP_OUT = 2, 0x03
+VND_CMD_LED_EVENT = 0x35
+VND_LED_EVENT_BOTH = 0x03
 
 dev = usb.core.find(idVendor=VID, idProduct=PID)
 if dev is None:
@@ -459,32 +694,39 @@ try:
 except Exception:
     pass
 
-dev.write(EP_OUT, bytes([VND_CMD_SET_LED_STRIP]), timeout=1000)
-print("Direct WS2812 strip mode disabled")
+try:
+    dev.set_interface_altsetting(interface=INTF, alternate_setting=1)
+except Exception:
+    pass
+
+payload = struct.pack("<BBH", VND_CMD_LED_EVENT, VND_LED_EVENT_BOTH, 1600)
+dev.write(EP_OUT, payload, timeout=1000)
+print("Sent RED_DOWN_UP_ALT for 1600 ms")
 PY
 ```
 
 ### Как это сочетается с локальной кнопкой `PC13`
 
-- `PC13` по-прежнему переключает только локальные тестовые паттерны STM32
-- если active direct-mode от RPI, для внешней ленты приоритет у данных, присланных по `0x38`
-- при выключении direct-mode (`payload = [0x38]`) устройство возвращается к текущему локальному паттерну STM32
-- временные события `0x35` можно использовать и дальше, если нужен кратковременный анимированный overlay поверх текущего фона
+- `PC13` переключает постоянный фон тестовых паттернов.
+- Команда `0x35` временно накладывает событие `RED_UP`, `RED_DOWN` или `RED_DOWN_UP_ALT`.
+- Команда `0x35` временно накладывает событие `RED_UP`, `RED_DOWN`, `RED_DOWN_UP_ALT`, `RED_SPLIT_IN` или `RED_SPLIT_OUT`.
+- После окончания таймера устройство возвращается к текущему локально выбранному паттерну.
 
-### Legacy: временные анимации `0x35`
+### Актуальный список локальных тестовых паттернов на устройстве
 
-Старая команда `0x35` (`VND_CMD_LED_EVENT`) не удалена. Она по-прежнему запускает короткие встроенные анимации:
+Текущий цикл по `PC13` такой:
 
-- `0x01` = `CHANNEL_B`
-- `0x02` = `CHANNEL_A`
-- `0x03` = `BOTH`
-- `0x04` = `SPLIT_IN`
-- `0x05` = `SPLIT_OUT`
+- `DRIP`
+- `RED_UP`
+- `RED_DOWN`
+- `RGB_SCOPE`
+- `RED_BLUE_SPLIT`
+- `COLOR_CYCLE`
 
-Для ручного запуска legacy-анимаций можно использовать [send_led_event.py](/d:/Users/Admin/Documents/Work/BMI20/STM32/BMI30.stm32h7/HostTools/send_led_event.py).
+Для `RED_UP` и `RED_DOWN` в текущей версии прошивки красный канал выставлен на максимальную яркость.
 
 Примечания
-- last-buffer-wins включён в прошивке для full-mode: если хост отстаёт, устройство пропускает старые буферы и отправляет самый свежий, чтобы минимизировать задержку.
+- last‑buffer‑wins включён в прошивке для full‑mode: если хост отстаёт, устройство пропускает старые буферы и отправляет самый свежий, чтобы минимизировать задержку.
 - EP0 GET_STATUS доступен всегда и не нарушает A/B‑последовательность.
 - Структуру заголовка кадров и STAT см. в `USBprotocol.txt` и коде `HostTools/vendor_stream_read.py`.
 
@@ -557,30 +799,40 @@ python3 HostTools/vendor_usb_start_and_read.py \
 
 Важно: «строго соблюдалась» здесь означает, что кадр появляется не когда хост “успеет”, а по факту накопления ровно `avg_n` входных буферов. Хосту на RPi нужно только стабильно читать bulk‑IN.
 
-### DC‑компенсация в конфигурации 2 (AVG_ROI)
+### DC-компенсация в AVG_ROI и LOSSLESS_ROI
 
-В режиме `STREAM_MODE=2` (AVG_ROI) прошивка дополнительно поддерживает **удаление DC** из усреднённых данных:
+В STM32 есть одна таблица коэффициентов `[channel][parity][sample]` и один процесс адаптации.
 
-- DC хранится как 4 независимых массива по 200 семплов: `(канал A/B) × (parity even/odd)`.
-- При выпуске усреднённого ROI‑кадра (200 семплов) прошивка вычитает соответствующий DC‑массив из данных.
-- DC адаптируется очень медленно: **каждый усреднённый пакет** обновляет **ровно 1 семпл** в своём DC‑массиве шагом **±1**.
+- RPI отправляет только `SET_DC_SPEED (0x1F)` с `uint32 settle_ms` little-endian.
+- Полный Bulk OUT пакет строго 5 байт.
+- `0` выключает обучение, но найденная коррекция продолжает применяться.
+- `1` — максимально быстро (1 мс); `1000` = 1 секунда.
+- Чем больше ненулевое значение, тем медленнее.
+- Ненулевое значение действует постоянно до следующей команды и не зависит от stream mode.
+- После reset скорость равна `0`; startup/reconnect RPI читает `GET_DC_CONFIG`
+  и отправляет требуемое значение, только если readback отличается.
+- Одинаковый `settle_ms` повторно не отправляется: ни при сохранении UI, ни при
+  смене host-профиля, ни при периодической проверке.
+- В `AVG_ROI` DC применяется и обучается один раз на raw ROI до усреднения.
+- В `LOSSLESS_ROI` текущая поправка применяется к локальной копии ROI перед USB.
+- Режимов WORK/DETECT/BOOT_FAST, таймеров acquisition/detection, pre/post и amplitude gate нет.
 
-#### Гейт по амплитуде (важно)
+Пример:
 
-Чтобы DC не работал на “маленьких” сигналах, введён гейт:
+```python
+import struct
 
-- Для каждого входного сырого буфера (обычно 600 семплов) прошивка смотрит размах `max - min`.
-- Если для канала размах **не превышает 60000**, то для этого канала **DC вычитание и адаптация отключены**.
-- Для экономии CPU: как только в текущем буфере найден размах `> 60000`, дальнейший контроль размаха для этого буфера прекращается.
+stream.send_cmd(0x1F, struct.pack("<I", 1_000))  # примерно 1 секунда
+stream.send_cmd(0x1F, struct.pack("<I", 1))      # максимально быстро
 
-#### Сохранение DC в долговременную память
+# Остановить обучение, оставив вычитание найденной поправки:
+stream.send_cmd(0x1F, struct.pack("<I", 0))
+```
 
-DC массивы периодически сохраняются во внутреннюю Flash примерно раз в 10–20 минут (по умолчанию ~15 минут), чтобы переживать перезагрузки/отключение питания.
-
-Важно про перепрошивку:
-
-- Если вы прошиваете без полного стирания (обычный `program ...`), DC обычно сохраняется.
-- Если используется **mass erase**/`flash_full` или иной сценарий полного стирания — сектор с DC будет очищен.
+Автоматическая периодическая запись Flash отключена. Чтобы таблица пережила reset или отключение
+питания, RPI отдельно отправляет `0x2B SAVE_DC_TO_FLASH` в выбранный им момент. Не отправляйте
+эту команду на каждом кадре. Обычная прошивка без mass erase обычно сохраняет выделенный DC-сектор;
+mass erase его очищает.
 
 ### Почему при большом avg_n появляется “время на повторы”
 

@@ -14,26 +14,64 @@ import mimetypes
 import os
 import pathlib
 import re
+import shlex
 import ssl
 import socket
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http import HTTPStatus
+from http.cookiejar import CookieJar
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, quote
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, quote, urlencode
+from urllib.request import HTTPRedirectHandler, HTTPCookieProcessor, Request, build_opener, urlopen
+
+
+def _initial_page_revision() -> str:
+    override = os.getenv("BMI30_PAGE_REV", "").strip()
+    if override:
+        return override
+    for manifest in (
+        "/home/techaid/Documents/host/bmi30_firmware_release.env",
+        os.path.join(os.path.dirname(__file__), "host", "bmi30_firmware_release.env"),
+    ):
+        try:
+            with open(manifest, "r", encoding="utf-8", errors="replace") as handle:
+                for raw_line in handle:
+                    if raw_line.startswith("BMI30_FIRMWARE_VERSION="):
+                        value = raw_line.split("=", 1)[1].strip().strip("'\"")
+                        if value:
+                            return value
+        except OSError:
+            pass
+    return str(int(os.path.getmtime(__file__)))
+
+
+def _sha256_file(path: str) -> str:
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return ""
 
 
 PORT         = int(os.getenv("BMI30_HOTSPOT_INFO_PORT",      "80"))
 HTTPS_PORT   = int(os.getenv("BMI30_HOTSPOT_INFO_HTTPS_PORT", "443"))
 CORE_SERVICE_URL = os.getenv("BMI30_SERVICE_URL", "http://127.0.0.1:8765").rstrip("/")
 REFRESH_S    = max(10, int(os.getenv("BMI30_HOTSPOT_INFO_REFRESH_S", "30")))
-SENSOR_REFRESH_S = max(1.0, float(os.getenv("BMI30_SENSOR_REFRESH_S", "2")))
+SENSOR_REFRESH_S = max(0.25, float(os.getenv("BMI30_SENSOR_REFRESH_S", "0.5")))
 STM32_TEMP_CACHE_S = max(SENSOR_REFRESH_S, float(os.getenv("BMI30_STM32_TEMP_CACHE_S", str(SENSOR_REFRESH_S))))
 STM32_TEMP_QUERY_TIMEOUT_S = max(0.2, float(os.getenv("BMI30_STM32_TEMP_QUERY_TIMEOUT_S", "0.8")))
+LAN_DEVICE_DISCOVERY_S = max(2.0, float(os.getenv("BMI30_LAN_DEVICE_DISCOVERY_S", "5")))
+LAN_SENSOR_REFRESH_S = max(0.25, float(os.getenv("BMI30_LAN_SENSOR_REFRESH_S", "0.5")))
+LAN_SENSOR_REQUEST_TIMEOUT_S = max(0.5, float(os.getenv("BMI30_LAN_SENSOR_REQUEST_TIMEOUT_S", "1.5")))
 HOTSPOT_IP   = os.getenv("BMI30_HOTSPOT_IP",   "10.42.0.1")
 HOTSPOT_CONN = os.getenv("BMI30_HOTSPOT_CONN",  "BMI30-Hotspot")
 WIFI_STA_IFACE = os.getenv("BMI30_WIFI_STA_IFACE", "wlan0")
@@ -58,13 +96,14 @@ PORTAL_SESSION_COOKIE = "bmi30_portal_session"
 PORTAL_SESSION_TTL_S = max(60, int(os.getenv("BMI30_PORTAL_SESSION_TTL_S", str(7 * 24 * 60 * 60))))
 PORTAL_PASSWORD_HASH_ITERATIONS = max(100_000, int(os.getenv("BMI30_PORTAL_PASSWORD_HASH_ITERATIONS", "390000")))
 _CONFIG_JSON_ENV = os.getenv("BMI30_CONFIG_JSON", "").strip()
+HOST_CONFIG_JSON = os.path.join(os.path.dirname(__file__), "host", "bmi30_config.json")
 if _CONFIG_JSON_ENV:
     CONFIG_JSON = _CONFIG_JSON_ENV
 else:
     _CONFIG_JSON_CANDIDATES = [
         "/etc/bmi30/portal_config.json",
         "/usr/local/bin/host/bmi30_config.json",
-        os.path.join(os.path.dirname(__file__), "host", "bmi30_config.json"),
+        HOST_CONFIG_JSON,
     ]
     _CONFIG_JSON_FALLBACK = _CONFIG_JSON_CANDIDATES[0] if getattr(os, "geteuid", lambda: 0)() == 0 else _CONFIG_JSON_CANDIDATES[-1]
     CONFIG_JSON = next((path for path in _CONFIG_JSON_CANDIDATES if os.path.isfile(path)), _CONFIG_JSON_FALLBACK)
@@ -73,7 +112,8 @@ SYNC_STATUS_OFFSET_S = os.getenv("BMI30_SYNC_STATUS_OFFSET", "").strip()
 DEVICE_STATE_JSON = os.getenv("BMI30_DEVICE_STATE_JSON", "/tmp/bmi30_device_state.json")
 DEVICE_STATE_MAX_AGE_S = max(1, int(os.getenv("BMI30_DEVICE_STATE_MAX_AGE_S", "300")))
 PORTAL_USB_STATUS_POLL = os.getenv("BMI30_PORTAL_USB_STATUS_POLL", "0").strip().lower() in {"1", "true", "yes", "on"}
-PAGE_REV = os.getenv("BMI30_PAGE_REV", str(int(os.path.getmtime(__file__))))
+PAGE_REV = _initial_page_revision()
+PORTAL_RUNTIME_SHA256 = _sha256_file(__file__)
 TAGIT_LOGO_CANDIDATES = [
     os.getenv("BMI30_PORTAL_TAGIT_LOGO_PATH", "").strip(),
     os.path.join(os.path.dirname(__file__), "docs", "Tagit_Logo.png"),
@@ -136,34 +176,75 @@ _SYNC_CACHE: dict[str, Any] = {
 _LCD_SYNC_CODE_RE = re.compile(r"^[MS][0-9]{2}$")
 _STM32_TEMP_CACHE: dict[str, Any] = {"ts": 0.0, "value": None}
 _STM32_TEMP_LOCK = threading.Lock()
+_LAN_DEVICE_CACHE: dict[str, Any] = {"updated_at": 0.0, "sensor_updated_at": 0.0, "devices": []}
+_LAN_DEVICE_LOCK = threading.Lock()
+_LAN_SENSOR_OPENERS: dict[str, Any] = {}
+_LAN_SENSOR_OPENERS_LOCK = threading.Lock()
 
 _PORTAL_CLIENTS: dict[str, float] = {}
 PORTAL_CLIENT_TTL_S = 15.0
 
 HTTPS_RUNTIME_ENABLED = False
 
-DC_MODE_NAMES = {
-    0: "FREEZE",
-    1: "WORK",
-    2: "DETECT",
-    3: "BOOT_FAST",
-}
 
-DC_MODE_VALUES = {name: value for value, name in DC_MODE_NAMES.items()}
+def _ready_sync_code(value: Any) -> str:
+    code = str(value or "").strip().upper()
+    return code if _LCD_SYNC_CODE_RE.fullmatch(code) else ""
+
+
 AVG_N_VALUES: tuple[int, ...] = (8, 16, 24, 32, 40, 48, 56, 64)
 DEFAULT_AVG_N = 24
 DC_SETTLE_MIN_S = 0.0
 DC_SETTLE_MAX_S = 86400.0
+DC_LIGHTNING_TIMEOUT_MIN_S = 0.1
 
 DEFAULT_DC_CONFIG: dict[str, Any] = {
-    "mode": "WORK",
-    "work_settle_s": 900.0,
-    "detect_settle_s": 60.0,
-    "detect_initial_settle_s": 60.0,
-    "detect_final_settle_s": 60.0,
-    "detect_ramp_s": 0.0,
-    "fast_settle_s": 5.0,
-    "fast_duration_s": 30.0,
+    "work_settle_s": 5.0,
+    "acquisition_settle_s": 500.0,
+    "detection_settle_s": 10000.0,
+    "startup_settle_s": 1.0,
+    "lightning_timeout_s": 1.0,
+}
+
+DEFAULT_SOUND_CONFIG: dict[str, Any] = {
+    "enabled": False,
+    "volume_percent": 100.0,
+    "upper_frequency_hz": 4000.0,
+    "lower_frequency_hz": 1000.0,
+    "phase_upper_min_hz": 1000.0,
+    "phase_upper_max_hz": 3000.0,
+    "phase_lower_min_hz": 2000.0,
+    "phase_lower_max_hz": 4000.0,
+    "minimum_duration_ms": 150,
+    "minimum_tone_cycles": 1,
+    "test_enabled": False,
+    "test_upper_enabled": False,
+    "test_lower_enabled": False,
+    "volume_scale": "ui_0_100_pwm_0_50",
+}
+DEFAULT_LCD_ROLE_OVERLAY: dict[str, Any] = {
+    "enabled": False,
+    "period_s": 4,
+    "duration_s": 4,
+}
+
+try:
+    _LED_PATTERN_MAX_RAW = int(os.getenv("BMI30_LED_PATTERN_MAX", "15"))
+except Exception:
+    _LED_PATTERN_MAX_RAW = 15
+LED_PATTERN_MAX = max(0, min(255, _LED_PATTERN_MAX_RAW))
+LED_PATTERN_VALUES: tuple[int, ...] = tuple(range(LED_PATTERN_MAX + 1))
+GROUP_LED_PATTERN_EVENTS: tuple[tuple[str, str], ...] = (
+    ("upper_detection", "Upper antenna detection"),
+    ("lower_detection", "Lower antenna detection"),
+    ("both_detection", "Both antennas detection"),
+    ("neighbor_upper_detection", "Neighbor upper antenna detection"),
+    ("neighbor_lower_detection", "Neighbor lower antenna detection"),
+    ("neighbor_both_detection", "Neighbor both antennas detection"),
+    ("fault", "Fault"),
+)
+DEFAULT_GROUP_LED_PATTERNS: dict[str, int] = {
+    event_key: 0 for event_key, _event_label in GROUP_LED_PATTERN_EVENTS
 }
 
 DEFAULT_TAG_DETECTION_CONFIG: dict[str, Any] = {
@@ -171,8 +252,14 @@ DEFAULT_TAG_DETECTION_CONFIG: dict[str, Any] = {
     "enabled1": True,
     "confirm0": 2,
     "confirm1": 2,
+    "confirm_phase_gate": 3,
     "threshold0": 2.0,
     "threshold1": 2.0,
+    "threshold_high0": 5.0,
+    "threshold_high1": 5.0,
+    "ratio_noise_max_u16": 10.0,
+    "auto_floor_u16": 10.0,
+    "auto_slope": 5.0,
     "auto0": False,
     "auto1": False,
     "filter_amplitude0": True,
@@ -183,6 +270,7 @@ DEFAULT_TAG_DETECTION_CONFIG: dict[str, Any] = {
     "filter_phase1": True,
     "filter_noise_adapt0": True,
     "filter_noise_adapt1": True,
+    "noise_window_s": 1.0,
     "noise_up0": 24,
     "noise_up1": 24,
     "noise_down0": 3,
@@ -195,10 +283,21 @@ DEFAULT_TAG_DETECTION_CONFIG: dict[str, Any] = {
     "burst_blank_s1": 0.08,
     "burst_max_ratio0": 8.0,
     "burst_max_ratio1": 8.0,
+    "smooth_mode": 0,
     "filter_casino": True,
     "filter_barkhausen": False,
     "filter_microwire": False,
     "filter_paper": False,
+    "peak_index_min": 0,
+    "peak_index_max": 199,
+    "barkhausen_radius": 24,
+    "barkhausen_frac": 0.22,
+    "barkhausen_min_width": 4,
+    "barkhausen_max_span": 140,
+    "barkhausen_min_product_level": 800000,
+    "barkhausen_max_product_level": 20000000,
+    "barkhausen_max_total_fraction": 0.82,
+    "barkhausen_all_quarter_frac": 0.45,
     "phase_max_shift": 12,
     "phase_shift_penalty": 0.02,
     "mark_window_start_frac": 0.05,
@@ -211,6 +310,32 @@ DEFAULT_TAG_DETECTION_CONFIG: dict[str, Any] = {
     "locality_max_outside_peaks": 1,
     "locality_outside_peak_frac": 0.35,
 }
+
+BARKHAUSEN_TAG_KEYS: tuple[str, ...] = (
+    "barkhausen_radius",
+    "barkhausen_frac",
+    "barkhausen_min_width",
+    "barkhausen_max_span",
+    "barkhausen_min_product_level",
+    "barkhausen_max_product_level",
+    "barkhausen_max_total_fraction",
+    "barkhausen_all_quarter_frac",
+)
+
+CORE_TAG_DETECTION_KEYS: tuple[str, ...] = (
+    "threshold_high0", "threshold_high1", "ratio_noise_max_u16", "auto_floor_u16", "auto_slope",
+    "noise_window_s", "noise_up0", "noise_up1", "noise_down0", "noise_down1", "noise_unit0", "noise_unit1",
+    "burst_gate0", "burst_gate1", "burst_blank_s0", "burst_blank_s1", "burst_max_ratio0", "burst_max_ratio1",
+    "smooth_mode",
+    "confirm_phase_gate",
+    "filter_casino", "filter_barkhausen", "filter_microwire", "filter_paper",
+    "peak_index_min", "peak_index_max",
+    *BARKHAUSEN_TAG_KEYS,
+    "phase_max_shift", "phase_shift_penalty",
+    "mark_window_start_frac", "mark_window_end_frac",
+    "mark_gap", "mark_gap_tol", "mark_second_frac", "mark_valley_frac", "mark_multi_max_humps",
+    "locality_max_outside_peaks", "locality_outside_peak_frac",
+)
 
 # PDF документация
 PDF_CACHE_DIR = pathlib.Path(os.getenv("BMI30_PDF_CACHE_DIR", "/var/cache/bmi30")).expanduser()
@@ -630,10 +755,65 @@ def _read_key_value_file(path: str) -> dict[str, str]:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, value = line.split("=", 1)
-                data[key.strip()] = value.strip().strip("'\"")
+                value = value.strip()
+                try:
+                    parsed = shlex.split(value, comments=False, posix=True)
+                    value = parsed[0] if len(parsed) == 1 else value.strip("'\"")
+                except ValueError:
+                    value = value.strip("'\"")
+                data[key.strip()] = value
     except Exception:
         pass
     return data
+
+
+def detect_bmi30_firmware_release() -> dict[str, Any]:
+    manifest_path = ""
+    data: dict[str, str] = {}
+    for candidate in (
+        os.getenv("BMI30_FIRMWARE_MANIFEST", "").strip(),
+        "/home/techaid/Documents/host/bmi30_firmware_release.env",
+        os.path.join(os.path.dirname(__file__), "host", "bmi30_firmware_release.env"),
+        "/usr/local/bin/host/bmi30_firmware_release.env",
+    ):
+        if not candidate:
+            continue
+        candidate_data = _read_key_value_file(candidate)
+        if candidate_data.get("BMI30_FIRMWARE_VERSION"):
+            manifest_path = candidate
+            data = candidate_data
+            break
+
+    version = data.get("BMI30_FIRMWARE_VERSION", "").strip()
+    label = data.get("BMI30_FIRMWARE_LABEL", "").strip() or version
+    expected_portal_hash = data.get("BMI30_FIRMWARE_PORTAL_SHA256", "").strip().lower()
+    runtime_portal_hash = PORTAL_RUNTIME_SHA256.lower()
+    portal_matches = bool(expected_portal_hash and runtime_portal_hash == expected_portal_hash)
+
+    return {
+        "version": version,
+        "label": label,
+        "created_at": data.get("BMI30_FIRMWARE_CREATED_AT", "").strip(),
+        "content_signature": data.get("BMI30_FIRMWARE_CONTENT_SIGNATURE", "").strip(),
+        "signature_version": data.get("BMI30_FIRMWARE_SIGNATURE_VERSION", "").strip(),
+        "core_path": data.get("BMI30_FIRMWARE_CORE_PATH", "").strip(),
+        "engine_path": data.get("BMI30_FIRMWARE_ENGINE_PATH", "").strip(),
+        "gui_path": data.get("BMI30_FIRMWARE_GUI_PATH", "").strip(),
+        "portal_path": data.get("BMI30_FIRMWARE_PORTAL_PATH", "").strip(),
+        "portal_sha256": expected_portal_hash,
+        "runtime_portal_sha256": runtime_portal_hash,
+        "portal_matches_release": portal_matches,
+        "manifest_path": manifest_path,
+    }
+
+
+def format_firmware_version_with_date(release: dict[str, Any]) -> str:
+    """Return the dated release ID for compact FW displays, not its prose label."""
+    version = str(release.get("version") or "").strip()
+    match = re.match(r"^(\d{4}-\d{2}-\d{2}-\d{4})(?:[-_.]|$)", version)
+    if match:
+        return match.group(1)
+    return version or str(release.get("label") or "").strip()
 
 
 def _format_active_app_version(path: str) -> str:
@@ -720,11 +900,16 @@ def _split_version_from_core_path(path: str) -> str:
     date_part = ""
     time_part = ""
 
-    match = re.search(r"(\d{4}-\d{2}-\d{2})", name)
+    match = re.search(r"(\d{4}-\d{2}-\d{2})-([0-9]{2})([0-9]{2})", name)
     if match:
         date_part = match.group(1)
+        time_part = f"{match.group(2)}{match.group(3)}"
+    else:
+        match = re.search(r"(\d{4}-\d{2}-\d{2})", name)
+        if match:
+            date_part = match.group(1)
 
-    if os.path.exists(resolved_path):
+    if not time_part and os.path.exists(resolved_path):
         try:
             mtime = dt.datetime.fromtimestamp(os.path.getmtime(resolved_path))
             if not date_part:
@@ -809,6 +994,11 @@ def detect_rpi_software_version() -> str:
         if value:
             return value
 
+    firmware_release = detect_bmi30_firmware_release()
+    release_version = format_firmware_version_with_date(firmware_release)
+    if release_version:
+        return release_version
+
     value = _read_first_text((
         "/etc/bmi30/rpi_fw_version",
         "/etc/bmi30/rpi_software_version",
@@ -886,9 +1076,19 @@ def _save_config_json(payload: dict[str, Any]) -> None:
     directory = os.path.dirname(CONFIG_JSON) or "."
     os.makedirs(directory, exist_ok=True)
     tmp_path = f"{CONFIG_JSON}.tmp"
+    try:
+        previous_stat = os.stat(CONFIG_JSON)
+    except Exception:
+        previous_stat = None
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
+    if previous_stat is not None:
+        try:
+            runtime_gid = os.stat("/home/techaid/Documents").st_gid
+            os.chown(tmp_path, previous_stat.st_uid, runtime_gid)
+        except Exception:
+            pass
     try:
         os.chmod(tmp_path, 0o640)
     except Exception:
@@ -951,6 +1151,197 @@ def _bool_form_value(form: dict[str, str], key: str, default: bool = False) -> b
     return str(raw).strip().lower() in {"1", "true", "yes", "on", "y", "t"}
 
 
+def _normalize_sound_config(raw: Any = None) -> dict[str, Any]:
+    source = raw if isinstance(raw, dict) else {}
+    cfg = dict(DEFAULT_SOUND_CONFIG)
+    cfg.update({k: source.get(k, v) for k, v in DEFAULT_SOUND_CONFIG.items()})
+    cfg["enabled"] = bool(cfg.get("enabled", False))
+    cfg["volume_percent"] = round(_float_form_value(cfg, "volume_percent", 100.0, 0.0, 100.0), 1)
+    cfg["upper_frequency_hz"] = round(_float_form_value(cfg, "upper_frequency_hz", 4000.0, 1.0, 20000.0), 1)
+    cfg["lower_frequency_hz"] = round(_float_form_value(cfg, "lower_frequency_hz", 1000.0, 1.0, 20000.0), 1)
+    cfg["phase_upper_min_hz"] = round(_float_form_value(cfg, "phase_upper_min_hz", 1000.0, 1.0, 20000.0), 1)
+    cfg["phase_upper_max_hz"] = round(_float_form_value(cfg, "phase_upper_max_hz", 3000.0, 1.0, 20000.0), 1)
+    cfg["phase_lower_min_hz"] = round(_float_form_value(cfg, "phase_lower_min_hz", 2000.0, 1.0, 20000.0), 1)
+    cfg["phase_lower_max_hz"] = round(_float_form_value(cfg, "phase_lower_max_hz", 4000.0, 1.0, 20000.0), 1)
+    cfg["minimum_duration_ms"] = _int_form_value(cfg, "minimum_duration_ms", 150, 0, 60000)
+    cfg["minimum_tone_cycles"] = _int_form_value(cfg, "minimum_tone_cycles", 1, 1, 1000)
+    if cfg["phase_upper_max_hz"] < cfg["phase_upper_min_hz"]:
+        cfg["phase_upper_min_hz"], cfg["phase_upper_max_hz"] = cfg["phase_upper_max_hz"], cfg["phase_upper_min_hz"]
+    if cfg["phase_lower_max_hz"] < cfg["phase_lower_min_hz"]:
+        cfg["phase_lower_min_hz"], cfg["phase_lower_max_hz"] = cfg["phase_lower_max_hz"], cfg["phase_lower_min_hz"]
+    legacy_test = bool(source.get("test_enabled", cfg.get("test_enabled", False)))
+    cfg["test_upper_enabled"] = bool(source.get("test_upper_enabled", legacy_test))
+    cfg["test_lower_enabled"] = bool(source.get("test_lower_enabled", legacy_test))
+    if cfg["test_upper_enabled"] and cfg["test_lower_enabled"]:
+        cfg["test_lower_enabled"] = False
+    cfg["test_enabled"] = bool(cfg["test_upper_enabled"] or cfg["test_lower_enabled"])
+    cfg["volume_scale"] = "ui_0_100_pwm_0_50"
+    return cfg
+
+
+def _normalize_lcd_role_overlay(raw: Any = None) -> dict[str, Any]:
+    source = raw if isinstance(raw, dict) else {}
+    def seconds(key: str) -> int:
+        try:
+            value = int(source.get(key, 4))
+        except Exception:
+            value = 4
+        return max(1, min(5, value))
+    return {
+        "enabled": _bool_form_value({"enabled": str(source.get("enabled", "0"))}, "enabled", False),
+        "period_s": seconds("period_s"),
+        "duration_s": seconds("duration_s"),
+    }
+
+
+def load_lcd_role_overlay() -> dict[str, Any]:
+    payload = _load_config_json()
+    return _normalize_lcd_role_overlay(payload.get("lcd_role_overlay"))
+
+
+def save_lcd_role_overlay(cfg: dict[str, Any]) -> None:
+    payload = _load_config_json()
+    payload["lcd_role_overlay"] = _normalize_lcd_role_overlay(cfg)
+    payload["lcd_role_overlay_updated_at"] = int(time.time())
+    _save_config_json(payload)
+
+
+def lcd_role_overlay_from_form(form: dict[str, str]) -> dict[str, Any]:
+    return _normalize_lcd_role_overlay({
+        "enabled": _bool_form_value(form, "lcd_role_overlay_enabled", False),
+        "period_s": form.get("lcd_role_overlay_period_s", 4),
+        "duration_s": form.get("lcd_role_overlay_duration_s", 4),
+    })
+
+
+def apply_lcd_role_overlay_to_core(cfg: dict[str, Any], persist: bool = True) -> tuple[bool, str, dict[str, Any]]:
+    cfg = _normalize_lcd_role_overlay(cfg)
+    payload = {"action": "lcd_role_overlay", "params": dict(cfg, persist=bool(persist))}
+    try:
+        req = Request(
+            f"{CORE_SERVICE_URL}/api/command",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-BMI30-Source": "portal_lcd_role_overlay"},
+            method="POST",
+        )
+        with urlopen(req, timeout=3.0) as response:
+            result = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception as exc:
+        return False, f"Unable to contact BMI30 core service: {exc}", dict(cfg, applied=False, pending=True)
+    actual = result.get("lcd_role_overlay") if isinstance(result, dict) else None
+    if not isinstance(actual, dict):
+        actual = dict(cfg, applied=False, pending=True)
+    if not isinstance(result, dict) or not bool(result.get("ok", False)):
+        return False, str(result.get("error") or "BMI30 core rejected LCD role overlay"), actual
+    return True, "LCD role overlay sent to BMI30 core service", actual
+
+
+def load_sound_config_from_core() -> dict[str, Any] | None:
+    try:
+        with urlopen(f"{CORE_SERVICE_URL}/api/status", timeout=0.5) as response:
+            status = json.loads(response.read().decode("utf-8") or "{}")
+        sound = (status or {}).get("sound")
+        if not isinstance(sound, dict):
+            return None
+        return _normalize_sound_config(sound)
+    except Exception:
+        return None
+
+
+def load_sound_config() -> dict[str, Any]:
+    payload = _load_config_json()
+    raw = payload.get("sound_settings")
+    if not isinstance(raw, dict):
+        raw = payload.get("sound")
+    source = raw if isinstance(raw, dict) else {}
+    if "sound_enabled" in payload and "enabled" not in source:
+        source = dict(source)
+        source["enabled"] = payload.get("sound_enabled")
+    if source and source.get("volume_scale") != "ui_0_100_pwm_0_50" and "volume_percent" in source:
+        try:
+            source = dict(source)
+            source["volume_percent"] = min(100.0, max(0.0, float(source.get("volume_percent", 50.0)) * 2.0))
+        except Exception:
+            pass
+    cfg = _normalize_sound_config(source)
+    core_cfg = load_sound_config_from_core()
+    if core_cfg is not None:
+        if not source:
+            cfg = core_cfg
+        else:
+            cfg["test_enabled"] = bool(core_cfg.get("test_enabled", False))
+            cfg["test_upper_enabled"] = bool(core_cfg.get("test_upper_enabled", False))
+            cfg["test_lower_enabled"] = bool(core_cfg.get("test_lower_enabled", False))
+    return _normalize_sound_config(cfg)
+
+
+def save_sound_config(cfg: dict[str, Any]) -> None:
+    payload = _load_config_json()
+    saved = _normalize_sound_config(cfg)
+    saved["test_enabled"] = False
+    saved["test_upper_enabled"] = False
+    saved["test_lower_enabled"] = False
+    payload["sound_enabled"] = bool(saved["enabled"])
+    payload["sound_settings"] = saved
+    payload["sound_settings_updated_at"] = int(time.time())
+    _save_config_json(payload)
+
+
+def sound_config_from_form(form: dict[str, str]) -> dict[str, Any]:
+    return _normalize_sound_config({
+        "enabled": _bool_form_value(form, "sound_enabled", False),
+        "volume_percent": _float_form_value(form, "sound_volume_percent", 100.0, 0.0, 100.0),
+        "upper_frequency_hz": _float_form_value(form, "sound_upper_frequency_hz", 4000.0, 1.0, 20000.0),
+        "lower_frequency_hz": _float_form_value(form, "sound_lower_frequency_hz", 1000.0, 1.0, 20000.0),
+        "phase_upper_min_hz": _float_form_value(form, "sound_phase_upper_min_hz", 1000.0, 1.0, 20000.0),
+        "phase_upper_max_hz": _float_form_value(form, "sound_phase_upper_max_hz", 3000.0, 1.0, 20000.0),
+        "phase_lower_min_hz": _float_form_value(form, "sound_phase_lower_min_hz", 2000.0, 1.0, 20000.0),
+        "phase_lower_max_hz": _float_form_value(form, "sound_phase_lower_max_hz", 4000.0, 1.0, 20000.0),
+        "minimum_duration_ms": _int_form_value(form, "sound_minimum_duration_ms", 150, 0, 60000),
+        "minimum_tone_cycles": _int_form_value(form, "sound_minimum_tone_cycles", 1, 1, 1000),
+        "test_upper_enabled": _bool_form_value(form, "sound_test_upper_enabled", False),
+        "test_lower_enabled": _bool_form_value(form, "sound_test_lower_enabled", False),
+    })
+
+
+def apply_sound_config_to_core(cfg: dict[str, Any], persist: bool = True) -> tuple[bool, str]:
+    cfg = _normalize_sound_config(cfg)
+    payload = {
+        "action": "sound_settings",
+        "params": {
+            "enabled": bool(cfg["enabled"]),
+            "volume_percent": float(cfg["volume_percent"]),
+            "upper_frequency_hz": float(cfg["upper_frequency_hz"]),
+            "lower_frequency_hz": float(cfg["lower_frequency_hz"]),
+            "phase_upper_min_hz": float(cfg["phase_upper_min_hz"]),
+            "phase_upper_max_hz": float(cfg["phase_upper_max_hz"]),
+            "phase_lower_min_hz": float(cfg["phase_lower_min_hz"]),
+            "phase_lower_max_hz": float(cfg["phase_lower_max_hz"]),
+            "minimum_duration_ms": int(cfg["minimum_duration_ms"]),
+            "minimum_tone_cycles": int(cfg["minimum_tone_cycles"]),
+            "test_enabled": bool(cfg["test_enabled"]),
+            "test_upper_enabled": bool(cfg["test_upper_enabled"]),
+            "test_lower_enabled": bool(cfg["test_lower_enabled"]),
+            "volume_scale": "ui_0_100_pwm_0_50",
+            "persist": bool(persist),
+        },
+    }
+    try:
+        req = Request(
+            f"{CORE_SERVICE_URL}/api/command",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-BMI30-Source": "portal_sound_settings"},
+            method="POST",
+        )
+        with urlopen(req, timeout=3.0) as response:
+            result = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception as exc:
+        return False, f"Unable to contact BMI30 core service: {exc}"
+    if not isinstance(result, dict) or not bool(result.get("ok", False)):
+        return False, str(result.get("error") or "BMI30 core service rejected sound settings")
+    return True, "Sound settings sent to BMI30 core service"
+
+
 def _noise_unit_value(value: Any, default: str = "adc") -> str:
     try:
         unit = str(value or default).strip().lower()
@@ -969,8 +1360,14 @@ def _normalize_tag_detection_config(raw: Any = None) -> dict[str, Any]:
     cfg["enabled1"] = bool(cfg.get("enabled1", True))
     cfg["confirm0"] = _int_form_value(cfg, "confirm0", 2, 1, 6)
     cfg["confirm1"] = _int_form_value(cfg, "confirm1", 2, 1, 6)
-    cfg["threshold0"] = round(_float_form_value(cfg, "threshold0", 2.0, 1.0, 4.0), 1)
-    cfg["threshold1"] = round(_float_form_value(cfg, "threshold1", 2.0, 1.0, 4.0), 1)
+    cfg["confirm_phase_gate"] = _int_form_value(cfg, "confirm_phase_gate", 3, 0, 199)
+    cfg["threshold0"] = round(_float_form_value(cfg, "threshold0", 2.0, 1.0, 100.0), 1)
+    cfg["threshold1"] = round(_float_form_value(cfg, "threshold1", 2.0, 1.0, 100.0), 1)
+    cfg["threshold_high0"] = round(_float_form_value(cfg, "threshold_high0", 5.0, 1.0, 100.0), 1)
+    cfg["threshold_high1"] = round(_float_form_value(cfg, "threshold_high1", 5.0, 1.0, 100.0), 1)
+    cfg["ratio_noise_max_u16"] = round(_float_form_value(cfg, "ratio_noise_max_u16", 10.0, 0.1, 65535.0), 3)
+    cfg["auto_floor_u16"] = round(_float_form_value(cfg, "auto_floor_u16", 10.0, 0.0, 65535.0), 3)
+    cfg["auto_slope"] = round(_float_form_value(cfg, "auto_slope", 5.0, 0.1, 100.0), 3)
     cfg["auto0"] = bool(cfg.get("auto0", False))
     cfg["auto1"] = bool(cfg.get("auto1", False))
     cfg["filter_amplitude0"] = bool(cfg.get("filter_amplitude0", True))
@@ -981,6 +1378,7 @@ def _normalize_tag_detection_config(raw: Any = None) -> dict[str, Any]:
     cfg["filter_phase1"] = bool(cfg.get("filter_phase1", True))
     cfg["filter_noise_adapt0"] = bool(cfg.get("filter_noise_adapt0", True))
     cfg["filter_noise_adapt1"] = bool(cfg.get("filter_noise_adapt1", True))
+    cfg["noise_window_s"] = round(_float_form_value(cfg, "noise_window_s", 1.0, 0.05, 10.0), 3)
     cfg["noise_up0"] = _int_form_value(cfg, "noise_up0", 24, 1, 65535)
     cfg["noise_up1"] = _int_form_value(cfg, "noise_up1", 24, 1, 65535)
     cfg["noise_down0"] = _int_form_value(cfg, "noise_down0", 3, 1, 65535)
@@ -993,14 +1391,38 @@ def _normalize_tag_detection_config(raw: Any = None) -> dict[str, Any]:
     cfg["burst_blank_s1"] = round(_float_form_value(cfg, "burst_blank_s1", 0.08, 0.0, 1.0), 3)
     cfg["burst_max_ratio0"] = round(_float_form_value(cfg, "burst_max_ratio0", 8.0, 0.0, 100.0), 1)
     cfg["burst_max_ratio1"] = round(_float_form_value(cfg, "burst_max_ratio1", 8.0, 0.0, 100.0), 1)
+    cfg["smooth_mode"] = _int_form_value(cfg, "smooth_mode", 0, 0, 5)
     cfg["filter_casino"] = bool(cfg.get("filter_casino", True))
     cfg["filter_barkhausen"] = bool(cfg.get("filter_barkhausen", False))
     cfg["filter_microwire"] = bool(cfg.get("filter_microwire", False))
     cfg["filter_paper"] = bool(cfg.get("filter_paper", False))
+    if "peak_index_min" not in source and "peak_index_max" not in source:
+        legacy_enabled = _bool_form_value(source, "peak_thirds_limit_enabled", False)
+        legacy_type = str(source.get("peak_thirds_limit_type", "microwire") or "microwire").strip().lower()
+        legacy_barkhausen = legacy_type in {"barkhausen", "bark", "b"}
+        cfg["peak_index_min"] = 67 if legacy_enabled and legacy_barkhausen else 0
+        cfg["peak_index_max"] = 66 if legacy_enabled and not legacy_barkhausen else 199
+    cfg["peak_index_min"] = _int_form_value(cfg, "peak_index_min", 0, 0, 199)
+    cfg["peak_index_max"] = _int_form_value(cfg, "peak_index_max", 199, 0, 199)
+    if cfg["peak_index_max"] < cfg["peak_index_min"]:
+        cfg["peak_index_max"] = cfg["peak_index_min"]
+    cfg["barkhausen_radius"] = _int_form_value(cfg, "barkhausen_radius", 24, 1, 120)
+    cfg["barkhausen_frac"] = round(_float_form_value(cfg, "barkhausen_frac", 0.22, 0.01, 1.0), 3)
+    cfg["barkhausen_min_width"] = _int_form_value(cfg, "barkhausen_min_width", 4, 1, 120)
+    cfg["barkhausen_max_span"] = _int_form_value(cfg, "barkhausen_max_span", 140, 1, 200)
+    cfg["barkhausen_min_product_level"] = _int_form_value(cfg, "barkhausen_min_product_level", 800000, 0, 2147483647)
+    cfg["barkhausen_max_product_level"] = _int_form_value(cfg, "barkhausen_max_product_level", 20000000, 0, 2147483647)
+    if cfg["barkhausen_max_product_level"] and cfg["barkhausen_max_product_level"] < cfg["barkhausen_min_product_level"]:
+        cfg["barkhausen_max_product_level"] = cfg["barkhausen_min_product_level"]
+    cfg["barkhausen_max_total_fraction"] = round(_float_form_value(cfg, "barkhausen_max_total_fraction", 0.82, 0.01, 1.0), 3)
+    cfg["barkhausen_all_quarter_frac"] = round(_float_form_value(cfg, "barkhausen_all_quarter_frac", 0.45, 0.01, 1.0), 3)
     cfg["phase_max_shift"] = _int_form_value(cfg, "phase_max_shift", 12, 0, 80)
     cfg["phase_shift_penalty"] = round(_float_form_value(cfg, "phase_shift_penalty", 0.02, 0.0, 1.0), 4)
     cfg["mark_window_start_frac"] = round(_float_form_value(cfg, "mark_window_start_frac", 0.05, 0.0, 0.95), 4)
-    cfg["mark_window_end_frac"] = round(_float_form_value(cfg, "mark_window_end_frac", 0.45, 0.01, 1.0), 4)
+    mark_window_end_default = 0.95 if cfg["filter_barkhausen"] else 0.45
+    cfg["mark_window_end_frac"] = round(_float_form_value(cfg, "mark_window_end_frac", mark_window_end_default, 0.01, 1.0), 4)
+    if cfg["filter_barkhausen"] and cfg["mark_window_end_frac"] < 0.90:
+        cfg["mark_window_end_frac"] = 0.95
     if cfg["mark_window_end_frac"] <= cfg["mark_window_start_frac"]:
         cfg["mark_window_end_frac"] = min(1.0, round(float(cfg["mark_window_start_frac"]) + 0.01, 4))
     cfg["mark_gap"] = _int_form_value(cfg, "mark_gap", 21, 1, 160)
@@ -1014,18 +1436,13 @@ def _normalize_tag_detection_config(raw: Any = None) -> dict[str, Any]:
 
 
 def load_tag_detection_config() -> dict[str, Any]:
-    raw = _load_config_json().get("tag_detection")
-    source = raw if isinstance(raw, dict) else {}
+    payload = _load_config_json()
+    raw = payload.get("tag_detection")
+    source = raw if isinstance(raw, dict) else payload
     cfg = _normalize_tag_detection_config(source)
-    core_backfill_keys = (
-        "noise_up0", "noise_up1", "noise_down0", "noise_down1", "noise_unit0", "noise_unit1",
-        "burst_gate0", "burst_gate1", "burst_blank_s0", "burst_blank_s1", "burst_max_ratio0", "burst_max_ratio1",
-        "filter_casino", "filter_barkhausen", "filter_microwire", "filter_paper",
-        "phase_max_shift", "phase_shift_penalty",
-        "mark_window_start_frac", "mark_window_end_frac",
-        "mark_gap", "mark_gap_tol", "mark_second_frac", "mark_valley_frac", "mark_multi_max_humps",
-        "locality_max_outside_peaks", "locality_outside_peak_frac",
-    )
+    if "smooth_mode" not in source and "smooth_mode" in payload:
+        cfg["smooth_mode"] = _int_form_value(payload, "smooth_mode", 0, 0, 5)
+    core_backfill_keys = CORE_TAG_DETECTION_KEYS
     missing_core = any(key not in source for key in core_backfill_keys)
     if missing_core:
         core_cfg = load_tag_detection_config_from_core()
@@ -1039,6 +1456,7 @@ def load_tag_detection_config() -> dict[str, Any]:
 def save_tag_detection_config(cfg: dict[str, Any]) -> None:
     payload = _load_config_json()
     payload["tag_detection"] = _normalize_tag_detection_config(cfg)
+    payload["smooth_mode"] = int(payload["tag_detection"]["smooth_mode"])
     payload["tag_detection_updated_at"] = int(time.time())
     _save_config_json(payload)
 
@@ -1049,8 +1467,14 @@ def tag_detection_config_from_form(form: dict[str, str]) -> dict[str, Any]:
         "enabled1": _bool_form_value(form, "enabled1", True),
         "confirm0": _int_form_value(form, "confirm0", 2, 1, 6),
         "confirm1": _int_form_value(form, "confirm1", 2, 1, 6),
-        "threshold0": _float_form_value(form, "threshold0", 2.0, 1.0, 4.0),
-        "threshold1": _float_form_value(form, "threshold1", 2.0, 1.0, 4.0),
+        "confirm_phase_gate": _int_form_value(form, "confirm_phase_gate", 3, 0, 199),
+        "threshold0": _float_form_value(form, "threshold0", 2.0, 1.0, 100.0),
+        "threshold1": _float_form_value(form, "threshold1", 2.0, 1.0, 100.0),
+        "threshold_high0": _float_form_value(form, "threshold_high0", 5.0, 1.0, 100.0),
+        "threshold_high1": _float_form_value(form, "threshold_high1", 5.0, 1.0, 100.0),
+        "ratio_noise_max_u16": _float_form_value(form, "ratio_noise_max_u16", 10.0, 0.1, 65535.0),
+        "auto_floor_u16": _float_form_value(form, "auto_floor_u16", 10.0, 0.0, 65535.0),
+        "auto_slope": _float_form_value(form, "auto_slope", 5.0, 0.1, 100.0),
         "auto0": _bool_form_value(form, "auto0", False),
         "auto1": _bool_form_value(form, "auto1", False),
         "filter_amplitude0": _bool_form_value(form, "filter_amplitude0", True),
@@ -1061,6 +1485,7 @@ def tag_detection_config_from_form(form: dict[str, str]) -> dict[str, Any]:
         "filter_phase1": _bool_form_value(form, "filter_phase1", True),
         "filter_noise_adapt0": True,
         "filter_noise_adapt1": True,
+        "noise_window_s": _float_form_value(form, "noise_window_s", 1.0, 0.05, 10.0),
         "noise_up0": _int_form_value(form, "noise_up0", 24, 1, 65535),
         "noise_up1": _int_form_value(form, "noise_up1", 24, 1, 65535),
         "noise_down0": _int_form_value(form, "noise_down0", 3, 1, 65535),
@@ -1073,10 +1498,21 @@ def tag_detection_config_from_form(form: dict[str, str]) -> dict[str, Any]:
         "burst_blank_s1": _float_form_value(form, "burst_blank_s1", 0.08, 0.0, 1.0),
         "burst_max_ratio0": _float_form_value(form, "burst_max_ratio0", 8.0, 0.0, 100.0),
         "burst_max_ratio1": _float_form_value(form, "burst_max_ratio1", 8.0, 0.0, 100.0),
+        "smooth_mode": _int_form_value(form, "smooth_mode", 0, 0, 5),
         "filter_casino": _bool_form_value(form, "filter_casino", True),
         "filter_barkhausen": _bool_form_value(form, "filter_barkhausen", False),
         "filter_microwire": _bool_form_value(form, "filter_microwire", False),
         "filter_paper": _bool_form_value(form, "filter_paper", False),
+        "peak_index_min": _int_form_value(form, "peak_index_min", 0, 0, 199),
+        "peak_index_max": _int_form_value(form, "peak_index_max", 199, 0, 199),
+        "barkhausen_radius": _int_form_value(form, "barkhausen_radius", 24, 1, 120),
+        "barkhausen_frac": _float_form_value(form, "barkhausen_frac", 0.22, 0.01, 1.0),
+        "barkhausen_min_width": _int_form_value(form, "barkhausen_min_width", 4, 1, 120),
+        "barkhausen_max_span": _int_form_value(form, "barkhausen_max_span", 140, 1, 200),
+        "barkhausen_min_product_level": _int_form_value(form, "barkhausen_min_product_level", 800000, 0, 2147483647),
+        "barkhausen_max_product_level": _int_form_value(form, "barkhausen_max_product_level", 20000000, 0, 2147483647),
+        "barkhausen_max_total_fraction": _float_form_value(form, "barkhausen_max_total_fraction", 0.82, 0.01, 1.0),
+        "barkhausen_all_quarter_frac": _float_form_value(form, "barkhausen_all_quarter_frac", 0.45, 0.01, 1.0),
         "phase_max_shift": _int_form_value(form, "phase_max_shift", 12, 0, 80),
         "phase_shift_penalty": _float_form_value(form, "phase_shift_penalty", 0.02, 0.0, 1.0),
         "mark_window_start_frac": _float_form_value(form, "mark_window_start_frac", 0.05, 0.0, 0.95),
@@ -1096,6 +1532,7 @@ def load_tag_detection_config_from_core() -> dict[str, Any] | None:
         with urlopen(f"{CORE_SERVICE_URL}/api/status", timeout=0.5) as response:
             status = json.loads(response.read().decode("utf-8") or "{}")
         detector = (status or {}).get("detector") or {}
+        smoothing = (status or {}).get("smoothing") or {}
         channels = detector.get("channels") or {}
         detector_settings = detector.get("settings") if isinstance(detector.get("settings"), dict) else {}
         upper = channels.get("upper") or {}
@@ -1109,8 +1546,14 @@ def load_tag_detection_config_from_core() -> dict[str, Any] | None:
             "confirm1": lower.get("confirm_count", 2),
             "threshold0": upper.get("threshold", 2.0),
             "threshold1": lower.get("threshold", 2.0),
+            "threshold_high0": upper.get("threshold_high", 5.0),
+            "threshold_high1": lower.get("threshold_high", 5.0),
+            "ratio_noise_max_u16": detector_settings.get("ratio_noise_max_u16", 10.0),
+            "auto_floor_u16": detector_settings.get("auto_floor_u16", 10.0),
+            "auto_slope": detector_settings.get("auto_slope", 5.0),
             "auto0": bool(upper.get("auto_threshold", False)),
             "auto1": bool(lower.get("auto_threshold", False)),
+            "noise_window_s": detector_settings.get("noise_window_s", 1.0),
             "noise_up0": upper.get("noise_up", 24),
             "noise_up1": lower.get("noise_up", 24),
             "noise_down0": upper.get("noise_down", 3),
@@ -1123,9 +1566,13 @@ def load_tag_detection_config_from_core() -> dict[str, Any] | None:
             "burst_blank_s1": lower.get("burst_blank_s", 0.08),
             "burst_max_ratio0": upper.get("burst_max_ratio", 8.0),
             "burst_max_ratio1": lower.get("burst_max_ratio", 8.0),
+            "smooth_mode": smoothing.get("mode", detector_settings.get("smooth_mode", 0)),
+            "confirm_phase_gate": detector_settings.get("confirm_phase_gate", 3),
         }
         for key in (
             "filter_casino", "filter_barkhausen", "filter_microwire", "filter_paper",
+            "peak_index_min", "peak_index_max",
+            *BARKHAUSEN_TAG_KEYS,
             "phase_max_shift", "phase_shift_penalty",
             "mark_window_start_frac", "mark_window_end_frac",
             "mark_gap", "mark_gap_tol", "mark_second_frac", "mark_valley_frac", "mark_multi_max_humps",
@@ -1149,8 +1596,14 @@ def apply_tag_detection_config_to_core(cfg: dict[str, Any]) -> tuple[bool, str]:
             "confirm1": int(cfg["confirm1"]),
             "threshold0": float(cfg["threshold0"]),
             "threshold1": float(cfg["threshold1"]),
+            "threshold_high0": float(cfg["threshold_high0"]),
+            "threshold_high1": float(cfg["threshold_high1"]),
+            "ratio_noise_max_u16": float(cfg["ratio_noise_max_u16"]),
+            "auto_floor_u16": float(cfg["auto_floor_u16"]),
+            "auto_slope": float(cfg["auto_slope"]),
             "auto0": bool(cfg["auto0"]),
             "auto1": bool(cfg["auto1"]),
+            "noise_window_s": float(cfg["noise_window_s"]),
             "noise_up0": int(cfg["noise_up0"]),
             "noise_up1": int(cfg["noise_up1"]),
             "noise_down0": int(cfg["noise_down0"]),
@@ -1163,10 +1616,22 @@ def apply_tag_detection_config_to_core(cfg: dict[str, Any]) -> tuple[bool, str]:
 			"burst_blank_s1": float(cfg["burst_blank_s1"]),
 			"burst_max_ratio0": float(cfg["burst_max_ratio0"]),
 			"burst_max_ratio1": float(cfg["burst_max_ratio1"]),
+			"smooth_mode": int(cfg["smooth_mode"]),
+			"confirm_phase_gate": int(cfg["confirm_phase_gate"]),
 			"filter_casino": bool(cfg["filter_casino"]),
 			"filter_barkhausen": bool(cfg["filter_barkhausen"]),
 			"filter_microwire": bool(cfg["filter_microwire"]),
 			"filter_paper": bool(cfg["filter_paper"]),
+			"peak_index_min": int(cfg["peak_index_min"]),
+			"peak_index_max": int(cfg["peak_index_max"]),
+			"barkhausen_radius": int(cfg["barkhausen_radius"]),
+			"barkhausen_frac": float(cfg["barkhausen_frac"]),
+			"barkhausen_min_width": int(cfg["barkhausen_min_width"]),
+			"barkhausen_max_span": int(cfg["barkhausen_max_span"]),
+			"barkhausen_min_product_level": int(cfg["barkhausen_min_product_level"]),
+			"barkhausen_max_product_level": int(cfg["barkhausen_max_product_level"]),
+			"barkhausen_max_total_fraction": float(cfg["barkhausen_max_total_fraction"]),
+			"barkhausen_all_quarter_frac": float(cfg["barkhausen_all_quarter_frac"]),
 			"phase_max_shift": int(cfg["phase_max_shift"]),
 			"phase_shift_penalty": float(cfg["phase_shift_penalty"]),
 			"mark_window_start_frac": float(cfg["mark_window_start_frac"]),
@@ -1196,15 +1661,28 @@ def apply_tag_detection_config_to_core(cfg: dict[str, Any]) -> tuple[bool, str]:
     return True, "Tag Detection settings sent to BMI30 core service"
 
 
-def apply_group_optic_to_core(reaction_enabled: bool, hold_seconds: int) -> tuple[bool, str]:
-    """Send local optic settings (trigger hold duration and detection reaction) to the core."""
+def apply_group_optic_to_core(
+    reaction_enabled: bool,
+    neighbor_reaction_enabled: bool,
+    neighbor_device_id: int | None,
+    hold_seconds: int,
+) -> tuple[bool, str]:
+    """Send hold duration and independent local/RS485 optic gates to the core."""
     hold_seconds = max(0, min(10, int(hold_seconds)))
     hold_ds = hold_seconds * 10
     messages: list[str] = []
     ok_all = True
     for action, params, src in (
         ("optic_hold", {"hold_ds": hold_ds}, "portal_optic_hold"),
-        ("optic_reaction", {"enabled": bool(reaction_enabled)}, "portal_optic_reaction"),
+        (
+            "optic_reaction",
+            {
+                "enabled": bool(reaction_enabled),
+                "neighbor_enabled": bool(neighbor_reaction_enabled),
+                "neighbor_device_id": neighbor_device_id,
+            },
+            "portal_optic_reaction",
+        ),
     ):
         payload = {"action": action, "params": params}
         try:
@@ -1223,23 +1701,517 @@ def apply_group_optic_to_core(reaction_enabled: bool, hold_seconds: int) -> tupl
             messages.append(str(result.get("error") or f"{action} rejected"))
     if not ok_all:
         return False, "; ".join(messages) or "BMI30 core rejected optic settings"
+    try:
+        cached = _CORE_OPTIC_CACHE.get("data")
+        data = dict(cached) if isinstance(cached, dict) else {}
+        data["reaction_enabled"] = bool(reaction_enabled)
+        data["neighbor_reaction_enabled"] = bool(neighbor_reaction_enabled)
+        data["neighbor_device_id"] = neighbor_device_id
+        data["indication_control_enabled"] = bool(reaction_enabled or neighbor_reaction_enabled)
+        data["indication_optic_hold_ds"] = hold_ds
+        data.setdefault("led_patterns", load_group_led_patterns())
+        _CORE_OPTIC_CACHE["t"] = time.time()
+        _CORE_OPTIC_CACHE["data"] = data
+        _CORE_STATUS_CACHE["t"] = 0.0
+    except Exception:
+        pass
     return True, "Optic settings sent to BMI30 core service"
 
 
-_CORE_OPTIC_CACHE: dict[str, Any] = {"t": 0.0, "data": {"reaction_enabled": False}}
+def _parse_group_sync_assignment(role: Any, node_id: Any = None) -> tuple[str, int | None]:
+    """Return an explicit persisted role; automatic/off assignments are forbidden."""
+    role_s = str(role or "").strip().lower()
+    if len(role_s) >= 2 and role_s[0] == "s" and role_s[1:].isdigit():
+        # Slave numbers are assigned by the master after a timestamped role
+        # assignment; they are status values, not a host-selectable role.
+        role_s = "slave"
+    if role_s in {"0", "master", "m"}:
+        return "master", None
+    if role_s in {"1", "slave", "s"}:
+        return "slave", None
+    raise ValueError("Role assignment is required and must be Master or Slave")
 
 
-def _read_core_optic_settings() -> dict[str, Any]:
-    """Best-effort read of the optic reaction flag from the BMI30 core status (cached ~1.5s)."""
+def apply_group_sync_mode_to_core(role: str, node_id: Any = None) -> tuple[bool, str, dict[str, Any]]:
+    """Force the local STM32 synchronization role via the BMI30 core service."""
+    try:
+        role_s, node = _parse_group_sync_assignment(role, node_id)
+    except ValueError as exc:
+        return False, str(exc), {}
+    params: dict[str, Any] = {"role": role_s}
+    payload = {"action": "sync_mode", "params": params}
+    try:
+        req = Request(
+            f"{CORE_SERVICE_URL}/api/command",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-BMI30-Source": "portal_sync_role"},
+            method="POST",
+        )
+        with urlopen(req, timeout=2.5) as response:
+            result = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception as exc:
+        return False, f"Unable to contact BMI30 core service: {exc}", params
+    if not isinstance(result, dict) or not bool(result.get("ok", False)):
+        return False, str((result or {}).get("error") or "BMI30 core rejected sync role"), params
+    return True, f"Role assigned: {role_s.capitalize()}", params
+
+
+def apply_group_rs485_id_to_core(device_id: Any) -> tuple[bool, str, dict[str, Any]]:
+    """Persist the local STM32 RS485 device ID independently from its role."""
+    try:
+        device_id_i = int(device_id)
+    except Exception:
+        return False, "RS485 ID must be an integer from 00 to 31", {}
+    if not 0 <= device_id_i <= 31:
+        return False, "RS485 ID must be from 00 to 31", {}
+    params = {"device_id": device_id_i}
+    payload = {"action": "rs485_id", "params": params}
+    try:
+        req = Request(
+            f"{CORE_SERVICE_URL}/api/command",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-BMI30-Source": "portal_rs485_id"},
+            method="POST",
+        )
+        with urlopen(req, timeout=3.0) as response:
+            result = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception as exc:
+        return False, f"Unable to contact BMI30 core service: {exc}", params
+    if not isinstance(result, dict) or not bool(result.get("ok", False)):
+        return False, str((result or {}).get("error") or "BMI30 core rejected RS485 ID"), params
+    return True, f"RS485 ID assigned: {device_id_i:02d}", params
+
+
+def refresh_group_rs485_ident_from_core(
+    request_scan: bool = True,
+    local_ip: str | None = None,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Request and read the replicated RS485 device identity map."""
+    params: dict[str, Any] = {"request_scan": bool(request_scan)}
+    # Firmware 1.2.13 makes EVT1 SENSOR_MAP the authoritative presence table.
+    # Restrict EP0 identity reads to those exact IDs; walking all 32 selectors
+    # can occupy the device long enough to delay normal RS485 status handling.
+    params["device_ids"] = []
+    cache = _read_device_state_cache()
+    events = cache.get("events") if isinstance(cache.get("events"), dict) else {}
+    sensor_map = events.get("sensor_map") if isinstance(events.get("sensor_map"), dict) else {}
+    sensors = cache.get("sensors") if isinstance(cache.get("sensors"), dict) else {}
+    if sensor_map.get("valid") is True:
+        try:
+            seen_mask = int(sensor_map.get("sync_seen_mask", 0) or 0) & 0xFFFFFFFF
+            params["device_ids"] = [
+                device_id
+                for device_id in range(32)
+                if bool(seen_mask & (1 << device_id))
+            ]
+        except Exception:
+            pass
+    elif sensors.get("remote_valid") is True:
+        try:
+            seen_mask = int(sensors.get("remote_seen_mask", 0) or 0) & 0xFFFFFFFF
+            params["device_ids"] = [
+                device_id
+                for device_id in range(32)
+                if bool(seen_mask & (1 << device_id))
+            ]
+        except Exception:
+            pass
+    params["local_ip"] = str(local_ip or "0.0.0.0")
+    rpi_id = group_local_rpi_id()
+    if rpi_id:
+        params["rpi_id"] = rpi_id
+    payload = {"action": "rs485_ident", "params": params}
+    try:
+        req = Request(
+            f"{CORE_SERVICE_URL}/api/command",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-BMI30-Source": "portal_rs485_ident"},
+            method="POST",
+        )
+        with urlopen(req, timeout=25.0) as response:
+            result = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception as exc:
+        return False, f"Unable to read RS485 device list: {exc}", {}
+    ident = result.get("rs485_ident") if isinstance(result, dict) else {}
+    if not isinstance(ident, dict):
+        ident = {}
+    if not isinstance(result, dict) or not bool(result.get("ok", False)):
+        return False, str((result or {}).get("error") or "BMI30 core rejected RS485 identity scan"), ident
+    return True, "RS485 device list refresh started", ident
+
+
+def publish_group_rpi_identity_to_core(local_ip: str | None = None) -> tuple[bool, str]:
+    """Publish the immutable hostname RPI ID and current preferred IPv4 over RS485."""
+    rpi_id = group_local_rpi_id()
+    if not rpi_id:
+        return False, "Hostname must have the form BMI30-XXXXXXXXX"
+    params = {
+        "rpi_id": rpi_id,
+        "local_ip": str(local_ip or _group_publication_ip(None) or "0.0.0.0"),
+    }
+    payload = {"action": "rpi_info", "params": params}
+    try:
+        req = Request(
+            f"{CORE_SERVICE_URL}/api/command",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-BMI30-Source": "portal_rpi_identity"},
+            method="POST",
+        )
+        with urlopen(req, timeout=3.0) as response:
+            result = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception as exc:
+        return False, f"Unable to publish RPI ID over RS485: {exc}"
+    if not isinstance(result, dict) or not bool(result.get("ok", False)):
+        return False, str((result or {}).get("error") or "BMI30 core rejected RPI ID publication")
+    if not bool(result.get("published", False)):
+        wire_format = str(result.get("wire_format") or "unknown")
+        return False, f"STM32 did not confirm RPI ID (identity format {wire_format})"
+    return True, f"Published {rpi_id} at {params['local_ip']} over RS485"
+
+
+def publish_group_rpi_identity_background() -> None:
+    """Republish on startup and IP changes; periodically refresh the STM32 copy."""
+    last_attempt_identity: tuple[str, str] | None = None
+    next_attempt_at = 0.0
+    while True:
+        rpi_id = group_local_rpi_id()
+        local_ip = str(_group_publication_ip(None) or "0.0.0.0")
+        identity = (rpi_id, local_ip)
+        now = time.monotonic()
+        if rpi_id and (identity != last_attempt_identity or now >= next_attempt_at):
+            last_attempt_identity = identity
+            ok, message = publish_group_rpi_identity_to_core(local_ip)
+            if ok:
+                next_attempt_at = now + 300.0
+            else:
+                retry_s = 300.0 if "did not confirm" in message else 30.0
+                next_attempt_at = now + retry_s
+                print(f"[RS485-RPI-ID] {message}", flush=True)
+        time.sleep(10.0)
+
+
+def _led_pattern_value(value: Any, default: int = 0) -> int:
+    try:
+        pattern = int(str(value).strip())
+    except Exception:
+        pattern = int(default)
+    return max(0, min(255, pattern))
+
+
+def _normalize_group_led_patterns(raw: Any = None) -> dict[str, int]:
+    source = raw if isinstance(raw, dict) else {}
+    cfg = dict(DEFAULT_GROUP_LED_PATTERNS)
+    for event_key, _event_label in GROUP_LED_PATTERN_EVENTS:
+        event_source = source.get(event_key)
+        if isinstance(event_source, dict):
+            legacy_value = None
+            for key in ("pattern", "value", "current", "upper", "lower"):
+                if key in event_source:
+                    legacy_value = event_source.get(key)
+                    break
+            event_source = legacy_value
+        cfg[event_key] = _led_pattern_value(event_source, cfg[event_key])
+    return cfg
+
+
+def load_group_led_patterns() -> dict[str, int]:
+    payload = _load_config_json()
+    return _normalize_group_led_patterns(payload.get("group_led_patterns"))
+
+
+def load_led_pattern_options() -> tuple[tuple[int, str], ...]:
+    payload = _load_config_json()
+    raw = payload.get("stm32_led_patterns")
+    if raw is None:
+        raw = payload.get("led_patterns")
+    options: list[tuple[int, str]] = []
+    seen: set[int] = set()
+
+    def add_option(pattern_id: Any, label: Any = None) -> None:
+        pid = _led_pattern_value(pattern_id)
+        if pid in seen:
+            return
+        text = str(label if label is not None else f"Pattern {pid}").strip()
+        options.append((pid, text or f"Pattern {pid}"))
+        seen.add(pid)
+
+    if isinstance(raw, dict):
+        for key in sorted(raw.keys(), key=lambda item: _led_pattern_value(item)):
+            add_option(key, raw.get(key))
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                add_option(
+                    item.get("id", item.get("value", item.get("pattern", 0))),
+                    item.get("label", item.get("name", item.get("title", None))),
+                )
+            else:
+                add_option(item)
+    if not options:
+        for pattern_id in LED_PATTERN_VALUES:
+            add_option(pattern_id)
+    return tuple(options)
+
+
+def save_group_led_patterns(cfg: dict[str, Any]) -> None:
+    normalized = _normalize_group_led_patterns(cfg)
+    payload = _load_config_json()
+    payload["group_led_patterns"] = normalized
+    payload["group_led_patterns_updated_at"] = int(time.time())
+    _save_config_json(payload)
+    if os.path.abspath(CONFIG_JSON) != os.path.abspath(HOST_CONFIG_JSON):
+        try:
+            host_payload: dict[str, Any] = {}
+            if os.path.isfile(HOST_CONFIG_JSON):
+                with open(HOST_CONFIG_JSON, "r", encoding="utf-8") as f:
+                    host_raw = json.load(f) or {}
+                if isinstance(host_raw, dict):
+                    host_payload = host_raw
+            host_payload["group_led_patterns"] = normalized
+            host_payload["group_led_patterns_updated_at"] = payload["group_led_patterns_updated_at"]
+            directory = os.path.dirname(HOST_CONFIG_JSON) or "."
+            os.makedirs(directory, exist_ok=True)
+            tmp_path = f"{HOST_CONFIG_JSON}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(host_payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+                f.write("\n")
+            try:
+                owner_source = HOST_CONFIG_JSON if os.path.exists(HOST_CONFIG_JSON) else directory
+                st = os.stat(owner_source)
+                os.chown(tmp_path, st.st_uid, st.st_gid)
+            except Exception:
+                pass
+            try:
+                os.chmod(tmp_path, 0o644)
+            except Exception:
+                pass
+            os.replace(tmp_path, HOST_CONFIG_JSON)
+        except Exception:
+            pass
+
+
+def group_led_patterns_from_form(form: dict[str, str]) -> dict[str, int]:
+    cfg = load_group_led_patterns()
+    for event_key, _event_label in GROUP_LED_PATTERN_EVENTS:
+        cfg[event_key] = _int_form_value(form, f"led_{event_key}", cfg[event_key], 0, 255)
+    return _normalize_group_led_patterns(cfg)
+
+
+def apply_group_led_patterns_to_core(cfg: dict[str, Any]) -> tuple[bool, str]:
+    payload = {
+        "action": "group_led_patterns",
+        "params": {
+            "patterns": _normalize_group_led_patterns(cfg),
+            "persist": False,
+        },
+    }
+    try:
+        req = Request(
+            f"{CORE_SERVICE_URL}/api/command",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-BMI30-Source": "portal_group_led_patterns"},
+            method="POST",
+        )
+        with urlopen(req, timeout=2.5) as response:
+            result = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception as exc:
+        return False, f"Unable to contact BMI30 core service: {exc}"
+    if not isinstance(result, dict) or not bool(result.get("ok", False)):
+        return False, str((result or {}).get("error") or "BMI30 core service rejected LED pattern settings")
+    return True, "LED pattern settings sent to BMI30 core service"
+
+
+def apply_led_pattern_to_core(pattern_id: int) -> tuple[bool, str]:
+    pattern_id = _led_pattern_value(pattern_id)
+    payload = {"action": "led_pattern", "params": {"pattern": pattern_id, "manual_test": True}}
+    try:
+        req = Request(
+            f"{CORE_SERVICE_URL}/api/command",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-BMI30-Source": "portal_group_led_live_test"},
+            method="POST",
+        )
+        with urlopen(req, timeout=2.5) as response:
+            result = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception as exc:
+        return False, f"Unable to contact BMI30 core service: {exc}"
+    if not isinstance(result, dict) or not bool(result.get("ok", False)):
+        return False, str((result or {}).get("error") or "BMI30 core service rejected LED pattern")
+    return True, f"LED pattern set to {pattern_id}"
+
+
+def apply_non_addressable_led_to_core(
+    enabled: bool | None = None,
+    test_enabled: bool | None = None,
+    persist: bool = False,
+) -> tuple[bool, str, dict[str, Any]]:
+    params: dict[str, Any] = {"persist": bool(persist)}
+    if enabled is not None:
+        params["enabled"] = bool(enabled)
+    if test_enabled is not None:
+        params["test_enabled"] = bool(test_enabled)
+    command = {"action": "non_addressable_led", "params": params}
+    try:
+        req = Request(
+            f"{CORE_SERVICE_URL}/api/command",
+            data=json.dumps(command).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-BMI30-Source": "portal_non_addressable_led"},
+            method="POST",
+        )
+        with urlopen(req, timeout=2.5) as response:
+            result = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception as exc:
+        return False, f"Unable to contact BMI30 core service: {exc}", {}
+    actual = result.get("non_addressable_led") if isinstance(result, dict) else None
+    if not isinstance(actual, dict):
+        actual = {}
+    if not isinstance(result, dict) or not bool(result.get("ok", False)):
+        return False, str((result or {}).get("error") or "BMI30 core rejected detection LED strip settings"), actual
+    return True, "Detection LED strip updated", actual
+
+
+_CORE_OPTIC_CACHE: dict[str, Any] = {"t": 0.0, "data": {}}
+_CORE_STATUS_CACHE: dict[str, Any] = {"t": 0.0, "data": {}}
+
+
+def _read_core_status_snapshot(max_age_s: float = 0.20) -> dict[str, Any]:
     now = time.time()
-    if (now - float(_CORE_OPTIC_CACHE.get("t", 0.0))) < 1.5:
-        return dict(_CORE_OPTIC_CACHE.get("data") or {"reaction_enabled": False})
-    out: dict[str, Any] = {"reaction_enabled": False}
+    try:
+        if (now - float(_CORE_STATUS_CACHE.get("t", 0.0))) < float(max_age_s):
+            data = _CORE_STATUS_CACHE.get("data")
+            return dict(data) if isinstance(data, dict) else {}
+    except Exception:
+        pass
     try:
         with urlopen(f"{CORE_SERVICE_URL}/api/status", timeout=0.6) as response:
             status = json.loads(response.read().decode("utf-8") or "{}")
+        if not isinstance(status, dict):
+            status = {}
+        _CORE_STATUS_CACHE.update({"t": now, "data": status})
+        return dict(status)
+    except Exception:
+        return {}
+
+
+def _portal_host_config_candidates() -> list[str]:
+    active_config = ""
+    for env_path in _split_active_env_candidates():
+        data = _read_key_value_file(env_path)
+        configured = str(data.get("BMI30_PROJECT_CONFIG_PATH") or "").strip()
+        if configured:
+            active_config = _resolve_project_path(configured)
+            break
+    return _unique_existing_text_paths((
+        os.getenv("BMI30_HOST_CONFIG_JSON", ""),
+        active_config,
+        "/home/techaid/Documents/host/bmi30_config.json",
+        os.path.join(_bmi30_project_roots()[0], "host", "bmi30_config.json"),
+        HOST_CONFIG_JSON,
+        "/usr/local/bin/host/bmi30_config.json",
+        CONFIG_JSON,
+        os.getenv("BMI30_CONFIG_JSON", ""),
+    ))
+
+
+def _read_saved_optic_settings() -> dict[str, Any]:
+    for path in _portal_host_config_candidates():
+        try:
+            if not os.path.isfile(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f) or {}
+            if not isinstance(payload, dict):
+                continue
+            source = payload.get("optic") if isinstance(payload.get("optic"), dict) else payload
+            out: dict[str, Any] = {}
+            if "optic_reaction_enabled" in payload:
+                out["reaction_enabled"] = bool(payload.get("optic_reaction_enabled"))
+            elif "reaction_enabled" in source:
+                out["reaction_enabled"] = bool(source.get("reaction_enabled"))
+            if "optic_neighbor_reaction_enabled" in payload:
+                out["neighbor_reaction_enabled"] = bool(payload.get("optic_neighbor_reaction_enabled"))
+            elif "neighbor_reaction_enabled" in source:
+                out["neighbor_reaction_enabled"] = bool(source.get("neighbor_reaction_enabled"))
+            raw_neighbor_device_id = payload.get(
+                "optic_neighbor_device_id",
+                source.get("neighbor_device_id"),
+            )
+            if raw_neighbor_device_id not in (None, "", -1, "-1", "any", "all"):
+                try:
+                    node_id = int(raw_neighbor_device_id)
+                    if 0 <= node_id <= 31:
+                        out["neighbor_device_id"] = node_id
+                except Exception:
+                    pass
+            else:
+                out["neighbor_device_id"] = None
+            if "indication_control_enabled" in source:
+                out["indication_control_enabled"] = bool(source.get("indication_control_enabled"))
+            if "optic_hold_ds" in source:
+                out["indication_optic_hold_ds"] = source.get("optic_hold_ds")
+            if out:
+                return out
+        except Exception:
+            continue
+    return {}
+
+
+def _read_core_optic_settings() -> dict[str, Any]:
+    """Best-effort read of optic settings without erasing saved values on short core timeouts."""
+    now = time.time()
+    if (now - float(_CORE_OPTIC_CACHE.get("t", 0.0))) < 0.25:
+        cached = _CORE_OPTIC_CACHE.get("data")
+        if isinstance(cached, dict) and cached:
+            return dict(cached)
+    cached = _CORE_OPTIC_CACHE.get("data")
+    out: dict[str, Any] = dict(cached) if isinstance(cached, dict) else {}
+    saved = _read_saved_optic_settings()
+    for key, value in saved.items():
+        out.setdefault(key, value)
+    out.setdefault("reaction_enabled", False)
+    out.setdefault("neighbor_reaction_enabled", False)
+    out.setdefault("neighbor_device_id", None)
+    out["led_patterns"] = load_group_led_patterns()
+    try:
+        status = _read_core_status_snapshot()
         optic = status.get("optic") if isinstance(status.get("optic"), dict) else {}
-        out["reaction_enabled"] = bool(optic.get("reaction_enabled", False))
+        if optic:
+            if "reaction_enabled" in optic:
+                out["reaction_enabled"] = bool(optic.get("reaction_enabled"))
+            if "neighbor_reaction_enabled" in optic:
+                out["neighbor_reaction_enabled"] = bool(optic.get("neighbor_reaction_enabled"))
+            if "neighbor_device_id" in optic:
+                raw_neighbor_device_id = optic.get("neighbor_device_id")
+                try:
+                    node_id = int(raw_neighbor_device_id)
+                    out["neighbor_device_id"] = node_id if 0 <= node_id <= 31 else None
+                except Exception:
+                    out["neighbor_device_id"] = None
+            if isinstance(optic.get("led_patterns"), dict):
+                out["led_patterns"] = _normalize_group_led_patterns(optic.get("led_patterns"))
+            for key in (
+                "indication_control_enabled",
+                "indication_allowed",
+                "indication_optic_active",
+                "indication_source",
+                "indication_sync_role",
+                "indication_local_node_id",
+                "indication_master_node_id",
+                "indication_optic_hold_ds",
+                "indication_host_hold_remaining_s",
+                "led_pattern_actual",
+                "led_pattern_actual_source",
+                "led_pattern_actual_age_s",
+                "led_pattern_commanded",
+                "led_manual_test_pattern",
+                "led_detection_allowed",
+                "led_event",
+                "led_desired_event",
+                "led_state",
+                "non_addressable_led",
+            ):
+                if key in optic:
+                    out[key] = optic.get(key)
     except Exception:
         pass
     _CORE_OPTIC_CACHE["t"] = now
@@ -1273,35 +2245,30 @@ def _normalize_dc_config(raw: Any = None) -> dict[str, Any]:
     source = raw if isinstance(raw, dict) else {}
     cfg = dict(DEFAULT_DC_CONFIG)
     cfg.update({k: source.get(k, v) for k, v in DEFAULT_DC_CONFIG.items()})
-    if "mode" not in source and "mode_value" in source:
-        try:
-            cfg["mode"] = DC_MODE_NAMES.get(int(source.get("mode_value", 1) or 1), "WORK")
-        except Exception:
-            cfg["mode"] = "WORK"
-    mode = str(cfg.get("mode", "WORK")).strip().upper().replace("-", "_")
-    if mode not in DC_MODE_VALUES:
-        mode = "WORK"
-    cfg["mode"] = mode
-    cfg["work_settle_s"] = _float_form_value(cfg, "work_settle_s", 900.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S)
-    detect_settle_default = source.get("detect_settle_s", source.get("detect_initial_settle_s", 60.0))
-    cfg["detect_settle_s"] = _float_form_value({"detect_settle_s": detect_settle_default}, "detect_settle_s", 60.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S)
-    cfg["detect_initial_settle_s"] = _float_form_value(
-        {"detect_initial_settle_s": source.get("detect_initial_settle_s", cfg["detect_settle_s"])},
-        "detect_initial_settle_s",
-        cfg["detect_settle_s"],
-        DC_SETTLE_MIN_S,
-        DC_SETTLE_MAX_S,
+    cfg["work_settle_s"] = _float_form_value(cfg, "work_settle_s", 5.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S)
+    # Migration from the old mislabeled form: detect_settle_s was shown as
+    # Acquisition, while fast_settle_s was shown as Detection.
+    legacy_schema = "acquisition_settle_s" not in source and "detection_settle_s" not in source
+    legacy_forbidden = (
+        legacy_schema
+        and cfg["work_settle_s"] == 900.0
+        and _float_form_value(source, "detect_settle_s", 500.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S) == 60.0
+        and _float_form_value(source, "fast_settle_s", 10000.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S) == 5.0
     )
-    cfg["detect_final_settle_s"] = _float_form_value(
-        {"detect_final_settle_s": source.get("detect_final_settle_s", cfg["detect_settle_s"])},
-        "detect_final_settle_s",
-        cfg["detect_settle_s"],
-        DC_SETTLE_MIN_S,
-        DC_SETTLE_MAX_S,
+    if legacy_forbidden:
+        cfg["work_settle_s"] = 5.0
+    acquisition_value = 500.0 if legacy_forbidden else source.get("acquisition_settle_s", source.get("detect_settle_s", 500.0))
+    detection_value = 10000.0 if legacy_forbidden else source.get("detection_settle_s", source.get("fast_settle_s", 10000.0))
+    cfg["acquisition_settle_s"] = _float_form_value(
+        {"value": acquisition_value}, "value", 500.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S
     )
-    cfg["detect_ramp_s"] = _float_form_value({"detect_ramp_s": source.get("detect_ramp_s", 0.0)}, "detect_ramp_s", 0.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S)
-    cfg["fast_settle_s"] = _float_form_value(cfg, "fast_settle_s", 5.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S)
-    cfg["fast_duration_s"] = _float_form_value(cfg, "fast_duration_s", 30.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S)
+    cfg["detection_settle_s"] = _float_form_value(
+        {"value": detection_value}, "value", 10000.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S
+    )
+    cfg["startup_settle_s"] = 1.0
+    cfg["lightning_timeout_s"] = _float_form_value(
+        cfg, "lightning_timeout_s", 1.0, DC_LIGHTNING_TIMEOUT_MIN_S, DC_SETTLE_MAX_S
+    )
     return cfg
 
 
@@ -1324,10 +2291,34 @@ def load_dc_config_from_core() -> dict[str, Any] | None:
 
 
 def save_dc_config(cfg: dict[str, Any]) -> None:
+    normalized = _normalize_dc_config(cfg)
     payload = _load_config_json()
-    payload["dc_config"] = _normalize_dc_config(cfg)
+    payload["dc_config"] = normalized
     payload["dc_config_updated_at"] = int(time.time())
     _save_config_json(payload)
+    # Core and Portal must see the same three host profiles. Keep the active
+    # project and installed fallback synchronized with the authoritative
+    # /etc config so a restart cannot resurrect stale 100/1000/10000 values.
+    for path in _portal_host_config_candidates():
+        if os.path.abspath(path) == os.path.abspath(CONFIG_JSON):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                host_payload = json.load(f) or {}
+            if not isinstance(host_payload, dict):
+                host_payload = {}
+            host_payload["dc_config"] = normalized
+            host_payload["dc_config_updated_at"] = payload["dc_config_updated_at"]
+            previous_stat = os.stat(path)
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(host_payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+                f.write("\n")
+            os.chown(tmp_path, previous_stat.st_uid, previous_stat.st_gid)
+            os.chmod(tmp_path, previous_stat.st_mode & 0o777)
+            os.replace(tmp_path, path)
+        except Exception as exc:
+            print(f"[DC] unable to synchronize config copy {path}: {exc}", flush=True)
 
 
 def save_portal_credentials(username: str, password: str) -> None:
@@ -1441,52 +2432,44 @@ def save_wifi_internet_metadata(ssid: str, connected: bool, message: str = "") -
 
 
 def dc_config_from_form(form: dict[str, str]) -> dict[str, Any]:
-    mode = form.get("mode", "WORK").strip().upper().replace("-", "_")
-    detect_settle_s = _float_form_value(
-        form,
-        "detect_settle_s",
-        _float_form_value(form, "detect_initial_settle_s", 60.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
-        DC_SETTLE_MIN_S,
-        DC_SETTLE_MAX_S,
-    )
     return _normalize_dc_config({
-        "mode": mode,
-        "work_settle_s": _float_form_value(form, "work_settle_s", 900.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
-        "detect_settle_s": detect_settle_s,
-        "detect_initial_settle_s": detect_settle_s,
-        "detect_final_settle_s": detect_settle_s,
-        "detect_ramp_s": 0.0,
-        "fast_settle_s": _float_form_value(form, "fast_settle_s", 5.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
-        "fast_duration_s": _float_form_value(form, "fast_duration_s", 30.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
+        "work_settle_s": _float_form_value(form, "work_settle_s", 5.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
+        "acquisition_settle_s": _float_form_value(form, "acquisition_settle_s", 500.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
+        "detection_settle_s": _float_form_value(form, "detection_settle_s", 10000.0, DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
+        "startup_settle_s": 1.0,
+        "lightning_timeout_s": _float_form_value(
+            form, "lightning_timeout_s", 1.0, DC_LIGHTNING_TIMEOUT_MIN_S, DC_SETTLE_MAX_S
+        ),
     })
 
 
 def dc_timing_config_from_form(form: dict[str, str], base: dict[str, Any] | None = None) -> dict[str, Any]:
     cfg = _normalize_dc_config(base)
-    cfg["mode"] = "WORK"
-    detect_settle_s = _float_form_value(form, "detect_settle_s", cfg["detect_settle_s"], DC_SETTLE_MIN_S, DC_SETTLE_MAX_S)
     cfg.update({
         "work_settle_s": _float_form_value(form, "work_settle_s", cfg["work_settle_s"], DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
-        "detect_settle_s": detect_settle_s,
-        "detect_initial_settle_s": detect_settle_s,
-        "detect_final_settle_s": detect_settle_s,
-        "fast_settle_s": _float_form_value(form, "fast_settle_s", cfg["fast_settle_s"], DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
-        "fast_duration_s": _float_form_value(form, "fast_duration_s", cfg["fast_duration_s"], DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
+        "acquisition_settle_s": _float_form_value(form, "acquisition_settle_s", cfg["acquisition_settle_s"], DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
+        "detection_settle_s": _float_form_value(form, "detection_settle_s", cfg["detection_settle_s"], DC_SETTLE_MIN_S, DC_SETTLE_MAX_S),
+        "lightning_timeout_s": _float_form_value(
+            form,
+            "lightning_timeout_s",
+            cfg["lightning_timeout_s"],
+            DC_LIGHTNING_TIMEOUT_MIN_S,
+            DC_SETTLE_MAX_S,
+        ),
     })
     return _normalize_dc_config(cfg)
 
 
 def apply_dc_config_to_device(cfg: dict[str, Any]) -> tuple[bool, str]:
     cfg = _normalize_dc_config(cfg)
-    mode_value = DC_MODE_VALUES.get(str(cfg["mode"]), 1)
     payload = {
         "action": "dc_config",
         "params": {
-            "mode": mode_value,
             "work_settle_s": float(cfg["work_settle_s"]),
-            "detect_settle_s": float(cfg["detect_settle_s"]),
-            "fast_settle_s": float(cfg["fast_settle_s"]),
-            "fast_duration_s": float(cfg["fast_duration_s"]),
+            "acquisition_settle_s": float(cfg["acquisition_settle_s"]),
+            "detection_settle_s": float(cfg["detection_settle_s"]),
+            "startup_settle_s": float(cfg["startup_settle_s"]),
+            "lightning_timeout_s": float(cfg["lightning_timeout_s"]),
         },
     }
     try:
@@ -1567,9 +2550,19 @@ def _read_device_status_packet() -> bytes | None:
 
 def _read_device_state_cache(max_age_s: int | None = None) -> dict[str, Any]:
     """Read last device state published by the main Bulk IN reader."""
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            with open(DEVICE_STATE_JSON, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.01)
+            else:
+                payload = None
     try:
-        with open(DEVICE_STATE_JSON, "r", encoding="utf-8") as f:
-            payload = json.load(f)
         if not isinstance(payload, dict):
             return {}
         ts = float(payload.get("updated_at", 0.0) or 0.0)
@@ -1584,6 +2577,7 @@ def _read_device_state_cache(max_age_s: int | None = None) -> dict[str, Any]:
         payload["_age_s"] = age
         return payload
     except Exception:
+        _ = last_error
         return {}
 
 
@@ -1604,13 +2598,219 @@ def _device_cache_temperature(cache: dict[str, Any]) -> float | None:
     return None
 
 
+def _cache_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return int(default)
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _sanitize_group_sync_snapshot(
+    sync_snapshot: dict[str, Any],
+    stat: dict[str, Any],
+    local: dict[str, Any],
+) -> tuple[dict[str, Any], int, int]:
+    """Normalize the fixed-role/fixed-ID protocol without inventing missing IDs."""
+    sync = dict(sync_snapshot) if isinstance(sync_snapshot, dict) else {}
+    raw_mask = _cache_int(sync.get("sync_seen_mask", stat.get("sync_seen_mask", 0)), 0) & 0xFFFFFFFF
+    local_id_raw = _cache_int(
+        sync.get("device_id", sync.get("local_node_id", local.get("node_id", local.get("status_node_id", 0)))),
+        0,
+    )
+    id_assigned_raw = sync.get("device_id_assigned")
+    if id_assigned_raw is None:
+        assignment_status = _cache_int(sync.get("assignment_status", sync.get("local_status_raw")), 0)
+        id_assigned = bool(assignment_status & 0x04)
+        if not id_assigned:
+            code = str(sync.get("code") or sync.get("lcd_code") or "").strip().upper()
+            id_assigned = bool(re.fullmatch(r"[MS][0-9]{2}", code))
+    else:
+        id_assigned = bool(id_assigned_raw)
+    local_id = local_id_raw if id_assigned and 0 <= local_id_raw <= 31 else -1
+
+    role = str(sync.get("role") or "").strip().lower()
+    raw_mode = _cache_int(sync.get("raw_mode"), -1)
+    if role not in {"master", "slave", "off"}:
+        role = {0: "master", 1: "slave", 2: "off"}.get(raw_mode, role)
+    assigned_role = str(sync.get("assigned_role") or "").strip().lower()
+    if assigned_role not in {"master", "slave"}:
+        assigned_role = {1: "master", 2: "slave"}.get(_cache_int(sync.get("saved_role_code"), 0), "")
+    if assigned_role not in {"master", "slave"} and bool(sync.get("role_persisted")) and role in {"master", "slave"}:
+        assigned_role = role
+
+    clean_mask = raw_mask
+    if local_id >= 0:
+        clean_mask |= 1 << local_id
+    clean_count = clean_mask.bit_count()
+
+    if sync:
+        sync["sync_seen_mask"] = clean_mask
+        sync["active_status_count"] = clean_count
+        sync["total_devices"] = max(clean_count, 1 if id_assigned else 0)
+        sync["device_id"] = local_id_raw
+        sync["local_node_id"] = local_id_raw
+        sync["device_id_assigned"] = id_assigned
+        if role:
+            sync["role"] = role
+        if assigned_role:
+            sync["assigned_role"] = assigned_role
+    return sync, clean_mask, local_id
+
+
 def _device_cache_sensors(cache: dict[str, Any]) -> dict[str, Any]:
     sensors = cache.get("sensors") if isinstance(cache.get("sensors"), dict) else {}
     local = sensors.get("local") if isinstance(sensors.get("local"), dict) else {}
     remote_raw = sensors.get("remote") if isinstance(sensors.get("remote"), list) else []
-    remote = [item for item in remote_raw if isinstance(item, dict)]
     stat = cache.get("stat") if isinstance(cache.get("stat"), dict) else {}
-    events = cache.get("events") if isinstance(cache.get("events"), dict) else {}
+    events_raw = cache.get("events") if isinstance(cache.get("events"), dict) else {}
+    events = dict(events_raw)
+    sync_snapshot = cache.get("sync") if isinstance(cache.get("sync"), dict) else {}
+    if isinstance(events_raw.get("sync_state"), dict):
+        sync_snapshot = events_raw["sync_state"]
+    sensor_map = events_raw.get("sensor_map") if isinstance(events_raw.get("sensor_map"), dict) else {}
+    if sensor_map.get("valid") is True:
+        sync_snapshot = {
+            **sync_snapshot,
+            "sync_seen_mask": sensor_map.get("sync_seen_mask", 0),
+            "active_status_count": sensor_map.get("node_count", 0),
+            "total_devices": sensor_map.get("node_count", 0),
+            "device_id": sensor_map.get("local_node_id"),
+            "local_node_id": sensor_map.get("local_node_id"),
+            "device_id_assigned": sensor_map.get("device_id_assigned", False),
+        }
+    sync_mask_known = isinstance(sync_snapshot, dict) and "sync_seen_mask" in sync_snapshot
+    sync_snapshot, current_seen_mask, current_local_id = _sanitize_group_sync_snapshot(sync_snapshot, stat, local)
+    sync_out = cache.get("sync") if isinstance(cache.get("sync"), dict) else {}
+    sync_out = {**sync_out, **sync_snapshot} if sync_snapshot else dict(sync_out)
+    if sync_snapshot:
+        events["sync_state"] = sync_snapshot
+    remote: list[dict[str, Any]] = []
+    for item in remote_raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            node_id_for_mask = int(item.get("node_id", item.get("status_node_id", 0)) or 0)
+        except Exception:
+            node_id_for_mask = 0
+        if node_id_for_mask < 0 or node_id_for_mask > 31 or node_id_for_mask == current_local_id:
+            continue
+        if sync_mask_known:
+            try:
+                if not (current_seen_mask & (1 << node_id_for_mask)):
+                    continue
+            except Exception:
+                continue
+        elif item.get("seen") is not True:
+            continue
+        remote.append(item)
+    rs485_ident = cache.get("rs485_ident") if isinstance(cache.get("rs485_ident"), dict) else {}
+    ident_nodes: dict[int, dict[str, Any]] = {}
+    try:
+        nodes = rs485_ident.get("nodes") if isinstance(rs485_ident.get("nodes"), dict) else {}
+        for key, entry in nodes.items():
+            if not isinstance(entry, dict):
+                continue
+            node_id = int(entry.get("node_id", key) or 0)
+            if 0 <= node_id <= 31:
+                ident_nodes[node_id] = entry
+    except Exception:
+        ident_nodes = {}
+
+    def _identity_patch(entry: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        entry_ip = str(entry.get("ip") or "").strip()
+        for key in (
+            "short_id",
+            "host_id",
+            "rpi_id",
+            "rpi_id_valid",
+            "wire_format",
+            "ip",
+            "ip_last",
+            "group_label",
+            "complete",
+            "recent",
+            "scan_active",
+            "flags_hex",
+            "host_updated_at",
+            "host_updated_iso",
+            "node_id",
+            "device_id_assigned",
+            "master",
+            "role",
+            "node_conflict",
+        ):
+            value = entry.get(key)
+            if key in {"ip", "ip_last"} and entry_ip in {"", "0.0.0.0"}:
+                continue
+            if value is not None and value != "":
+                out[key] = value
+        return out
+
+    local_id = current_local_id
+    if 0 <= local_id <= 31 and local_id in ident_nodes:
+        local = {**_identity_patch(ident_nodes[local_id]), **local}
+    elif isinstance(rs485_ident.get("local"), dict):
+        local = {**_identity_patch(rs485_ident["local"]), **local}
+    if 0 <= local_id <= 31:
+        local["node_id"] = local_id
+        local["device_id_assigned"] = True
+
+    optic_event = events.get("optic_state") if isinstance(events.get("optic_state"), dict) else {}
+    if "optic_active" in optic_event:
+        local["optic_active_event"] = bool(optic_event.get("optic_active"))
+        runtime_gate = any(
+            bool(local.get(key))
+            for key in (
+                "optic_active_flags_runtime",
+                "optic_master_flags_runtime",
+                "optic_any_flags_runtime",
+                "optic_indication_allow",
+            )
+        )
+        local["optic_active"] = bool(local.get("optic_active_flags_runtime", optic_event.get("optic_active")))
+        local["optic_indication_allow"] = bool(
+            runtime_gate
+            or optic_event.get("optic_indication_allow", optic_event.get("optic_active"))
+        )
+    elif isinstance(stat, dict) and "optic_active" in stat:
+        local["optic_active"] = bool(stat.get("optic_active"))
+        local["optic_indication_allow"] = bool(
+            stat.get("optic_active")
+            or stat.get("master_optic_active")
+            or stat.get("any_optic_active")
+        )
+
+    merged_remote: list[dict[str, Any]] = []
+    seen_remote_ids: set[int] = set()
+    for item in remote:
+        try:
+            node_id = int(item.get("node_id", item.get("status_node_id", 0)) or 0)
+        except Exception:
+            node_id = 0
+        if 0 <= node_id <= 31:
+            seen_remote_ids.add(node_id)
+            if node_id in ident_nodes:
+                item = {**_identity_patch(ident_nodes[node_id]), **item}
+        merged_remote.append(item)
+    for node_id, entry in sorted(ident_nodes.items()):
+        if node_id == local_id or node_id in seen_remote_ids:
+            continue
+        seen_now = bool(current_seen_mask & (1 << node_id))
+        if sync_mask_known and not seen_now:
+            continue
+        if not sync_mask_known and entry.get("recent") is not True:
+            continue
+        identity_item = _identity_patch(entry)
+        if not identity_item:
+            continue
+        identity_item["node_id"] = node_id
+        identity_item["seen"] = seen_now
+        identity_item["online"] = bool(seen_now if sync_mask_known else entry.get("recent"))
+        merged_remote.append(identity_item)
+    remote = merged_remote
     return {
         "available": bool(cache) and not bool(cache.get("_stale")),
         "stale": bool(cache.get("_stale")) if cache else True,
@@ -1624,14 +2824,49 @@ def _device_cache_sensors(cache: dict[str, Any]) -> dict[str, Any]:
         "event_updates": cache.get("event_updates") if isinstance(cache.get("event_updates"), dict) else {},
         "service": cache.get("service") if isinstance(cache.get("service"), dict) else {},
         "identity": cache.get("identity") if isinstance(cache.get("identity"), dict) else {},
+        "rs485_ident": rs485_ident,
         "local": local,
         "remote": remote,
         "remote_count": len(remote),
         "stat": stat,
         "events": events,
         "mode": cache.get("mode") if isinstance(cache.get("mode"), dict) else {},
-        "sync": cache.get("sync") if isinstance(cache.get("sync"), dict) else {},
+        "sync": sync_out,
     }
+
+
+def _current_group_lan_devices(
+    devices: Any,
+    device_sensors: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Keep LAN metadata only for IDs present in the current STM32 group mask."""
+    lan_devices = [item for item in devices if isinstance(item, dict)] if isinstance(devices, list) else []
+    sync = device_sensors.get("sync") if isinstance(device_sensors.get("sync"), dict) else {}
+    events = device_sensors.get("events") if isinstance(device_sensors.get("events"), dict) else {}
+    sync_event = events.get("sync_state") if isinstance(events.get("sync_state"), dict) else {}
+    sensor_map = events.get("sensor_map") if isinstance(events.get("sensor_map"), dict) else {}
+    mask_raw = (
+        sensor_map.get("sync_seen_mask")
+        if sensor_map.get("valid") is True
+        else sync_event.get("sync_seen_mask", sync.get("sync_seen_mask"))
+    )
+    if mask_raw is None:
+        return lan_devices
+    try:
+        seen_mask = int(mask_raw) & 0xFFFFFFFF
+    except Exception:
+        return []
+    current: list[dict[str, Any]] = []
+    for item in lan_devices:
+        if item.get("device_id_assigned") is not True:
+            continue
+        try:
+            node_id = int(item.get("node_id"))
+        except Exception:
+            continue
+        if 0 <= node_id <= 31 and (seen_mask & (1 << node_id)):
+            current.append(item)
+    return current
 
 
 def _stm32_identity_from_cache(cache: dict[str, Any]) -> dict[str, Any]:
@@ -1752,6 +2987,31 @@ def detect_sync_mode() -> dict[str, Any]:
             "code": str(_SYNC_CACHE.get("code", "")),
             "source": str(_SYNC_CACHE.get("source", "device")),
             "device_responded": bool(_SYNC_CACHE.get("responded", False)),
+        }
+
+    core_status = _read_core_status_snapshot()
+    core_sync = core_status.get("sync") if isinstance(core_status.get("sync"), dict) else {}
+    core_code = _ready_sync_code(core_sync.get("code") or core_sync.get("lcd_code"))
+    core_value = str(core_sync.get("value") or core_sync.get("role") or "").strip().lower()
+    if core_sync and (core_code or core_value in {"master", "slave", "off"}):
+        if core_code:
+            role_from_code = _sync_role_from_lcd_code(core_code)
+            if role_from_code:
+                core_value = role_from_code
+        if core_value not in {"master", "slave", "auto"}:
+            core_value = "---"
+        _SYNC_CACHE.update({
+            "ts": now,
+            "responded": bool(core_sync.get("device_responded", True)),
+            "value": core_value or "---",
+            "code": core_code,
+            "source": str(core_sync.get("source") or "core"),
+        })
+        return {
+            "value": core_value or "---",
+            "code": core_code,
+            "source": str(core_sync.get("source") or "core"),
+            "device_responded": bool(core_sync.get("device_responded", True)),
         }
 
     cached = _sync_mode_from_device_cache(_read_device_state_cache())
@@ -3309,6 +4569,494 @@ def extract_request_host_ip(host_header: str) -> str | None:
         return None
 
 
+def _group_publication_ip(preferred_ip: str | None = None) -> str | None:
+    """Choose the most useful local IPv4 address for RS485 identity.
+
+    Priority: router/default-route address, the exact local address used to
+    open Portal, then an active Ethernet/Wi-Fi/hotspot address.
+    """
+    interfaces = collect_ipv4_interfaces()
+    usable = [
+        item for item in interfaces
+        if item.get("role") != "loopback" and item.get("ip")
+    ]
+
+    default_iface = detect_default_route()
+    if default_iface:
+        for item in usable:
+            if item.get("iface") == default_iface:
+                return str(item["ip"])
+
+    try:
+        preferred = str(ipaddress.ip_address(str(preferred_ip or "").strip()))
+    except ValueError:
+        preferred = ""
+    if preferred and any(item.get("ip") == preferred for item in usable):
+        return preferred
+
+    role_order = {"ethernet": 0, "wifi": 1, "hotspot": 2, "other": 3}
+    usable.sort(key=lambda item: role_order.get(str(item.get("role")), 9))
+    if usable:
+        return str(usable[0]["ip"])
+
+    try:
+        fallback = ipaddress.ip_address(str(HOTSPOT_IP or "").strip())
+        if fallback.version == 4 and not fallback.is_loopback and not fallback.is_unspecified:
+            return str(fallback)
+    except ValueError:
+        pass
+    return None
+
+
+def _group_short_host_id(hostname: str | None = None) -> str:
+    raw = str(hostname or socket.gethostname() or "").strip().split(".", 1)[0]
+    if not raw:
+        raw = ""
+    match = re.search(r"(?i)bmi30[-_]?([0-9a-f]{6,})$", raw)
+    if match:
+        return match.group(1).upper()
+    match = re.search(r"([0-9A-Fa-f]{8,})$", raw)
+    if match:
+        return match.group(1).upper()
+    try:
+        serial = str(detect_rpi_identity().get("serial") or "").strip()
+        if serial:
+            return serial[-9:].upper()
+    except Exception:
+        pass
+    return (raw or "---").upper()
+
+
+def group_local_rpi_id(hostname: str | None = None) -> str:
+    raw = str(hostname or socket.gethostname() or "").strip().split(".", 1)[0]
+    match = re.fullmatch(r"(?i)BMI30-([0-9A-F]{9})", raw)
+    return match.group(1).upper() if match else ""
+
+
+def _ip_last_octet(ip: str | None) -> str:
+    try:
+        parsed = ipaddress.ip_address(str(ip or "").strip())
+        if parsed.version == 4:
+            return str(parsed).rsplit(".", 1)[-1]
+        return str(parsed).rsplit(":", 1)[-1]
+    except Exception:
+        return ""
+
+
+def group_local_host_identity(preferred_ip: str | None = None) -> dict[str, Any]:
+    ip = str(_group_publication_ip(preferred_ip) or "").strip()
+    host_id = _group_short_host_id()
+    ip_last = _ip_last_octet(ip)
+    label = f"{host_id}/{ip_last}" if ip_last else host_id
+    identity: dict[str, Any] = {
+        "host_id": host_id,
+        "rpi_id": group_local_rpi_id(),
+        "ip": ip,
+        "ip_last": ip_last,
+        "label": label,
+    }
+    return identity
+
+
+def _bmi30_rpi_id_from_name(value: Any) -> str:
+    name = str(value or "").strip().split(".", 1)[0]
+    match = re.fullmatch(r"(?i)BMI30-([0-9A-F]{9})", name)
+    return match.group(1).upper() if match else ""
+
+
+def _lan_bmi30_candidates() -> list[dict[str, str]]:
+    """Return currently advertised/neighbor IPv4 candidates without subnet scanning."""
+    candidates: dict[tuple[str, str], dict[str, str]] = {}
+    try:
+        proc = subprocess.run(
+            ["timeout", "4", "avahi-browse", "-rtpk", "_device-info._tcp"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=LAN_SENSOR_REQUEST_TIMEOUT_S,
+        )
+        avahi_output = proc.stdout or ""
+    except Exception:
+        avahi_output = ""
+    for raw_line in avahi_output.splitlines():
+        if not raw_line.startswith("=;"):
+            continue
+        fields = raw_line.split(";")
+        if len(fields) < 9 or fields[2] != "IPv4":
+            continue
+        iface = fields[1].strip()
+        service_name = fields[3].strip().replace("\\032", " ")
+        rpi_id = _bmi30_rpi_id_from_name(service_name)
+        ip = fields[7].strip()
+        try:
+            parsed = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if parsed.version != 4 or parsed.is_loopback or parsed.is_unspecified:
+            continue
+        if not rpi_id:
+            continue
+        candidates[(ip, iface)] = {
+            "ip": ip,
+            "iface": iface,
+            "rpi_id": rpi_id,
+            "hostname": f"BMI30-{rpi_id}",
+            "discovery_source": "mdns",
+        }
+
+    neighbor_output = run_command("ip", "-4", "neigh", "show")
+    for raw_line in neighbor_output.splitlines():
+        fields = raw_line.split()
+        if not fields:
+            continue
+        ip = fields[0].strip()
+        try:
+            parsed = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if parsed.version != 4 or parsed.is_loopback or parsed.is_unspecified:
+            continue
+        iface = ""
+        if "dev" in fields:
+            idx = fields.index("dev")
+            if idx + 1 < len(fields):
+                iface = fields[idx + 1]
+        key = (ip, iface)
+        candidates.setdefault(key, {
+            "ip": ip,
+            "iface": iface,
+            "rpi_id": "",
+            "hostname": "",
+            "discovery_source": "neighbor",
+        })
+    return list(candidates.values())[:64]
+
+
+def _probe_remote_group_state(ip: str, expected_rpi_id: str) -> dict[str, Any]:
+    def _read_sensors(opener: Any) -> dict[str, Any]:
+        with opener.open(
+            Request(
+                f"http://{ip}/api/sensors",
+                headers={"Accept": "application/json", "X-BMI30-Source": "group_sensor_discovery"},
+                method="GET",
+            ),
+            timeout=5.0,
+        ) as response:
+            payload = json.loads(response.read(524288).decode("utf-8") or "{}")
+        if not isinstance(payload, dict):
+            return {}
+        host = payload.get("host") if isinstance(payload.get("host"), dict) else {}
+        remote_rpi_id = str(host.get("rpi_id") or "").strip().upper()
+        if remote_rpi_id and remote_rpi_id != expected_rpi_id:
+            return {}
+        device = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+        events = device.get("events") if isinstance(device.get("events"), dict) else {}
+        optic = events.get("optic_state") if isinstance(events.get("optic_state"), dict) else {}
+        local = device.get("local") if isinstance(device.get("local"), dict) else {}
+        state: dict[str, Any] = {}
+        for key in ("optic_active", "optic_indication_allow", "tx_enabled", "detadc1", "detadc2"):
+            value = optic.get(key) if key in optic else local.get(key)
+            if isinstance(value, bool):
+                state[key] = value
+        return state
+
+    with _LAN_SENSOR_OPENERS_LOCK:
+        cached_opener = _LAN_SENSOR_OPENERS.get(ip)
+    if cached_opener is not None:
+        try:
+            state = _read_sensors(cached_opener)
+            if state:
+                return state
+        except Exception:
+            with _LAN_SENSOR_OPENERS_LOCK:
+                _LAN_SENSOR_OPENERS.pop(ip, None)
+
+    try:
+        class _PortalLoginNoRedirect(HTTPRedirectHandler):
+            def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+                return None
+
+        jar = CookieJar()
+        opener = build_opener(HTTPCookieProcessor(jar), _PortalLoginNoRedirect())
+        login_body = urlencode({
+            "username": get_portal_username(),
+            "password": PORTAL_PASSWORD,
+            "remember": "0",
+        }).encode("utf-8")
+        try:
+            with opener.open(
+                Request(
+                    f"http://{ip}/portal-login",
+                    data=login_body,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                ),
+                timeout=max(2.0, LAN_SENSOR_REQUEST_TIMEOUT_S),
+            ) as response:
+                response.read(1)
+        except HTTPError as exc:
+            if exc.code not in (HTTPStatus.MOVED_PERMANENTLY, HTTPStatus.FOUND, HTTPStatus.SEE_OTHER, HTTPStatus.TEMPORARY_REDIRECT, HTTPStatus.PERMANENT_REDIRECT):
+                raise
+        state = _read_sensors(opener)
+        if state:
+            with _LAN_SENSOR_OPENERS_LOCK:
+                _LAN_SENSOR_OPENERS[ip] = opener
+            return state
+    except Exception:
+        pass
+    return {}
+
+
+def _public_group_state_from_status(status: dict[str, Any]) -> dict[str, Any]:
+    group_state = status.get("group_state") if isinstance(status.get("group_state"), dict) else {}
+    state: dict[str, Any] = {}
+    for key in ("optic_active", "optic_indication_allow", "detadc1", "detadc2", "tx_enabled"):
+        value = group_state.get(key)
+        if isinstance(value, bool):
+            state[key] = value
+    return state
+
+
+def _probe_lan_bmi30(candidate: dict[str, str]) -> dict[str, Any] | None:
+    ip = str(candidate.get("ip") or "").strip()
+    rpi_id = str(candidate.get("rpi_id") or "").strip().upper()
+    hostname = str(candidate.get("hostname") or "").strip()
+    status: dict[str, Any] = {}
+    api_ok = False
+    try:
+        req = Request(
+            f"http://{ip}/api/status",
+            headers={"Accept": "application/json", "X-BMI30-Source": "group_lan_discovery"},
+            method="GET",
+        )
+        with urlopen(req, timeout=1.2) as response:
+            parsed = json.loads(response.read(262144).decode("utf-8") or "{}")
+        if isinstance(parsed, dict):
+            status = parsed
+            api_ok = True
+    except Exception:
+        status = {}
+
+    remote_hostname = str(status.get("hostname") or "").strip()
+    remote_rpi_id = _bmi30_rpi_id_from_name(remote_hostname)
+    # An mDNS advertisement or neighbor-cache entry is only a candidate.  It
+    # must answer now and identify itself as BMI30 before it is shown.
+    if not api_ok or not remote_rpi_id:
+        return None
+    rpi_id = remote_rpi_id
+    hostname = f"BMI30-{rpi_id}"
+
+    sync = status.get("sync_mode") if isinstance(status.get("sync_mode"), dict) else {}
+    code = str(sync.get("code") or "").strip().upper()
+    code_match = re.fullmatch(r"([MS])([0-9]{2})", code)
+    role = str(sync.get("value") or "").strip().lower()
+    if role not in {"master", "slave"} and code_match:
+        role = "master" if code_match.group(1) == "M" else "slave"
+    device_id = int(code_match.group(2)) if code_match else None
+    access = status.get("access") if isinstance(status.get("access"), dict) else {}
+    access_ip = str(access.get("ip") or "").strip()
+    if access_ip == ip:
+        connect_url = str(access.get("web_url") or "").strip()
+    else:
+        connect_url = ""
+    if not connect_url:
+        connect_url = f"http://{ip}/"
+    group_state = _public_group_state_from_status(status)
+    public_group_state = isinstance(group_state.get("optic_active"), bool)
+    if not isinstance(group_state.get("optic_active"), bool):
+        group_state = _probe_remote_group_state(ip, rpi_id)
+
+    return {
+        "rpi_id": rpi_id,
+        "hostname": hostname,
+        "ip": ip,
+        "ip_last": _ip_last_octet(ip),
+        "iface": str(candidate.get("iface") or ""),
+        "connect_url": connect_url,
+        "role": role if role in {"master", "slave"} else "",
+        "code": code if code_match else "",
+        "node_id": device_id,
+        "device_id_assigned": device_id is not None,
+        "role_assigned": role in {"master", "slave"},
+        "device_responded": bool(sync.get("device_responded", False)),
+        "online": True,
+        "api_ok": api_ok,
+        "public_group_state": public_group_state,
+        "optic_active": group_state.get("optic_active") if isinstance(group_state.get("optic_active"), bool) else None,
+        "optic_indication_allow": group_state.get("optic_indication_allow") if isinstance(group_state.get("optic_indication_allow"), bool) else None,
+        "detadc1": group_state.get("detadc1") if isinstance(group_state.get("detadc1"), bool) else None,
+        "detadc2": group_state.get("detadc2") if isinstance(group_state.get("detadc2"), bool) else None,
+        "tx_enabled": group_state.get("tx_enabled") if isinstance(group_state.get("tx_enabled"), bool) else None,
+        "discovery_source": str(candidate.get("discovery_source") or "lan"),
+        "last_seen_at": time.time(),
+    }
+
+
+def discover_lan_bmi30_devices() -> list[dict[str, Any]]:
+    candidates = _lan_bmi30_candidates()
+    discovered: list[dict[str, Any]] = []
+    if candidates:
+        with ThreadPoolExecutor(max_workers=min(12, len(candidates))) as pool:
+            futures = [pool.submit(_probe_lan_bmi30, candidate) for candidate in candidates]
+            for future in as_completed(futures):
+                try:
+                    item = future.result()
+                except Exception:
+                    item = None
+                if item:
+                    discovered.append(item)
+
+    default_iface = detect_default_route()
+    role_order = {"wifi": 0, "ethernet": 1, "hotspot": 2, "other": 3, "loopback": 9}
+
+    def _priority(item: dict[str, Any]) -> tuple[int, int, int, str]:
+        iface = str(item.get("iface") or "")
+        ip = str(item.get("ip") or "")
+        return (
+            0 if bool(item.get("api_ok")) else 1,
+            0 if default_iface and iface == default_iface else 1,
+            role_order.get(classify_interface(iface, ip), 8),
+            ip,
+        )
+
+    by_rpi: dict[str, dict[str, Any]] = {}
+    for item in sorted(discovered, key=_priority):
+        rpi_id = str(item.get("rpi_id") or "")
+        if rpi_id and rpi_id not in by_rpi:
+            by_rpi[rpi_id] = item
+    result = sorted(by_rpi.values(), key=lambda item: str(item.get("rpi_id") or ""))
+    node_owners: dict[int, set[str]] = {}
+    for item in result:
+        node_id = item.get("node_id")
+        if isinstance(node_id, int) and 0 <= node_id <= 31:
+            node_owners.setdefault(node_id, set()).add(str(item.get("rpi_id") or ""))
+    for item in result:
+        node_id = item.get("node_id")
+        item["node_conflict"] = (
+            isinstance(node_id, int)
+            and len(node_owners.get(node_id, set())) > 1
+        )
+    return result
+
+
+def lan_bmi30_discovery_background() -> None:
+    while True:
+        try:
+            devices = discover_lan_bmi30_devices()
+            with _LAN_DEVICE_LOCK:
+                _LAN_DEVICE_CACHE["updated_at"] = time.time()
+                _LAN_DEVICE_CACHE["devices"] = devices
+        except Exception as exc:
+            print(f"[LAN-BMI30] discovery failed: {exc}", flush=True)
+        time.sleep(LAN_DEVICE_DISCOVERY_S)
+
+
+def _probe_known_lan_sensor_state(device: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    ip = str(device.get("ip") or "").strip()
+    rpi_id = str(device.get("rpi_id") or "").strip().upper()
+    if not ip or not rpi_id:
+        return rpi_id, ip, {}
+
+    if device.get("public_group_state") is True:
+        try:
+            req = Request(
+                f"http://{ip}/api/status",
+                headers={"Accept": "application/json", "X-BMI30-Source": "group_sensor_refresh"},
+                method="GET",
+            )
+            with urlopen(req, timeout=LAN_SENSOR_REQUEST_TIMEOUT_S) as response:
+                status = json.loads(response.read(262144).decode("utf-8") or "{}")
+            if isinstance(status, dict) and _bmi30_rpi_id_from_name(status.get("hostname")) == rpi_id:
+                state = _public_group_state_from_status(status)
+                if state:
+                    return rpi_id, ip, state
+        except Exception:
+            pass
+
+    return rpi_id, ip, _probe_remote_group_state(ip, rpi_id)
+
+
+def lan_bmi30_sensor_refresh_background() -> None:
+    """Refresh transient sensor bits without repeating full mDNS discovery."""
+    local_rpi_id = group_local_rpi_id()
+    while True:
+        started = time.monotonic()
+        with _LAN_DEVICE_LOCK:
+            cached = _LAN_DEVICE_CACHE.get("devices")
+            devices = [
+                dict(item)
+                for item in cached
+                if isinstance(item, dict)
+                and str(item.get("rpi_id") or "").strip().upper() != local_rpi_id
+            ] if isinstance(cached, list) else []
+
+        updates: list[tuple[str, str, dict[str, Any]]] = []
+        if devices:
+            with ThreadPoolExecutor(max_workers=min(8, len(devices))) as pool:
+                futures = [pool.submit(_probe_known_lan_sensor_state, item) for item in devices]
+                for future in as_completed(futures):
+                    try:
+                        update = future.result()
+                    except Exception:
+                        update = ("", "", {})
+                    if update[2]:
+                        updates.append(update)
+
+        if updates:
+            now = time.time()
+            update_by_rpi = {rpi_id: (ip, state) for rpi_id, ip, state in updates if rpi_id}
+            with _LAN_DEVICE_LOCK:
+                current = _LAN_DEVICE_CACHE.get("devices")
+                if isinstance(current, list):
+                    for item in current:
+                        if not isinstance(item, dict):
+                            continue
+                        rpi_id = str(item.get("rpi_id") or "").strip().upper()
+                        update = update_by_rpi.get(rpi_id)
+                        if update is None or (update[0] and str(item.get("ip") or "") != update[0]):
+                            continue
+                        for key, value in update[1].items():
+                            if isinstance(value, bool):
+                                item[key] = value
+                        item["sensor_updated_at"] = now
+                        item["last_seen_at"] = now
+                _LAN_DEVICE_CACHE["sensor_updated_at"] = now
+
+        elapsed = time.monotonic() - started
+        time.sleep(max(0.05, LAN_SENSOR_REFRESH_S - elapsed))
+
+
+def get_lan_bmi30_devices() -> list[dict[str, Any]]:
+    now = time.time()
+    max_age_s = max(30.0, LAN_DEVICE_DISCOVERY_S * 2.5)
+    local_rpi_id = group_local_rpi_id()
+    with _LAN_DEVICE_LOCK:
+        devices = _LAN_DEVICE_CACHE.get("devices")
+        if not isinstance(devices, list):
+            return []
+        return [
+            dict(item)
+            for item in devices
+            if item.get("api_ok") is True
+            and item.get("online") is True
+            and str(item.get("rpi_id") or "").strip().upper() != local_rpi_id
+            and now - float(item.get("last_seen_at", 0.0) or 0.0) <= max_age_s
+        ]
+
+
+def collect_public_group_state() -> dict[str, Any]:
+    device = _device_cache_sensors(_read_device_state_cache())
+    events = device.get("events") if isinstance(device.get("events"), dict) else {}
+    optic = events.get("optic_state") if isinstance(events.get("optic_state"), dict) else {}
+    local = device.get("local") if isinstance(device.get("local"), dict) else {}
+    state: dict[str, Any] = {}
+    for key in ("optic_active", "optic_indication_allow", "tx_enabled", "detadc1", "detadc2"):
+        value = optic.get(key) if key in optic else local.get(key)
+        if isinstance(value, bool):
+            state[key] = value
+    return state
+
+
 def collect_remote_access_targets(preferred_ip: str | None = None) -> dict[str, Any]:
     hotspot = detect_hotspot_connection()
     interfaces = collect_ipv4_interfaces()
@@ -3335,6 +5083,7 @@ def collect_remote_access_targets(preferred_ip: str | None = None) -> dict[str, 
 
     sync_mode = detect_sync_mode()
     split_system = detect_bmi30_split_system_version()
+    firmware_release = detect_bmi30_firmware_release()
     tagit_logo_path = detect_logo_path(TAGIT_LOGO_CANDIDATES)
     am_logo_path = detect_logo_path(AM_LOGO_CANDIDATES)
     web_scheme = "https" if is_https_enabled() and FORCE_HTTPS else "http"
@@ -3365,7 +5114,9 @@ def collect_remote_access_targets(preferred_ip: str | None = None) -> dict[str, 
         },
         "channels": load_channel_permissions(),
         "sync_mode": sync_mode,
+        "group_state": collect_public_group_state(),
         "split_system": split_system,
+        "firmware_release": firmware_release,
         "logos": {
             "tagit": {
                 "available": bool(tagit_logo_path),
@@ -4087,6 +5838,14 @@ def render_portal_page(
     split_system_source = html.escape(split_system.get("source") or split_system.get("selected_by") or "---")
     split_system_core = html.escape(split_system.get("core_path") or "---")
     split_system_selected_at = html.escape(split_system.get("selected_at") or "---")
+    firmware_release = detect_bmi30_firmware_release()
+    firmware_version = html.escape(format_firmware_version_with_date(firmware_release) or "---")
+    firmware_created_at = html.escape(str(firmware_release.get("created_at") or "---"))
+    firmware_portal_hash = str(firmware_release.get("runtime_portal_sha256") or "").strip()
+    firmware_portal_status = "OK" if firmware_release.get("portal_matches_release") else "MISMATCH"
+    firmware_portal_build = html.escape(
+        f"{firmware_portal_hash[:12]} {firmware_portal_status}" if firmware_portal_hash else "---"
+    )
     rpi_identity_text = html.escape(format_rpi_identity(detect_rpi_identity()))
     initial_device_cache = _read_device_state_cache(max_age_s=24 * 60 * 60)
     stm32_identity_text = html.escape(format_stm32_identity(_stm32_identity_from_cache(initial_device_cache)))
@@ -4098,6 +5857,7 @@ def render_portal_page(
     tag_enabled1_checked = " checked" if tag_cfg["enabled1"] else ""
     tag_auto0_checked = " checked" if tag_cfg["auto0"] else ""
     tag_auto1_checked = " checked" if tag_cfg["auto1"] else ""
+    tag_confirm_phase_gate_value = int(tag_cfg["confirm_phase_gate"])
     tag_threshold0_readonly = " readonly" if tag_cfg["auto0"] else ""
     tag_threshold1_readonly = " readonly" if tag_cfg["auto1"] else ""
     tag_filter_amplitude0_checked = " checked" if tag_cfg["filter_amplitude0"] else ""
@@ -4110,6 +5870,16 @@ def render_portal_page(
     tag_filter_barkhausen_checked = " checked" if tag_cfg["filter_barkhausen"] else ""
     tag_filter_microwire_checked = " checked" if tag_cfg["filter_microwire"] else ""
     tag_filter_paper_checked = " checked" if tag_cfg["filter_paper"] else ""
+    tag_peak_index_min_value = int(tag_cfg["peak_index_min"])
+    tag_peak_index_max_value = int(tag_cfg["peak_index_max"])
+    tag_barkhausen_radius_value = int(tag_cfg["barkhausen_radius"])
+    tag_barkhausen_frac_value = f'{float(tag_cfg["barkhausen_frac"]):.3f}'.rstrip("0").rstrip(".")
+    tag_barkhausen_min_width_value = int(tag_cfg["barkhausen_min_width"])
+    tag_barkhausen_max_span_value = int(tag_cfg["barkhausen_max_span"])
+    tag_barkhausen_min_product_level_value = int(tag_cfg["barkhausen_min_product_level"])
+    tag_barkhausen_max_product_level_value = int(tag_cfg["barkhausen_max_product_level"])
+    tag_barkhausen_max_total_fraction_value = f'{float(tag_cfg["barkhausen_max_total_fraction"]):.3f}'.rstrip("0").rstrip(".")
+    tag_barkhausen_all_quarter_frac_value = f'{float(tag_cfg["barkhausen_all_quarter_frac"]):.3f}'.rstrip("0").rstrip(".")
     tag_phase_max_shift_value = int(tag_cfg["phase_max_shift"])
     tag_phase_shift_penalty_value = f'{float(tag_cfg["phase_shift_penalty"]):.4f}'.rstrip("0").rstrip(".")
     tag_mark_window_start_frac_value = f'{float(tag_cfg["mark_window_start_frac"]):.4f}'.rstrip("0").rstrip(".")
@@ -4135,6 +5905,11 @@ def render_portal_page(
     tag_burst_blank_s1_value = f'{float(tag_cfg["burst_blank_s1"]):.3f}'.rstrip("0").rstrip(".")
     tag_burst_max_ratio0_value = f'{float(tag_cfg["burst_max_ratio0"]):.1f}'
     tag_burst_max_ratio1_value = f'{float(tag_cfg["burst_max_ratio1"]):.1f}'
+    tag_smooth_mode_options = "".join(
+        f'<option value="{mode}"{" selected" if int(tag_cfg["smooth_mode"]) == mode else ""}>'
+        f'{label}</option>'
+        for mode, label in enumerate(("off", "med3", "med5", "avg7", "avg9", "avg11"))
+    )
     tag_confirm0_options = "\n".join(
         f'<option value="{i}"{" selected" if int(tag_cfg["confirm0"]) == i else ""}>{i}</option>'
         for i in range(1, 7)
@@ -4145,6 +5920,12 @@ def render_portal_page(
     )
     tag_threshold0_value = f'{float(tag_cfg["threshold0"]):.1f}'
     tag_threshold1_value = f'{float(tag_cfg["threshold1"]):.1f}'
+    tag_threshold_high0_value = f'{float(tag_cfg["threshold_high0"]):.1f}'
+    tag_threshold_high1_value = f'{float(tag_cfg["threshold_high1"]):.1f}'
+    tag_ratio_noise_max_u16_value = f'{float(tag_cfg["ratio_noise_max_u16"]):.3f}'.rstrip("0").rstrip(".")
+    tag_auto_floor_u16_value = f'{float(tag_cfg["auto_floor_u16"]):.3f}'.rstrip("0").rstrip(".")
+    tag_auto_slope_value = f'{float(tag_cfg["auto_slope"]):.3f}'.rstrip("0").rstrip(".")
+    tag_noise_window_s_value = f'{float(tag_cfg["noise_window_s"]):.3f}'.rstrip("0").rstrip(".")
     core_oscilloscope_url = "/portal-oscilloscope"
     portal_auth = load_portal_auth_config()
     portal_username = html.escape(portal_auth["username"])
@@ -4159,6 +5940,23 @@ def render_portal_page(
         f'<option value="{value}"{" selected" if default_avg_n == value else ""}>{value}</option>'
         for value in AVG_N_VALUES
     )
+    sound_cfg = load_sound_config()
+    lcd_role_cfg = load_lcd_role_overlay()
+    lcd_role_enabled_checked = " checked" if lcd_role_cfg["enabled"] else ""
+    lcd_role_period_options = "".join(f'<option value="{value}"{" selected" if lcd_role_cfg["period_s"] == value else ""}>{value} s</option>' for value in range(1, 6))
+    lcd_role_duration_options = "".join(f'<option value="{value}"{" selected" if lcd_role_cfg["duration_s"] == value else ""}>{value} s</option>' for value in range(1, 6))
+    sound_enabled_checked = " checked" if sound_cfg["enabled"] else ""
+    sound_test_upper_checked = " checked" if sound_cfg["test_upper_enabled"] else ""
+    sound_test_lower_checked = " checked" if sound_cfg["test_lower_enabled"] else ""
+    sound_volume_value = f'{float(sound_cfg["volume_percent"]):.1f}'.rstrip("0").rstrip(".")
+    sound_upper_frequency_value = f'{float(sound_cfg["upper_frequency_hz"]):.1f}'.rstrip("0").rstrip(".")
+    sound_lower_frequency_value = f'{float(sound_cfg["lower_frequency_hz"]):.1f}'.rstrip("0").rstrip(".")
+    sound_phase_upper_min_value = f'{float(sound_cfg["phase_upper_min_hz"]):.1f}'.rstrip("0").rstrip(".")
+    sound_phase_upper_max_value = f'{float(sound_cfg["phase_upper_max_hz"]):.1f}'.rstrip("0").rstrip(".")
+    sound_phase_lower_min_value = f'{float(sound_cfg["phase_lower_min_hz"]):.1f}'.rstrip("0").rstrip(".")
+    sound_phase_lower_max_value = f'{float(sound_cfg["phase_lower_max_hz"]):.1f}'.rstrip("0").rstrip(".")
+    sound_minimum_duration_value = int(sound_cfg["minimum_duration_ms"])
+    sound_minimum_cycles_value = int(sound_cfg["minimum_tone_cycles"])
     wifi_meta_raw = config_payload.get("wifi_internet")
     wifi_meta = wifi_meta_raw if isinstance(wifi_meta_raw, dict) else {}
     wifi_active = detect_wifi_internet_connection(WIFI_STA_IFACE)
@@ -4206,6 +6004,77 @@ def render_portal_page(
         '<div class="metric"><span>Local RS485 D2</span><strong data-sensor-text="local-detadc2">---</strong></div>'
         '<div class="sensor-list" data-sensor-list="remote-sensors"></div>'
     )
+    group_optic_cfg = _read_core_optic_settings()
+    group_led_cfg = load_group_led_patterns()
+    group_led_options = load_led_pattern_options()
+    group_led_event_labels = {event_key: event_label for event_key, event_label in GROUP_LED_PATTERN_EVENTS}
+    group_led_desired_event = str(
+        group_optic_cfg.get("led_desired_event") or group_optic_cfg.get("led_event") or ""
+    ).strip()
+    group_led_actual_raw = group_optic_cfg.get("led_pattern_actual")
+    if group_led_desired_event == "manual_test":
+        group_led_target_raw = group_optic_cfg.get(
+            "led_manual_test_pattern",
+            group_optic_cfg.get("led_pattern_commanded", 0),
+        )
+    else:
+        group_led_target_raw = group_led_cfg.get(group_led_desired_event, 0) if group_led_desired_event else 0
+
+    def _group_led_pattern_text(value: Any) -> str:
+        if value is None:
+            return "---"
+        return f"Pattern {_led_pattern_value(value)}"
+
+    group_led_event_text = group_led_event_labels.get(
+        group_led_desired_event,
+        "Idle" if not group_led_desired_event else ("Manual test" if group_led_desired_event == "manual_test" else group_led_desired_event.replace("_", " ").title()),
+    )
+    group_led_feedback_html = (
+        '<div class="group-led-feedback" data-group-led-feedback-root>'
+        '<span>Current <b data-group-led-feedback="actual">'
+        f'{html.escape(_group_led_pattern_text(group_led_actual_raw))}</b></span>'
+        '<span>Target <b data-group-led-feedback="target">'
+        f'{html.escape(_group_led_pattern_text(group_led_target_raw))}</b></span>'
+        '<span>State <b data-group-led-feedback="event">'
+        f'{html.escape(group_led_event_text)}</b></span>'
+        '</div>'
+    )
+
+    def _group_led_select(event_key: str) -> str:
+        selected = _led_pattern_value(group_led_cfg[event_key])
+        option_values = {pattern_id for pattern_id, _label in group_led_options}
+        pattern_options = group_led_options
+        if selected not in option_values:
+            pattern_options = tuple(sorted((*group_led_options, (selected, f"Pattern {selected}")), key=lambda item: item[0]))
+        options = "".join(
+            f'<option value="{pattern_id}"{" selected" if selected == pattern_id else ""}>{html.escape(label)}</option>'
+            for pattern_id, label in pattern_options
+        )
+        return (
+            f'<select class="group-led-select" name="led_{event_key}" data-group-led-select="{event_key}" '
+            f'aria-label="{html.escape(event_key.replace("_", " "))} pattern">'
+            f'{options}</select>'
+        )
+
+    group_led_pattern_rows = "\n".join(
+        '<tr>'
+        f'<th>{html.escape(event_label)}</th>'
+        f'<td>{_group_led_select(event_key)}</td>'
+        f'<td><div class="group-led-test-cell">'
+        f'<button class="link link-secondary group-led-test-btn" type="button" data-group-led-test="{event_key}" aria-pressed="false">Test</button>'
+        f'</div></td>'
+        + '</tr>'
+        for event_key, event_label in GROUP_LED_PATTERN_EVENTS
+    )
+    group_nonaddr_led = group_optic_cfg.get("non_addressable_led")
+    if not isinstance(group_nonaddr_led, dict):
+        group_nonaddr_led = {}
+    group_nonaddr_led_enabled = bool(group_nonaddr_led.get("enabled", True))
+    group_nonaddr_led_test = bool(group_nonaddr_led.get("test_enabled", False))
+    group_nonaddr_led_level = 1 if bool(group_nonaddr_led.get("level", False)) else 0
+    group_nonaddr_led_enabled_checked = " checked" if group_nonaddr_led_enabled else ""
+    group_nonaddr_led_test_pressed = "true" if group_nonaddr_led_test else "false"
+    group_nonaddr_led_test_active_class = " is-active" if group_nonaddr_led_test else ""
     remote_desktop = load_remote_desktop_config()
     remote_username = html.escape(str(remote_desktop["username"]))
     remote_password_state = "Saved" if remote_desktop.get("password_saved") else "Current system password"
@@ -4390,6 +6259,14 @@ def render_portal_page(
     .session-tag{{display:inline-flex;align-items:center;gap:8px;margin:0 0 14px;padding:8px 12px;border-radius:999px;
                   background:var(--accent-soft);color:var(--text);font-size:12px;font-weight:600}}
     .portal-side{{display:grid;justify-items:end;align-content:start;gap:8px;max-width:min(760px,100%);min-width:min(360px,100%)}}
+    .language-switch{{grid-column:1;grid-row:1 / span 2;align-self:center;display:block;width:38px;height:26px;padding:0;
+                      border:0;border-radius:2px;background:transparent;color:inherit;cursor:pointer;
+                      box-shadow:0 1px 3px rgba(0,0,0,.24);overflow:hidden;
+                      transition:box-shadow .14s ease,transform .14s ease}}
+    .language-switch:hover{{transform:translateY(-1px);box-shadow:0 3px 7px rgba(0,0,0,.28)}}
+    .language-switch:focus-visible{{outline:2px solid var(--accent);outline-offset:3px}}
+    .language-switch-flag{{display:block;width:38px;height:26px}}
+    .language-switch-flag[hidden]{{display:none}}
     .session-block{{display:grid;justify-items:end;align-content:start;gap:8px;max-width:min(540px,100%)}}
     .session-notice-slot{{width:min(540px,100%);min-height:0}}
     .session-notice-slot .notice{{margin:0}}
@@ -4397,11 +6274,13 @@ def render_portal_page(
     .device-identity{{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:5px 14px;margin-top:8px;
                       font-family:ui-monospace,"SFMono-Regular",Consolas,monospace;color:var(--text);
                       font-size:13px;line-height:1.35;max-width:min(520px,100%)}}
-    .device-meta{{display:grid;grid-template-columns:max-content minmax(0,max-content);justify-content:end;gap:3px 10px;margin:0;
-                  font-family:ui-monospace,"SFMono-Regular",Consolas,monospace;font-size:12px;line-height:1.25;
+    .device-meta{{display:grid;grid-template-columns:max-content max-content minmax(0,max-content);grid-template-rows:repeat(2,13px);
+                  justify-content:end;align-items:center;column-gap:10px;row-gap:0;height:26px;margin:0;
+                  font-family:ui-monospace,"SFMono-Regular",Consolas,monospace;font-size:11px;line-height:13px;
                   max-width:min(760px,100%);text-align:left}}
-    .device-meta .identity-label{{font-size:14px}}
-    .device-meta .identity-value{{max-width:min(620px,52vw)}}
+    .device-meta .identity-label{{grid-column:2;align-self:center;font-size:11px;line-height:13px}}
+    .device-meta .identity-value{{grid-column:3;max-width:min(620px,52vw);line-height:13px;white-space:nowrap;
+                                  overflow:hidden;text-overflow:ellipsis;overflow-wrap:normal}}
     .identity-label{{align-self:baseline;color:var(--accent);font-size:16px;font-weight:900;text-transform:uppercase;letter-spacing:0}}
     .identity-value{{min-width:0;color:var(--muted);overflow-wrap:anywhere}}
     .identity-device-value{{color:var(--text);font-size:16px;font-weight:900}}
@@ -4455,8 +6334,10 @@ def render_portal_page(
       border:1px solid var(--line);border-radius:6px;background:var(--note-bg);
       color:var(--text);font-size:11px;line-height:1.2;padding:5px 7px;overflow-wrap:anywhere}}
     #panel-antenna .sensor-chip b,#panel-operation .sensor-chip b,#panel-group .sensor-chip b{{font-size:11px;color:var(--accent)}}
-    #panel-group .group-head{{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}}
+    #panel-group .group-head{{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}}
+    #panel-group .group-head-actions{{display:flex;align-items:center;gap:8px;flex-wrap:wrap}}
     #panel-group .group-update{{font-size:12px;color:var(--muted,#888)}}
+    #panel-group .group-refresh{{min-height:28px;padding:4px 9px;font-size:11px}}
     #panel-group .group-legend{{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:10px 0 2px;font-size:12px;color:var(--text)}}
     #panel-group .group-legend .group-dot{{margin-right:5px}}
     #panel-group .group-matrix-wrap{{overflow-x:auto;margin-top:12px;border-radius:10px}}
@@ -4468,6 +6349,7 @@ def render_portal_page(
     #panel-group .group-matrix .group-dev-badge{{display:block;margin-top:3px;font-size:10px;font-weight:600;color:var(--text);opacity:.7;text-transform:uppercase}}
     #panel-group .group-matrix .group-dev-cell.is-local{{background:color-mix(in srgb, var(--accent) 14%, transparent)}}
     #panel-group .group-matrix .group-dev-head.is-local{{box-shadow:inset 0 3px 0 var(--accent)}}
+    #panel-group .group-ip-link{{color:var(--accent);font-weight:700;text-decoration:underline;text-underline-offset:2px}}
     #panel-group .group-dot{{display:inline-block;width:14px;height:14px;border-radius:50%;background:#9aa0a6;vertical-align:middle}}
     #panel-group .group-dot.is-green{{background:#2ecc71;box-shadow:0 0 7px rgba(46,204,113,.7)}}
     #panel-group .group-dot.is-red{{background:#e74c3c;box-shadow:0 0 7px rgba(231,76,60,.7)}}
@@ -4477,10 +6359,38 @@ def render_portal_page(
     #panel-group .group-flag.is-off,#panel-group .group-flag.is-unknown{{color:var(--muted,#888)}}
     #panel-group .group-empty{{margin-top:12px;font-size:12px;color:var(--muted,#888)}}
     #panel-group .group-note{{margin-top:10px;font-size:11px;color:var(--muted,#888)}}
-    #panel-group .group-matrix .group-dev-ctl{{padding:6px 10px}}
-    #panel-group .group-matrix .group-ctl-select{{font-size:12px;padding:2px 4px}}
+    #panel-group .group-matrix .group-dev-ctl{{padding:4px 10px}}
+    #panel-group .group-matrix .group-ctl-select{{height:24px;min-height:24px;font-size:12px;line-height:20px;padding:1px 4px}}
+    #panel-group .group-role-control{{display:flex;align-items:center;justify-content:center;gap:6px;min-height:24px;white-space:nowrap}}
+    #panel-group .group-role-assigned{{font-size:10px;line-height:12px;color:var(--muted,#888)}}
+    #panel-group .group-role-feedback{{font-size:10px;line-height:12px;color:#2ecc71;white-space:nowrap}}
+    #panel-group .group-role-feedback:empty{{display:none}}
+    #panel-group .group-role-feedback.is-error{{color:#e74c3c}}
     #panel-group .group-matrix .group-dev-ctl input[type=checkbox]{{width:16px;height:16px;cursor:pointer}}
     #panel-group .group-matrix .group-dev-ctl input[type=checkbox]:disabled,#panel-group .group-matrix .group-ctl-select:disabled{{opacity:.4;cursor:not-allowed}}
+    #panel-group .group-led-form{{display:grid;gap:10px;margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}}
+    #panel-group .group-led-head{{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}}
+    #panel-group .group-led-head h3{{margin:0;font-size:15px}}
+    #panel-group .group-led-feedback{{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;font-size:12px;color:var(--muted);font-weight:600}}
+    #panel-group .group-led-feedback b{{color:var(--text);font-weight:700}}
+    #panel-group .group-led-table-wrap{{overflow-x:auto;border-radius:10px}}
+    #panel-group .group-led-table{{width:100%;min-width:520px;border-collapse:collapse;font-size:13px}}
+    #panel-group .group-led-table th,#panel-group .group-led-table td{{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:middle}}
+    #panel-group .group-led-table thead th{{font-size:12px;color:var(--muted);background:var(--note-bg)}}
+    #panel-group .group-led-table tbody th{{font-weight:700;color:var(--text);background:var(--note-bg);width:44%}}
+    #panel-group .group-led-select{{width:100%;min-width:132px;min-height:34px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg);color:var(--text);font:inherit;padding:6px 8px}}
+    #panel-group .group-led-test-cell{{display:flex;align-items:center;gap:8px;flex-wrap:wrap}}
+    #panel-group .group-led-test-btn{{display:inline-flex;align-items:center;justify-content:center;width:74px;min-width:74px;min-height:34px;padding:6px 10px;border-radius:8px}}
+    #panel-group .group-led-test-btn.is-active,#panel-group .group-led-test-btn[aria-pressed="true"]{{border-color:var(--accent);background:var(--accent-soft);color:var(--text);box-shadow:inset 0 0 0 1px var(--accent)}}
+    #panel-group .group-led-test-btn.is-busy{{opacity:.62;cursor:wait}}
+    #panel-group .group-nonaddr-led-row{{display:flex;align-items:center;gap:10px 16px;flex-wrap:wrap;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--note-bg)}}
+    #panel-group .group-nonaddr-led-label{{display:grid;gap:2px;flex:1 1 260px;color:var(--text)}}
+    #panel-group .group-nonaddr-led-label strong{{font-size:13px}}
+    #panel-group .group-nonaddr-led-label span{{font-size:11px;color:var(--muted)}}
+    #panel-group .group-nonaddr-led-enable{{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;white-space:nowrap}}
+    #panel-group .group-nonaddr-led-enable input{{width:17px;height:17px;cursor:pointer}}
+    #panel-group .group-nonaddr-led-level{{min-width:70px;font-size:12px;font-weight:800;color:var(--accent);text-align:center}}
+    #panel-group .group-led-actions{{display:flex;align-items:center;gap:8px;justify-content:flex-end;flex-wrap:wrap}}
     .security-note{{display:none;margin-top:18px;border:1px solid var(--note-border);background:var(--note-bg);
                     color:var(--note-text);border-radius:8px;padding:12px 14px;font-size:12px;line-height:1.55;
                     box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
@@ -4493,6 +6403,9 @@ def render_portal_page(
                   border-radius:8px;background:var(--note-bg);cursor:pointer;font-weight:700;color:var(--text)}}
     .mode-option input{{position:absolute;opacity:0;pointer-events:none}}
     .mode-option:has(input:checked){{border-color:var(--accent);background:var(--accent-soft);box-shadow:inset 0 0 0 1px var(--accent)}}
+    .smooth-mode-select{{width:min(100%,180px);min-height:42px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;
+                         background:var(--note-bg);color:var(--text);font-family:inherit;font-size:14px;font-weight:800;cursor:pointer}}
+    .smooth-mode-select:hover,.smooth-mode-select:focus{{border-color:var(--accent);outline:none}}
     .fields{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:12px}}
     .field{{display:grid;gap:6px}}
     .field span{{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:700;color:var(--text)}}
@@ -4521,6 +6434,25 @@ def render_portal_page(
                             box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
     .operation-lowerline{{display:flex;align-items:end;gap:12px;flex-wrap:wrap}}
     .operation-avg-field{{flex:1 1 220px;max-width:320px}}
+    .operation-sound{{display:grid;gap:10px;width:100%;padding:12px 0;border-top:1px solid var(--line)}}
+    .operation-sound-head{{display:flex;align-items:center;gap:14px;flex-wrap:wrap}}
+    .operation-sound-head h3{{margin:0;font-size:13px;color:var(--muted);white-space:nowrap}}
+    .sound-toggle{{display:inline-flex;align-items:center;gap:7px;font-size:13px;font-weight:800;color:var(--text);cursor:pointer}}
+    .sound-toggle input{{width:16px;height:16px;accent-color:var(--accent)}}
+    .sound-volume{{display:grid;grid-template-columns:auto minmax(160px,1fr) auto;gap:8px;align-items:center;min-width:min(100%,390px);flex:1 1 320px}}
+    .sound-volume-label{{font-size:12px;font-weight:800;color:var(--text);white-space:nowrap}}
+    .sound-volume input{{width:100%;accent-color:var(--accent)}}
+    .sound-volume-output{{font-size:12px;font-weight:900;color:var(--accent);font-variant-numeric:tabular-nums;min-width:44px;text-align:right}}
+    .sound-fields{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,150px),1fr));gap:8px}}
+    .sound-field{{display:grid;gap:4px}}
+    .sound-field span{{font-size:12px;font-weight:800;color:var(--text)}}
+    .sound-field input{{width:100%;min-height:36px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg);color:var(--text);
+                        font:inherit;font-variant-numeric:tabular-nums;padding:7px 8px;box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}}
+    .operation-lcd-role{{display:flex;align-items:center;gap:8px 12px;white-space:nowrap;width:100%;overflow-x:auto;padding:10px 0;border-top:1px solid var(--line)}}
+    .operation-lcd-role h3{{margin:0;font-size:13px;color:var(--muted)}}
+    .lcd-role-field{{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:800}}
+    .lcd-role-field select{{min-height:34px;border:1px solid var(--line);border-radius:8px;background:var(--note-bg);color:var(--text);padding:5px 8px}}
+    .lcd-role-status{{font-size:12px;font-weight:900;color:var(--accent)}}
     .operation-actions{{width:100%;justify-content:flex-end;padding-top:12px;border-top:1px solid var(--line)}}
     .tag-settings{{width:100%;border-collapse:collapse;margin-top:10px;border-top:1px solid var(--line)}}
     .tag-settings th,.tag-settings td{{padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:middle;text-align:left}}
@@ -4756,20 +6688,31 @@ def render_portal_page(
   <main class="panel">
     <div class="portal-head">
       <div class="portal-title">
-        <p class="eyebrow">BMI30 Management Portal</p>
-        <h1>Device Control</h1>
+        <p class="eyebrow" data-header-en="BMI30 Management Portal" data-header-uk="Портал керування BMI30">BMI30 Management Portal</p>
+        <h1 data-header-en="Device Control" data-header-uk="Керування пристроєм">Device Control</h1>
         <p class="device-identity">
-          <span class="identity-label">Device</span><strong class="identity-value identity-device-value">{title}</strong>
+          <span class="identity-label" data-header-en="Device" data-header-uk="Пристрій">Device</span><strong class="identity-value identity-device-value">{title}</strong>
         </p>
       </div>
       <div class="portal-side">
         <p class="device-meta">
+          <button class="language-switch" id="portal-language-switch" type="button">
+            <svg class="language-switch-flag language-switch-flag-uk" viewBox="0 0 38 26" aria-hidden="true" focusable="false">
+              <rect width="38" height="13" fill="#0057b7"/><rect y="13" width="38" height="13" fill="#ffd700"/>
+            </svg>
+            <svg class="language-switch-flag language-switch-flag-en" viewBox="0 0 60 40" aria-hidden="true" focusable="false" hidden>
+              <rect width="60" height="40" fill="#012169"/>
+              <path d="M0 0l60 40M60 0L0 40" stroke="#fff" stroke-width="8"/>
+              <path d="M0 0l60 40M60 0L0 40" stroke="#c8102e" stroke-width="4"/>
+              <path d="M30 0v40M0 20h60" stroke="#fff" stroke-width="12"/>
+              <path d="M30 0v40M0 20h60" stroke="#c8102e" stroke-width="7"/>
+            </svg>
+          </button>
           <span class="identity-label">RPI</span><span class="identity-value">{rpi_identity_text}</span>
           <span class="identity-label">STM32</span><span class="identity-value" data-sensor-text="header-stm32">{stm32_identity_text}</span>
-          <span class="identity-label">Split</span><span class="identity-value" data-split-version>{split_system_label}</span>
         </p>
         <div class="session-block">
-          <p class="session-tag">Signed in as {signed_in_as or "authorized user"} · {access_label}</p>
+          <p class="session-tag" data-header-session data-username="{signed_in_as or 'authorized user'}" data-role="{session_role}">Signed in as {signed_in_as or "authorized user"} · {access_label}</p>
           <div class="session-notice-slot">{notice_html}</div>
         </div>
       </div>
@@ -4792,7 +6735,7 @@ def render_portal_page(
           <div class="summary-grid">
             <div class="summary-item"><h3>Signal</h3><div class="metric"><span>TX</span><strong data-sensor-text="local-tx">---</strong></div><div class="metric"><span>Level</span><strong>---</strong></div><div class="metric"><span>Noise</span><strong>---</strong></div></div>
             <div class="summary-item"><h3>Sensors</h3>{temp_metrics}{device_sensor_metrics}</div>
-            <div class="summary-item"><h3>Device</h3><div class="metric"><span>Stream</span><strong>---</strong></div><div class="metric"><span>DC mode</span><strong>{html.escape(str(cfg['mode']))}</strong></div></div>
+            <div class="summary-item"><h3>Device</h3><div class="metric"><span>Stream</span><strong>---</strong></div><div class="metric"><span>DC control</span><strong>RPi → speed only</strong></div></div>
           </div>
         </section>
         <section class="portal-panel" id="panel-detection">
@@ -4828,6 +6771,14 @@ def render_portal_page(
                   </tr>
                   <tr>
                     <td class="tag-desc">
+                      <span class="tag-param">Confirmation phase gate <b class="help tag-help" tabindex="0" aria-label="Maximum allowed movement of the next detection maximum relative to the previous confirmed maximum, in samples. A larger movement starts a new confirmation chain. Range 0-199, default 3." data-tip="Maximum allowed movement of the next detection maximum relative to the previous confirmed maximum, in samples. A larger movement starts a new confirmation chain. Range 0-199, default 3.">?</b></span>
+                    </td>
+                    <td class="tag-channel" colspan="2">
+                      <label class="tag-control"><input name="confirm_phase_gate" type="number" min="0" max="199" step="1" inputmode="numeric" value="{tag_confirm_phase_gate_value}" aria-label="Confirmation phase gate in samples"> samples</label>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td class="tag-desc">
                       <span class="tag-param">Automatic threshold <b class="help tag-help" tabindex="0" aria-label="When enabled, the manual threshold field is inactive." data-tip="When enabled, the manual threshold field is inactive.">?</b></span>
                     </td>
                     <td class="tag-channel">
@@ -4839,10 +6790,41 @@ def render_portal_page(
                   </tr>
                   <tr>
                     <td class="tag-desc">
-                      <span class="tag-param">Manual trigger threshold <b class="help tag-help" tabindex="0" aria-label="Range 1.0-4.0 with 0.1 step." data-tip="Range 1.0-4.0 with 0.1 step.">?</b></span>
+                      <span class="tag-param">Manual low-noise threshold <b class="help tag-help" tabindex="0" aria-label="Low-noise manual coefficient. Range 1.0-100.0 with 0.1 step. The U/L fields on the oscilloscope edit this value." data-tip="Low-noise manual coefficient. Range 1.0-100.0 with 0.1 step. The U/L fields on the oscilloscope edit this value.">?</b></span>
                     </td>
-                    <td class="tag-channel"><label class="tag-control"><input name="threshold0" data-tag-threshold="upper" type="number" min="1" max="4" step="0.1" value="{tag_threshold0_value}"{tag_threshold0_readonly}></label></td>
-                    <td class="tag-channel"><label class="tag-control"><input name="threshold1" data-tag-threshold="lower" type="number" min="1" max="4" step="0.1" value="{tag_threshold1_value}"{tag_threshold1_readonly}></label></td>
+                    <td class="tag-channel"><label class="tag-control"><input name="threshold0" data-tag-threshold="upper" data-tag-manual="upper" type="number" min="1" max="100" step="0.1" value="{tag_threshold0_value}"{tag_threshold0_readonly}></label></td>
+                    <td class="tag-channel"><label class="tag-control"><input name="threshold1" data-tag-threshold="lower" data-tag-manual="lower" type="number" min="1" max="100" step="0.1" value="{tag_threshold1_value}"{tag_threshold1_readonly}></label></td>
+                  </tr>
+                  <tr>
+                    <td class="tag-desc">
+                      <span class="tag-param">Manual high-noise threshold <b class="help tag-help" tabindex="0" aria-label="High-noise manual coefficient. Range 1.0-100.0 with 0.1 step. The detector interpolates from low-noise to high-noise threshold." data-tip="High-noise manual coefficient. Range 1.0-100.0 with 0.1 step. The detector interpolates from low-noise to high-noise threshold.">?</b></span>
+                    </td>
+                    <td class="tag-channel"><label class="tag-control"><input name="threshold_high0" data-tag-manual="upper" type="number" min="1" max="100" step="0.1" value="{tag_threshold_high0_value}"{tag_threshold0_readonly}></label></td>
+                    <td class="tag-channel"><label class="tag-control"><input name="threshold_high1" data-tag-manual="lower" type="number" min="1" max="100" step="0.1" value="{tag_threshold_high1_value}"{tag_threshold1_readonly}></label></td>
+                  </tr>
+                  <tr>
+                    <td class="tag-desc">
+                      <span class="tag-param">Manual noise max display <b class="help tag-help" tabindex="0" aria-label="Display noise level where the manual curve reaches the high-noise threshold." data-tip="Display noise level where the manual curve reaches the high-noise threshold. Below this level the coefficient is interpolated between low and high.">?</b></span>
+                    </td>
+                    <td class="tag-channel" colspan="2"><label class="tag-control"><input name="ratio_noise_max_u16" type="number" min="0.1" max="65535" step="0.1" inputmode="decimal" value="{tag_ratio_noise_max_u16_value}"></label></td>
+                  </tr>
+                  <tr>
+                    <td class="tag-desc">
+                      <span class="tag-param">Auto min trigger level display <b class="help tag-help" tabindex="0" aria-label="Minimum automatic trigger level in oscilloscope display units." data-tip="Minimum automatic trigger level in oscilloscope display units. In AUTO mode the pink line never goes below this level.">?</b></span>
+                    </td>
+                    <td class="tag-channel" colspan="2"><label class="tag-control"><input name="auto_floor_u16" type="number" min="0" max="65535" step="0.1" inputmode="decimal" value="{tag_auto_floor_u16_value}"></label></td>
+                  </tr>
+                  <tr>
+                    <td class="tag-desc">
+                      <span class="tag-param">Auto noise slope <b class="help tag-help" tabindex="0" aria-label="Automatic threshold slope. Range 0.1-100.0 with 0.1 step." data-tip="Automatic threshold slope. Range 0.1-100.0 with 0.1 step. Higher values raise the automatic threshold more strongly as noise grows.">?</b></span>
+                    </td>
+                    <td class="tag-channel" colspan="2"><label class="tag-control"><input name="auto_slope" type="number" min="0.1" max="100" step="0.1" inputmode="decimal" value="{tag_auto_slope_value}"></label></td>
+                  </tr>
+                  <tr>
+                    <td class="tag-desc">
+                      <span class="tag-param">Noise averaging window <b class="help tag-help" tabindex="0" aria-label="Seconds of reference-side noise accumulated for the adaptive trigger threshold." data-tip="Seconds of reference-side noise accumulated for the adaptive trigger threshold. The number of buffers follows the current receive rate.">?</b></span>
+                    </td>
+                    <td class="tag-channel" colspan="2"><label class="tag-control"><input name="noise_window_s" type="number" min="0.05" max="10" step="0.05" inputmode="decimal" value="{tag_noise_window_s_value}"> s</label></td>
                   </tr>
                 </tbody>
               </table>
@@ -4934,6 +6916,32 @@ def render_portal_page(
 	              </table>
 	            </div>
 	            <div class="section">
+	              <h2>Input Smoothing</h2>
+	              <select class="smooth-mode-select" name="smooth_mode" aria-label="Input smoothing mode">
+	                {tag_smooth_mode_options}
+	              </select>
+	              <p class="notice">Choose off, med3, med5, avg7, avg9, or avg11. The selected filter is applied once to each input frame before both detection and oscilloscope display.</p>
+	            </div>
+	            <div class="section">
+	              <h2>Peak Position Limits</h2>
+	              <table class="tag-settings">
+	                <tbody>
+	                  <tr>
+	                    <td class="tag-desc">
+	                      <span class="tag-param">Allowed peak index <b class="help tag-help" tabindex="0" aria-label="Detection is accepted only when the peak index is between the lower and upper limits, inclusive. Both values can be set from 0 through 199." data-tip="Detection is accepted only when the peak index is between the lower and upper limits, inclusive. Both values can be set from 0 through 199.">?</b></span>
+	                    </td>
+	                    <td class="tag-channel" colspan="2">
+	                      <label class="tag-control tag-noise-control">
+	                        <span class="tag-mini-field">Lower <input name="peak_index_min" type="number" min="0" max="199" step="1" inputmode="numeric" value="{tag_peak_index_min_value}" aria-label="Minimum allowed peak index"></span>
+	                        <span class="tag-mini-field">Upper <input name="peak_index_max" type="number" min="0" max="199" step="1" inputmode="numeric" value="{tag_peak_index_max_value}" aria-label="Maximum allowed peak index"></span>
+	                      </label>
+	                    </td>
+	                  </tr>
+	                </tbody>
+	              </table>
+	              <p class="notice">The limits are inclusive and independent from named filters. Use 0…199 to allow the full detector array.</p>
+	            </div>
+	            <div class="section">
 	              <h2>Named Detection Filters</h2>
 	              <table class="tag-settings">
 	                <tbody>
@@ -4946,6 +6954,29 @@ def render_portal_page(
 	                      <label class="tag-control tag-inline-check"><input type="hidden" name="filter_barkhausen" value="0"><input type="checkbox" name="filter_barkhausen" value="1"{tag_filter_barkhausen_checked}>Barkhausen</label>
 	                      <label class="tag-control tag-inline-check"><input type="hidden" name="filter_microwire" value="0"><input type="checkbox" name="filter_microwire" value="1"{tag_filter_microwire_checked}>Microwire</label>
 	                      <label class="tag-control tag-inline-check"><input type="hidden" name="filter_paper" value="0"><input type="checkbox" name="filter_paper" value="1"{tag_filter_paper_checked}>Paper</label>
+	                    </td>
+	                  </tr>
+	                  <tr>
+	                    <td class="tag-desc">
+	                      <span class="tag-param">Barkhausen shape <b class="help tag-help" tabindex="0" aria-label="Compact broad-response gate used by Barkhausen tags. Product level limits reject basket/background peaks outside the expected tag level." data-tip="Compact broad-response gate used by Barkhausen tags. Product level limits reject basket/background peaks outside the expected tag level.">?</b></span>
+	                    </td>
+	                    <td class="tag-channel" colspan="2">
+	                      <label class="tag-control tag-noise-control">
+	                        <span class="tag-noise-pair">
+	                          <span class="tag-mini-field">Radius <input name="barkhausen_radius" type="number" min="1" max="120" step="1" inputmode="numeric" value="{tag_barkhausen_radius_value}" aria-label="Barkhausen radius"></span>
+	                          <span class="tag-mini-field">Frac <input name="barkhausen_frac" type="number" min="0.01" max="1" step="0.01" inputmode="decimal" value="{tag_barkhausen_frac_value}" aria-label="Barkhausen support fraction"></span>
+	                          <span class="tag-mini-field">Width <input name="barkhausen_min_width" type="number" min="1" max="120" step="1" inputmode="numeric" value="{tag_barkhausen_min_width_value}" aria-label="Barkhausen minimum width"></span>
+	                          <span class="tag-mini-field">Span <input name="barkhausen_max_span" type="number" min="1" max="200" step="1" inputmode="numeric" value="{tag_barkhausen_max_span_value}" aria-label="Barkhausen maximum span"></span>
+	                        </span>
+	                      </label>
+	                      <label class="tag-control tag-noise-control">
+	                        <span class="tag-noise-pair">
+	                          <span class="tag-mini-field">Min level <input name="barkhausen_min_product_level" type="number" min="0" max="2147483647" step="1000" inputmode="numeric" value="{tag_barkhausen_min_product_level_value}" aria-label="Barkhausen minimum product level"></span>
+	                          <span class="tag-mini-field">Max level <input name="barkhausen_max_product_level" type="number" min="0" max="2147483647" step="1000" inputmode="numeric" value="{tag_barkhausen_max_product_level_value}" aria-label="Barkhausen maximum product level"></span>
+	                          <span class="tag-mini-field">Total <input name="barkhausen_max_total_fraction" type="number" min="0.01" max="1" step="0.01" inputmode="decimal" value="{tag_barkhausen_max_total_fraction_value}" aria-label="Barkhausen maximum total fraction"></span>
+	                          <span class="tag-mini-field">Quarters <input name="barkhausen_all_quarter_frac" type="number" min="0.01" max="1" step="0.01" inputmode="decimal" value="{tag_barkhausen_all_quarter_frac_value}" aria-label="Barkhausen all-quarter fraction"></span>
+	                        </span>
+	                      </label>
 	                    </td>
 	                  </tr>
 	                  <tr>
@@ -5018,21 +7049,21 @@ def render_portal_page(
             <div class="operation-topline">
               <h3>Adaptation timing</h3>
               <div class="dc-timing-row">
-                <label class="dc-timing-field" title="Background DC compensation settle time in seconds. Range 0..86400 sec; 0 = fastest.">
-                  <span class="dc-timing-label"><span class="dc-timing-text">Work, sec.</span><b class="help" title="Background DC compensation settle time in seconds. Range 0..86400 sec; 0 = fastest.">?</b></span>
+                <label class="dc-timing-field" title="Background DC compensation settle time in seconds. Range 0..86400 sec; 0 = off, 1 = fastest.">
+                  <span class="dc-timing-label"><span class="dc-timing-text">Work, sec.</span><b class="help" title="Background DC compensation settle time in seconds. Range 0..86400 sec; 0 = off, 1 = fastest.">?</b></span>
                   <input name="work_settle_s" type="number" min="0" max="86400" step="1" inputmode="decimal" value="{cfg['work_settle_s']:g}">
                 </label>
-                <label class="dc-timing-field" title="DC compensation settle time while acquiring a signal before detection. Range 0..86400 sec; 0 = fastest.">
-                  <span class="dc-timing-label"><span class="dc-timing-text">Acquisition, sec.</span><b class="help" title="DC compensation settle time while acquiring a signal before detection. Range 0..86400 sec; 0 = fastest.">?</b></span>
-                  <input name="detect_settle_s" type="number" min="0" max="86400" step="1" inputmode="decimal" value="{cfg['detect_settle_s']:g}">
+                <label class="dc-timing-field" title="DC compensation settle time while acquiring a signal before detection. Range 0..86400 sec; 0 = off, 1 = fastest.">
+                  <span class="dc-timing-label"><span class="dc-timing-text">Acquisition, sec.</span><b class="help" title="DC compensation settle time while acquiring a signal before detection. Range 0..86400 sec; 0 = off, 1 = fastest.">?</b></span>
+                  <input name="acquisition_settle_s" type="number" min="0" max="86400" step="1" inputmode="decimal" value="{cfg['acquisition_settle_s']:g}">
                 </label>
-                <label class="dc-timing-field" title="DC compensation settle time during detection. Range 0..86400 sec; 0 = fastest.">
-                  <span class="dc-timing-label"><span class="dc-timing-text">Detection, sec.</span><b class="help" title="DC compensation settle time during detection. Range 0..86400 sec; 0 = fastest.">?</b></span>
-                  <input name="fast_settle_s" type="number" min="0" max="86400" step="1" inputmode="decimal" value="{cfg['fast_settle_s']:g}">
+                <label class="dc-timing-field" title="DC compensation settle time during detection. Range 0..86400 sec; 0 = off, 1 = fastest.">
+                  <span class="dc-timing-label"><span class="dc-timing-text">Detection, sec.</span><b class="help" title="DC compensation settle time during detection. Range 0..86400 sec; 0 = off, 1 = fastest.">?</b></span>
+                  <input name="detection_settle_s" type="number" min="0" max="86400" step="1" inputmode="decimal" value="{cfg['detection_settle_s']:g}">
                 </label>
-                <label class="dc-timing-field" title="Startup DC compensation settle time during switching and boot. Range 0..86400 sec; 0 = fastest.">
-                  <span class="dc-timing-label"><span class="dc-timing-text">Start, sec.</span><b class="help" title="Startup DC compensation settle time during switching and boot. Range 0..86400 sec; 0 = fastest.">?</b></span>
-                  <input name="fast_duration_s" type="number" min="0" max="86400" step="1" inputmode="decimal" value="{cfg['fast_duration_s']:g}">
+                <label class="dc-timing-field" title="Maximum lightning duration. Work is restored when either 99% compensation is reached or this timer expires.">
+                  <span class="dc-timing-label"><span class="dc-timing-text">Lightning timer, sec.</span><b class="help" title="Maximum lightning duration. Work is restored when either 99% compensation is reached or this timer expires.">?</b></span>
+                  <input name="lightning_timeout_s" type="number" min="0.1" max="86400" step="0.1" inputmode="decimal" value="{cfg['lightning_timeout_s']:g}">
                 </label>
               </div>
             </div>
@@ -5042,6 +7073,36 @@ def render_portal_page(
                 <select name="avg_n">{avg_n_options}</select>
                 <small>Used by BMI30 core on startup; live apply updates the running core.</small>
               </label>
+            </div>
+            <div class="operation-sound" data-sound-form>
+              <div class="operation-sound-head">
+                <h3>Sound output</h3>
+                <label class="sound-toggle"><input type="hidden" name="sound_enabled" value="0"><input data-sound-live name="sound_enabled" type="checkbox" value="1"{sound_enabled_checked}>Enabled</label>
+                <label class="sound-toggle"><input type="hidden" name="sound_test_upper_enabled" value="0"><input data-sound-live data-sound-test name="sound_test_upper_enabled" type="checkbox" value="1"{sound_test_upper_checked}>Test Upper</label>
+                <label class="sound-toggle"><input type="hidden" name="sound_test_lower_enabled" value="0"><input data-sound-live data-sound-test name="sound_test_lower_enabled" type="checkbox" value="1"{sound_test_lower_checked}>Test Lower</label>
+                <label class="sound-volume">
+                  <span class="sound-volume-label">Volume 0-100%</span>
+                  <input data-sound-live data-sound-volume name="sound_volume_percent" type="range" min="0" max="100" step="1" value="{sound_volume_value}" aria-label="Sound volume percent">
+                  <span class="sound-volume-output" data-sound-volume-output>{sound_volume_value}%</span>
+                </label>
+              </div>
+              <div class="sound-fields">
+                <label class="sound-field"><span>Upper tone, Hz</span><input data-sound-live name="sound_upper_frequency_hz" type="number" min="1" max="20000" step="1" inputmode="decimal" value="{sound_upper_frequency_value}"></label>
+                <label class="sound-field"><span>Lower tone, Hz</span><input data-sound-live name="sound_lower_frequency_hz" type="number" min="1" max="20000" step="1" inputmode="decimal" value="{sound_lower_frequency_value}"></label>
+                <label class="sound-field"><span>Upper phase min, Hz</span><input data-sound-live name="sound_phase_upper_min_hz" type="number" min="1" max="20000" step="1" inputmode="decimal" value="{sound_phase_upper_min_value}"></label>
+                <label class="sound-field"><span>Upper phase max, Hz</span><input data-sound-live name="sound_phase_upper_max_hz" type="number" min="1" max="20000" step="1" inputmode="decimal" value="{sound_phase_upper_max_value}"></label>
+                <label class="sound-field"><span>Lower phase min, Hz</span><input data-sound-live name="sound_phase_lower_min_hz" type="number" min="1" max="20000" step="1" inputmode="decimal" value="{sound_phase_lower_min_value}"></label>
+                <label class="sound-field"><span>Lower phase max, Hz</span><input data-sound-live name="sound_phase_lower_max_hz" type="number" min="1" max="20000" step="1" inputmode="decimal" value="{sound_phase_lower_max_value}"></label>
+                <label class="sound-field" title="Once started, the hardware tone stays on for at least this time."><span>Minimum sound, ms</span><input data-sound-live name="sound_minimum_duration_ms" type="number" min="0" max="60000" step="10" inputmode="numeric" value="{sound_minimum_duration_value}"></label>
+                <label class="sound-field" title="Consecutive detector/phase calculation cycles required before sound starts; short detections remain silent."><span>Minimum tone cycles</span><input data-sound-live name="sound_minimum_tone_cycles" type="number" min="1" max="1000" step="1" inputmode="numeric" value="{sound_minimum_cycles_value}"></label>
+              </div>
+            </div>
+            <div class="operation-lcd-role" data-lcd-role-form title="Shows full-screen Mxx for a master, Sxx for a slave, or O when sync is off. Changes are sent immediately and saved.">
+              <h3>Large LCD role</h3>
+              <label class="sound-toggle"><input type="hidden" name="lcd_role_overlay_enabled" value="0"><input data-lcd-role-live name="lcd_role_overlay_enabled" type="checkbox" value="1"{lcd_role_enabled_checked}>Enabled</label>
+              <label class="lcd-role-field"><span>Repeat</span><select data-lcd-role-live name="lcd_role_overlay_period_s">{lcd_role_period_options}</select></label>
+              <label class="lcd-role-field"><span>Show</span><select data-lcd-role-live name="lcd_role_overlay_duration_s">{lcd_role_duration_options}</select></label>
+              <span class="lcd-role-status" data-lcd-role-status>{'Enabled' if lcd_role_cfg['enabled'] else 'Disabled'}</span>
             </div>
             <div class="summary-grid">
               <div class="summary-item"><h3>Radar</h3><div class="metric"><span>Connection</span><strong>---</strong></div></div>
@@ -5058,13 +7119,15 @@ def render_portal_page(
         <section class="portal-panel" id="panel-group">
           <div class="section group-section">
             <div class="group-head">
-              <h2>Synchronized Devices</h2>
-              <span class="group-update">Last status update: <strong data-sensor-text="group-cache">---</strong></span>
+              <h2>Group Devices</h2>
+              <div class="group-head-actions">
+                <span class="group-update">Last status update: <strong data-sensor-text="group-cache">---</strong></span>
+                <button class="link link-secondary group-refresh" type="button" data-group-refresh>Refresh device list</button>
+              </div>
             </div>
             <p class="group-legend">
-              <span><span class="group-dot is-green"></span>Optic triggered</span>
-              <span><span class="group-dot is-red"></span>Modulation signal, not triggered</span>
-              <span><span class="group-dot is-off"></span>No signal</span>
+              <span><span class="group-dot is-green"></span>Optic active</span>
+              <span><span class="group-dot is-off"></span>Optic inactive</span>
             </p>
             <div class="group-matrix-wrap">
               <table class="group-matrix" id="group-matrix">
@@ -5072,21 +7135,60 @@ def render_portal_page(
                   <tr data-group-row="head"><th class="group-param">Device</th></tr>
                 </thead>
                 <tbody>
-                  <tr data-group-row="indicator"><th class="group-param">State</th></tr>
-                  <tr data-group-row="role"><th class="group-param">Role</th></tr>
-                  <tr data-group-row="node"><th class="group-param">Node ID</th></tr>
+                  <tr data-group-row="indicator"><th class="group-param">State optic</th></tr>
+                  <tr data-group-row="role"><th class="group-param">Current role</th></tr>
+                  <tr data-group-row="syncctl"><th class="group-param">Role assignment</th></tr>
+                  <tr data-group-row="node"><th class="group-param">RS485 ID</th></tr>
+                  <tr data-group-row="stm32"><th class="group-param">STM32 UID</th></tr>
+                  <tr data-group-row="ip"><th class="group-param">IP address</th></tr>
                   <tr data-group-row="optic"><th class="group-param">Optic sensor</th></tr>
                   <tr data-group-row="detadc1"><th class="group-param">DetADC1 (modulation)</th></tr>
                   <tr data-group-row="detadc2"><th class="group-param">DetADC2 (modulation)</th></tr>
                   <tr data-group-row="tx"><th class="group-param">TX</th></tr>
                   <tr data-group-row="online"><th class="group-param">RS485 online</th></tr>
-                  <tr data-group-row="reaction"><th class="group-param">Detection reaction on optic</th></tr>
+                  <tr data-group-row="reaction"><th class="group-param">Own optic → sound/LED/relay</th></tr>
+                  <tr data-group-row="neighbor-reaction"><th class="group-param">RS485 neighbor optics → sound / LED / relay</th></tr>
                   <tr data-group-row="hold"><th class="group-param">Optic trigger hold (sec)</th></tr>
                 </tbody>
               </table>
             </div>
-            <p class="group-empty" data-group-empty hidden>No synchronized devices reported yet.</p>
-            <p class="group-note">Reaction switch and hold delay apply to <b>this device</b>. Per-device control of other devices over RS485 is not available yet.</p>
+            <p class="group-empty" data-group-empty hidden>No available group devices reported yet.</p>
+            <p class="group-note">Only devices present in the current STM32 RS485 mask are shown. Click an IP address to open that device. The local optic and the selected neighboring RS485 optic are independent sources; selected sources are combined by OR and gate sound, LED indication, and the relay control signal. Choose Off to disable reaction to neighboring optic sensors. If a selected neighbor disappears, its gate closes without switching to another device. Oscilloscope detection stays visible.</p>
+            <form class="group-led-form" method="post" action="/portal-group-led-pattern-config" autocomplete="off">
+              <div class="group-led-head">
+                <h3>Addressable LED patterns</h3>
+                {group_led_feedback_html}
+              </div>
+              <div class="group-led-table-wrap">
+                <table class="group-led-table">
+                  <thead>
+                    <tr>
+                      <th>Situation</th>
+                      <th>Pattern</th>
+                      <th>Test</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {group_led_pattern_rows}
+                  </tbody>
+                </table>
+              </div>
+              <div class="group-nonaddr-led-row" data-nonaddr-led-root>
+                <div class="group-nonaddr-led-label">
+                  <strong>Detection LED strip</strong>
+                  <span>Simple LED strip · lights with the detection alarm from either channel</span>
+                </div>
+                <label class="group-nonaddr-led-enable">
+                  <input type="checkbox" data-nonaddr-led-enable{group_nonaddr_led_enabled_checked}>Enabled
+                </label>
+                <span class="group-nonaddr-led-level" data-nonaddr-led-level>LED: {group_nonaddr_led_level}</span>
+                <button class="link link-secondary group-led-test-btn{group_nonaddr_led_test_active_class}" type="button" data-nonaddr-led-test aria-pressed="{group_nonaddr_led_test_pressed}">Test</button>
+              </div>
+              <div class="group-led-actions">
+                <button class="link" type="submit" name="apply" value="1">Save and Apply</button>
+                <button class="link link-secondary" type="submit" name="apply" value="0">Save Only</button>
+              </div>
+            </form>
           </div>
         </section>
         <section class="portal-panel" id="panel-privacy">
@@ -5290,7 +7392,7 @@ def render_portal_page(
         <section class="portal-panel" id="panel-about">
           <div class="summary-grid">
             <div class="summary-item"><h3>Identity</h3><div class="metric"><span>Hostname</span><strong>{title}</strong></div><div class="metric"><span>Serial</span><strong>---</strong></div></div>
-            <div class="summary-item"><h3>Firmware</h3><div class="metric"><span>Version</span><strong>---</strong></div><div class="metric"><span>Build</span><strong>---</strong></div></div>
+            <div class="summary-item"><h3>Firmware</h3><div class="metric"><span>Release</span><strong data-firmware-version>{firmware_version}</strong></div><div class="metric"><span>Created</span><strong data-firmware-created-at>{firmware_created_at}</strong></div><div class="metric"><span>Portal</span><strong data-firmware-portal>{firmware_portal_build}</strong></div></div>
             <div class="summary-item"><h3>Split System</h3><div class="metric"><span>Version</span><strong data-split-version>{split_system_label}</strong></div><div class="metric"><span>Source</span><strong data-split-source>{split_system_source}</strong></div></div>
             <div class="summary-item"><h3>Host</h3><div class="metric"><span>Software</span><strong>BMI30 Portal</strong></div><div class="metric"><span>Role</span><strong>{access_label}</strong></div><div class="metric"><span>Core</span><strong data-split-core>{split_system_core}</strong></div><div class="metric"><span>Selected</span><strong data-split-selected-at>{split_system_selected_at}</strong></div></div>
           </div>
@@ -5301,6 +7403,57 @@ def render_portal_page(
   <button id="scroll-top-btn" class="scroll-top-btn" type="button" aria-label="Scroll to top">↑</button>
   {render_debug_panel()}
   {render_debug_panel_script()}
+  <script>
+    (function () {{
+      var storageKey = 'bmi30_portal_language';
+      function storedLanguage() {{
+        try {{ return window.localStorage.getItem(storageKey) === 'uk' ? 'uk' : 'en'; }} catch (error) {{ return 'en'; }}
+      }}
+      function setHeaderLanguage(language, persist) {{
+        language = language === 'uk' ? 'uk' : 'en';
+        var button = document.getElementById('portal-language-switch');
+        if (!button) {{ return; }}
+        document.querySelectorAll('[data-header-en][data-header-uk]').forEach(function (element) {{
+          element.textContent = element.getAttribute('data-header-' + language) || '';
+        }});
+        var session = document.querySelector('[data-header-session]');
+        if (session) {{
+          var username = session.getAttribute('data-username') || (language === 'uk' ? 'авторизований користувач' : 'authorized user');
+          var engineer = session.getAttribute('data-role') === 'engineer';
+          var access = language === 'uk' ? (engineer ? 'Інженерний доступ' : 'Користувацький доступ') : (engineer ? 'Engineering access' : 'User access');
+          session.textContent = (language === 'uk' ? 'Вхід як ' : 'Signed in as ') + username + ' · ' + access;
+        }}
+        var header = document.querySelector('.portal-head');
+        if (header) {{ header.setAttribute('lang', language); }}
+        var targetIsUkrainian = language === 'en';
+        var ukrainianFlag = button.querySelector('.language-switch-flag-uk');
+        var englishFlag = button.querySelector('.language-switch-flag-en');
+        if (targetIsUkrainian) {{
+          ukrainianFlag.removeAttribute('hidden');
+          englishFlag.setAttribute('hidden', '');
+        }} else {{
+          ukrainianFlag.setAttribute('hidden', '');
+          englishFlag.removeAttribute('hidden');
+        }}
+        var languageName = targetIsUkrainian ? 'Українська' : 'English';
+        var actionLabel = targetIsUkrainian ? 'Switch to Ukrainian' : 'Перемкнути на англійську';
+        button.setAttribute('aria-label', actionLabel);
+        button.setAttribute('title', languageName);
+        button.dataset.currentLanguage = language;
+        if (persist) {{
+          try {{ window.localStorage.setItem(storageKey, language); }} catch (error) {{}}
+        }}
+      }}
+      var switchButton = document.getElementById('portal-language-switch');
+      if (switchButton) {{
+        switchButton.addEventListener('click', function () {{
+          var currentLanguage = switchButton.dataset.currentLanguage === 'uk' ? 'uk' : 'en';
+          setHeaderLanguage(currentLanguage === 'en' ? 'uk' : 'en', true);
+        }});
+      }}
+      setHeaderLanguage(storedLanguage(), false);
+    }})();
+  </script>
   <script>
     var menuButtons = Array.prototype.slice.call(document.querySelectorAll('.menu-btn[data-panel]'));
     var panels = Array.prototype.slice.call(document.querySelectorAll('.portal-panel'));
@@ -5330,9 +7483,17 @@ def render_portal_page(
     function updateTagThresholdInputs() {{
       ['upper', 'lower'].forEach(function (name) {{
         var auto = document.querySelector('[data-tag-auto="' + name + '"]');
-        var input = document.querySelector('[data-tag-threshold="' + name + '"]');
-        if (auto && input) {{
-          input.readOnly = !!auto.checked;
+        var inputs = Array.prototype.slice.call(document.querySelectorAll('[data-tag-manual="' + name + '"]'));
+        inputs.forEach(function (input) {{
+          if (auto && input) {{
+            input.readOnly = !!auto.checked;
+          }}
+        }});
+        if (!inputs.length) {{
+          var input = document.querySelector('[data-tag-threshold="' + name + '"]');
+          if (auto && input) {{
+            input.readOnly = !!auto.checked;
+          }}
         }}
       }});
     }}
@@ -5340,6 +7501,293 @@ def render_portal_page(
       el.addEventListener('change', updateTagThresholdInputs);
     }});
     updateTagThresholdInputs();
+    var soundForm = document.querySelector('[data-sound-form]');
+    var soundLiveTimer = null;
+    function soundCheckbox(name) {{
+      return soundForm ? soundForm.querySelector('input[type="checkbox"][name="' + name + '"]') : null;
+    }}
+    function soundNumber(name, fallback) {{
+      if (!soundForm) {{ return fallback; }}
+      var el = soundForm.querySelector('[name="' + name + '"]');
+      var value = el ? parseFloat(el.value) : NaN;
+      return isFinite(value) ? value : fallback;
+    }}
+    function soundChecked(name) {{
+      var el = soundCheckbox(name);
+      return !!(el && el.checked);
+    }}
+    function updateSoundVolumeOutput() {{
+      if (!soundForm) {{ return; }}
+      var slider = soundForm.querySelector('[data-sound-volume]');
+      var output = soundForm.querySelector('[data-sound-volume-output]');
+      if (slider && output) {{
+        output.textContent = String(Math.round(parseFloat(slider.value) || 0)) + '%';
+      }}
+    }}
+    function soundCurrentConfig() {{
+      return {{
+        enabled: soundChecked('sound_enabled'),
+        volume_percent: soundNumber('sound_volume_percent', 100),
+        upper_frequency_hz: soundNumber('sound_upper_frequency_hz', 4000),
+        lower_frequency_hz: soundNumber('sound_lower_frequency_hz', 1000),
+        phase_upper_min_hz: soundNumber('sound_phase_upper_min_hz', 1000),
+        phase_upper_max_hz: soundNumber('sound_phase_upper_max_hz', 3000),
+        phase_lower_min_hz: soundNumber('sound_phase_lower_min_hz', 2000),
+        phase_lower_max_hz: soundNumber('sound_phase_lower_max_hz', 4000),
+        minimum_duration_ms: Math.round(soundNumber('sound_minimum_duration_ms', 150)),
+        minimum_tone_cycles: Math.round(soundNumber('sound_minimum_tone_cycles', 1)),
+        test_upper_enabled: soundChecked('sound_test_upper_enabled'),
+        test_lower_enabled: soundChecked('sound_test_lower_enabled'),
+        persist: false
+      }};
+    }}
+    function soundAnyTestEnabled() {{
+      return soundChecked('sound_test_upper_enabled') || soundChecked('sound_test_lower_enabled');
+    }}
+    function sendSoundLive(immediate) {{
+      if (!soundForm) {{ return; }}
+      window.clearTimeout(soundLiveTimer);
+      var run = function () {{
+        fetch('/api/sound-config', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          cache: 'no-store',
+          body: JSON.stringify(soundCurrentConfig())
+        }}).catch(function () {{}});
+      }};
+      if (immediate) {{
+        run();
+      }} else {{
+        soundLiveTimer = window.setTimeout(run, 220);
+      }}
+    }}
+    if (soundForm) {{
+      updateSoundVolumeOutput();
+      Array.prototype.slice.call(soundForm.querySelectorAll('[data-sound-live]')).forEach(function (el) {{
+        var handle = function () {{
+          updateSoundVolumeOutput();
+          if (el.name === 'sound_enabled' && !el.checked) {{
+            var upper = soundCheckbox('sound_test_upper_enabled');
+            var lower = soundCheckbox('sound_test_lower_enabled');
+            if (upper) {{ upper.checked = false; }}
+            if (lower) {{ lower.checked = false; }}
+            sendSoundLive(true);
+            return;
+          }}
+          if (el.hasAttribute('data-sound-test') && el.checked) {{
+            var otherName = el.name === 'sound_test_upper_enabled'
+              ? 'sound_test_lower_enabled'
+              : 'sound_test_upper_enabled';
+            var otherTest = soundCheckbox(otherName);
+            if (otherTest) {{ otherTest.checked = false; }}
+            var enabled = soundCheckbox('sound_enabled');
+            if (enabled) {{ enabled.checked = true; }}
+          }}
+          if (el.hasAttribute('data-sound-test') || soundAnyTestEnabled()) {{
+            sendSoundLive(el.hasAttribute('data-sound-test'));
+          }}
+        }};
+        // Checkboxes fire both input and change in current browsers. Sending
+        // both restarts the hardware test sequence twice for one click.
+        // Sliders need live input updates; all other controls need one change.
+        el.addEventListener(el.type === 'range' ? 'input' : 'change', handle);
+      }});
+    }}
+    var lcdRoleForm = document.querySelector('[data-lcd-role-form]');
+    function sendLcdRoleLive() {{
+      if (!lcdRoleForm) {{ return; }}
+      var enabled = lcdRoleForm.querySelector('[name="lcd_role_overlay_enabled"]:checked');
+      var period = lcdRoleForm.querySelector('[name="lcd_role_overlay_period_s"]');
+      var duration = lcdRoleForm.querySelector('[name="lcd_role_overlay_duration_s"]');
+      var status = lcdRoleForm.querySelector('[data-lcd-role-status]');
+      if (status) {{ status.textContent = 'Applying…'; }}
+      fetch('/api/lcd-role-overlay', {{method:'POST',headers:{{'Content-Type':'application/json'}},cache:'no-store',body:JSON.stringify({{
+        enabled:!!enabled,period_s:period?parseInt(period.value,10):4,duration_s:duration?parseInt(duration.value,10):4,persist:true
+      }})}}).then(function(r){{return r.json();}}).then(function(j){{
+        if (!j.ok) {{ throw new Error(j.message || 'apply failed'); }}
+        var actual=j.lcd_role_overlay||{{}};
+        if(status){{status.textContent=(actual.enabled?'Enabled':'Disabled')+(actual.applied?' · applied':' · waiting for USB');}}
+      }}).catch(function(){{if(status){{status.textContent='Apply failed';}}}});
+    }}
+    if (lcdRoleForm) {{ Array.prototype.slice.call(lcdRoleForm.querySelectorAll('[data-lcd-role-live]')).forEach(function(el){{el.addEventListener('change',sendLcdRoleLive);}}); }}
+    var groupLedForm = document.querySelector('.group-led-form');
+    var groupLedFeedbackEls = {{}};
+    var nonAddressableLedRoot = document.querySelector('[data-nonaddr-led-root]');
+    var nonAddressableLedEnable = document.querySelector('[data-nonaddr-led-enable]');
+    var nonAddressableLedTest = document.querySelector('[data-nonaddr-led-test]');
+    var nonAddressableLedLevel = document.querySelector('[data-nonaddr-led-level]');
+    var nonAddressableLedBusy = false;
+    var nonAddressableLedState = null;
+    document.querySelectorAll('[data-group-led-feedback]').forEach(function (el) {{
+      groupLedFeedbackEls[el.getAttribute('data-group-led-feedback')] = el;
+    }});
+    var groupLedEventLabels = {{
+      upper_detection: 'Upper antenna detection',
+      lower_detection: 'Lower antenna detection',
+      both_detection: 'Both antennas detection',
+      neighbor_upper_detection: 'Neighbor upper antenna detection',
+      neighbor_lower_detection: 'Neighbor lower antenna detection',
+      neighbor_both_detection: 'Neighbor both antennas detection',
+      fault: 'Fault',
+      manual_test: 'Manual test'
+    }};
+    function groupLedPatternLabel(value) {{
+      var n = parseInt(value, 10);
+      return isFinite(n) ? ('Pattern ' + String(Math.max(0, Math.min(255, n)))) : '---';
+    }}
+    function groupLedEventLabel(key) {{
+      key = String(key || '');
+      if (!key) {{ return 'Idle'; }}
+      return groupLedEventLabels[key] || key.replace(/_/g, ' ');
+    }}
+    function updateGroupLedFeedback(settings) {{
+      settings = settings || {{}};
+      var desiredEvent = String(settings.led_desired_event || settings.led_event || '');
+      var patterns = settings.led_patterns || {{}};
+      var targetPattern = desiredEvent && Object.prototype.hasOwnProperty.call(patterns, desiredEvent) ? patterns[desiredEvent] : 0;
+      if (desiredEvent === 'manual_test') {{
+        targetPattern = settings.led_manual_test_pattern || settings.led_pattern_commanded || targetPattern;
+      }}
+      if (groupLedFeedbackEls.actual) {{
+        groupLedFeedbackEls.actual.textContent = groupLedPatternLabel(settings.led_pattern_actual);
+      }}
+      if (groupLedFeedbackEls.target) {{
+        groupLedFeedbackEls.target.textContent = groupLedPatternLabel(targetPattern);
+      }}
+      if (groupLedFeedbackEls.event) {{
+        groupLedFeedbackEls.event.textContent = groupLedEventLabel(desiredEvent);
+      }}
+      updateNonAddressableLed(settings, false);
+    }}
+    function updateNonAddressableLed(settings, force) {{
+      settings = settings || {{}};
+      var cfg = settings.non_addressable_led || {{}};
+      var enabled = cfg.enabled === undefined ? true : !!cfg.enabled;
+      var testEnabled = !!cfg.test_enabled;
+      var detectionActive = !!cfg.detection_active;
+      var level = Number(cfg.level) ? 1 : 0;
+      nonAddressableLedState = {{
+        enabled: enabled,
+        test_enabled: testEnabled,
+        detection_active: detectionActive,
+        level: level,
+        gpio: Number(cfg.gpio) || 22,
+        available: cfg.available,
+        backend: String(cfg.backend || '')
+      }};
+      if (nonAddressableLedEnable && (!nonAddressableLedBusy || force)) {{
+        nonAddressableLedEnable.checked = enabled;
+      }}
+      if (nonAddressableLedTest && (!nonAddressableLedBusy || force)) {{
+        nonAddressableLedTest.classList.toggle('is-active', testEnabled);
+        nonAddressableLedTest.setAttribute('aria-pressed', testEnabled ? 'true' : 'false');
+      }}
+      if (nonAddressableLedLevel) {{
+        nonAddressableLedLevel.textContent = cfg.available === false ? 'LED: unavailable' : ('LED: ' + String(level));
+      }}
+    }}
+    function setNonAddressableLedBusy(busy, control) {{
+      nonAddressableLedBusy = !!busy;
+      [nonAddressableLedEnable, nonAddressableLedTest].forEach(function (el) {{
+        if (el) {{ el.disabled = !!busy; }}
+      }});
+      if (control) {{ control.classList.toggle('is-busy', !!busy); }}
+    }}
+    function sendNonAddressableLed(change, control) {{
+      if (!nonAddressableLedRoot) {{ return Promise.resolve(false); }}
+      var previous = nonAddressableLedState ? Object.assign({{}}, nonAddressableLedState) : null;
+      setNonAddressableLedBusy(true, control);
+      return fetch('/api/non-addressable-led', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        cache: 'no-store',
+        body: JSON.stringify(change || {{}})
+      }}).then(function (response) {{
+        return response.json().then(function (data) {{
+          if (!response.ok || !data || !data.ok) {{ throw new Error((data && data.message) || 'Detection LED strip update failed'); }}
+          updateNonAddressableLed({{non_addressable_led: data.non_addressable_led || {{}}}}, true);
+          return true;
+        }});
+      }}).catch(function () {{
+        if (previous) {{ updateNonAddressableLed({{non_addressable_led: previous}}, true); }}
+        if (nonAddressableLedLevel) {{ nonAddressableLedLevel.textContent = 'LED: error'; }}
+        return false;
+      }}).finally(function () {{
+        setNonAddressableLedBusy(false, control);
+      }});
+    }}
+    function groupLedSelectFor(key) {{
+      return groupLedForm ? groupLedForm.querySelector('[data-group-led-select="' + key + '"]') : null;
+    }}
+    function groupLedSelectedPattern(key) {{
+      var sel = groupLedSelectFor(key);
+      if (!sel) {{ return 0; }}
+      var pattern = parseInt(sel.value, 10);
+      if (!isFinite(pattern)) {{ pattern = 0; }}
+      return pattern;
+    }}
+    function setGroupLedActive(activeKey) {{
+      if (!groupLedForm) {{ return; }}
+      Array.prototype.slice.call(groupLedForm.querySelectorAll('[data-group-led-test]')).forEach(function (button) {{
+        var isActive = !!activeKey && button.getAttribute('data-group-led-test') === activeKey;
+        button.classList.toggle('is-active', isActive);
+        button.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+      }});
+    }}
+    function sendGroupLedPattern(key, button, forcedPattern) {{
+      if (!groupLedSelectFor(key)) {{ return Promise.resolve(false); }}
+      var pattern = typeof forcedPattern === 'number' ? forcedPattern : groupLedSelectedPattern(key);
+      if (button) {{ button.classList.add('is-busy'); button.disabled = true; }}
+      return fetch('/api/group-led-pattern-test', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        cache: 'no-store',
+        body: JSON.stringify({{event: key, pattern: pattern}})
+      }}).then(function (response) {{
+        return response.ok;
+      }}).catch(function () {{
+        return false;
+      }}).finally(function () {{
+        if (button) {{ button.classList.remove('is-busy'); button.disabled = false; }}
+      }});
+    }}
+    if (groupLedForm) {{
+      Array.prototype.slice.call(groupLedForm.querySelectorAll('[data-group-led-test]')).forEach(function (button) {{
+        button.addEventListener('click', function () {{
+          var key = button.getAttribute('data-group-led-test') || '';
+          var isActive = button.getAttribute('aria-pressed') === 'true';
+          var nextPattern = isActive ? 0 : groupLedSelectedPattern(key);
+          sendGroupLedPattern(key, button, nextPattern).then(function (ok) {{
+            if (!ok) {{ return; }}
+            setGroupLedActive(!isActive && nextPattern > 0 ? key : '');
+          }});
+        }});
+      }});
+    }}
+    if (nonAddressableLedRoot) {{
+      nonAddressableLedState = {{
+        enabled: !!(nonAddressableLedEnable && nonAddressableLedEnable.checked),
+        test_enabled: !!(nonAddressableLedTest && nonAddressableLedTest.getAttribute('aria-pressed') === 'true'),
+        detection_active: false,
+        level: parseInt((nonAddressableLedLevel && nonAddressableLedLevel.textContent.split(':').pop()) || '0', 10) || 0,
+        gpio: 22
+      }};
+      if (nonAddressableLedEnable) {{
+        nonAddressableLedEnable.addEventListener('change', function () {{
+          sendNonAddressableLed({{
+            enabled: !!nonAddressableLedEnable.checked,
+            test_enabled: false,
+            persist: true
+          }}, nonAddressableLedEnable);
+        }});
+      }}
+      if (nonAddressableLedTest) {{
+        nonAddressableLedTest.addEventListener('click', function () {{
+          var next = nonAddressableLedTest.getAttribute('aria-pressed') !== 'true';
+          sendNonAddressableLed({{test_enabled: next, persist: false}}, nonAddressableLedTest);
+        }});
+      }}
+    }}
     var docTabs = Array.prototype.slice.call(document.querySelectorAll('.doc-tab'));
     var docPages = Array.prototype.slice.call(document.querySelectorAll('.doc-page'));
     function setDocPage(name) {{
@@ -5417,6 +7865,7 @@ def render_portal_page(
             }}
           }});
           var split = data && data.split_system ? data.split_system : {{}};
+          var firmware = data && data.firmware_release ? data.firmware_release : {{}};
           document.querySelectorAll('[data-split-version]').forEach(function (el) {{
             el.textContent = split.label || split.version || '---';
           }});
@@ -5428,6 +7877,17 @@ def render_portal_page(
           }});
           document.querySelectorAll('[data-split-selected-at]').forEach(function (el) {{
             el.textContent = split.selected_at || '---';
+          }});
+          document.querySelectorAll('[data-firmware-version]').forEach(function (el) {{
+            el.textContent = firmware.label || firmware.version || '---';
+          }});
+          document.querySelectorAll('[data-firmware-created-at]').forEach(function (el) {{
+            el.textContent = firmware.created_at || '---';
+          }});
+          document.querySelectorAll('[data-firmware-portal]').forEach(function (el) {{
+            var portalHash = firmware.runtime_portal_sha256 || '';
+            var portalStatus = firmware.portal_matches_release ? 'OK' : 'MISMATCH';
+            el.textContent = portalHash ? portalHash.slice(0, 12) + ' ' + portalStatus : '---';
           }});
         }})
         .catch(function () {{}});
@@ -5629,6 +8089,7 @@ def render_portal_page(
     function _opticSensorItems(device) {{
       var events = (device && device.events) ? device.events : {{}};
       var optic = events.optic_state || {{}};
+      var opticSettings = (device && device.optic_settings) ? device.optic_settings : {{}};
       var items = [];
       function add(label, value, unit) {{
         if (value !== null && value !== undefined && value !== '') {{
@@ -5638,9 +8099,21 @@ def render_portal_page(
       add('optic_ver', optic.payload_version, '');
       add('optic_flags', optic.flags, '');
       add('optic_active', optic.optic_active, '');
-      add('optic_power', optic.optic_power, '');
-      add('optic_hold_ds', optic.optic_hold_ds, 'ds');
-      add('led_pattern', optic.led_pattern, '');
+	      add('indication_optic_active', opticSettings.indication_optic_active, '');
+	      add('indication_allowed', opticSettings.indication_allowed, '');
+	      add('indication_source', opticSettings.indication_source, '');
+	      add('indication_sync_role', opticSettings.indication_sync_role, '');
+	      add('indication_local_node_id', opticSettings.indication_local_node_id, '');
+	      add('indication_master_node_id', opticSettings.indication_master_node_id, '');
+	      add('indication_optic_hold_ds', opticSettings.indication_optic_hold_ds, 'ds');
+	      add('indication_host_hold_remaining_s', opticSettings.indication_host_hold_remaining_s, 's');
+	      add('indication_local_optic_active', opticSettings.indication_local_optic_active, '');
+	      add('indication_master_optic_active', opticSettings.indication_master_optic_active, '');
+	      add('indication_any_optic_active', opticSettings.indication_any_optic_active, '');
+	      add('indication_sync_local_optic_active', opticSettings.indication_sync_local_optic_active, '');
+	      add('optic_power', optic.optic_power, '');
+	      add('optic_hold_ds', optic.optic_hold_ds, 'ds');
+	      add('led_pattern', optic.led_pattern, '');
       add('optic_age', _eventAgeLabel(device, 'optic_state'), '');
       return items;
     }}
@@ -5652,18 +8125,61 @@ def render_portal_page(
         _groupRows[tr.getAttribute('data-group-row')] = tr;
       }});
     }}
-    function _padNode2(n) {{
-      var v = (typeof n === 'number' && isFinite(n)) ? Math.max(0, Math.round(n)) : 0;
-      return ('0' + v).slice(-2);
+	    function _padNode2(n) {{
+	      var v = (typeof n === 'number' && isFinite(n)) ? Math.max(0, Math.round(n)) : 0;
+	      return ('0' + v).slice(-2);
+	    }}
+	    function _roleChar(role) {{
+	      if (role === 'master') {{ return 'M'; }}
+	      if (role === 'slave') {{ return 'S'; }}
+	      return '?';
+	    }}
+	    function _readyRoleCode(value) {{
+	      var code = String(value || '').trim().toUpperCase();
+	      return (/^[MS][0-9]{{2}}$/.test(code)) ? code : '';
+	    }}
+	    function _readyCodeFrom(source) {{
+	      source = source || {{}};
+	      return _readyRoleCode(source.code || source.lcd_code || source.role_code || source.display_code);
+	    }}
+	    function _capitalizeRole(s) {{
+	      s = String(s || '');
+	      return s ? (s.charAt(0).toUpperCase() + s.slice(1)) : '---';
+	    }}
+    function _groupShortHostId(value) {{
+      var text = String(value || '').trim();
+      if (!text) {{ return ''; }}
+      text = text.split('.')[0];
+      var m = text.match(/BMI30[-_]?([0-9a-f]{{6,}})$/i);
+      if (m) {{ return m[1].toUpperCase(); }}
+      m = text.match(/([0-9a-f]{{8,}})$/i);
+      return m ? m[1].toUpperCase() : text.toUpperCase();
     }}
-    function _roleChar(role) {{
-      if (role === 'master') {{ return 'M'; }}
-      if (role === 'slave') {{ return 'S'; }}
-      return '?';
+    function _groupIpLast(value) {{
+      var text = String(value || '').trim();
+      if (!text) {{ return ''; }}
+      if (/^[0-9]+$/.test(text)) {{ return text; }}
+      if (text.indexOf('.') >= 0) {{ return text.split('.').pop(); }}
+      if (text.indexOf(':') >= 0) {{ return text.split(':').pop(); }}
+      return '';
     }}
-    function _capitalizeRole(s) {{
-      s = String(s || '');
-      return s ? (s.charAt(0).toUpperCase() + s.slice(1)) : '---';
+    function _groupDeviceHeaderLabel(source, fallbackNode) {{
+      source = source || {{}};
+      var rpiId = source.rpi_id || source.rpi_identifier;
+      if (rpiId) {{
+        rpiId = _groupShortHostId(rpiId);
+        var rpiIpLast = source.ip_last || source.ip_octet || _groupIpLast(source.ip || source.address);
+        return rpiIpLast ? (rpiId + '/' + rpiIpLast) : rpiId;
+      }}
+      var explicit = source.group_label || source.header_label || source.host_label;
+      if (explicit) {{ return String(explicit); }}
+      var hostId = source.host_id || source.device_id || source.short_id || source.serial || source.hostname || source.host;
+      hostId = _groupShortHostId(hostId);
+      var ipLast = source.ip_last || source.ip_octet || _groupIpLast(source.ip || source.address);
+      if (hostId && ipLast) {{ return hostId + '/' + ipLast; }}
+      if (hostId) {{ return hostId; }}
+      if (fallbackNode !== undefined && fallbackNode !== null && fallbackNode !== '') {{ return 'RS485 ' + String(fallbackNode); }}
+      return '---';
     }}
     function _localSyncRole(sync) {{
       var role = String(sync.role || '').toLowerCase();
@@ -5677,137 +8193,524 @@ def render_portal_page(
       var sync = device.sync || {{}};
       var events = device.events || {{}};
       var syncEvt = events.sync_state || {{}};
+      var sensorMap = events.sensor_map || {{}};
+      var presenceEvt = (sensorMap.valid === true) ? sensorMap : syncEvt;
       var local = device.local || {{}};
       var remote = device.remote || [];
+      var lanDevices = Array.isArray(device.lan_devices) ? device.lan_devices : [];
+      var host = device.host || {{}};
+      var rs485Ident = device.rs485_ident || {{}};
+      var identNodes = rs485Ident.nodes || {{}};
       var optic = events.optic_state || {{}};
+      var opticSettings = device.optic_settings || {{}};
       function _pick(a, b) {{ return (a !== undefined && a !== null) ? a : b; }}
+      function _nodeId(value) {{
+        var parsed = parseInt(value, 10);
+        return (isFinite(parsed) && parsed >= 0 && parsed <= 31) ? parsed : null;
+      }}
       var rawMode = _pick(syncEvt.raw_mode, sync.raw_mode);
       var localRole = String(_pick(syncEvt.role, sync.role) || '').toLowerCase();
       if (localRole !== 'master' && localRole !== 'slave' && localRole !== 'off') {{
         var rmap = {{0: 'master', 1: 'slave', 2: 'off'}};
         localRole = rmap[rawMode] || '---';
       }}
-      var localNode = _pick(syncEvt.local_node_id, _pick(sync.local_node_id, local.node_id));
-      if (typeof localNode !== 'number') {{ localNode = 0; }}
-      var seenMask = _pick(syncEvt.sync_seen_mask, sync.sync_seen_mask);
-      if (typeof seenMask !== 'number') {{ seenMask = 0; }}
-      // Authoritative present-node set comes from sync_seen_mask (bit i -> node_id i+1).
-      // The raw remote[] list from the STAT packet is unreliable in this firmware, so it
-      // is only used to look up per-node state for nodes that are actually present.
+      var assignedRole = String(_pick(syncEvt.assigned_role, sync.assigned_role) || '').toLowerCase();
+      if (assignedRole !== 'master' && assignedRole !== 'slave') {{
+        var savedRoleCode = parseInt(_pick(syncEvt.saved_role_code, sync.saved_role_code), 10);
+        assignedRole = (savedRoleCode === 1) ? 'master' : ((savedRoleCode === 2) ? 'slave' : '');
+      }}
+      if (!assignedRole && (localRole === 'master' || localRole === 'slave')) {{ assignedRole = localRole; }}
+      var assignmentStatus = parseInt(_pick(syncEvt.assignment_status, sync.assignment_status), 10);
+      var idAssignedRaw = _pick(presenceEvt.device_id_assigned, sync.device_id_assigned);
+      var idAssigned = (typeof idAssignedRaw === 'boolean')
+        ? idAssignedRaw
+        : (isFinite(assignmentStatus) && !!(assignmentStatus & 0x04));
+      var localNode = _nodeId(_pick(
+        presenceEvt.device_id,
+        _pick(presenceEvt.local_node_id, _pick(sync.device_id, _pick(sync.local_node_id, local.node_id)))
+      ));
+      var localIdent = (rs485Ident.local && typeof rs485Ident.local === 'object') ? rs485Ident.local : {{}};
+      if (!idAssigned && localIdent.device_id_assigned === true) {{
+        var localIdentNode = _nodeId(localIdent.node_id);
+        if (localIdentNode !== null) {{
+          localNode = localIdentNode;
+          idAssigned = true;
+        }}
+      }}
+      if (!idAssigned) {{ localNode = null; }}
+      var seenMaskRaw = _pick(presenceEvt.sync_seen_mask, sync.sync_seen_mask);
+      var seenMaskKnown = seenMaskRaw !== undefined && seenMaskRaw !== null;
+      var seenMask = Number(seenMaskRaw) >>> 0;
       var remoteById = {{}};
       remote.forEach(function (item) {{
-        if (item && typeof item.node_id === 'number') {{ remoteById[item.node_id] = item; }}
+        var visibleNow = !!item && (
+          item.local === true ||
+          item.seen === true ||
+          item.online === true ||
+          item.recent === true
+        );
+        if (!visibleNow) {{ return; }}
+        var nid = item ? _nodeId(_pick(item.node_id, item.status_node_id)) : null;
+        if (nid !== null) {{ remoteById[nid] = item; }}
       }});
+      var identityById = {{}};
+      Object.keys(identNodes || {{}}).forEach(function (key) {{
+        var entry = identNodes[key] || {{}};
+        var nid = _nodeId((entry.node_id !== undefined && entry.node_id !== null) ? entry.node_id : key);
+        if (nid !== null) {{ identityById[nid] = entry; }}
+      }});
+      if (idAssigned && localNode !== null) {{
+        identityById[localNode] = Object.assign({{}}, identityById[localNode] || {{}}, localIdent);
+      }}
       var presentIds = [];
       for (var i = 0; i < 32; i++) {{
-        if (seenMask & (1 << i)) {{ presentIds.push(i + 1); }}
+        if (((seenMask >>> i) & 1) === 1) {{ presentIds.push(i); }}
       }}
-      if (localNode > 0 && presentIds.indexOf(localNode) === -1) {{
-        presentIds.push(localNode);
-      }} else if (presentIds.length === 0 && (localRole === 'master' || localRole === 'slave')) {{
+      Object.keys(identityById || {{}}).forEach(function (key) {{
+        var knownNid = parseInt(key, 10);
+        var knownEntry = identityById[key] || {{}};
+        var visibleNow = knownEntry.local === true || (
+          isFinite(knownNid) && (
+            seenMaskKnown
+              ? (((seenMask >>> knownNid) & 1) === 1)
+              : (knownEntry.recent === true || knownEntry.online === true)
+          )
+        );
+        if (visibleNow && isFinite(knownNid) && presentIds.indexOf(knownNid) === -1) {{
+          presentIds.push(knownNid);
+        }}
+      }});
+      Object.keys(remoteById || {{}}).forEach(function (key) {{
+        var remoteNid = parseInt(key, 10);
+        var remotePresent = isFinite(remoteNid) && (
+          !seenMaskKnown || (((seenMask >>> remoteNid) & 1) === 1)
+        );
+        if (remotePresent && presentIds.indexOf(remoteNid) === -1) {{ presentIds.push(remoteNid); }}
+      }});
+      if (idAssigned && localNode !== null && presentIds.indexOf(localNode) === -1) {{
         presentIds.push(localNode);
       }}
       var remoteCount = 0;
       presentIds.forEach(function (n) {{ if (n !== localNode) {{ remoteCount++; }} }});
-      // A synchronized slave implies a master exists even when the firmware does not
-      // list it in sync_seen_mask. If no peer is present to be that master, add an
-      // implied master column (M00) so the group always shows the master first.
-      var impliedMaster = null;
-      if ((localRole === 'slave' || localRole === 'off') && remoteCount === 0) {{
-        impliedMaster = {{
-          code: 'M' + _padNode2(0),
-          role: 'master',
-          node_id: 0,
-          optic_active: null,
-          detadc1: null,
-          detadc2: null,
-          tx_enabled: null,
-          online: true,
-          is_local: false
-        }};
-      }}
-      var devices = presentIds.map(function (nid) {{
-        var isLocal = (nid === localNode);
-        var role;
+		      var devices = presentIds.map(function (nid) {{
+		        var isLocal = idAssigned && (nid === localNode);
+		        var role;
         if (isLocal) {{
           role = localRole;
-        }} else if (localRole === 'master') {{
-          role = 'slave';
-        }} else if ((localRole === 'slave' || localRole === 'off') && remoteCount === 1) {{
-          role = 'master';
         }} else {{
-          role = 'slave';
-        }}
-        var st = isLocal ? local : (remoteById[nid] || {{}});
-        var code;
-        if (isLocal) {{
-          var localChar = String(_pick(syncEvt.display_char, sync.display_char) || '').toUpperCase() || _roleChar(role);
-          var localVal = _pick(syncEvt.display_value, sync.display_value);
-          if (typeof localVal !== 'number') {{ localVal = nid; }}
-          var sc = String(_pick(syncEvt.code, sync.code) || '').toUpperCase();
-          code = (/^[MS][0-9]{{2}}$/.test(sc)) ? sc : (localChar + _padNode2(localVal));
-        }} else {{
-          code = _roleChar(role) + _padNode2(nid);
-        }}
+          var roleIdent = identityById[nid] || {{}};
+          var explicitRole = String(roleIdent.role || '').toLowerCase();
+          if (explicitRole === 'master' || explicitRole === 'slave') {{
+            role = explicitRole;
+          }} else if (roleIdent.master === true) {{
+            role = 'master';
+          }} else if (roleIdent.master === false) {{
+            role = 'slave';
+          }} else if (localRole === 'master') {{
+            role = 'slave';
+          }} else if (remoteCount === 1) {{
+            role = 'master';
+          }} else {{
+            role = '---';
+          }}
+		        }}
+		        var ident = identityById[nid] || {{}};
+		        var st = isLocal ? Object.assign({{}}, ident, localIdent, local) : Object.assign({{}}, ident, remoteById[nid] || {{}});
+		        var code = _roleChar(role) + _padNode2(nid);
+	        var opticActive = st.optic_active;
+	        if (isLocal) {{
+	          if (optic.optic_active !== undefined && optic.optic_active !== null) {{
+	            opticActive = !!optic.optic_active;
+	          }} else if (st.optic_active_event !== undefined && st.optic_active_event !== null) {{
+	            opticActive = !!st.optic_active_event;
+	          }} else if (st.optic_active_flags_runtime !== undefined && st.optic_active_flags_runtime !== null) {{
+	            opticActive = !!st.optic_active_flags_runtime;
+	          }}
+	        }}
         return {{
           code: code,
           role: role,
           node_id: nid,
-          optic_active: st.optic_active,
-          detadc1: st.detadc1,
-          detadc2: st.detadc2,
-          tx_enabled: isLocal ? ((st.tx_enabled !== undefined) ? st.tx_enabled : optic.tx_enabled) : st.tx_enabled,
+          header_label: isLocal ? _groupDeviceHeaderLabel(Object.assign({{}}, ident, host), nid) : _groupDeviceHeaderLabel(st, nid),
+          rpi_id: String((isLocal ? (host.rpi_id || st.rpi_id) : st.rpi_id) || ''),
+          rpi_id_published: st.rpi_id_valid === true,
+          stm32_id: String(st.short_id || st.host_id || ''),
+          node_conflict: st.node_conflict === true,
+          identity_complete: st.complete === true,
+          wire_format: String(st.wire_format || ''),
+          optic_active: opticActive,
+		          ip: st.ip || '',
+		          detadc1: st.detadc1,
+		          detadc2: st.detadc2,
+		          tx_enabled: isLocal ? ((st.tx_enabled !== undefined) ? st.tx_enabled : optic.tx_enabled) : st.tx_enabled,
+		          online: isLocal ? true : !!(st.online || st.seen || st.recent),
+		          is_local: isLocal,
+		          id_assigned: true
+		        }};
+		      }});
+      if (!idAssigned) {{
+        var unassignedState = Object.assign({{}}, localIdent, local);
+        var unassignedOptic = unassignedState.optic_active;
+        if (optic.optic_active !== undefined && optic.optic_active !== null) {{
+          unassignedOptic = !!optic.optic_active;
+        }} else if (unassignedState.optic_active_event !== undefined && unassignedState.optic_active_event !== null) {{
+          unassignedOptic = !!unassignedState.optic_active_event;
+        }} else if (unassignedState.optic_active_flags_runtime !== undefined && unassignedState.optic_active_flags_runtime !== null) {{
+          unassignedOptic = !!unassignedState.optic_active_flags_runtime;
+        }}
+        devices.push({{
+          code: _roleChar(localRole) + '--',
+          role: localRole,
+          node_id: null,
+          header_label: _groupDeviceHeaderLabel(Object.assign({{}}, localIdent, host), '--'),
+          rpi_id: String(host.rpi_id || localIdent.rpi_id || ''),
+          rpi_id_published: localIdent.rpi_id_valid === true,
+          stm32_id: String(localIdent.short_id || localIdent.host_id || ''),
+          node_conflict: localIdent.node_conflict === true,
+          identity_complete: localIdent.complete === true,
+          wire_format: String(localIdent.wire_format || ''),
+          optic_active: unassignedOptic,
+          ip: localIdent.ip || host.ip || '',
+          detadc1: unassignedState.detadc1,
+          detadc2: unassignedState.detadc2,
+          tx_enabled: (unassignedState.tx_enabled !== undefined) ? unassignedState.tx_enabled : optic.tx_enabled,
           online: true,
-          is_local: isLocal
-        }};
+          is_local: true,
+          id_assigned: false
+        }});
+      }}
+      var lanNodeCounts = {{}};
+      lanDevices.forEach(function (lan) {{
+        var lanNode = lan && lan.device_id_assigned === true ? _nodeId(lan.node_id) : null;
+        if (lanNode !== null) {{
+          lanNodeCounts[lanNode] = (lanNodeCounts[lanNode] || 0) + 1;
+        }}
       }});
-      if (impliedMaster) {{ devices.push(impliedMaster); }}
-      // The master is always single and shows how many slaves are connected to it
-      // (1 slave -> M01, 2 slaves -> M02). Slaves keep their own S0N numbering.
-      var slaveN = devices.filter(function (d) {{ return d.role === 'slave'; }}).length;
+      lanDevices.forEach(function (lan) {{
+        lan = lan || {{}};
+        if (lan.api_ok !== true || lan.online !== true) {{ return; }}
+        var lanRpiId = _groupShortHostId(lan.rpi_id || lan.hostname);
+        if (!/^[0-9A-F]{{9}}$/.test(lanRpiId)) {{ return; }}
+        var lanNode = lan.device_id_assigned === true ? _nodeId(lan.node_id) : null;
+        if (seenMaskKnown && lanNode !== null && (((seenMask >>> lanNode) & 1) !== 1)) {{
+          return;
+        }}
+        var lanRole = String(lan.role || '').toLowerCase();
+        if (lanRole !== 'master' && lanRole !== 'slave') {{ lanRole = '---'; }}
+        var lanIsLocal = String(host.rpi_id || '').toUpperCase() === lanRpiId;
+        var existing = null;
+        devices.some(function (candidate) {{
+          if (String(candidate.rpi_id || '').toUpperCase() === lanRpiId) {{
+            existing = candidate;
+            return true;
+          }}
+          return false;
+        }});
+        if (!existing && lan.ip) {{
+          var lanIp = String(lan.ip);
+          var ipMatches = devices.filter(function (candidate) {{
+            return String(candidate.ip || '') === lanIp && !candidate.rpi_id;
+          }});
+          if (ipMatches.length === 1) {{ existing = ipMatches[0]; }}
+        }}
+        if (!existing && lanNode !== null && lanNodeCounts[lanNode] === 1) {{
+          var nodeMatches = devices.filter(function (candidate) {{
+            return candidate.node_id === lanNode && (seenMaskKnown || !candidate.rpi_id);
+          }});
+          if (nodeMatches.length === 1) {{ existing = nodeMatches[0]; }}
+        }}
+        if (existing) {{
+          existing.rpi_id = lanRpiId;
+          existing.ip = String(lan.ip || existing.ip || '');
+          existing.connect_url = String(lan.connect_url || existing.connect_url || '');
+          existing.lan_available = true;
+          existing.online = true;
+          existing.node_conflict = existing.node_conflict || lan.node_conflict === true;
+          existing.is_local = existing.is_local || lanIsLocal;
+          existing.header_label = _groupDeviceHeaderLabel(lan, lanNode);
+          if (!lanIsLocal && !seenMaskKnown) {{
+            if (lan.optic_active === true || lan.optic_active === false) {{ existing.optic_active = lan.optic_active; }}
+            if (lan.detadc1 === true || lan.detadc1 === false) {{ existing.detadc1 = lan.detadc1; }}
+            if (lan.detadc2 === true || lan.detadc2 === false) {{ existing.detadc2 = lan.detadc2; }}
+            if (lan.tx_enabled === true || lan.tx_enabled === false) {{ existing.tx_enabled = lan.tx_enabled; }}
+          }}
+          if (existing.role !== 'master' && existing.role !== 'slave' && lanRole !== '---') {{
+            existing.role = lanRole;
+          }}
+          if (existing.id_assigned === false && lanNode !== null) {{
+            existing.node_id = lanNode;
+            existing.id_assigned = true;
+            existing.code = _roleChar(existing.role) + _padNode2(lanNode);
+          }}
+          if (lanNode !== null && existing.node_id !== null && existing.node_id !== lanNode) {{
+            existing.node_conflict = true;
+          }}
+          return;
+        }}
+        if (seenMaskKnown) {{
+          return;
+        }}
+        devices.push({{
+          code: _roleChar(lanRole) + (lanNode === null ? '--' : _padNode2(lanNode)),
+          role: lanRole,
+          node_id: lanNode,
+          header_label: _groupDeviceHeaderLabel(lan, lanNode === null ? '--' : lanNode),
+          rpi_id: lanRpiId,
+          rpi_id_published: false,
+          stm32_id: '',
+          node_conflict: lan.node_conflict === true,
+          identity_complete: false,
+          wire_format: 'LAN',
+          optic_active: (lan.optic_active === true || lan.optic_active === false) ? lan.optic_active : null,
+          ip: String(lan.ip || ''),
+          connect_url: String(lan.connect_url || ''),
+          detadc1: (lan.detadc1 === true || lan.detadc1 === false) ? lan.detadc1 : null,
+          detadc2: (lan.detadc2 === true || lan.detadc2 === false) ? lan.detadc2 : null,
+          tx_enabled: (lan.tx_enabled === true || lan.tx_enabled === false) ? lan.tx_enabled : null,
+          online: true,
+          lan_available: true,
+          is_local: lanIsLocal,
+          id_assigned: lanNode !== null
+        }});
+      }});
+      var ownersByNode = {{}};
       devices.forEach(function (d) {{
-        if (d.role === 'master' && !d.is_local) {{ d.code = 'M' + _padNode2(slaveN); }}
+        if (d.id_assigned === false || d.node_id === null) {{ return; }}
+        var ownerKey = String(d.rpi_id || d.stm32_id || d.header_label || '');
+        ownersByNode[d.node_id] = ownersByNode[d.node_id] || {{}};
+        ownersByNode[d.node_id][ownerKey] = true;
+      }});
+      devices.forEach(function (d) {{
+        var owners = d.node_id === null ? [] : Object.keys(ownersByNode[d.node_id] || {{}});
+        if (owners.length > 1) {{ d.node_conflict = true; }}
       }});
       devices.sort(function (a, b) {{
         var ar = (a.role === 'master') ? 0 : 1;
         var br = (b.role === 'master') ? 0 : 1;
         if (ar !== br) {{ return ar - br; }}
-        return (a.node_id || 0) - (b.node_id || 0);
+        if (a.is_local !== b.is_local) {{ return a.is_local ? -1 : 1; }}
+        return (a.node_id === null ? 99 : a.node_id) - (b.node_id === null ? 99 : b.node_id);
       }});
       var opticStateLocal = (device.events || {{}}).optic_state || {{}};
-      var opticSettings = device.optic_settings || {{}};
       var localHoldSec = 3;
       var _hd = parseInt(opticStateLocal.optic_hold_ds, 10);
       if (isFinite(_hd)) {{ localHoldSec = Math.max(0, Math.min(10, Math.round(_hd / 10))); }}
       var localReaction = !!opticSettings.reaction_enabled;
-      devices.forEach(function (d) {{ if (d.is_local) {{ d._holdSec = localHoldSec; d._reaction = localReaction; }} }});
+      var neighborReaction = !!opticSettings.neighbor_reaction_enabled;
+      var neighborDeviceId = parseInt(opticSettings.neighbor_device_id, 10);
+      if (!isFinite(neighborDeviceId) || neighborDeviceId < 0 || neighborDeviceId > 31) {{
+        neighborDeviceId = null;
+      }}
+      var opticApplyRecent = (Date.now() - _groupLocalApplyT) < 6000;
+      if (opticApplyRecent) {{
+        if (_groupLocalDesiredReaction !== null) {{ localReaction = !!_groupLocalDesiredReaction; }}
+        if (_groupLocalDesiredNeighborReaction !== null) {{ neighborReaction = !!_groupLocalDesiredNeighborReaction; }}
+        if (_groupLocalDesiredNeighborDeviceId !== undefined) {{
+          var desiredNeighborId = parseInt(_groupLocalDesiredNeighborDeviceId, 10);
+          neighborDeviceId = (isFinite(desiredNeighborId) && desiredNeighborId >= 0 && desiredNeighborId <= 31)
+            ? desiredNeighborId
+            : null;
+        }}
+        var desiredHold = parseInt(_groupLocalDesiredHold, 10);
+        if (isFinite(desiredHold)) {{ localHoldSec = Math.max(0, Math.min(10, desiredHold)); }}
+      }}
+      var localSyncControlRole = (localRole === 'master' || localRole === 'slave') ? localRole : 'slave';
+      devices.forEach(function (d) {{
+        if (d.is_local) {{
+          d._holdSec = localHoldSec;
+          d._reaction = localReaction;
+          d._neighborReaction = neighborReaction;
+          d._neighborDeviceId = neighborDeviceId;
+          d._neighborOptions = devices.filter(function (candidate) {{
+            return !candidate.is_local && candidate.id_assigned !== false && candidate.node_id !== null;
+          }}).map(function (candidate) {{
+            return {{
+              node_id: candidate.node_id,
+              label: candidate.code + (candidate.header_label ? ' · ' + candidate.header_label : '')
+            }};
+          }});
+          d._syncRole = localSyncControlRole;
+          d._syncAssign = assignedRole || localSyncControlRole;
+          d._assignedRole = assignedRole || '';
+          d._rs485Id = localNode;
+          d._idAssigned = idAssigned;
+        }}
+      }});
       return devices;
     }}
     function _groupStateClass(d) {{
       if (d.optic_active === true) {{ return 'is-green'; }}
-      if (d.detadc1 === true || d.detadc2 === true) {{ return 'is-red'; }}
       return 'is-off';
     }}
     function _groupStateTitle(d) {{
-      if (d.optic_active === true) {{ return 'Optic sensor triggered'; }}
-      if (d.detadc1 === true || d.detadc2 === true) {{ return 'Not triggered, modulation signal present'; }}
-      return 'No signal';
+      if (d.optic_active === true) {{ return 'Optic active'; }}
+      if (d.optic_active === false) {{ return 'Optic inactive'; }}
+      return 'Optic unknown';
     }}
     var _groupSig = null;
+    var _groupPendingSig = null;
+    var _groupPendingDevices = null;
+    var _groupPendingSince = 0;
+    var _groupPendingCount = 0;
+    var _groupStableMs = 1800;
+    var _groupStablePolls = 3;
     var _groupCols = [];
     var _groupLocalReaction = null;
+    var _groupLocalNeighborDeviceId = null;
     var _groupLocalHold = null;
+    var _groupLocalDesiredReaction = null;
+    var _groupLocalDesiredNeighborReaction = null;
+    var _groupLocalDesiredNeighborDeviceId = undefined;
+    var _groupLocalDesiredHold = null;
+    var _groupLocalSyncRole = null;
+    var _groupLocalSyncStatus = null;
+    var _groupLocalAssignedRole = null;
+    var _groupLocalRs485Id = null;
+    var _groupLocalRs485IdStatus = null;
     var _groupLocalApplyT = 0;
+    var _groupLocalSyncApplyT = 0;
+    var _groupLocalIdApplyT = 0;
+    var _groupIdentRefreshT = 0;
+    var _groupIdentScanT = 0;
+    var _groupIdentRefreshing = false;
     function _groupApplyOptic() {{
       var reaction = _groupLocalReaction ? !!_groupLocalReaction.checked : false;
+      var neighborDeviceRaw = _groupLocalNeighborDeviceId ? String(_groupLocalNeighborDeviceId.value || 'off') : 'off';
+      var neighborReaction = neighborDeviceRaw !== 'off';
+      var neighborDeviceParsed = parseInt(neighborDeviceRaw, 10);
+      var neighborDeviceId = (isFinite(neighborDeviceParsed) && neighborDeviceParsed >= 0 && neighborDeviceParsed <= 31)
+        ? neighborDeviceParsed
+        : null;
       var holdSec = _groupLocalHold ? (parseInt(_groupLocalHold.value, 10) || 0) : 0;
       _groupLocalApplyT = Date.now();
+      _groupLocalDesiredReaction = reaction;
+      _groupLocalDesiredNeighborReaction = neighborReaction;
+      _groupLocalDesiredNeighborDeviceId = neighborDeviceId;
+      _groupLocalDesiredHold = holdSec;
       fetch('/api/group-optic-config', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
         cache: 'no-store',
-        body: JSON.stringify({{reaction: reaction, hold_seconds: holdSec}})
-      }}).then(function (r) {{ return r.ok ? r.json() : null; }}).catch(function () {{}});
+        body: JSON.stringify({{
+          reaction: reaction,
+          neighbor_reaction: neighborReaction,
+          neighbor_device_id: neighborDeviceId,
+          hold_seconds: holdSec
+        }})
+      }}).then(function (r) {{ return r.ok ? r.json() : null; }}).then(function (data) {{
+        if (!data || !data.ok) {{ return; }}
+        _groupLocalDesiredReaction = !!data.reaction_enabled;
+        _groupLocalDesiredNeighborReaction = !!data.neighbor_reaction_enabled;
+        _groupLocalDesiredNeighborDeviceId =
+          (data.neighbor_device_id === null || data.neighbor_device_id === undefined)
+            ? null
+            : parseInt(data.neighbor_device_id, 10);
+        var savedHold = parseInt(data.hold_seconds, 10);
+        if (isFinite(savedHold)) {{ _groupLocalDesiredHold = Math.max(0, Math.min(10, savedHold)); }}
+      }}).catch(function () {{}});
+    }}
+    function _groupApplySyncRole() {{
+      var role = _groupLocalSyncRole ? String(_groupLocalSyncRole.value || '') : '';
+      if (role !== 'master' && role !== 'slave') {{
+        if (_groupLocalSyncStatus) {{
+          _groupLocalSyncStatus.textContent = 'Select Master or Slave';
+          _groupLocalSyncStatus.classList.add('is-error');
+        }}
+        return;
+      }}
+      _groupLocalSyncApplyT = Date.now();
+      if (_groupLocalSyncRole) {{ _groupLocalSyncRole.disabled = true; }}
+      if (_groupLocalSyncStatus) {{
+        _groupLocalSyncStatus.textContent = 'Assigning…';
+        _groupLocalSyncStatus.classList.remove('is-error');
+      }}
+      fetch('/api/group-sync-config', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        cache: 'no-store',
+        body: JSON.stringify({{role: role}})
+      }}).then(function (r) {{
+        return r.json().catch(function () {{ return {{}}; }}).then(function (data) {{
+          if (!r.ok || !data.ok) {{ throw new Error(data.message || 'Role assignment failed'); }}
+          return data;
+        }});
+      }}).then(function (data) {{
+        if (_groupLocalAssignedRole) {{
+          _groupLocalAssignedRole.textContent = 'Assigned: ' + _capitalizeRole(role);
+        }}
+        if (_groupLocalSyncStatus) {{
+          _groupLocalSyncStatus.textContent = data.message || ('Assigned: ' + _capitalizeRole(role));
+          _groupLocalSyncStatus.classList.remove('is-error');
+        }}
+      }}).catch(function (err) {{
+        if (_groupLocalSyncStatus) {{
+          _groupLocalSyncStatus.textContent = String((err && err.message) || 'Role assignment failed');
+          _groupLocalSyncStatus.classList.add('is-error');
+        }}
+      }}).finally(function () {{
+        if (_groupLocalSyncRole) {{ _groupLocalSyncRole.disabled = false; }}
+      }});
+    }}
+    function _groupApplyRs485Id() {{
+      var deviceId = _groupLocalRs485Id ? parseInt(_groupLocalRs485Id.value, 10) : NaN;
+      if (!isFinite(deviceId) || deviceId < 0 || deviceId > 31) {{
+        if (_groupLocalRs485IdStatus) {{
+          _groupLocalRs485IdStatus.textContent = 'Select ID 00–31';
+          _groupLocalRs485IdStatus.classList.add('is-error');
+        }}
+        return;
+      }}
+      _groupLocalIdApplyT = Date.now();
+      if (_groupLocalRs485Id) {{ _groupLocalRs485Id.disabled = true; }}
+      if (_groupLocalRs485IdStatus) {{
+        _groupLocalRs485IdStatus.textContent = 'Assigning…';
+        _groupLocalRs485IdStatus.classList.remove('is-error');
+      }}
+      fetch('/api/group-rs485-id', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        cache: 'no-store',
+        body: JSON.stringify({{device_id: deviceId}})
+      }}).then(function (r) {{
+        return r.json().catch(function () {{ return {{}}; }}).then(function (data) {{
+          if (!r.ok || !data.ok) {{ throw new Error(data.message || 'RS485 ID assignment failed'); }}
+          return data;
+        }});
+      }}).then(function (data) {{
+        if (_groupLocalRs485IdStatus) {{
+          _groupLocalRs485IdStatus.textContent = data.message || ('Assigned: ' + _padNode2(deviceId));
+          _groupLocalRs485IdStatus.classList.remove('is-error');
+        }}
+        _groupRefreshIdentity(true);
+      }}).catch(function (err) {{
+        if (_groupLocalRs485IdStatus) {{
+          _groupLocalRs485IdStatus.textContent = String((err && err.message) || 'RS485 ID assignment failed');
+          _groupLocalRs485IdStatus.classList.add('is-error');
+        }}
+      }}).finally(function () {{
+        if (_groupLocalRs485Id) {{ _groupLocalRs485Id.disabled = false; }}
+      }});
+    }}
+    function _groupRefreshIdentity(force) {{
+      var now = Date.now();
+      if (_groupIdentRefreshing || (!force && (now - _groupIdentRefreshT) < 20000)) {{ return; }}
+      _groupIdentRefreshing = true;
+      _groupIdentRefreshT = now;
+      var requestScan = !!force || (now - _groupIdentScanT) >= 30000;
+      if (requestScan) {{ _groupIdentScanT = now; }}
+      var button = document.querySelector('[data-group-refresh]');
+      if (button) {{ button.disabled = true; button.textContent = 'Refreshing…'; }}
+      fetch('/api/group-rs485-ident', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        cache: 'no-store',
+        body: JSON.stringify({{request_scan: requestScan}})
+      }}).catch(function () {{
+        return null;
+      }}).finally(function () {{
+        _groupIdentRefreshing = false;
+        if (button) {{ button.disabled = false; button.textContent = 'Refresh device list'; }}
+      }});
     }}
     function _groupMakeHead(d) {{
       var th = document.createElement('th');
@@ -5816,10 +8719,10 @@ def render_portal_page(
       code.className = 'group-dev-code';
       code.textContent = d.code || '??';
       th.appendChild(code);
-      if (d.is_local) {{
+      if (d.header_label) {{
         var badge = document.createElement('span');
         badge.className = 'group-dev-badge';
-        badge.textContent = 'this device';
+        badge.textContent = d.header_label;
         th.appendChild(badge);
       }}
       return th;
@@ -5844,6 +8747,108 @@ def render_portal_page(
     function _groupSetText(td, text) {{
       td.textContent = (text === null || text === undefined || text === '') ? '---' : text;
     }}
+    function _groupMakeIpCell(d) {{
+      var td = _groupMakeTextCell(d);
+      _groupSetIpCell(td, d);
+      return td;
+    }}
+    function _groupSetIpCell(td, d) {{
+      td.textContent = '';
+      var ip = String(d.ip || '').trim();
+      if (!ip) {{
+        td.textContent = '---';
+        return;
+      }}
+      var href = String(d.connect_url || '').trim();
+      if (!/^https?:\\/\\//i.test(href)) {{ href = 'http://' + ip + '/'; }}
+      var link = document.createElement('a');
+      link.className = 'group-ip-link';
+      link.href = href;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.title = 'Open ' + String(d.rpi_id || d.header_label || ip);
+      link.textContent = ip;
+      td.appendChild(link);
+    }}
+    function _groupMakeSyncRoleCell(d) {{
+      var td = document.createElement('td');
+      td.className = 'group-dev-cell group-dev-ctl' + (d.is_local ? ' is-local' : '');
+      if (d.is_local) {{
+        var wrap = document.createElement('div');
+        wrap.className = 'group-role-control';
+        var sel = document.createElement('select');
+        sel.className = 'group-ctl-select';
+        var options = [
+          ['master', 'Master'],
+          ['slave', 'Slave']
+        ];
+        var selectedValue = d._syncAssign || d._syncRole || 'slave';
+        var selectedKnown = options.some(function (pair) {{ return pair[0] === selectedValue; }});
+        if (!selectedKnown) {{ selectedValue = 'slave'; }}
+        options.forEach(function (pair) {{
+          var opt = document.createElement('option');
+          opt.value = pair[0];
+          opt.textContent = pair[1];
+          if (pair[0] === selectedValue) {{ opt.selected = true; }}
+          sel.appendChild(opt);
+        }});
+        sel.addEventListener('change', _groupApplySyncRole);
+        wrap.appendChild(sel);
+        var assignedLabel = document.createElement('span');
+        assignedLabel.className = 'group-role-assigned';
+        assignedLabel.textContent = d._assignedRole ? ('Assigned: ' + _capitalizeRole(d._assignedRole)) : 'Assigned: ---';
+        wrap.appendChild(assignedLabel);
+        var status = document.createElement('span');
+        status.className = 'group-role-feedback';
+        status.setAttribute('aria-live', 'polite');
+        wrap.appendChild(status);
+        td.appendChild(wrap);
+        td._ctlSelect = sel;
+        td._assignedLabel = assignedLabel;
+        _groupLocalSyncRole = sel;
+        _groupLocalSyncStatus = status;
+        _groupLocalAssignedRole = assignedLabel;
+      }} else {{
+        td.textContent = '\u2014';
+      }}
+      return td;
+    }}
+    function _groupMakeRs485IdCell(d) {{
+      var td = document.createElement('td');
+      td.className = 'group-dev-cell group-dev-ctl' + (d.is_local ? ' is-local' : '');
+      if (!d.is_local) {{
+        _groupSetText(td, d.node_id === null ? '--' : _padNode2(d.node_id));
+        return td;
+      }}
+      var wrap = document.createElement('div');
+      wrap.className = 'group-role-control';
+      var sel = document.createElement('select');
+      sel.className = 'group-ctl-select';
+      for (var id = 0; id <= 31; id++) {{
+        var opt = document.createElement('option');
+        opt.value = String(id);
+        opt.textContent = _padNode2(id);
+        if (d._idAssigned && id === d._rs485Id) {{ opt.selected = true; }}
+        sel.appendChild(opt);
+      }}
+      if (!d._idAssigned) {{ sel.selectedIndex = -1; }}
+      sel.addEventListener('change', _groupApplyRs485Id);
+      wrap.appendChild(sel);
+      var assignedLabel = document.createElement('span');
+      assignedLabel.className = 'group-role-assigned';
+      assignedLabel.textContent = d._idAssigned ? ('Assigned: ' + _padNode2(d._rs485Id)) : 'Assigned: ---';
+      wrap.appendChild(assignedLabel);
+      var status = document.createElement('span');
+      status.className = 'group-role-feedback';
+      status.setAttribute('aria-live', 'polite');
+      wrap.appendChild(status);
+      td.appendChild(wrap);
+      td._ctlSelect = sel;
+      td._assignedLabel = assignedLabel;
+      _groupLocalRs485Id = sel;
+      _groupLocalRs485IdStatus = status;
+      return td;
+    }}
     function _groupMakeBoolCell(d) {{
       var td = document.createElement('td');
       td.className = 'group-dev-cell' + (d.is_local ? ' is-local' : '');
@@ -5856,23 +8861,62 @@ def render_portal_page(
       span.className = 'group-flag ' + (value === true ? 'is-on' : (value === false ? 'is-off' : 'is-unknown'));
       span.textContent = _formatBool(value);
     }}
-    function _groupMakeReactionCell(d) {{
+    function _groupMakeReactionCell(d, neighbor) {{
       var td = document.createElement('td');
       td.className = 'group-dev-cell group-dev-ctl' + (d.is_local ? ' is-local' : '');
-      var label = document.createElement('label');
-      var cb = document.createElement('input');
-      cb.type = 'checkbox';
-      if (d.is_local) {{
+      if (!d.is_local) {{
+        td.textContent = '\u2014';
+        return td;
+      }}
+      var wrap = document.createElement('div');
+      wrap.className = 'group-role-control';
+      if (!neighbor) {{
+        var label = document.createElement('label');
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
         cb.checked = !!d._reaction;
+        cb.title = 'Gate local sound, LED, and relay by this device optic sensor';
         cb.addEventListener('change', _groupApplyOptic);
         _groupLocalReaction = cb;
-      }} else {{
-        cb.disabled = true;
-        cb.title = 'Remote control not available yet';
+        label.appendChild(cb);
+        wrap.appendChild(label);
+        td._ctlInput = cb;
       }}
-      label.appendChild(cb);
-      td.appendChild(label);
-      td._ctlInput = cb;
+      if (neighbor) {{
+        var sel = document.createElement('select');
+        sel.className = 'group-ctl-select';
+        var offOpt = document.createElement('option');
+        offOpt.value = 'off';
+        offOpt.textContent = 'Off · ignore neighbor optics';
+        sel.appendChild(offOpt);
+        var anyOpt = document.createElement('option');
+        anyOpt.value = 'any';
+        anyOpt.textContent = 'Any current neighbor';
+        sel.appendChild(anyOpt);
+        var selectedPresent = d._neighborDeviceId === null;
+        (d._neighborOptions || []).forEach(function (item) {{
+          var opt = document.createElement('option');
+          opt.value = String(item.node_id);
+          opt.textContent = item.label || ('RS485 ' + _padNode2(item.node_id));
+          if (item.node_id === d._neighborDeviceId) {{ selectedPresent = true; }}
+          sel.appendChild(opt);
+        }});
+        if (d._neighborDeviceId !== null && !selectedPresent) {{
+          var missingOpt = document.createElement('option');
+          missingOpt.value = String(d._neighborDeviceId);
+          missingOpt.textContent = 'RS485 ' + _padNode2(d._neighborDeviceId) + ' · absent';
+          sel.appendChild(missingOpt);
+        }}
+        sel.value = !d._neighborReaction
+          ? 'off'
+          : (d._neighborDeviceId === null ? 'any' : String(d._neighborDeviceId));
+        sel.title = 'Off disables neighbor reaction; otherwise select any current neighbor or one RS485 device whose optic controls sound, LED, and relay';
+        sel.addEventListener('change', _groupApplyOptic);
+        wrap.appendChild(sel);
+        td._ctlSelect = sel;
+        _groupLocalNeighborDeviceId = sel;
+      }}
+      td.appendChild(wrap);
       return td;
     }}
     function _groupMakeHoldCell(d) {{
@@ -5904,31 +8948,61 @@ def render_portal_page(
       }});
       _groupCols = [];
       _groupLocalReaction = null;
+      _groupLocalNeighborDeviceId = null;
       _groupLocalHold = null;
+      _groupLocalSyncRole = null;
+      _groupLocalSyncStatus = null;
+      _groupLocalAssignedRole = null;
+      _groupLocalRs485Id = null;
+      _groupLocalRs485IdStatus = null;
       devices.forEach(function (d) {{
         var col = {{is_local: d.is_local, cells: {{}}}};
         if (_groupRows.head) {{ var h = _groupMakeHead(d); _groupRows.head.appendChild(h); col.head = h; }}
         if (_groupRows.indicator) {{ var stc = _groupMakeStateCell(d); _groupSetState(stc, d); _groupRows.indicator.appendChild(stc); col.cells.indicator = stc; }}
         if (_groupRows.role) {{ var rc = _groupMakeTextCell(d); _groupSetText(rc, _capitalizeRole(d.role)); _groupRows.role.appendChild(rc); col.cells.role = rc; }}
-        if (_groupRows.node) {{ var nc = _groupMakeTextCell(d); _groupSetText(nc, String(d.node_id)); _groupRows.node.appendChild(nc); col.cells.node = nc; }}
+        if (_groupRows.syncctl) {{ var sc = _groupMakeSyncRoleCell(d); _groupRows.syncctl.appendChild(sc); col.cells.syncctl = sc; }}
+        if (_groupRows.node) {{ var nc = _groupMakeRs485IdCell(d); _groupRows.node.appendChild(nc); col.cells.node = nc; }}
+        if (_groupRows.stm32) {{ var uc = _groupMakeTextCell(d); _groupSetText(uc, d.stm32_id); _groupRows.stm32.appendChild(uc); col.cells.stm32 = uc; }}
+        if (_groupRows.ip) {{ var ipc = _groupMakeIpCell(d); _groupRows.ip.appendChild(ipc); col.cells.ip = ipc; }}
         if (_groupRows.optic) {{ var oc = _groupMakeBoolCell(d); _groupSetBool(oc, d.optic_active); _groupRows.optic.appendChild(oc); col.cells.optic = oc; }}
         if (_groupRows.detadc1) {{ var c1 = _groupMakeBoolCell(d); _groupSetBool(c1, d.detadc1); _groupRows.detadc1.appendChild(c1); col.cells.detadc1 = c1; }}
         if (_groupRows.detadc2) {{ var c2 = _groupMakeBoolCell(d); _groupSetBool(c2, d.detadc2); _groupRows.detadc2.appendChild(c2); col.cells.detadc2 = c2; }}
         if (_groupRows.tx) {{ var tc = _groupMakeBoolCell(d); _groupSetBool(tc, d.tx_enabled); _groupRows.tx.appendChild(tc); col.cells.tx = tc; }}
         if (_groupRows.online) {{ var lc = _groupMakeBoolCell(d); _groupSetBool(lc, d.online); _groupRows.online.appendChild(lc); col.cells.online = lc; }}
-        if (_groupRows.reaction) {{ var rcl = _groupMakeReactionCell(d); _groupRows.reaction.appendChild(rcl); col.cells.reaction = rcl; }}
+        if (_groupRows.reaction) {{ var rcl = _groupMakeReactionCell(d, false); _groupRows.reaction.appendChild(rcl); col.cells.reaction = rcl; }}
+        if (_groupRows['neighbor-reaction']) {{ var nrcl = _groupMakeReactionCell(d, true); _groupRows['neighbor-reaction'].appendChild(nrcl); col.cells.neighborReaction = nrcl; }}
         if (_groupRows.hold) {{ var hcl = _groupMakeHoldCell(d); _groupRows.hold.appendChild(hcl); col.cells.hold = hcl; }}
         _groupCols.push(col);
       }});
     }}
     function _groupUpdateColumns(devices) {{
       var recent = (Date.now() - _groupLocalApplyT) < 6000;
+      var syncRecent = (Date.now() - _groupLocalSyncApplyT) < 6000;
+      var idRecent = (Date.now() - _groupLocalIdApplyT) < 6000;
       devices.forEach(function (d, idx) {{
         var col = _groupCols[idx];
         if (!col) {{ return; }}
+        if (col.head) {{
+          col.head.className = 'group-dev-cell group-dev-head' + (d.is_local ? ' is-local' : '');
+          var codeEl = col.head.querySelector('.group-dev-code');
+          if (codeEl) {{ codeEl.textContent = d.code || '??'; }}
+          var badgeEl = col.head.querySelector('.group-dev-badge');
+          if (d.header_label) {{
+            if (!badgeEl) {{
+              badgeEl = document.createElement('span');
+              badgeEl.className = 'group-dev-badge';
+              col.head.appendChild(badgeEl);
+            }}
+            badgeEl.textContent = d.header_label;
+          }} else if (badgeEl) {{
+            badgeEl.remove();
+          }}
+        }}
         if (col.cells.indicator) {{ _groupSetState(col.cells.indicator, d); }}
         if (col.cells.role) {{ _groupSetText(col.cells.role, _capitalizeRole(d.role)); }}
-        if (col.cells.node) {{ _groupSetText(col.cells.node, String(d.node_id)); }}
+        if (!d.is_local && col.cells.node) {{ _groupSetText(col.cells.node, d.node_id === null ? '--' : _padNode2(d.node_id)); }}
+        if (col.cells.stm32) {{ _groupSetText(col.cells.stm32, d.stm32_id); }}
+        if (col.cells.ip) {{ _groupSetIpCell(col.cells.ip, d); }}
         if (col.cells.optic) {{ _groupSetBool(col.cells.optic, d.optic_active); }}
         if (col.cells.detadc1) {{ _groupSetBool(col.cells.detadc1, d.detadc1); }}
         if (col.cells.detadc2) {{ _groupSetBool(col.cells.detadc2, d.detadc2); }}
@@ -5937,21 +9011,84 @@ def render_portal_page(
         if (d.is_local && !recent) {{
           var rc = col.cells.reaction;
           if (rc && rc._ctlInput && document.activeElement !== rc._ctlInput) {{ rc._ctlInput.checked = !!d._reaction; }}
+          var nrc = col.cells.neighborReaction;
+          if (nrc && nrc._ctlSelect && document.activeElement !== nrc._ctlSelect) {{
+            nrc._ctlSelect.value = !d._neighborReaction
+              ? 'off'
+              : (d._neighborDeviceId === null ? 'any' : String(d._neighborDeviceId));
+          }}
           var hc = col.cells.hold;
           if (hc && hc._ctlSelect && document.activeElement !== hc._ctlSelect) {{ hc._ctlSelect.value = String(d._holdSec); }}
         }}
+        if (d.is_local && !syncRecent) {{
+          var sc = col.cells.syncctl;
+          var assignedRole = String(d._syncAssign || d._syncRole || 'slave');
+          if (assignedRole !== 'master' && assignedRole !== 'slave') {{ assignedRole = 'slave'; }}
+          if (sc && sc._ctlSelect && document.activeElement !== sc._ctlSelect) {{ sc._ctlSelect.value = assignedRole; }}
+          if (sc && sc._assignedLabel) {{
+            sc._assignedLabel.textContent = d._assignedRole ? ('Assigned: ' + _capitalizeRole(d._assignedRole)) : 'Assigned: ---';
+          }}
+        }}
+        if (d.is_local && !idRecent) {{
+          var nc = col.cells.node;
+          if (nc && nc._ctlSelect && document.activeElement !== nc._ctlSelect) {{
+            nc._ctlSelect.value = d._idAssigned ? String(d._rs485Id) : '';
+            if (!d._idAssigned) {{ nc._ctlSelect.selectedIndex = -1; }}
+          }}
+          if (nc && nc._assignedLabel) {{
+            nc._assignedLabel.textContent = d._idAssigned ? ('Assigned: ' + _padNode2(d._rs485Id)) : 'Assigned: ---';
+          }}
+        }}
       }});
     }}
-    function _updateGroupMatrix(device) {{
-      if (!_groupMatrix) {{ return; }}
-      var devices = _buildGroupDevices(device || {{}});
-      if (_groupEmpty) {{ _groupEmpty.hidden = devices.length > 0; }}
-      var sig = devices.map(function (d) {{ return d.code + (d.is_local ? '*' : ''); }}).join('|');
+    function _groupCompositionSig(devices) {{
+      return devices.map(function (d) {{
+        return [
+          d.code || '?',
+          d.rpi_id || d.stm32_id || '?',
+          d.is_local ? 'L' : 'R',
+          d.role || '?',
+          d.id_assigned === false ? '--' : String(d.node_id)
+        ].join(':');
+      }}).join('|');
+    }}
+    function _groupCommitDevices(devices, sig) {{
       if (sig !== _groupSig) {{
         _groupRebuildColumns(devices);
         _groupSig = sig;
       }} else {{
         _groupUpdateColumns(devices);
+      }}
+    }}
+    function _updateGroupMatrix(device) {{
+      if (!_groupMatrix) {{ return; }}
+      var devices = _buildGroupDevices(device || {{}});
+      var sig = _groupCompositionSig(devices);
+      if (_groupEmpty) {{ _groupEmpty.hidden = (_groupSig !== null || devices.length > 0); }}
+      if (_groupSig === null || sig === _groupSig) {{
+        _groupPendingSig = null;
+        _groupPendingDevices = null;
+        _groupPendingCount = 0;
+        _groupPendingSince = 0;
+        _groupCommitDevices(devices, sig);
+        return;
+      }}
+      var now = Date.now();
+      if (sig !== _groupPendingSig) {{
+        _groupPendingSig = sig;
+        _groupPendingDevices = devices;
+        _groupPendingSince = now;
+        _groupPendingCount = 1;
+        return;
+      }}
+      _groupPendingDevices = devices;
+      _groupPendingCount += 1;
+      if (_groupPendingCount >= _groupStablePolls || (now - _groupPendingSince) >= _groupStableMs) {{
+        _groupCommitDevices(_groupPendingDevices || devices, _groupPendingSig);
+        _groupPendingSig = null;
+        _groupPendingDevices = null;
+        _groupPendingCount = 0;
+        _groupPendingSince = 0;
       }}
     }}
     function _updateDeviceSensors(device) {{
@@ -5962,7 +9099,18 @@ def render_portal_page(
       var updateText = _formatLastDeviceUpdate(device);
       _updateSensorTextEl('device-cache', updateText);
       _updateSensorTextEl('group-cache', updateText);
-      _updateSensorTextEl('local-optic', _formatBool(local.optic_active));
+      var opticSettings = device.optic_settings || {{}};
+	      var localOpticValue;
+	      if (optic.optic_active !== undefined && optic.optic_active !== null) {{
+	        localOpticValue = !!optic.optic_active;
+	      }} else if (local.optic_active_event !== undefined && local.optic_active_event !== null) {{
+	        localOpticValue = !!local.optic_active_event;
+	      }} else if (local.optic_active_flags_runtime !== undefined && local.optic_active_flags_runtime !== null) {{
+	        localOpticValue = !!local.optic_active_flags_runtime;
+	      }} else {{
+	        localOpticValue = local.optic_active;
+	      }}
+      _updateSensorTextEl('local-optic', _formatBool(localOpticValue));
       _updateSensorTextEl('local-detadc1', _formatBool(local.detadc1));
       _updateSensorTextEl('local-detadc2', _formatBool(local.detadc2));
       _updateSensorTextEl('local-tx', _formatBool(local.tx_enabled !== undefined ? local.tx_enabled : optic.tx_enabled));
@@ -5970,10 +9118,12 @@ def render_portal_page(
       _setRemoteSensors(device.remote || []);
       _setSensorChips('stm32-raw-sensors', 'STM32 raw', _stm32RawSensorItems(device));
       _setSensorChips('optic-sensors', 'Optic raw', _opticSensorItems(device));
+      updateGroupLedFeedback(device.optic_settings || {{}});
       _updateGroupMatrix(device);
     }}
     function _pollSensors() {{
       if (_activePanel !== 'antenna' && _activePanel !== 'operation' && _activePanel !== 'group') {{ return; }}
+      if (_activePanel === 'group') {{ _groupRefreshIdentity(false); }}
       fetch('/api/sensors?v=' + Date.now(), {{ cache: 'no-store' }})
         .then(function (r) {{ return r.ok ? r.json() : null; }})
         .then(function (data) {{
@@ -5981,7 +9131,9 @@ def render_portal_page(
           var rpi = data.rpi || {{}};
           Object.keys(rpi).forEach(function (k) {{ _updateSensorEl('rpi-' + k, rpi[k]); }});
           _updateSensorEl('stm32-temp', data.stm32);
-          _updateDeviceSensors(data.device || {{}});
+          var device = data.device || {{}};
+          device.host = data.host || {{}};
+          _updateDeviceSensors(device);
           _setSensorChips('rpi-hwmon', 'RPI hwmon', data.rpi_hwmon || []);
         }})
         .catch(function () {{}});
@@ -5993,7 +9145,12 @@ def render_portal_page(
     setActivePanel = function (name, updateHash) {{
       _activePanel = name;
       _origSetActivePanel(name, updateHash);
+      if (name === 'group') {{ _groupRefreshIdentity(false); }}
     }};
+    var groupRefreshButton = document.querySelector('[data-group-refresh]');
+    if (groupRefreshButton) {{
+      groupRefreshButton.addEventListener('click', function () {{ _groupRefreshIdentity(true); }});
+    }}
     var engineerToggle = document.getElementById('engineer-toggle');
     var engineerModal = document.getElementById('engineer-modal');
     var engineerClose = engineerModal ? engineerModal.querySelector('[data-modal-close]') : null;
@@ -6657,6 +9814,10 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            firmware = data.get("firmware_release") if isinstance(data.get("firmware_release"), dict) else {}
+            self.send_header("X-BMI30-Firmware-Version", str(firmware.get("version") or "unknown"))
+            self.send_header("X-BMI30-Portal-SHA256", str(firmware.get("runtime_portal_sha256") or "unknown"))
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             if send_body:
@@ -6676,11 +9837,27 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             device_cache = _read_device_state_cache()
             stm32_temp = _device_cache_temperature(device_cache)
             device_sensors = _device_cache_sensors(device_cache)
+            core_status = _read_core_status_snapshot()
+            core_sync = core_status.get("sync") if isinstance(core_status.get("sync"), dict) else {}
+            if core_sync:
+                device_sensors["sync"] = dict(core_sync)
+                events = device_sensors.get("events") if isinstance(device_sensors.get("events"), dict) else {}
+                sync_state = events.get("sync_state") if isinstance(events.get("sync_state"), dict) else {}
+                events["sync_state"] = {**sync_state, **core_sync}
+                device_sensors["events"] = events
             device_sensors["optic_settings"] = _read_core_optic_settings()
+            device_sensors["lan_devices"] = _current_group_lan_devices(
+                get_lan_bmi30_devices(),
+                device_sensors,
+            )
+            with _LAN_DEVICE_LOCK:
+                device_sensors["lan_devices_updated_at"] = float(_LAN_DEVICE_CACHE.get("updated_at", 0.0) or 0.0)
+                device_sensors["lan_sensors_updated_at"] = float(_LAN_DEVICE_CACHE.get("sensor_updated_at", 0.0) or 0.0)
             sensors_data: dict = {
                 "rpi": rpi_data,
                 "rpi_hwmon": rpi_hwmon,
                 "stm32": round(stm32_temp, 1) if isinstance(stm32_temp, (int, float)) else None,
+                "host": group_local_host_identity(preferred_ip=preferred_ip),
                 "device": device_sensors,
             }
             payload = json.dumps(sensors_data, ensure_ascii=False).encode("utf-8")
@@ -6734,11 +9911,14 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
                 notice = "Optic settings could not be applied. Check the BMI30 core service and USB connection."
                 notice_kind = "error"
             if query.get("operation_saved", [""])[0] == "1":
-                notice = "Operating mode defaults and DC adaptation timing saved."
+                notice = "Operating mode, sound, and DC adaptation timing saved."
             if query.get("operation_applied", [""])[0] == "1":
-                notice = "Operating mode defaults and DC adaptation timing saved and sent to BMI30 core."
+                notice = "Operating mode, sound, and DC adaptation timing saved and sent to BMI30 core."
             if query.get("operation_error", [""])[0] == "1":
-                notice = "Operating mode settings saved, but BMI30 core did not accept the live apply. Check core service and try again."
+                notice = query.get(
+                    "message",
+                    ["Operating mode settings saved, but BMI30 core did not accept the live apply. Check core service and try again."],
+                )[0][:240]
                 notice_kind = "error"
             if query.get("account", [""])[0] == "1":
                 notice = "Portal login and password saved."
@@ -7234,9 +10414,13 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             form = self._read_post_form()
             avg_n = avg_n_from_form(form)
             dc_cfg = dc_timing_config_from_form(form, load_dc_config())
+            sound_cfg = sound_config_from_form(form)
+            lcd_role_cfg = lcd_role_overlay_from_form(form)
             try:
                 save_default_avg_n(avg_n)
                 save_dc_config(dc_cfg)
+                save_sound_config(sound_cfg)
+                save_lcd_role_overlay(lcd_role_cfg)
             except Exception:
                 payload = render_portal_page(
                     collect_remote_access_targets(preferred_ip=extract_request_host_ip(self.headers.get("Host", "")))["hostname"],
@@ -7256,16 +10440,329 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
             apply_now = form.get("apply", "1").strip().lower() not in {"0", "false", "off", "no"}
             if apply_now:
-                avg_ok, _avg_message = apply_avg_n_to_core(avg_n)
-                dc_ok, _dc_message = apply_dc_config_to_device(dc_cfg)
-                ok = avg_ok and dc_ok
-                suffix = "?operation_applied=1#operation" if ok else "?operation_error=1#operation"
+                def _apply_step(name: str, call):
+                    result = call()
+                    if not bool(result[0]):
+                        # Core can be briefly busy with USB readback or a mode
+                        # transition. All four operations are idempotent, so one
+                        # bounded retry prevents a false failure banner.
+                        time.sleep(0.15)
+                        result = call()
+                    return name, bool(result[0]), str(result[1] if len(result) > 1 else "")
+
+                apply_results = [
+                    _apply_step("averaging", lambda: apply_avg_n_to_core(avg_n)),
+                    _apply_step("DC timing", lambda: apply_dc_config_to_device(dc_cfg)),
+                    _apply_step("sound", lambda: apply_sound_config_to_core(sound_cfg, persist=True)),
+                    _apply_step("LCD role overlay", lambda: apply_lcd_role_overlay_to_core(lcd_role_cfg, persist=True)),
+                ]
+                failures = [(name, message) for name, step_ok, message in apply_results if not step_ok]
+                if failures:
+                    detail = "; ".join(f"{name}: {message}" for name, message in failures)
+                    print(f"[OPERATION-APPLY] failed after retry: {detail}", flush=True)
+                    notice = f"Settings saved; live apply failed: {detail}"[:240]
+                    suffix = f"?operation_error=1&message={quote(notice)}#operation"
+                else:
+                    suffix = "?operation_applied=1#operation"
             else:
                 suffix = "?operation_saved=1#operation"
             self._send_redirect(
                 self._absolute_url(f"/portal{suffix}", scheme=self._preferred_scheme()),
                 status=HTTPStatus.SEE_OTHER,
             )
+            return
+
+        if path == "/api/sound-config":
+            if self._get_portal_session() is None:
+                self.send_response(HTTPStatus.FORBIDDEN)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except Exception:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                body = {}
+            cfg = _normalize_sound_config(body if isinstance(body, dict) else {})
+            persist = _bool_form_value({"persist": str((body or {}).get("persist", "0"))}, "persist", False) if isinstance(body, dict) else False
+            ok, message = apply_sound_config_to_core(cfg, persist=persist)
+            if ok and persist:
+                try:
+                    save_sound_config(cfg)
+                except Exception:
+                    ok = False
+                    message = "Unable to save sound settings."
+            payload = json.dumps({
+                "ok": bool(ok),
+                "message": message,
+                "sound": cfg,
+                "persisted": bool(persist and ok),
+            }, ensure_ascii=False).encode("utf-8")
+            self.send_response(HTTPStatus.OK if ok else HTTPStatus.BAD_GATEWAY)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if path == "/api/lcd-role-overlay":
+            if self._get_portal_session() is None:
+                self.send_response(HTTPStatus.FORBIDDEN)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except Exception:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                body = {}
+            cfg = _normalize_lcd_role_overlay(body if isinstance(body, dict) else {})
+            persist = _bool_form_value({"persist": str((body or {}).get("persist", "1"))}, "persist", True) if isinstance(body, dict) else True
+            ok, message, actual = apply_lcd_role_overlay_to_core(cfg, persist=persist)
+            if ok and persist:
+                try:
+                    save_lcd_role_overlay(cfg)
+                except Exception:
+                    ok = False
+                    message = "Unable to save LCD role overlay settings."
+            payload = json.dumps({
+                "ok": bool(ok),
+                "message": message,
+                "lcd_role_overlay": actual,
+                "persisted": bool(persist and ok),
+            }, ensure_ascii=False).encode("utf-8")
+            self.send_response(HTTPStatus.OK if ok else HTTPStatus.BAD_GATEWAY)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if path == "/portal-group-led-pattern-config":
+            session = self._get_portal_session()
+            if session is None:
+                self._send_redirect(
+                    self._absolute_url(with_rev("/login"), scheme=self._preferred_scheme()),
+                    status=HTTPStatus.SEE_OTHER,
+                    set_cookie=build_expired_portal_session_cookie(secure=self._is_tls()),
+                )
+                return
+
+            form = self._read_post_form()
+            cfg = group_led_patterns_from_form(form)
+            try:
+                save_group_led_patterns(cfg)
+            except Exception:
+                payload = render_portal_page(
+                    collect_remote_access_targets(preferred_ip=extract_request_host_ip(self.headers.get("Host", "")))["hostname"],
+                    session_username=str(session.get("u", "")),
+                    session_role=str(session.get("r", "user")),
+                    notice="Unable to save Addressable LED pattern settings.",
+                    notice_kind="error",
+                    request_host=self.headers.get("Host", ""),
+                )
+                self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
+            apply_now = form.get("apply", "1").strip().lower() not in {"0", "false", "off", "no"}
+            if apply_now:
+                ok, _message = apply_group_led_patterns_to_core(cfg)
+                suffix = "?group_led_applied=1#group" if ok else "?group_led_error=1#group"
+            else:
+                suffix = "?group_led_saved=1#group"
+            self._send_redirect(
+                self._absolute_url(f"/portal{suffix}", scheme=self._preferred_scheme()),
+                status=HTTPStatus.SEE_OTHER,
+            )
+            return
+
+        if path == "/api/group-led-pattern-test":
+            if self._get_portal_session() is None:
+                self.send_response(HTTPStatus.FORBIDDEN)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except Exception:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            pattern_id = _led_pattern_value(body.get("pattern", body.get("pattern_id", 0)))
+            ok, message = apply_led_pattern_to_core(pattern_id)
+            payload = json.dumps({
+                "ok": bool(ok),
+                "message": message,
+                "pattern": pattern_id,
+            }, ensure_ascii=False).encode("utf-8")
+            self.send_response(HTTPStatus.OK if ok else HTTPStatus.BAD_GATEWAY)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if path == "/api/non-addressable-led":
+            if self._get_portal_session() is None:
+                self.send_response(HTTPStatus.FORBIDDEN)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except Exception:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            enabled = None
+            if "enabled" in body:
+                enabled = _bool_form_value({"enabled": str(body.get("enabled"))}, "enabled", True)
+            test_enabled = None
+            if "test_enabled" in body:
+                test_enabled = _bool_form_value({"test_enabled": str(body.get("test_enabled"))}, "test_enabled", False)
+            persist = _bool_form_value(
+                {"persist": str(body.get("persist", enabled is not None))},
+                "persist",
+                enabled is not None,
+            )
+            ok, message, actual = apply_non_addressable_led_to_core(
+                enabled=enabled,
+                test_enabled=test_enabled,
+                persist=persist,
+            )
+            payload = json.dumps({
+                "ok": bool(ok),
+                "message": message,
+                "non_addressable_led": actual,
+                "persisted": bool(persist and ok),
+            }, ensure_ascii=False).encode("utf-8")
+            self.send_response(HTTPStatus.OK if ok else HTTPStatus.BAD_GATEWAY)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if path == "/api/group-sync-config":
+            if self._get_portal_session() is None:
+                self.send_response(HTTPStatus.FORBIDDEN)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except Exception:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b""
+            role = ""
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+                role = str(body.get("role", body.get("mode", "")) or "")
+                node_id = body.get("node_id", body.get("slave_id", None))
+            except Exception:
+                node_id = None
+            ok, message, applied = apply_group_sync_mode_to_core(role, node_id)
+            payload = json.dumps({
+                "ok": bool(ok),
+                "message": message,
+                "role": str(applied.get("role", role)).strip().lower(),
+                "node_id": applied.get("node_id"),
+            }).encode("utf-8")
+            self.send_response(HTTPStatus.OK if ok else (HTTPStatus.BAD_REQUEST if not applied else HTTPStatus.BAD_GATEWAY))
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if path == "/api/group-rs485-id":
+            if self._get_portal_session() is None:
+                self.send_response(HTTPStatus.FORBIDDEN)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except Exception:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                body = {}
+            device_id = body.get("device_id", body.get("node_id")) if isinstance(body, dict) else None
+            ok, message, applied = apply_group_rs485_id_to_core(device_id)
+            payload = json.dumps({
+                "ok": bool(ok),
+                "message": message,
+                "device_id": applied.get("device_id"),
+                "device_id_assigned": bool(ok),
+            }).encode("utf-8")
+            self.send_response(HTTPStatus.OK if ok else (HTTPStatus.BAD_REQUEST if not applied else HTTPStatus.BAD_GATEWAY))
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if path == "/api/group-rs485-ident":
+            if self._get_portal_session() is None:
+                self.send_response(HTTPStatus.FORBIDDEN)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except Exception:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                body = {}
+            request_scan = bool(body.get("request_scan", body.get("scan", True))) if isinstance(body, dict) else True
+            local_ip = _group_publication_ip(extract_request_host_ip(self.headers.get("Host", "")))
+            ok, message, ident = refresh_group_rs485_ident_from_core(request_scan=request_scan, local_ip=local_ip)
+            payload = json.dumps({
+                "ok": bool(ok),
+                "message": message,
+                "rs485_ident": ident,
+            }, ensure_ascii=False).encode("utf-8")
+            self.send_response(HTTPStatus.OK if ok else HTTPStatus.BAD_GATEWAY)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
             return
 
         if path == "/api/group-optic-config":
@@ -7280,19 +10777,42 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
                 length = 0
             raw = self.rfile.read(length) if length > 0 else b""
             reaction_enabled = False
+            neighbor_reaction_enabled = False
+            neighbor_device_id = None
             hold_seconds = 3
             try:
                 body = json.loads(raw.decode("utf-8") or "{}")
                 reaction_enabled = bool(body.get("reaction", body.get("reaction_enabled", False)))
+                neighbor_reaction_enabled = bool(
+                    body.get(
+                        "neighbor_reaction",
+                        body.get("neighbor_reaction_enabled", False),
+                    )
+                )
+                raw_neighbor_device_id = body.get(
+                    "neighbor_device_id",
+                    body.get("neighbor_id"),
+                )
+                if raw_neighbor_device_id not in (None, "", -1, "-1", "any", "all"):
+                    parsed_neighbor_device_id = int(raw_neighbor_device_id)
+                    if 0 <= parsed_neighbor_device_id <= 31:
+                        neighbor_device_id = parsed_neighbor_device_id
                 hold_seconds = int(body.get("hold_seconds", body.get("seconds", 3)))
             except Exception:
                 pass
             hold_seconds = max(0, min(10, hold_seconds))
-            ok, message = apply_group_optic_to_core(reaction_enabled, hold_seconds)
+            ok, message = apply_group_optic_to_core(
+                reaction_enabled,
+                neighbor_reaction_enabled,
+                neighbor_device_id,
+                hold_seconds,
+            )
             payload = json.dumps({
                 "ok": bool(ok),
                 "message": message,
                 "reaction_enabled": bool(reaction_enabled),
+                "neighbor_reaction_enabled": bool(neighbor_reaction_enabled),
+                "neighbor_device_id": neighbor_device_id,
                 "hold_seconds": hold_seconds,
             }).encode("utf-8")
             self.send_response(HTTPStatus.OK if ok else HTTPStatus.BAD_GATEWAY)
@@ -7448,6 +10968,27 @@ def main() -> None:
     # Запускаем фоновый процесс обновления PDF документов
     pdf_update_thread = threading.Thread(target=update_pdf_documents_background, daemon=True)
     pdf_update_thread.start()
+
+    rpi_identity_thread = threading.Thread(
+        target=publish_group_rpi_identity_background,
+        name="bmi30-rs485-rpi-identity",
+        daemon=True,
+    )
+    rpi_identity_thread.start()
+
+    lan_discovery_thread = threading.Thread(
+        target=lan_bmi30_discovery_background,
+        name="bmi30-lan-discovery",
+        daemon=True,
+    )
+    lan_discovery_thread.start()
+
+    lan_sensor_thread = threading.Thread(
+        target=lan_bmi30_sensor_refresh_background,
+        name="bmi30-lan-sensor-refresh",
+        daemon=True,
+    )
+    lan_sensor_thread.start()
 
     http_server = ThreadingHTTPServer(("0.0.0.0", PORT), HotspotInfoHandler)
 

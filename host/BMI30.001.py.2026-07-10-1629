@@ -52,7 +52,7 @@ def _product_display_scale() -> float:
 SERVICE_VERSION = "001"
 HOST_DIR = Path(__file__).resolve().parent
 REPO_DIR = HOST_DIR.parent
-DEFAULT_ENGINE_FILE = HOST_DIR / "BMI30.200.py.2026-07-01-1038-player-weak-hold"
+DEFAULT_ENGINE_FILE = HOST_DIR / "BMI30.200.py.2026-07-10-1629"
 ENGINE_FILE = Path(os.getenv("BMI30_ENGINE_SOURCE", str(DEFAULT_ENGINE_FILE))).expanduser()
 API_HOST = os.getenv("BMI30_SERVICE_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("BMI30_SERVICE_PORT", "8765"))
@@ -65,6 +65,9 @@ DC_MODE_NAMES = {
 }
 DC_MODE_VALUES = {name: value for value, name in DC_MODE_NAMES.items()}
 DC_SETTLE_MAX_S = 86400.0
+DC_FLAG_PRE_APPLY = 0x0010
+DC_FLAG_PRE_LEARN = 0x0020
+DC_STAGE_FLAGS = DC_FLAG_PRE_APPLY | DC_FLAG_PRE_LEARN
 DEVICE_STATE_JSON = Path(os.getenv("BMI30_DEVICE_STATE_JSON", "/tmp/bmi30_device_state.json")).expanduser()
 DEVICE_STATE_MAX_AGE_S = max(1, int(os.getenv("BMI30_DEVICE_STATE_MAX_AGE_S", "300")))
 _LCD_SYNC_CODE_RE = re.compile(r"^[MS][0-9]{2}$")
@@ -141,6 +144,19 @@ else:
     _CONFIG_JSON_FALLBACK = _CONFIG_JSON_CANDIDATES[0] if getattr(os, "geteuid", lambda: 0)() == 0 else _CONFIG_JSON_CANDIDATES[-1]
     CONFIG_JSON = next((path for path in _CONFIG_JSON_CANDIDATES if path.is_file() and os.access(path, os.R_OK)), _CONFIG_JSON_FALLBACK)
 
+GROUP_LED_PATTERN_EVENTS: tuple[tuple[str, str], ...] = (
+    ("upper_detection", "Upper antenna detection"),
+    ("lower_detection", "Lower antenna detection"),
+    ("both_detection", "Both antennas detection"),
+    ("neighbor_upper_detection", "Neighbor upper antenna detection"),
+    ("neighbor_lower_detection", "Neighbor lower antenna detection"),
+    ("neighbor_both_detection", "Neighbor both antennas detection"),
+    ("fault", "Fault"),
+)
+DEFAULT_GROUP_LED_PATTERNS: dict[str, int] = {
+    event_key: 0 for event_key, _event_label in GROUP_LED_PATTERN_EVENTS
+}
+
 
 def _normalize_avg_n(value: Any, default: int = 24) -> int:
     try:
@@ -192,13 +208,28 @@ def _load_default_dc_config() -> dict[str, Any]:
     mode = str(source.get("mode", "WORK") or "WORK").strip().upper().replace("-", "_")
     if mode not in DC_MODE_VALUES or mode == "BOOT_FAST":
         mode = "WORK"
-    detect_s = _dc_float(source.get("detect_settle_s", source.get("detect_initial_settle_s", 60.0)), 60.0)
+    legacy_schema = "acquisition_settle_s" not in source and "detection_settle_s" not in source
+    legacy_forbidden = (
+        legacy_schema
+        and _dc_float(source.get("work_settle_s", 5.0), 5.0) == 900.0
+        and _dc_float(source.get("detect_settle_s", 500.0), 500.0) == 60.0
+        and _dc_float(source.get("fast_settle_s", 10000.0), 10000.0) == 5.0
+    )
+    # Older portal builds mislabeled detect_settle_s as Acquisition and
+    # fast_settle_s as Detection. Canonical keys remove that ambiguity.
+    acquisition_s = _dc_float(
+        500.0 if legacy_forbidden else source.get("acquisition_settle_s", source.get("detect_settle_s", 500.0)),
+        500.0,
+    )
+    detection_s = _dc_float(
+        10000.0 if legacy_forbidden else source.get("detection_settle_s", source.get("fast_settle_s", 10000.0)),
+        10000.0,
+    )
     return {
         "mode": mode,
-        "work_settle_s": _dc_float(source.get("work_settle_s", 900.0), 900.0),
-        "detect_settle_s": detect_s,
-        "fast_settle_s": _dc_float(source.get("fast_settle_s", 5.0), 5.0),
-        "fast_duration_s": _dc_float(source.get("fast_duration_s", 30.0), 30.0),
+        "work_settle_s": 5.0 if legacy_forbidden else _dc_float(source.get("work_settle_s", 5.0), 5.0),
+        "acquisition_settle_s": acquisition_s,
+        "detection_settle_s": detection_s,
     }
 
 
@@ -219,13 +250,9 @@ def _save_default_dc_config(cfg: dict[str, Any]) -> None:
             mode_name = DC_MODE_NAMES.get(mode_value, "WORK")
         payload["dc_config"] = {
             "mode": mode_name,
-            "work_settle_s": _dc_float(cfg.get("work_settle_s", 900.0), 900.0),
-            "detect_settle_s": _dc_float(cfg.get("detect_settle_s", 60.0), 60.0),
-            "detect_initial_settle_s": _dc_float(cfg.get("detect_settle_s", 60.0), 60.0),
-            "detect_final_settle_s": _dc_float(cfg.get("detect_settle_s", 60.0), 60.0),
-            "detect_ramp_s": 0.0,
-            "fast_settle_s": _dc_float(cfg.get("fast_settle_s", 5.0), 5.0),
-            "fast_duration_s": _dc_float(cfg.get("fast_duration_s", 30.0), 30.0),
+            "work_settle_s": _dc_float(cfg.get("work_settle_s", 5.0), 5.0),
+            "acquisition_settle_s": _dc_float(cfg.get("acquisition_settle_s", 500.0), 500.0),
+            "detection_settle_s": _dc_float(cfg.get("detection_settle_s", 10000.0), 10000.0),
         }
         payload["dc_config_updated_at"] = int(time.time())
         tmp = path.with_name(f".{path.name}.tmp")
@@ -235,6 +262,62 @@ def _save_default_dc_config(cfg: dict[str, Any]) -> None:
         os.replace(tmp, path)
     except Exception as exc:
         print(f"[DC] save default config failed: {exc}", flush=True)
+
+
+def _led_pattern_value(value: Any, default: int = 0) -> int:
+    try:
+        pattern = int(str(value).strip())
+    except Exception:
+        pattern = int(default)
+    return max(0, min(255, pattern))
+
+
+def _normalize_group_led_patterns(raw: Any = None) -> dict[str, int]:
+    source = raw if isinstance(raw, dict) else {}
+    cfg = dict(DEFAULT_GROUP_LED_PATTERNS)
+    for event_key, _event_label in GROUP_LED_PATTERN_EVENTS:
+        event_source = source.get(event_key)
+        if isinstance(event_source, dict):
+            legacy_value = None
+            for key in ("pattern", "value", "current", "upper", "lower"):
+                if key in event_source:
+                    legacy_value = event_source.get(key)
+                    break
+            event_source = legacy_value
+        cfg[event_key] = _led_pattern_value(event_source, cfg[event_key])
+    return cfg
+
+
+def _load_group_led_patterns() -> dict[str, int]:
+    try:
+        with open(CONFIG_JSON, "r", encoding="utf-8") as f:
+            payload = json.load(f) or {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return _normalize_group_led_patterns(payload.get("group_led_patterns"))
+
+
+def _save_group_led_patterns(cfg: dict[str, Any]) -> None:
+    try:
+        path = CONFIG_JSON
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f) or {}
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["group_led_patterns"] = _normalize_group_led_patterns(cfg)
+        payload["group_led_patterns_updated_at"] = int(time.time())
+        tmp = path.with_name(f".{path.name}.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception as exc:
+        print(f"[LED] save group LED patterns failed: {exc}", flush=True)
 
 
 def _dc_wire_seconds(value: Any, default: float) -> float:
@@ -251,58 +334,48 @@ def _expected_dc_config(profile: str | None = None, mode: int | None = None, cfg
     if profile_name in {"work", "operation"}:
         mode_value = 1
         active_settle_s = float(source["work_settle_s"])
-        fast_settle_s = float(source["fast_settle_s"])
-        fast_duration_s = float(source["fast_duration_s"])
     elif profile_name in {"acquisition", "acquire", "predetect", "pre_detect"}:
-        mode_value = 2
-        active_settle_s = float(source["detect_settle_s"])
-        fast_settle_s = float(source["fast_settle_s"])
-        fast_duration_s = float(source["fast_duration_s"])
-    elif profile_name in {"detection", "detect"}:
         mode_value = 3
-        active_settle_s = float(source["fast_settle_s"])
-        fast_settle_s = float(source["fast_settle_s"])
-        fast_duration_s = float(source["fast_duration_s"])
+        active_settle_s = float(source["acquisition_settle_s"])
+    elif profile_name in {"detection", "detect"}:
+        mode_value = 2
+        active_settle_s = float(source["detection_settle_s"])
     elif profile_name in {"startup", "start", "boot_fast"}:
         mode_value = 3
-        active_settle_s = float(source["fast_duration_s"])
-        fast_settle_s = float(source["fast_settle_s"])
-        fast_duration_s = float(source["fast_duration_s"])
+        active_settle_s = float(source["acquisition_settle_s"])
+        profile_name = "acquisition"
     else:
         try:
             mode_value = int(DC_MODE_VALUES.get(str(source.get("mode", "WORK")), 1) if mode is None else mode)
         except Exception:
             mode_value = 1
         if mode_value == 2:
-            active_settle_s = float(source["detect_settle_s"])
-            profile_name = "acquisition"
+            active_settle_s = float(source["detection_settle_s"])
+            profile_name = "detection"
         elif mode_value == 3:
-            active_settle_s = float(source["fast_duration_s"])
-            profile_name = "startup"
+            active_settle_s = float(source["acquisition_settle_s"])
+            profile_name = "acquisition"
+        elif mode_value == 0:
+            active_settle_s = 0.0
+            profile_name = "freeze"
         else:
             active_settle_s = float(source["work_settle_s"])
             profile_name = "work"
-        fast_settle_s = float(source["fast_settle_s"])
-        fast_duration_s = float(source["fast_duration_s"])
-        if mode_value == 3:
-            fast_settle_s = float(source["fast_settle_s"])
-            fast_duration_s = float(source["fast_duration_s"])
-    fast_duration_wire_s = float(fast_duration_s)
-    if profile_name in {"work", "acquisition", "detection"}:
-        fast_duration_wire_s = float(active_settle_s)
     return {
+        "version": 2,
         "profile": profile_name,
         "mode": DC_MODE_NAMES.get(int(mode_value), "WORK"),
         "mode_value": int(mode_value),
-        "work_settle_s": _dc_wire_seconds(source.get("work_settle_s", 900.0), 900.0),
-        "detect_settle_s": _dc_wire_seconds(source.get("detect_settle_s", 60.0), 60.0),
-        "fast_settle_s": _dc_wire_seconds(fast_settle_s, 5.0),
-        "fast_duration_s": _dc_wire_seconds(fast_duration_wire_s, 30.0),
-        "active_settle_s": _dc_wire_seconds(active_settle_s, 0.0),
+        "flags": DC_STAGE_FLAGS,
+        "work_settle_s": _dc_wire_seconds(source.get("work_settle_s", 5.0), 5.0),
+        "detect_settle_s": _dc_wire_seconds(source.get("detection_settle_s", 10000.0), 10000.0),
+        "fast_settle_s": _dc_wire_seconds(source.get("acquisition_settle_s", 500.0), 500.0),
+        "pre_settle_s": 0.0,
+        "post_settle_s": 0.0,
+        "active_settle_s": 0.0 if mode_value == 0 else _dc_wire_seconds(active_settle_s, 5.0),
         "config_work_settle_s": float(source["work_settle_s"]),
-        "config_detect_settle_s": float(source["detect_settle_s"]),
-        "config_fast_settle_s": float(source["fast_settle_s"]),
-        "config_fast_duration_s": float(source["fast_duration_s"]),
+        "config_acquisition_settle_s": float(source["acquisition_settle_s"]),
+        "config_detection_settle_s": float(source["detection_settle_s"]),
     }
 
 
@@ -315,7 +388,14 @@ def _dc_config_mismatches(readback: dict[str, Any], expected: dict[str, Any], to
             mismatches.append(f"mode:{readback.get('mode_value')}!={expected.get('mode_value')}")
     except Exception:
         mismatches.append("mode")
-    for key in ("work_settle_s", "detect_settle_s", "fast_settle_s", "fast_duration_s", "active_settle_s"):
+    try:
+        actual_stage_flags = int(readback.get("flags", 0)) & 0x00F0
+        expected_stage_flags = int(expected.get("flags", DC_STAGE_FLAGS)) & 0x00F0
+        if actual_stage_flags != expected_stage_flags:
+            mismatches.append(f"stage_flags:0x{actual_stage_flags:04x}!=0x{expected_stage_flags:04x}")
+    except Exception:
+        mismatches.append("stage_flags")
+    for key in ("work_settle_s", "detect_settle_s", "fast_settle_s", "pre_settle_s", "post_settle_s", "active_settle_s"):
         try:
             actual = float(readback.get(key, -1.0))
             want = float(expected.get(key, -2.0))
@@ -338,6 +418,8 @@ def _dc_steady_profile_for_mode(selected: Any) -> str:
         selected_i = int(selected)
     except Exception:
         selected_i = 0
+    if selected_i == 5:
+        return "acquisition"
     if selected_i > 0:
         return "work"
     return ""
@@ -349,20 +431,33 @@ def _apply_default_dc_config(scope: Any, mode: int | None = None, reason: str = 
         return False
     expected = _expected_dc_config(profile=profile, mode=mode)
     try:
-        stream.set_dc_config_seconds(
+        payload = stream.set_dc_config_seconds(
             mode=int(expected["mode_value"]),
             work_settle_s=float(expected["work_settle_s"]),
             detect_settle_s=float(expected["detect_settle_s"]),
             fast_settle_s=float(expected["fast_settle_s"]),
-            fast_duration_s=float(expected["fast_duration_s"]),
+            pre_settle_s=float(expected["pre_settle_s"]),
+            post_settle_s=float(expected["post_settle_s"]),
+            flags=int(expected["flags"]),
         )
+        readback_raw = stream.get_dc_config()
+        readback = _dc_config_from_device(readback_raw)
+        mismatches = _dc_config_mismatches(readback, expected)
+        transport_module = sys.modules.get(type(stream).__module__)
+        transport_path = str(getattr(transport_module, "__file__", "") or "")
         print(
-            f"[DC] default config applied mode={expected['mode']} "
-            f"W={float(expected['config_work_settle_s']):g}s D={float(expected['config_detect_settle_s']):g}s "
-            f"F={float(expected['config_fast_settle_s']):g}s active={float(expected['active_settle_s']):g}s "
-            f"wire_active={float(expected['fast_duration_s']):g}s profile={expected['profile']} reason={reason}",
+            f"[DC] config v2 write mode={expected['mode']} "
+            f"work={float(expected['config_work_settle_s']):g}s "
+            f"acquisition={float(expected['config_acquisition_settle_s']):g}s "
+            f"detection={float(expected['config_detection_settle_s']):g}s "
+            f"active={float(expected['active_settle_s']):g}s flags=0x{int(expected['flags']):04x} "
+            f"profile={expected['profile']} reason={reason} transport={transport_path} "
+            f"payload={bytes(payload or b'').hex()} readback={json.dumps(readback_raw, sort_keys=True)}",
             flush=True,
         )
+        if mismatches:
+            print(f"[DC] config v2 rejected mismatches={','.join(mismatches)}", flush=True)
+            return False
         try:
             profile_s = str(expected["profile"])
             scope._host_dc_profile = profile_s
@@ -371,29 +466,11 @@ def _apply_default_dc_config(scope: Any, mode: int | None = None, reason: str = 
             scope._host_dc_profile_t = time.time()
         except Exception:
             pass
+        print(f"[DC] config v2 verified profile={expected['profile']}", flush=True)
         return True
     except Exception as exc:
         print(f"[DC] default config apply failed reason={reason}: {exc}", flush=True)
         return False
-
-
-def _dc_startup_restore_delay_s() -> float:
-    cfg = _load_default_dc_config()
-    try:
-        start_s = float(cfg.get("fast_duration_s", 0.0) or 0.0)
-    except Exception:
-        start_s = 0.0
-    try:
-        fastest_window = float(os.getenv("BMI30_DC_STARTUP_FASTEST_WINDOW_S", "3.0"))
-    except Exception:
-        fastest_window = 3.0
-    try:
-        max_window = float(os.getenv("BMI30_DC_STARTUP_MAX_WINDOW_S", "30.0"))
-    except Exception:
-        max_window = 30.0
-    if start_s <= 0.0:
-        return max(0.2, min(max_window, fastest_window))
-    return max(0.2, min(max_window, start_s))
 
 
 def _load_default_detector_settings() -> dict[str, Any] | None:
@@ -423,6 +500,11 @@ def _load_default_detector_settings() -> dict[str, Any] | None:
         "confirm1": ("confirm1", "count1", "lower_confirm", "det_confirm_count1"),
         "threshold0": ("threshold0", "ratio0", "upper_threshold", "det_ratio0", "det_threshold0"),
         "threshold1": ("threshold1", "ratio1", "lower_threshold", "det_ratio1", "det_threshold1"),
+        "threshold_high0": ("threshold_high0", "ratio_high0", "upper_threshold_high", "det_ratio_high0"),
+        "threshold_high1": ("threshold_high1", "ratio_high1", "lower_threshold_high", "det_ratio_high1"),
+        "ratio_noise_max_u16": ("ratio_noise_max_u16", "threshold_noise_max_u16", "det_ratio_noise_max_u16"),
+        "auto_floor_u16": ("auto_floor_u16", "threshold_auto_floor_u16", "det_auto_floor_u16"),
+        "auto_slope": ("auto_slope", "threshold_auto_slope", "det_auto_slope"),
         "auto0": ("auto0", "threshold_auto0", "upper_auto", "det_threshold_auto0"),
         "auto1": ("auto1", "threshold_auto1", "lower_auto", "det_threshold_auto1"),
         "noise_up0": ("noise_up0", "upper_noise_up", "det_noise_up0", "det_step_idle_up0"),
@@ -441,6 +523,14 @@ def _load_default_detector_settings() -> dict[str, Any] | None:
         "filter_barkhausen": ("filter_barkhausen", "det_filter_barkhausen"),
         "filter_microwire": ("filter_microwire", "det_filter_microwire"),
         "filter_paper": ("filter_paper", "det_filter_paper"),
+        "barkhausen_radius": ("barkhausen_radius", "det_barkhausen_radius"),
+        "barkhausen_frac": ("barkhausen_frac", "det_barkhausen_frac"),
+        "barkhausen_min_width": ("barkhausen_min_width", "det_barkhausen_min_width"),
+        "barkhausen_max_span": ("barkhausen_max_span", "det_barkhausen_max_span"),
+        "barkhausen_min_product_level": ("barkhausen_min_product_level", "det_barkhausen_min_product_level"),
+        "barkhausen_max_product_level": ("barkhausen_max_product_level", "det_barkhausen_max_product_level"),
+        "barkhausen_max_total_fraction": ("barkhausen_max_total_fraction", "det_barkhausen_max_total_fraction"),
+        "barkhausen_all_quarter_frac": ("barkhausen_all_quarter_frac", "det_barkhausen_all_quarter_frac"),
         "phase_max_shift": ("phase_max_shift", "det_phase_max_shift"),
         "phase_shift_penalty": ("phase_shift_penalty", "det_phase_shift_penalty"),
         "mark_window_start_frac": ("mark_window_start_frac", "det_mark_window_start_frac"),
@@ -698,7 +788,10 @@ def _dc_config_from_device(raw: Any) -> dict[str, Any]:
         mode_value = int(raw.get("mode", 1) or 1)
     except Exception:
         mode_value = 1
-    detect_s = _dc_seconds_from_ms(raw, "detect_settle_ms", 60.0)
+    detection_s = _dc_seconds_from_ms(raw, "detect_settle_ms", 10000.0)
+    acquisition_s = _dc_seconds_from_ms(raw, "fast_settle_ms", 500.0)
+    pre_settle_s = _dc_seconds_from_ms(raw, "pre_settle_ms", _dc_seconds_from_ms(raw, "fast_duration_ms", 0.0))
+    post_settle_s = _dc_seconds_from_ms(raw, "post_settle_ms", _dc_seconds_from_ms(raw, "fast_until_ms", 0.0))
     return {
         "available": True,
         "source": "device",
@@ -706,13 +799,13 @@ def _dc_config_from_device(raw: Any) -> dict[str, Any]:
         "mode": DC_MODE_NAMES.get(mode_value, "WORK"),
         "mode_value": mode_value,
         "flags": int(raw.get("flags", 0) or 0),
-        "work_settle_s": _dc_seconds_from_ms(raw, "work_settle_ms", 900.0),
-        "detect_settle_s": detect_s,
-        "detect_initial_settle_s": detect_s,
-        "detect_final_settle_s": detect_s,
-        "detect_ramp_s": 0.0,
-        "fast_settle_s": _dc_seconds_from_ms(raw, "fast_settle_ms", 5.0),
-        "fast_duration_s": _dc_seconds_from_ms(raw, "fast_duration_ms", 30.0),
+        "work_settle_s": _dc_seconds_from_ms(raw, "work_settle_ms", 5.0),
+        "detect_settle_s": detection_s,
+        "fast_settle_s": acquisition_s,
+        "detection_settle_s": detection_s,
+        "acquisition_settle_s": acquisition_s,
+        "pre_settle_s": pre_settle_s,
+        "post_settle_s": post_settle_s,
         "active_settle_s": _dc_seconds_from_ms(raw, "active_settle_ms", 0.0),
         "mode_enter_ms": int(raw.get("mode_enter_ms", 0) or 0),
         "fast_until_ms": int(raw.get("fast_until_ms", 0) or 0),
@@ -725,20 +818,24 @@ def _dc_config_from_device(raw: Any) -> dict[str, Any]:
 def _dc_config_for_api(readback: dict[str, Any]) -> dict[str, Any]:
     cfg = _load_default_dc_config()
     result = dict(readback or {})
-    for key in ("work_settle_s", "detect_settle_s", "fast_settle_s", "fast_duration_s"):
+    for key in (
+        "work_settle_s",
+        "detection_settle_s",
+        "acquisition_settle_s",
+        "pre_settle_s",
+        "post_settle_s",
+    ):
         if key in result:
             result[f"device_{key}"] = result.get(key)
     result["work_settle_s"] = float(cfg["work_settle_s"])
-    result["detect_settle_s"] = float(cfg["detect_settle_s"])
-    result["detect_initial_settle_s"] = float(cfg["detect_settle_s"])
-    result["detect_final_settle_s"] = float(cfg["detect_settle_s"])
-    result["fast_settle_s"] = float(cfg["fast_settle_s"])
-    result["fast_duration_s"] = float(cfg["fast_duration_s"])
+    result["acquisition_settle_s"] = float(cfg["acquisition_settle_s"])
+    result["detection_settle_s"] = float(cfg["detection_settle_s"])
+    result["fast_settle_s"] = float(cfg["acquisition_settle_s"])
+    result["detect_settle_s"] = float(cfg["detection_settle_s"])
     result["configured"] = {
         "work_settle_s": float(cfg["work_settle_s"]),
-        "detect_settle_s": float(cfg["detect_settle_s"]),
-        "fast_settle_s": float(cfg["fast_settle_s"]),
-        "fast_duration_s": float(cfg["fast_duration_s"]),
+        "acquisition_settle_s": float(cfg["acquisition_settle_s"]),
+        "detection_settle_s": float(cfg["detection_settle_s"]),
     }
     result["timing_source"] = "config"
     if str(result.get("source", "") or "") == "device":
@@ -930,26 +1027,6 @@ class ScopeApi:
             pass
         return selected
 
-    def _restore_dc_after_startup(self, reason: str = "") -> None:
-        try:
-            selected = int(self.scope.num_group.checkedId())
-        except Exception:
-            selected = 0
-        try:
-            restore_profile = str(getattr(self.scope, "_host_dc_startup_restore_profile", "") or "").strip().lower()
-        except Exception:
-            restore_profile = ""
-        if restore_profile not in {"work", "acquisition", "detection"}:
-            profile = _dc_steady_profile_for_mode(selected)
-        else:
-            profile = restore_profile
-        if profile:
-            _apply_default_dc_config(self.scope, reason=f"{reason}:restore_{profile}", profile=profile)
-        try:
-            self.scope._host_dc_startup_restore_profile = ""
-        except Exception:
-            pass
-
     def _start_dc_startup_compensation(self, selected: int, reason: str = "") -> bool:
         try:
             selected = int(selected)
@@ -957,28 +1034,12 @@ class ScopeApi:
             selected = 0
         if selected < 5:
             return False
-        delay_s = _dc_startup_restore_delay_s()
         try:
-            restore_profile = str(getattr(self.scope, "_host_dc_desired_profile", "") or "").strip().lower()
-        except Exception:
-            restore_profile = ""
-        if restore_profile not in {"work", "acquisition", "detection"}:
-            restore_profile = _dc_steady_profile_for_mode(selected)
-        try:
-            self.scope._host_dc_startup_restore_profile = restore_profile
+            self.scope._host_dc_startup_until = 0.0
+            self.scope._host_dc_startup_restore_profile = ""
         except Exception:
             pass
-        try:
-            self.scope._host_dc_startup_until = time.time() + max(0.2, delay_s)
-        except Exception:
-            pass
-        ok = _apply_default_dc_config(self.scope, reason=f"{reason}:startup", profile="startup")
-        if _dc_steady_profile_for_mode(selected):
-            try:
-                _call_qt_later_s(max(0.2, delay_s), lambda: self._restore_dc_after_startup(reason))
-            except Exception:
-                pass
-        return bool(ok)
+        return bool(_apply_default_dc_config(self.scope, reason=f"{reason}:acquisition", profile="acquisition"))
 
     def _apply_mode5_startup_dc(self, reason: str = "") -> None:
         try:
@@ -1083,6 +1144,12 @@ class ScopeApi:
             enabled = bool(params.get("enabled", params.get("value", True)))
             scope._set_sound_enabled(enabled, reason="api", announce=True)
             return {"ok": True, "sound_enabled": enabled}
+        if action in {"sound_settings", "sound_config", "set_sound_settings", "set_sound_config"}:
+            if not hasattr(scope, "_set_sound_settings"):
+                raise RuntimeError("engine does not support sound settings")
+            persist = _api_bool(params.get("persist", params.get("save", True)), True)
+            snapshot = scope._set_sound_settings(params, persist=persist, announce=True)
+            return {"ok": True, "sound": snapshot, "persisted": persist}
         if action in {"optic_hold", "optic_delay", "set_optic_hold", "optic_hold_ds"}:
             raw = params.get("hold_ds", params.get("ds", None))
             if raw is None:
@@ -1107,6 +1174,30 @@ class ScopeApi:
                 raise RuntimeError("engine does not support optic reaction")
             scope._set_optic_reaction_enabled(enabled)
             return {"ok": True, "optic_reaction_enabled": bool(enabled)}
+        if action in {"group_led_patterns", "set_group_led_patterns", "led_pattern_map"}:
+            raw = params.get("patterns", params.get("config", params))
+            snapshot = _normalize_group_led_patterns(raw if isinstance(raw, dict) else {})
+            persist = _api_bool(params.get("persist", params.get("save", True)), True)
+            try:
+                if hasattr(scope, "_set_group_led_patterns"):
+                    snapshot = _normalize_group_led_patterns(scope._set_group_led_patterns(snapshot))
+                else:
+                    scope._group_led_patterns = snapshot
+            except Exception:
+                pass
+            if persist:
+                _save_group_led_patterns(snapshot)
+            return {"ok": True, "led_patterns": snapshot, "persisted": bool(persist)}
+        if action in {"led_pattern", "set_led_pattern"}:
+            pattern_id = _led_pattern_value(params.get("pattern", params.get("pattern_id", params.get("value", 0))))
+            if not hasattr(scope, "_send_led_pattern"):
+                raise RuntimeError("engine does not support LED pattern command")
+            manual_test = _api_bool(params.get("manual_test", params.get("test_mode", False)), False)
+            if manual_test and hasattr(scope, "_set_group_led_manual_test_pattern"):
+                ok = bool(scope._set_group_led_manual_test_pattern(pattern_id))
+            else:
+                ok = bool(scope._send_led_pattern(pattern_id))
+            return {"ok": ok, "led_pattern": pattern_id, "manual_test": bool(manual_test)}
         if action in {"normalization", "normalize", "norm", "xcorr_norm"}:
             current = bool(getattr(scope, "xcorr_norm_enabled", False))
             enabled = _api_bool(params.get("enabled", params.get("value", not current)), not current)
@@ -1216,7 +1307,8 @@ class ScopeApi:
             name = str(params.get("name", params.get("file", "latest")) or "latest")
             marks = params.get("marks", [])
             ranges = params.get("ranges", [])
-            result = scope.player_recording_save_marks(name=name, marks=marks, ranges=ranges)
+            deleted_ranges = params.get("deleted_ranges", params.get("deleted_markers", []))
+            result = scope.player_recording_save_marks(name=name, marks=marks, ranges=ranges, deleted_ranges=deleted_ranges)
             result["action"] = action
             return result
         if action in {"player_record_load", "player_raw_record_load"}:
@@ -1257,25 +1349,15 @@ class ScopeApi:
             if not hasattr(stream, "set_dc_config_seconds"):
                 raise RuntimeError("stream does not support set_dc_config_seconds")
             mode_value = int(params.get("mode", 1))
-            work_settle_s = float(params.get("work_settle_s", 900.0))
-            detect_settle_s = float(params.get("detect_settle_s", params.get("detect_initial_settle_s", 30.0)))
-            fast_settle_s = float(params.get("fast_settle_s", 5.0))
-            fast_duration_s = float(params.get("fast_duration_s", 30.0))
-            if "active_settle_s" in params:
-                active_settle_s = float(params.get("active_settle_s", work_settle_s))
-            elif mode_value == 2:
-                active_settle_s = detect_settle_s
-            elif mode_value == 3:
-                active_settle_s = fast_duration_s
-            else:
-                active_settle_s = work_settle_s
+            work_settle_s = float(params.get("work_settle_s", 5.0))
+            acquisition_settle_s = float(params.get("acquisition_settle_s", params.get("fast_settle_s", 500.0)))
+            detection_settle_s = float(params.get("detection_settle_s", params.get("detect_settle_s", 10000.0)))
             requested_dc = {
                 "mode_value": mode_value,
                 "mode": DC_MODE_NAMES.get(int(mode_value), "WORK"),
                 "work_settle_s": work_settle_s,
-                "detect_settle_s": detect_settle_s,
-                "fast_settle_s": fast_settle_s,
-                "fast_duration_s": fast_duration_s,
+                "acquisition_settle_s": acquisition_settle_s,
+                "detection_settle_s": detection_settle_s,
             }
             _save_default_dc_config(requested_dc)
             try:
@@ -1283,18 +1365,13 @@ class ScopeApi:
             except Exception:
                 selected_for_dc = 0
             if selected_for_dc == 5:
-                self._start_dc_startup_compensation(5, "api_dc_config_mode5")
+                dc_applied = self._start_dc_startup_compensation(5, "api_dc_config_mode5")
             elif selected_for_dc > 0:
-                _apply_default_dc_config(scope, reason="api_dc_config_work", profile="work")
-            elif selected_for_dc <= 0:
-                expected = _expected_dc_config(mode=mode_value, cfg=requested_dc)
-                stream.set_dc_config_seconds(
-                    mode=int(expected["mode_value"]),
-                    work_settle_s=float(expected["work_settle_s"]),
-                    detect_settle_s=float(expected["detect_settle_s"]),
-                    fast_settle_s=float(expected["fast_settle_s"]),
-                    fast_duration_s=float(expected["fast_duration_s"]),
-                )
+                dc_applied = _apply_default_dc_config(scope, reason="api_dc_config_work", profile="work")
+            else:
+                dc_applied = _apply_default_dc_config(scope, mode=mode_value, reason="api_dc_config_idle")
+            if not dc_applied:
+                raise RuntimeError("STM32 rejected SET_DC_CONFIG v2 readback verification")
             result: dict[str, Any] = {"ok": True, "action": action}
             try:
                 readback = self._read_dc_config()
@@ -1380,6 +1457,23 @@ class ScopeApi:
                 "det_burst_max_ratio1": 8.0,
             }
         try:
+            sound_settings = scope._sound_settings_snapshot()
+        except Exception:
+            sound_settings = {
+                "enabled": bool(getattr(scope, "_sound_enabled", False)),
+                "volume_percent": 100.0,
+                "upper_frequency_hz": float(getattr(scope, "_beep_adc0_base", 4000.0) or 4000.0),
+                "lower_frequency_hz": float(getattr(scope, "_beep_adc1_base", 1000.0) or 1000.0),
+                "phase_upper_min_hz": float(getattr(scope, "_beep_adc0_min", 1000.0) or 1000.0),
+                "phase_upper_max_hz": float(getattr(scope, "_beep_adc0_max", 3000.0) or 3000.0),
+                "phase_lower_min_hz": float(getattr(scope, "_beep_adc1_min", 2000.0) or 2000.0),
+                "phase_lower_max_hz": float(getattr(scope, "_beep_adc1_max", 4000.0) or 4000.0),
+                "test_enabled": bool(getattr(scope, "_sound_test_enabled", False)),
+                "test_upper_enabled": bool(getattr(scope, "_sound_test_upper_enabled", False)),
+                "test_lower_enabled": bool(getattr(scope, "_sound_test_lower_enabled", False)),
+                "volume_scale": "ui_0_100_pwm_0_50",
+            }
+        try:
             det_flash_t0 = float(getattr(scope, "_web_det_flash_t0", 0.0) or 0.0)
         except Exception:
             det_flash_t0 = 0.0
@@ -1417,6 +1511,12 @@ class ScopeApi:
         det_thr1 = int(getattr(scope, "_det_thr1", 0) or 0)
         det_lvl0 = int(getattr(scope, "_det_last_lvl0", 0) or 0)
         det_lvl1 = int(getattr(scope, "_det_last_lvl1", 0) or 0)
+        det_noise_ref0 = float(getattr(scope, "_det_noise_ref0", 0.0) or 0.0)
+        det_noise_ref1 = float(getattr(scope, "_det_noise_ref1", 0.0) or 0.0)
+        det_noise_avg0 = float(getattr(scope, "_det_noise_avg0", 0.0) or 0.0)
+        det_noise_avg1 = float(getattr(scope, "_det_noise_avg1", 0.0) or 0.0)
+        det_trigger0 = int(getattr(scope, "_det_trigger0", det_thr0) or det_thr0)
+        det_trigger1 = int(getattr(scope, "_det_trigger1", det_thr1) or det_thr1)
         det_display_scale = _product_display_scale()
         try:
             gate_until0 = float(getattr(scope, "_det_burst_gate_until0", 0.0) or 0.0)
@@ -1454,6 +1554,17 @@ class ScopeApi:
             "last_age_s": (now - dc_verify_t) if dc_verify_t > 0.0 else None,
             "fix_count": int(getattr(scope, "_host_dc_verify_fix_count", 0) or 0),
         }
+        led_pattern_actual_info = {"pattern": None, "source": "none", "age_s": None}
+        try:
+            if hasattr(scope, "_group_led_actual_pattern_info"):
+                raw_led_info = scope._group_led_actual_pattern_info()
+                if isinstance(raw_led_info, dict):
+                    led_pattern_actual_info.update(raw_led_info)
+            elif hasattr(scope, "_group_led_actual_pattern"):
+                led_pattern_actual_info["pattern"] = scope._group_led_actual_pattern()
+                led_pattern_actual_info["source"] = "legacy"
+        except Exception:
+            pass
         return _json_safe(
             {
                 "ok": True,
@@ -1481,8 +1592,32 @@ class ScopeApi:
                     "applied": bool(getattr(scope, "tim2_applied", False)),
                     "pending": bool(getattr(scope, "tim2_pending", False)),
                 },
-                "sound": {"enabled": bool(getattr(scope, "_sound_enabled", False))},
-                "optic": {"reaction_enabled": bool(getattr(scope, "optic_reaction_enabled", False))},
+                "sound": dict(sound_settings, enabled=bool(getattr(scope, "_sound_enabled", sound_settings.get("enabled", False)))),
+                "optic": {
+                    "reaction_enabled": bool(getattr(scope, "optic_reaction_enabled", False)),
+                    "led_patterns": _normalize_group_led_patterns(
+                        getattr(scope, "_group_led_patterns", None) or _load_group_led_patterns()
+                    ),
+                    "led_pattern_actual": led_pattern_actual_info.get("pattern"),
+                    "led_pattern_actual_source": str(led_pattern_actual_info.get("source") or "none"),
+                    "led_pattern_actual_age_s": led_pattern_actual_info.get("age_s"),
+                    "led_pattern_commanded": int(getattr(scope, "_group_led_active_pattern", 0) or 0),
+                    "led_manual_test_pattern": int(getattr(scope, "_group_led_manual_test_pattern", 0) or 0),
+                    "led_detection_allowed": (
+                        bool(scope._group_led_detection_allowed()) if hasattr(scope, "_group_led_detection_allowed") else True
+                    ),
+                    "led_event": str(getattr(scope, "_group_led_active_event", "") or ""),
+                    "led_desired_event": (
+                        scope._group_led_current_event() if hasattr(scope, "_group_led_current_event") else ""
+                    ),
+                    "led_state": {
+                        "fault": bool(getattr(scope, "_group_led_fault_active", False)),
+                        "local_upper": bool(getattr(scope, "_group_led_local_upper_active", False)),
+                        "local_lower": bool(getattr(scope, "_group_led_local_lower_active", False)),
+                        "neighbor_upper": bool(getattr(scope, "_group_led_neighbor_upper_active", False)),
+                        "neighbor_lower": bool(getattr(scope, "_group_led_neighbor_lower_active", False)),
+                    },
+                },
                 "normalization": {"enabled": bool(getattr(scope, "xcorr_norm_enabled", False))},
                 "optimize": {
                     "dc_autotune_active": bool(getattr(scope, "_dc_autotune_active", False)),
@@ -1496,6 +1631,12 @@ class ScopeApi:
                     "thr1": det_thr1,
                     "lvl0": det_lvl0,
                     "lvl1": det_lvl1,
+                    "noise_ref0": det_noise_ref0,
+                    "noise_ref1": det_noise_ref1,
+                    "noise_avg0": det_noise_avg0,
+                    "noise_avg1": det_noise_avg1,
+                    "trigger0": det_trigger0,
+                    "trigger1": det_trigger1,
                     "display_scale": det_display_scale,
                     "display_unit": "u16",
                     "hold0": det_hold0,
@@ -1526,6 +1667,14 @@ class ScopeApi:
                         "filter_barkhausen": bool(det_settings.get("filter_barkhausen", False)),
                         "filter_microwire": bool(det_settings.get("filter_microwire", False)),
                         "filter_paper": bool(det_settings.get("filter_paper", False)),
+                        "barkhausen_radius": int(det_settings.get("barkhausen_radius", 24) or 24),
+                        "barkhausen_frac": float(det_settings.get("barkhausen_frac", 0.22)),
+                        "barkhausen_min_width": int(det_settings.get("barkhausen_min_width", 4) or 4),
+                        "barkhausen_max_span": int(det_settings.get("barkhausen_max_span", 140) or 140),
+                        "barkhausen_min_product_level": int(det_settings.get("barkhausen_min_product_level", 0) or 0),
+                        "barkhausen_max_product_level": int(det_settings.get("barkhausen_max_product_level", 0) or 0),
+                        "barkhausen_max_total_fraction": float(det_settings.get("barkhausen_max_total_fraction", 0.82)),
+                        "barkhausen_all_quarter_frac": float(det_settings.get("barkhausen_all_quarter_frac", 0.45)),
                         "phase_max_shift": int(det_settings.get("phase_max_shift", 12) or 12),
                         "phase_shift_penalty": float(det_settings.get("phase_shift_penalty", 0.02)),
                         "mark_window_start_frac": float(det_settings.get("mark_window_start_frac", 0.05)),
@@ -1537,14 +1686,22 @@ class ScopeApi:
                         "mark_multi_max_humps": int(det_settings.get("mark_multi_max_humps", 3) or 3),
                         "locality_max_outside_peaks": int(det_settings.get("locality_max_outside_peaks", 1)),
                         "locality_outside_peak_frac": float(det_settings.get("locality_outside_peak_frac", 0.35)),
+                        "noise_window_s": float(det_settings.get("det_noise_window_s", 1.0) or 1.0),
+                        "ratio_noise_max_u16": float(det_settings.get("det_ratio_noise_max_u16", 10.0) or 10.0),
+                        "auto_floor_u16": float(det_settings.get("det_auto_floor_u16", 10.0) or 10.0),
+                        "auto_slope": float(det_settings.get("det_auto_slope", 5.0) or 5.0),
                     },
                     "channels": {
                         "upper": {
                             "enabled": bool(det_settings.get("det_channel_enabled0", True)),
                             "confirm_count": int(det_settings.get("det_confirm_count0", 2) or 2),
                             "threshold": float(det_settings.get("det_ratio0", 2.0) or 2.0),
+                            "threshold_high": float(det_settings.get("det_ratio_high0", 5.0) or 5.0),
                             "effective_threshold": float(det_settings.get("det_effective_ratio0", 2.0) or 2.0),
                             "auto_threshold": bool(det_settings.get("det_threshold_auto0", False)),
+                            "noise_ref": det_noise_ref0,
+                            "noise_avg": det_noise_avg0,
+                            "trigger": det_trigger0,
                             "noise_up": int(det_settings.get("det_noise_up0", 24) or 24),
                             "noise_down": int(det_settings.get("det_noise_down0", 3) or 3),
                             "noise_unit": str(det_settings.get("det_noise_unit0", "adc") or "adc"),
@@ -1559,8 +1716,12 @@ class ScopeApi:
                             "enabled": bool(det_settings.get("det_channel_enabled1", True)),
                             "confirm_count": int(det_settings.get("det_confirm_count1", 2) or 2),
                             "threshold": float(det_settings.get("det_ratio1", 2.0) or 2.0),
+                            "threshold_high": float(det_settings.get("det_ratio_high1", 5.0) or 5.0),
                             "effective_threshold": float(det_settings.get("det_effective_ratio1", 2.0) or 2.0),
                             "auto_threshold": bool(det_settings.get("det_threshold_auto1", False)),
+                            "noise_ref": det_noise_ref1,
+                            "noise_avg": det_noise_avg1,
+                            "trigger": det_trigger1,
                             "noise_up": int(det_settings.get("det_noise_up1", 24) or 24),
                             "noise_down": int(det_settings.get("det_noise_down1", 3) or 3),
                             "noise_unit": str(det_settings.get("det_noise_unit1", "adc") or "adc"),
@@ -2146,7 +2307,7 @@ main{height:100vh;display:grid;grid-template-rows:auto 1fr;gap:8px;padding:10px;
 .top{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:start}
 .status,.controls,.scope-card{background:var(--panel);border:1px solid var(--line);border-radius:8px}
 .status{padding:9px 11px;min-width:0}.title{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.title h1{font-size:18px;margin:0}.pill{border:1px solid var(--line);border-radius:999px;padding:3px 8px;color:var(--muted);font-size:12px;text-decoration:none}.pill-link{cursor:pointer}.pill-link:hover{border-color:var(--accent);color:var(--text);background:var(--accent-soft)}.status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-top:8px;align-items:start}.metric{min-width:0}.metric b{display:block;color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase}.metric span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.metric span.det-rich{display:flex;align-items:center;gap:6px;min-width:0;line-height:22px}.metric span.det-rich.det-tall{display:inline-grid;grid-template-columns:max-content 168px 184px;align-items:start;gap:6px;line-height:1;overflow:visible;white-space:normal}.metric span.det-stack,.metric span.det-noise-stack{display:grid;grid-template-rows:repeat(2,22px);gap:2px;overflow:visible;white-space:normal}.metric span.det-stack{width:168px}.metric span.det-noise-stack{width:184px}.det-state{display:inline-flex;align-items:center;height:22px;max-width:116px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}.det-ch{appearance:none;display:inline-flex;align-items:center;justify-content:center;min-width:42px;min-height:22px;height:22px;padding:0 7px;border:1px solid transparent;border-radius:999px;font-family:inherit;font-size:12px;font-weight:800;line-height:22px;vertical-align:middle;cursor:pointer}.det-rich.det-tall .det-ch{width:168px;min-width:168px;min-height:22px;height:22px;padding:0 10px;font-size:12px;line-height:22px}.det-noise{display:inline-flex;align-items:center;justify-content:flex-start;width:184px;min-height:22px;height:22px;padding:0 7px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;font-size:11px;font-weight:800;line-height:22px;white-space:pre;overflow:hidden;text-overflow:clip}.det-ch:hover{filter:brightness(1.08)}.det-ch:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.det-ch.on{background:rgba(81,200,120,.20);border-color:rgba(81,200,120,.75);color:#51c878}.det-ch.off{background:rgba(255,107,107,.16);border-color:rgba(255,107,107,.78);color:#ff6b6b}.det-ch.fire-u{background:rgba(56,189,248,.26);border-color:rgba(56,189,248,.95);color:#38bdf8}.det-ch.fire-l{background:rgba(250,204,21,.30);border-color:rgba(250,204,21,.95);color:#facc15}
-.controls{display:grid;gap:6px;padding:8px;max-width:760px;justify-items:end}button,select{font:inherit;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);min-height:34px;padding:7px 10px;cursor:pointer}button:hover,select:hover{border-color:var(--accent)}button.active{background:var(--accent);border-color:var(--accent);color:#04111f}.mode-line,.mode-row,.control-row{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;align-items:center}.mode-row button{min-width:43px;padding-left:8px;padding-right:8px}.mode-row button.disabled{opacity:.38;filter:saturate(.35);cursor:default}.mode-row button.disabled:hover{border-color:var(--line)}.threshold-control{display:inline-grid;grid-template-columns:auto 58px 19px;grid-template-rows:17px 17px;align-items:stretch;min-height:34px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);overflow:hidden}.threshold-control:focus-within,.threshold-control:hover{border-color:var(--accent)}.threshold-label{grid-row:1/3;display:grid;place-items:center;min-width:25px;padding:0 7px;border-right:1px solid var(--line);color:var(--muted);font-size:12px;font-weight:800}.threshold-input{grid-row:1/3;width:58px;min-height:32px;border:0;border-radius:0;background:transparent;color:var(--text);font:800 13px/1 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;text-align:center;outline:0;font-variant-numeric:tabular-nums;appearance:textfield;-moz-appearance:textfield}.threshold-input::-webkit-outer-spin-button,.threshold-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}.threshold-arrow{position:relative;min-width:19px;min-height:17px;height:17px;border:0;border-left:1px solid var(--line);border-radius:0;background:rgba(255,255,255,.025);padding:0}.threshold-arrow:hover{background:var(--accent-soft)}.threshold-arrow span{position:absolute;left:50%;top:50%;width:0;height:0;transform:translate(-50%,-50%);border-left:4px solid transparent;border-right:4px solid transparent}.threshold-arrow.up span{border-bottom:5px solid var(--text)}.threshold-arrow.down span{border-top:5px solid var(--text)}.threshold-control.busy{opacity:.62}.threshold-control.busy .threshold-arrow,.threshold-control.busy .threshold-input{cursor:default}.tool-btn{width:34px;min-width:34px;min-height:34px;padding:0;font-weight:900}.scope{display:grid;grid-template-rows:1fr 1fr;gap:8px;min-height:0}.scope.single{grid-template-rows:1fr}.scope-card{display:grid;grid-template-rows:auto 1fr;min-height:0;overflow:hidden}.scope-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 10px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.025)}.scope-head h2{font-size:14px;margin:0}.legend{display:flex;gap:10px;color:var(--muted);font-size:12px}.sw{display:inline-block;width:18px;height:3px;border-radius:99px;vertical-align:middle;margin-right:5px}.plot-wrap{position:relative;min-height:0}.plot-wrap canvas{display:block;width:100%;height:100%}.empty{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);pointer-events:none}.hidden{display:none!important}.theme-tab{position:fixed;right:0;top:50%;z-index:60;transform:translateY(-50%);border:1px solid var(--line);border-right:0;border-radius:8px 0 0 8px;background:var(--panel);color:var(--text);padding:10px 8px;font-size:12px;font-weight:700;box-shadow:0 10px 24px rgba(0,0,0,.22);cursor:pointer;writing-mode:vertical-rl;letter-spacing:0}.theme-drawer{position:fixed;right:0;top:0;bottom:0;z-index:70;width:min(320px,calc(100vw - 24px));padding:18px;background:var(--panel);color:var(--text);border-left:1px solid var(--line);box-shadow:-24px 0 58px rgba(0,0,0,.25);transform:translateX(100%);transition:transform .18s ease}.theme-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:20px}.theme-title{font-size:15px;font-weight:800}.theme-close{inline-size:32px;block-size:32px;border-radius:999px;padding:0;font-weight:800}.theme-group{display:grid;gap:8px;margin-bottom:18px}.theme-label{font-size:11px;text-transform:uppercase;color:var(--muted);font-weight:800}.theme-seg{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.theme-seg.style{grid-template-columns:repeat(4,1fr)}.theme-option{min-height:34px;font-size:12px;font-weight:700}.theme-option[aria-pressed="true"]{border-color:var(--accent);background:var(--accent-soft);box-shadow:inset 1px 1px 0 rgba(255,255,255,.22),0 8px 18px rgba(0,0,0,.16)}.theme-note{font-size:12px;line-height:1.5;color:var(--muted)}html[data-theme-panel="open"] .theme-drawer{transform:translateX(0)}html[data-theme-panel="open"] .theme-tab{display:none}html[data-ui-style="glass"] .status,html[data-ui-style="glass"] .controls,html[data-ui-style="glass"] .scope-card,html[data-ui-style="glass"] .theme-tab,html[data-ui-style="glass"] .theme-drawer{backdrop-filter:blur(18px) saturate(1.2);-webkit-backdrop-filter:blur(18px) saturate(1.2)}html[data-ui-style="warm"] .status,html[data-ui-style="warm"] .controls,html[data-ui-style="warm"] .scope-card,html[data-ui-style="warm"] .theme-tab,html[data-ui-style="warm"] .theme-drawer{box-shadow:0 12px 30px rgba(80,45,20,.13)}html[data-ui-style="neumorph"] .status,html[data-ui-style="neumorph"] .controls,html[data-ui-style="neumorph"] .scope-card,html[data-ui-style="neumorph"] .theme-tab,html[data-ui-style="neumorph"] .theme-drawer{border-color:transparent;box-shadow:8px 8px 20px rgba(0,0,0,.18),-8px -8px 20px rgba(255,255,255,.05)}html[data-ui-style="neumorph"][data-theme="light"] .status,html[data-ui-style="neumorph"][data-theme="light"] .controls,html[data-ui-style="neumorph"][data-theme="light"] .scope-card,html[data-ui-style="neumorph"][data-theme="light"] .theme-tab,html[data-ui-style="neumorph"][data-theme="light"] .theme-drawer{box-shadow:8px 8px 18px rgba(147,160,176,.34),-8px -8px 18px rgba(255,255,255,.76)}@media(max-width:820px){main{height:auto;min-height:100vh}.top{grid-template-columns:1fr}.controls{max-width:none;justify-items:start}.mode-line,.mode-row,.control-row{justify-content:flex-start}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.scope{min-height:620px}}@media(max-width:640px){.theme-tab{top:auto;bottom:18px;writing-mode:horizontal-tb}}
+.controls{display:grid;gap:6px;padding:8px;max-width:760px;justify-items:end}button,select{font:inherit;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);min-height:34px;padding:7px 10px;cursor:pointer}button:hover,select:hover{border-color:var(--accent)}button.active{background:var(--accent);border-color:var(--accent);color:#04111f}.mode-line,.mode-row,.control-row{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;align-items:center}.mode-row button{min-width:43px;padding-left:8px;padding-right:8px}.mode-row button.disabled{opacity:.38;filter:saturate(.35);cursor:default}.mode-row button.disabled:hover{border-color:var(--line)}.threshold-control{display:inline-grid;grid-template-columns:auto 58px 19px;grid-template-rows:17px 17px;align-items:stretch;min-height:34px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);overflow:hidden}.threshold-control:focus-within,.threshold-control:hover{border-color:var(--accent)}.threshold-control.auto{border-color:#00e5ff;background:rgba(0,229,255,.09)}.threshold-control.auto .threshold-label{color:#00e5ff}.threshold-control.auto .threshold-input{color:#bdfaff}.threshold-label{grid-row:1/3;display:grid;place-items:center;min-width:25px;padding:0 7px;border-right:1px solid var(--line);color:var(--muted);font-size:12px;font-weight:800}.threshold-input{grid-row:1/3;width:58px;min-height:32px;border:0;border-radius:0;background:transparent;color:var(--text);font:800 13px/1 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;text-align:center;outline:0;font-variant-numeric:tabular-nums;appearance:textfield;-moz-appearance:textfield}.threshold-input::-webkit-outer-spin-button,.threshold-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}.threshold-arrow{position:relative;min-width:19px;min-height:17px;height:17px;border:0;border-left:1px solid var(--line);border-radius:0;background:rgba(255,255,255,.025);padding:0}.threshold-arrow:hover{background:var(--accent-soft)}.threshold-arrow span{position:absolute;left:50%;top:50%;width:0;height:0;transform:translate(-50%,-50%);border-left:4px solid transparent;border-right:4px solid transparent}.threshold-arrow.up span{border-bottom:5px solid var(--text)}.threshold-arrow.down span{border-top:5px solid var(--text)}.threshold-control.busy{opacity:.62}.threshold-control.busy .threshold-arrow,.threshold-control.busy .threshold-input{cursor:default}.tool-btn{width:34px;min-width:34px;min-height:34px;padding:0;font-weight:900}.scope{display:grid;grid-template-rows:1fr 1fr;gap:8px;min-height:0}.scope.single{grid-template-rows:1fr}.scope-card{display:grid;grid-template-rows:auto 1fr;min-height:0;overflow:hidden}.scope-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 10px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.025)}.scope-head h2{font-size:14px;margin:0}.legend{display:flex;gap:10px;color:var(--muted);font-size:12px}.sw{display:inline-block;width:18px;height:3px;border-radius:99px;vertical-align:middle;margin-right:5px}.plot-wrap{position:relative;min-height:0}.plot-wrap canvas{display:block;width:100%;height:100%}.empty{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);pointer-events:none}.hidden{display:none!important}.theme-tab{position:fixed;right:0;top:50%;z-index:60;transform:translateY(-50%);border:1px solid var(--line);border-right:0;border-radius:8px 0 0 8px;background:var(--panel);color:var(--text);padding:10px 8px;font-size:12px;font-weight:700;box-shadow:0 10px 24px rgba(0,0,0,.22);cursor:pointer;writing-mode:vertical-rl;letter-spacing:0}.theme-drawer{position:fixed;right:0;top:0;bottom:0;z-index:70;width:min(320px,calc(100vw - 24px));padding:18px;background:var(--panel);color:var(--text);border-left:1px solid var(--line);box-shadow:-24px 0 58px rgba(0,0,0,.25);transform:translateX(100%);transition:transform .18s ease}.theme-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:20px}.theme-title{font-size:15px;font-weight:800}.theme-close{inline-size:32px;block-size:32px;border-radius:999px;padding:0;font-weight:800}.theme-group{display:grid;gap:8px;margin-bottom:18px}.theme-label{font-size:11px;text-transform:uppercase;color:var(--muted);font-weight:800}.theme-seg{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.theme-seg.style{grid-template-columns:repeat(4,1fr)}.theme-option{min-height:34px;font-size:12px;font-weight:700}.theme-option[aria-pressed="true"]{border-color:var(--accent);background:var(--accent-soft);box-shadow:inset 1px 1px 0 rgba(255,255,255,.22),0 8px 18px rgba(0,0,0,.16)}.theme-note{font-size:12px;line-height:1.5;color:var(--muted)}html[data-theme-panel="open"] .theme-drawer{transform:translateX(0)}html[data-theme-panel="open"] .theme-tab{display:none}html[data-ui-style="glass"] .status,html[data-ui-style="glass"] .controls,html[data-ui-style="glass"] .scope-card,html[data-ui-style="glass"] .theme-tab,html[data-ui-style="glass"] .theme-drawer{backdrop-filter:blur(18px) saturate(1.2);-webkit-backdrop-filter:blur(18px) saturate(1.2)}html[data-ui-style="warm"] .status,html[data-ui-style="warm"] .controls,html[data-ui-style="warm"] .scope-card,html[data-ui-style="warm"] .theme-tab,html[data-ui-style="warm"] .theme-drawer{box-shadow:0 12px 30px rgba(80,45,20,.13)}html[data-ui-style="neumorph"] .status,html[data-ui-style="neumorph"] .controls,html[data-ui-style="neumorph"] .scope-card,html[data-ui-style="neumorph"] .theme-tab,html[data-ui-style="neumorph"] .theme-drawer{border-color:transparent;box-shadow:8px 8px 20px rgba(0,0,0,.18),-8px -8px 20px rgba(255,255,255,.05)}html[data-ui-style="neumorph"][data-theme="light"] .status,html[data-ui-style="neumorph"][data-theme="light"] .controls,html[data-ui-style="neumorph"][data-theme="light"] .scope-card,html[data-ui-style="neumorph"][data-theme="light"] .theme-tab,html[data-ui-style="neumorph"][data-theme="light"] .theme-drawer{box-shadow:8px 8px 18px rgba(147,160,176,.34),-8px -8px 18px rgba(255,255,255,.76)}@media(max-width:820px){main{height:auto;min-height:100vh}.top{grid-template-columns:1fr}.controls{max-width:none;justify-items:start}.mode-line,.mode-row,.control-row{justify-content:flex-start}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.scope{min-height:620px}}@media(max-width:640px){.theme-tab{top:auto;bottom:18px;writing-mode:horizontal-tb}}
 .metric span.det-rich.det-tall{vertical-align:top}
 .metric span.det-stack,.metric span.det-noise-stack{align-self:start;margin-top:-22px}
 .metric span.det-rich.det-tall{grid-template-columns:max-content 168px 196px!important}
@@ -2342,7 +2503,7 @@ html[data-top-panel="controls"] .controls{display:grid!important}
 	.player-cluster{display:grid;grid-template-rows:repeat(2,30px);gap:5px;min-width:0}
 	.player-row{display:grid;align-items:center;gap:5px;min-width:0}
 	.player-left .player-row{grid-template-columns:repeat(5,minmax(48px,1fr))}
-	.player-right .player-row{grid-template-columns:repeat(5,minmax(54px,1fr))}
+	.player-right .player-row{grid-template-columns:repeat(6,minmax(44px,1fr))}
 	.player-tag-type{grid-column:span 2}
 	.player-download-btn{grid-column:auto}
 	.player-grid button,.player-grid select,.player-file{min-height:30px;height:30px;min-width:0;padding:0 9px;font-size:12px;line-height:30px;white-space:nowrap}
@@ -2390,8 +2551,8 @@ html[data-top-panel="controls"] .controls{display:grid!important}
 	.player-file:hover{border-color:var(--accent)}
 	.player-file input{display:none}
 	.player-close{width:30px;min-width:30px;min-height:30px;height:30px;padding:0;font-weight:800}
-	@media(max-width:1180px){.player-grid{grid-template-columns:minmax(238px,auto) minmax(110px,1fr) minmax(322px,auto);gap:6px}.player-cluster{grid-template-rows:repeat(2,28px);gap:4px}.player-left .player-row{grid-template-columns:repeat(5,minmax(38px,1fr))}.player-right .player-row{grid-template-columns:repeat(5,minmax(42px,1fr))}.player-grid button,.player-grid select,.player-file{height:28px;min-height:28px;line-height:28px;padding:0 5px;font-size:10.5px}.player-seek-wrap,.player-seek{height:48px}.player-seek-marks{top:11px;height:26px}.player-seek-line{margin:0 8px}.player-seek-line.lower{top:26px}.player-download-btn{grid-column:span 2}}
-	@media(max-width:860px){.player-grid{grid-template-columns:minmax(0,1fr);gap:7px}.player-left .player-row{grid-template-columns:repeat(5,minmax(0,1fr))}.player-right .player-row{grid-template-columns:repeat(5,minmax(0,1fr))}.player-seek-wrap,.player-seek{height:42px}.player-seek-marks{top:8px;height:26px}.player-seek-line.lower{top:26px}.player-title{display:grid;gap:2px}.player-title span{font-size:10px}}
+	@media(max-width:1180px){.player-grid{grid-template-columns:minmax(238px,auto) minmax(110px,1fr) minmax(322px,auto);gap:6px}.player-cluster{grid-template-rows:repeat(2,28px);gap:4px}.player-left .player-row{grid-template-columns:repeat(5,minmax(38px,1fr))}.player-right .player-row{grid-template-columns:repeat(6,minmax(38px,1fr))}.player-grid button,.player-grid select,.player-file{height:28px;min-height:28px;line-height:28px;padding:0 5px;font-size:10.5px}.player-seek-wrap,.player-seek{height:48px}.player-seek-marks{top:11px;height:26px}.player-seek-line{margin:0 8px}.player-seek-line.lower{top:26px}.player-download-btn{grid-column:span 2}}
+	@media(max-width:860px){.player-grid{grid-template-columns:minmax(0,1fr);gap:7px}.player-left .player-row{grid-template-columns:repeat(5,minmax(0,1fr))}.player-right .player-row{grid-template-columns:repeat(6,minmax(0,1fr))}.player-seek-wrap,.player-seek{height:42px}.player-seek-marks{top:8px;height:26px}.player-seek-line.lower{top:26px}.player-title{display:grid;gap:2px}.player-title span{font-size:10px}}
 	@media(max-width:560px){.player-panel{left:5px;right:5px;bottom:5px;padding:7px}.player-grid{gap:6px}.player-cluster{grid-template-rows:auto;gap:4px}.player-grid button,.player-grid select,.player-file{height:28px;min-height:28px;line-height:28px;font-size:10px;padding:0 4px}.player-seek-mark{width:2px;margin-left:-1px}.player-tag-type{grid-column:span 2}.player-download-btn{grid-column:span 2}}
 	.det-state{font-size:12px!important}
 	.det-rich.det-tall .det-ch{font-size:12px!important}
@@ -2425,13 +2586,13 @@ html[data-top-panel="controls"] .controls{display:grid!important}
       <div class="control-row">
         <span class="threshold-control" id="upperThrControl" title="Upper trigger threshold">
           <span class="threshold-label">U</span>
-          <input id="upperThrInput" class="threshold-input" type="number" min="1" max="4" step="0.1" inputmode="decimal" value="2.0" onchange="commitDetectorThreshold('upper')" onkeydown="detectorThresholdKey(event,'upper')" aria-label="Upper trigger threshold">
+          <input id="upperThrInput" class="threshold-input" type="number" min="1" max="100" step="0.1" inputmode="decimal" value="2.0" onchange="commitDetectorThreshold('upper')" onkeydown="detectorThresholdKey(event,'upper')" aria-label="Upper trigger threshold">
           <button id="upperThrUp" class="threshold-arrow up" type="button" title="Upper trigger threshold +0.1" aria-label="Upper trigger threshold up" onclick="adjustDetectorThreshold('upper',0.1)"><span></span></button>
           <button id="upperThrDown" class="threshold-arrow down" type="button" title="Upper trigger threshold -0.1" aria-label="Upper trigger threshold down" onclick="adjustDetectorThreshold('upper',-0.1)"><span></span></button>
         </span>
         <span class="threshold-control" id="lowerThrControl" title="Lower trigger threshold">
           <span class="threshold-label">L</span>
-          <input id="lowerThrInput" class="threshold-input" type="number" min="1" max="4" step="0.1" inputmode="decimal" value="2.0" onchange="commitDetectorThreshold('lower')" onkeydown="detectorThresholdKey(event,'lower')" aria-label="Lower trigger threshold">
+          <input id="lowerThrInput" class="threshold-input" type="number" min="1" max="100" step="0.1" inputmode="decimal" value="2.0" onchange="commitDetectorThreshold('lower')" onkeydown="detectorThresholdKey(event,'lower')" aria-label="Lower trigger threshold">
           <button id="lowerThrUp" class="threshold-arrow up" type="button" title="Lower trigger threshold +0.1" aria-label="Lower trigger threshold up" onclick="adjustDetectorThreshold('lower',0.1)"><span></span></button>
           <button id="lowerThrDown" class="threshold-arrow down" type="button" title="Lower trigger threshold -0.1" aria-label="Lower trigger threshold down" onclick="adjustDetectorThreshold('lower',-0.1)"><span></span></button>
         </span>
@@ -2447,11 +2608,11 @@ html[data-top-panel="controls"] .controls{display:grid!important}
   </div>
 	  <section class="scope">
 	    <article class="scope-card" id="upperCard">
-	      <div class="scope-head"><h2>Upper Channel</h2><div class="scope-norm" id="upperNorm"></div><div class="legend"><span><i class="sw" style="background:#ffb86b"></i>1</span><span><i class="sw" style="background:#00e5ff"></i>0</span><span><i class="sw" style="background:#ffe066"></i>det</span></div></div>
+	      <div class="scope-head"><h2>Upper Channel</h2><div class="scope-norm" id="upperNorm"></div><div class="legend"><span><i class="sw" style="background:#ffb86b"></i>1</span><span><i class="sw" style="background:#00e5ff"></i>0</span><span><i class="sw" style="background:#ffe066"></i>det</span><span><i class="sw" style="background:#ff4fd8"></i>thr</span></div></div>
 	      <div class="plot-wrap"><canvas id="upperPlot"></canvas><div class="empty" id="upperEmpty">waiting for frame</div></div>
     </article>
     <article class="scope-card" id="lowerCard">
-      <div class="scope-head"><h2>Lower Channel</h2><div class="scope-norm" id="lowerNorm"></div><div class="legend"><span><i class="sw" style="background:#ff6b6b"></i>1</span><span><i class="sw" style="background:#00ffd5"></i>0</span><span><i class="sw" style="background:#35d7ff"></i>det</span></div></div>
+      <div class="scope-head"><h2>Lower Channel</h2><div class="scope-norm" id="lowerNorm"></div><div class="legend"><span><i class="sw" style="background:#ff6b6b"></i>1</span><span><i class="sw" style="background:#00ffd5"></i>0</span><span><i class="sw" style="background:#35d7ff"></i>det</span><span><i class="sw" style="background:#ff4fd8"></i>thr</span></div></div>
 	      <div class="plot-wrap"><canvas id="lowerPlot"></canvas><div class="empty" id="lowerEmpty">waiting for frame</div></div>
 	    </article>
 	  </section>
@@ -2472,8 +2633,8 @@ html[data-top-panel="controls"] .controls{display:grid!important}
 	        <div class="player-row">
 	          <button id="playerLiveBtn" type="button" onclick="playerLive()" title="Return to the realtime oscilloscope and resume live input.">Live</button>
 	          <select id="playerTagType" class="player-tag-type" onchange="playerSetTagType(this.value,true)" aria-label="Manual tag response type" title="Manual tag response type for player labels."><option value="casino">Casino</option><option value="barkhausen">Barkhausen</option><option value="microwire">Microwire</option><option value="paper">Paper</option></select>
-	          <button id="playerMarkTagUpperBtn" class="mark-tag" type="button" onpointerdown="playerTagHoldStart(event,'upper')" onpointerup="playerTagHoldStop(event)" onpointercancel="playerTagHoldStop(event)" onpointerleave="playerTagHoldStop(event)" onclick="playerTagClick(event,'upper')" title="Weak tag in the upper antenna. Hold during Rec to mark every recorded upper frame until release.">Tag U?</button>
-	          <button id="playerMarkTagLowerBtn" class="mark-tag" type="button" onpointerdown="playerTagHoldStart(event,'lower')" onpointerup="playerTagHoldStop(event)" onpointercancel="playerTagHoldStop(event)" onpointerleave="playerTagHoldStop(event)" onclick="playerTagClick(event,'lower')" title="Weak tag in the lower antenna. Hold during Rec to mark every recorded lower frame until release.">Tag L?</button>
+	          <button id="playerMarkTagUpperBtn" class="mark-tag" type="button" onpointerdown="playerTagHoldStart(event,'upper')" onpointerup="playerTagHoldStop(event)" onpointercancel="playerTagHoldStop(event)" onpointerleave="playerTagHoldStop(event)" onclick="playerTagClick(event,'upper')" title="Toggle a weak tag in the upper antenna. Hold during Rec to mark every recorded upper frame until release.">Tag U?</button>
+	          <button id="playerMarkTagLowerBtn" class="mark-tag" type="button" onpointerdown="playerTagHoldStart(event,'lower')" onpointerup="playerTagHoldStop(event)" onpointercancel="playerTagHoldStop(event)" onpointerleave="playerTagHoldStop(event)" onclick="playerTagClick(event,'lower')" title="Toggle a weak tag in the lower antenna. Hold during Rec to mark every recorded lower frame until release.">Tag L?</button>
 	        </div>
 	      </div>
 	      <div class="player-seek-wrap">
@@ -2491,6 +2652,7 @@ html[data-top-panel="controls"] .controls{display:grid!important}
 	        <div class="player-row">
 	          <button id="playerSaveBtn" type="button" onclick="playerSaveMarks()" title="Save edited frame labels next to the loaded raw recording.">Save</button>
 	          <button id="playerClearWeakBtn" type="button" onpointerdown="playerWeakClearHoldStart(event)" onpointerup="playerWeakClearHoldStop(event)" onpointercancel="playerWeakClearHoldCancel(event)" onpointerleave="playerWeakClearHoldCancel(event)" onclick="playerClearWeakClick(event)" oncontextmenu="return false" title="Short press clears the current or nearest weak Tag mark. Hold for 2 seconds to clear the current continuous weak interval for that channel. Exact ranges stay.">Weak X</button>
+	          <button id="playerDeleteMarkBtn" type="button" onclick="playerDeleteExactMark()" title="Delete the nearest exact range mark on this frame. Right-click a range edge on the plot to delete that exact mark.">Mark X</button>
 	          <button class="player-download-btn" type="button" onclick="playerDownloadRecording()" title="Download the loaded or latest raw recording to this browser computer.">Download</button>
 	          <button type="button" onclick="playerChooseLoadFile()" title="Load a .npz raw recording through the system file picker.">Load</button>
 	          <input id="playerLoadInput" type="file" accept=".npz,application/octet-stream" onchange="playerLoadPickedFile(this.files&&this.files[0]);this.value='';" hidden>
@@ -2574,9 +2736,10 @@ let lastWorkingWindowKey='';
 let lastRenderedFrameKey='';
 let lastStatusUiKey='';
 let lastDetectorUiKey='';
+let lastDetectorPlotKey='';
 	let lastSelectedMode=null;
 	let frameRedrawNeeded=false;
-	let playerState={open:false,recording:false,playback:false,playing:false,frames:[],idx:-1,timer:null,maxFrames:1200,maxPackets:5000,lastCaptureT:null,savedFile:'',source:'raw_usb_before_detection',dirty:false,rangeDrag:null,tagType:'casino',liveTagChannel:'',liveTagTimer:null,liveTagBusy:false,weakClearTimer:null,weakClearHandled:false,weakClearPointer:false,weakClearSuppressClick:false};
+	let playerState={open:false,recording:false,playback:false,playing:false,frames:[],idx:-1,timer:null,maxFrames:1200,maxPackets:5000,lastCaptureT:null,savedFile:'',source:'raw_usb_before_detection',dirty:false,rangeDrag:null,lastPlotChannel:'',lastPlotSample:null,tagType:'casino',liveTagChannel:'',liveTagTimer:null,liveTagBusy:false,weakClearTimer:null,weakClearHandled:false,weakClearPointer:false,weakClearSuppressClick:false};
 	const themeMediaQuery=window.matchMedia?window.matchMedia('(prefers-color-scheme: dark)'):null;
 function byId(id){return document.getElementById(id)}
 function cssVar(name,fallback){let v=getComputedStyle(document.documentElement).getPropertyValue(name).trim();return v||fallback}
@@ -2610,7 +2773,35 @@ function initTooltips(){if(tooltipEl)return;tooltipEl=document.createElement('di
 function setTopPanel(panel){panel=(panel==='controls')?'controls':'status';let root=document.documentElement;root.setAttribute('data-top-panel',panel);root.removeAttribute('data-controls-panel');let statusBtn=byId('mobileStatusTab'),controlsBtn=byId('mobileControlsTab');if(statusBtn)statusBtn.setAttribute('aria-pressed',panel==='status'?'true':'false');if(controlsBtn)controlsBtn.setAttribute('aria-pressed',panel==='controls'?'true':'false');frameRedrawNeeded=true;if(lastFrame)setTimeout(function(){renderFrame(lastFrame,true);frameRedrawNeeded=false},40)}
 function toggleControlsPanel(force){let current=document.documentElement.getAttribute('data-top-panel')||'status';let open=(typeof force==='boolean')?force:(current!=='controls');setTopPanel(open?'controls':'status')}
 function cmd(action,params){return fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action,params:params||{}})}).then(r=>r.json()).then(j=>{if(!j.ok)throw new Error(j.error||('command failed: '+action));refresh();return j})}
-function buildModes(){let b=byId('modeButtons');for(let i=0;i<=9;i++){let x=document.createElement('button');x.id='mode'+i;x.textContent=String(i);setTooltip(x,MODE_TITLES[i]||MODE_LABELS[i]||('Mode '+i));if(i>=8){x.className='disabled';x.setAttribute('aria-disabled','true');x.onclick=function(ev){if(ev&&ev.preventDefault)ev.preventDefault()}}else{x.onclick=function(){if(i>0)lastRunMode=i;cmd('mode',{idx:i})}}b.appendChild(x)}}
+function buildModes(){
+	let b=byId('modeButtons');
+	for(let i=0;i<=9;i++){
+		let x=document.createElement('button');
+		x.id='mode'+i;
+		x.textContent=String(i);
+		setTooltip(x,MODE_TITLES[i]||MODE_LABELS[i]||('Mode '+i));
+		if(i>=8){
+			x.className='disabled';
+			x.setAttribute('aria-disabled','true');
+			x.onclick=function(ev){if(ev&&ev.preventDefault)ev.preventDefault()};
+		}else{
+			x.onclick=function(){
+				if(playerState.playback&&i>0){
+					lastRunMode=i;
+					lastSelectedMode=i;
+					for(let j=0;j<=9;j++)setActive('mode'+j,j===i);
+					setText('modeText',i+' '+(MODE_LABELS[i]||''));
+					if(lastFrame)renderFrame(lastFrame,true);
+					updatePlayerUi();
+					return;
+				}
+				if(i>0)lastRunMode=i;
+				cmd('mode',{idx:i});
+			};
+		}
+		b.appendChild(x);
+	}
+}
 function statusMode(){return Number((((lastStatus||{}).mode)||{}).selected||0)}
 function statusConn(){return ((lastStatus||{}).connection)||{}}
 function updateRunButton(){let btn=byId('runBtn');if(!btn)return;let conn=statusConn();let running=!!conn.connected||!!conn.connecting;setElText(btn,runBusy?'...':(running?'Stop':'Start'));setTooltip(btn,runBusy?'Command in progress.':(running?'Stop: stop the data stream now, turn TX off, and keep the current selected mode. The next Start resumes that same mode. This does not switch to mode 0.':'Start: start the stream in the last selected mode. If Stop was used, Start resumes the preserved mode.'));btn.classList.remove('active');if(btn.disabled!==!!runBusy)btn.disabled=!!runBusy}
@@ -2629,10 +2820,14 @@ function toggleFreeze(){if(freezeMode==='live')setFreezeMode('freeze');else if(f
 function toggleCommand(id,action){let next=!byId(id).classList.contains('active');cmd(action,{enabled:next})}
 function sendFreq(){cmd('frequency',{hz:parseInt(byId('freqSel').value,10)||200})}
 function sendAvg(){cmd('avg',{avg_n:parseInt(byId('avgSel').value,10)||24})}
-function clampDetectorThreshold(value){if(typeof value==='string')value=value.replace(',','.');let v=Number(value);if(!Number.isFinite(v))v=2.0;return Math.max(1.0,Math.min(4.0,Math.round(v*10)/10))}
+function clampDetectorThreshold(value){if(typeof value==='string')value=value.replace(',','.');let v=Number(value);if(!Number.isFinite(v))v=2.0;return Math.max(1.0,Math.min(100.0,Math.round(v*10)/10))}
+function clampDetectorDisplayLevel(value){let v=Number(value);if(!Number.isFinite(v))v=0;return Math.max(0,Math.min(65535,Math.round(v*10)/10))}
+function detectorThresholdText(value,auto){let v=auto?clampDetectorDisplayLevel(value):clampDetectorThreshold(value);if(auto&&v>=100)return String(Math.round(v));return v.toFixed(1)}
+function detectorAutoTriggerDisplay(channel,ch,det){ch=ch||{};det=det||{};let v=Number(ch.trigger);if(!Number.isFinite(v)||v<=0)v=channel==='lower'?Number(det.trigger1):Number(det.trigger0);if(!Number.isFinite(v)||v<=0)v=channel==='lower'?Number(det.thr1):Number(det.thr0);let x=detectorDisplayLevel(v,det);return Number.isFinite(x)?x:0}
+function detectorAutoThresholdTitle(channel,value,ch,det){let settings=(det&&det.settings)||{},floor=Number(settings.auto_floor_u16),slope=Number(settings.auto_slope);let bits=[(channel==='lower'?'Lower':'Upper')+' AUTO trigger '+detectorThresholdText(value,true)+' display'];if(Number.isFinite(floor))bits.push('min '+floor);if(Number.isFinite(slope))bits.push('slope '+slope);bits.push('pink line is this calculated trigger');return bits.join(' | ')}
 function setDetectorThresholdControlsDisabled(channel,disabled){let prefix=channel==='lower'?'lower':'upper';[prefix+'ThrInput',prefix+'ThrUp',prefix+'ThrDown'].forEach(function(id){let el=byId(id);if(el&&el.disabled!==!!disabled)el.disabled=!!disabled});setClassToggle(byId(prefix+'ThrControl'),'busy',disabled)}
-function paintDetectorThreshold(channel,value,auto,force){let prefix=channel==='lower'?'lower':'upper',label=(channel==='lower'?'Lower':'Upper')+' trigger threshold'+(auto?' (auto effective)':'');let input=byId(prefix+'ThrInput'),control=byId(prefix+'ThrControl');setTooltip(control,label);if(input){let text=clampDetectorThreshold(value).toFixed(1);setTooltip(input,label);if((force||document.activeElement!==input)&&input.value!==text)input.value=text}setDetectorThresholdControlsDisabled(channel,detectorThresholdBusy[channel])}
-function updateDetectorThresholdControls(det){det=det||{};let channels=det.channels||{};[['upper',channels.upper||{}],['lower',channels.lower||{}]].forEach(function(pair){let key=pair[0],ch=pair[1]||{};let value=Number(ch.threshold);if(ch.auto_threshold&&Number.isFinite(Number(ch.effective_threshold)))value=Number(ch.effective_threshold);value=clampDetectorThreshold(value);if(!detectorThresholdBusy[key])detectorThresholds[key]=value;paintDetectorThreshold(key,detectorThresholds[key],!!ch.auto_threshold)})}
+function paintDetectorThreshold(channel,value,auto,force,ch,det){let prefix=channel==='lower'?'lower':'upper',manualLabel=(channel==='lower'?'Lower':'Upper')+' manual threshold coefficient',label=auto?detectorAutoThresholdTitle(channel,value,ch,det):manualLabel+' x noise';let input=byId(prefix+'ThrInput'),control=byId(prefix+'ThrControl'),labelEl=control?control.querySelector('.threshold-label'):null;setTooltip(control,label);setClassToggle(control,'auto',!!auto);if(labelEl)setElText(labelEl,auto?(channel==='lower'?'AL':'AU'):(channel==='lower'?'L':'U'));if(input){let text=detectorThresholdText(value,!!auto);input.min=auto?'0':'1';input.max=auto?'65535':'100';input.readOnly=!!auto;setTooltip(input,label);if((force||document.activeElement!==input)&&input.value!==text)input.value=text}setDetectorThresholdControlsDisabled(channel,detectorThresholdBusy[channel]||!!auto)}
+function updateDetectorThresholdControls(det){det=det||{};let channels=det.channels||{};[['upper',channels.upper||{}],['lower',channels.lower||{}]].forEach(function(pair){let key=pair[0],ch=pair[1]||{},auto=!!ch.auto_threshold,value=auto?detectorAutoTriggerDisplay(key,ch,det):clampDetectorThreshold(Number(ch.threshold));if(!detectorThresholdBusy[key])detectorThresholds[key]=value;paintDetectorThreshold(key,detectorThresholds[key],auto,false,ch,det)})}
 function detectorThresholdPayload(channel,value){let payload={persist:false};if(channel==='lower'){payload.threshold1=value;payload.auto1=false}else{payload.threshold0=value;payload.auto0=false}return payload}
 function setDetectorThreshold(channel,value){let key=channel==='lower'?'lower':'upper';let v=clampDetectorThreshold(value);detectorThresholds[key]=v;detectorThresholdBusy[key]=true;paintDetectorThreshold(key,v,false,true);cmd('runtime_detector_settings',detectorThresholdPayload(key,v)).catch(e=>{setText('serviceState','error');setText('conn',String(e))}).finally(()=>{detectorThresholdBusy[key]=false;paintDetectorThreshold(key,detectorThresholds[key],false,true);refresh()})}
 function adjustDetectorThreshold(channel,delta){let key=channel==='lower'?'lower':'upper';if(detectorThresholdBusy[key])return;setDetectorThreshold(key,clampDetectorThreshold(detectorThresholds[key])+Number(delta||0))}
@@ -2643,6 +2838,8 @@ function detectorCount(v){v=Number(v||0);return Number.isFinite(v)&&v>0?Math.flo
 function resetDetectorCounter(channel){let key=channel==='lower'?'lower':'upper';detectorFireSeq[key]=null;detectorFlashUntil[key]=0;cmd('reset_detector_counts',{channel:channel}).catch(e=>{setText('serviceState','error');setText('conn',String(e))})}
 function detectorDisplayScale(det){let v=Number((det||{}).display_scale);if(!Number.isFinite(v)||v<=0)v=16384.250003814755;return v}
 function detectorDisplayLevel(v,det){v=Number(v);if(!Number.isFinite(v)||v<0)return NaN;let scale=detectorDisplayScale(det);return Math.max(0,Math.min(65535,Math.round(v/scale)))}
+function detectorPlotThreshold(channel,normStats){let det=(lastStatus&&lastStatus.detector)||{},v=channel==='lower'?Number(det.trigger1):Number(det.trigger0);if(!Number.isFinite(v)||v<=0)v=channel==='lower'?Number(det.thr1):Number(det.thr0);let level=detectorDisplayLevel(v,det);if(normalizationEnabled()&&normStats){let mx=Number(normStats.display_max);if(Number.isFinite(level)&&Number.isFinite(mx)&&mx>0)level=level*65535/mx}return Math.max(0,Math.min(65535,Math.round(level)))}
+function detectorPlotThresholdLabel(channel){let det=(lastStatus&&lastStatus.detector)||{},channels=det.channels||{},ch=channel==='lower'?(channels.lower||{}):(channels.upper||{}),raw=channel==='lower'?Number(det.trigger1):Number(det.trigger0);if(!Number.isFinite(raw)||raw<=0)raw=channel==='lower'?Number(det.thr1):Number(det.thr0);let level=detectorDisplayLevel(raw,det),txt=Number.isFinite(level)?detectorThresholdText(level,true):'';return (ch.auto_threshold?'AUTO ':'THR ')+txt}
 function detectorLevelText(v,det){let x=detectorDisplayLevel(v,det);return Number.isFinite(x)?String(x):'-----'}
 function detectorNoiseHtml(lvl,thr,avg,det){return '<i class="det-noise-label">x/t/a&nbsp;</i><i class="det-noise-num">'+detectorLevelText(lvl,det)+'</i><i class="det-noise-sep">/</i><i class="det-noise-num">'+detectorLevelText(thr,det)+'</i><i class="det-noise-sep">/</i><i class="det-noise-num">'+detectorLevelText(avg,det)+'</i>'}
 function detectorNoiseSource(thr,lvl){let t=Number(thr);if(Number.isFinite(t)&&t>0)return t;let x=Number(lvl);return Number.isFinite(x)?x:NaN}
@@ -2760,17 +2957,65 @@ function drawMarkerRanges(ctx,markers,xs,sampleCount,w,plotH,d,frameMark){
   ctx.restore();
 }
 function drawTrace(ctx,arr,color,w,plotH){let n=arr&&arr.length||0;if(n<2)return;let sx=w/(n-1),sy=plotH/65535;ctx.strokeStyle=color;ctx.lineWidth=Math.max(1,(window.devicePixelRatio||1)*1.2);ctx.beginPath();for(let i=0;i<n;i++){let v=arr[i];if(v<0)v=0;else if(v>65535)v=65535;let y=plotH-v*sy;if(i===0)ctx.moveTo(0,y);else ctx.lineTo(i*sx,y)}ctx.stroke()}
-function drawPlot(canvas,empty,xs,a,b,prod,c1,c2,c3,win,markers,frameMark){let size=resizeCanvas(canvas);let ctx=canvas.getContext('2d');let labelH=Math.max(24*size.d,22);let plotH=Math.max(24,size.h-labelH);let count=Math.max((a&&a.length)||0,(b&&b.length)||0,(prod&&prod.length)||0);drawGrid(ctx,size.w,size.h,plotH,labelH,size.d);drawWorkingWindow(ctx,win,xs,count,size.w,plotH,size.d);drawMarkerRanges(ctx,markers||[],xs,count,size.w,plotH,size.d,frameMark);drawXAxis(ctx,xs,count,size.w,size.h,plotH,labelH,size.d);let ok=(a&&a.length>1)||(b&&b.length>1)||(prod&&prod.length>1);if(ok){drawTrace(ctx,a,c1,size.w,plotH);drawTrace(ctx,b,c2,size.w,plotH);drawTrace(ctx,prod,c3,size.w,plotH)}empty.style.display=ok?'none':'grid'}
+function drawLevelLine(ctx,value,color,w,plotH,d,label){let v=Number(value);if(!Number.isFinite(v)||v<=0)return;v=Math.max(0,Math.min(65535,v));let y=plotH-(v*plotH/65535);ctx.save();ctx.strokeStyle=color;ctx.lineWidth=Math.max(1,1.4*d);ctx.setLineDash([7*d,4*d]);ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();ctx.setLineDash([]);if(label){let txt=String(label),fs=Math.max(9,10*d),padX=4*d,padY=2*d;ctx.font='800 '+fs+'px ui-monospace,SFMono-Regular,Consolas,monospace';let tw=ctx.measureText(txt).width,boxW=tw+padX*2,boxH=fs+padY*2,x=Math.max(2*d,w-boxW-6*d),yy=Math.max(2*d,Math.min(plotH-boxH-2*d,y-boxH-3*d));ctx.fillStyle='rgba(4,17,31,.82)';ctx.fillRect(x,yy,boxW,boxH);ctx.fillStyle=color;ctx.fillText(txt,x+padX,yy+fs+padY*.35)}ctx.restore()}
+function drawPlot(canvas,empty,xs,a,b,prod,c1,c2,c3,win,markers,frameMark,thresholdLevel,thresholdLabel){let size=resizeCanvas(canvas);let ctx=canvas.getContext('2d');let labelH=Math.max(24*size.d,22);let plotH=Math.max(24,size.h-labelH);let count=Math.max((a&&a.length)||0,(b&&b.length)||0,(prod&&prod.length)||0);drawGrid(ctx,size.w,size.h,plotH,labelH,size.d);drawWorkingWindow(ctx,win,xs,count,size.w,plotH,size.d);drawMarkerRanges(ctx,markers||[],xs,count,size.w,plotH,size.d,frameMark);drawXAxis(ctx,xs,count,size.w,size.h,plotH,labelH,size.d);let ok=(a&&a.length>1)||(b&&b.length>1)||(prod&&prod.length>1);if(ok){drawTrace(ctx,a,c1,size.w,plotH);drawTrace(ctx,b,c2,size.w,plotH);drawTrace(ctx,prod,c3,size.w,plotH);drawLevelLine(ctx,thresholdLevel,'rgba(255,79,216,.95)',size.w,plotH,size.d,thresholdLabel)}empty.style.display=ok?'none':'grid'}
 function normNumber(v){v=Number(v);if(!Number.isFinite(v))return'---';let a=Math.abs(v);if(a>=1000000||(a>0&&a<0.01))return v.toExponential(2);if(a>=1000)return String(Math.round(v));let s=v.toFixed(2);return s.replace(/\.?0+$/,'')}
 function normScale(v){v=Number(v);if(!Number.isFinite(v)||v<=0)return'0';if(v>=1000||v<0.01)return v.toExponential(2);let s=v.toFixed(3);return s.replace(/\.?0+$/,'')}
 function setNormReadout(id,stats,label){let el=byId(id);if(!el)return;if(!stats){setElText(el,'');setClassToggle(el,'active',false);setTooltip(el,'');return}let text=label+' src:'+normNumber(stats.display_min)+'..'+normNumber(stats.display_max)+' d='+normNumber(stats.display_span);setElText(el,text);setClassToggle(el,'active',true);setTooltip(el,'Source product magnitude in the normal display scale 0..65535: '+normNumber(stats.display_min)+'..'+normNumber(stats.display_max)+', span '+normNumber(stats.display_span)+'. Calculated as abs(raw)/product scale from zero before normalization; BMI30_PROD_SCALE overrides the full-scale ADC default. Raw magnitude: '+normNumber(stats.min)+'..'+normNumber(stats.max)+'.')}
-	function updateNormReadouts(f,showProd){if(!showProd||!f){setNormReadout('upperNorm',null,'');setNormReadout('lowerNorm',null,'');return}setNormReadout('upperNorm',f.prod_norm0,'N');setNormReadout('lowerNorm',f.prod_norm1,'N')}
+	function setV7Readout(id,meta,label){
+		let el=byId(id);
+		if(!el)return;
+		if(!meta){
+			setElText(el,'');
+			setClassToggle(el,'active',false);
+			setTooltip(el,'');
+			return;
+		}
+		let kind=String(meta.score_kind||'COMBINED'),dc=String(meta.dc_filter_mode||'OFF'),shift=Number(meta.shift)||0,peak=Number(meta.peak)||0,norm=Number(meta.score_norm)||0,energy=Number(meta.energy)||0,noise=Number(meta.noise_floor)||0,mx=Number(meta.sum_max_idx),mn=Number(meta.sum_min_idx),mid=Number(meta.sum_mid_idx),gap=Number(meta.sum_lobe_gap)||0,p2p=Number(meta.sum_p2p)||0,mxv=Number(meta.sum_max_value)||0,mnv=Number(meta.sum_min_value)||0;
+		let lobes=(Number.isFinite(mx)&&Number.isFinite(mn)&&Number.isFinite(mid))?(' mx:'+Math.round(mx)+' mn:'+Math.round(mn)+' mid:'+normNumber(mid)):'';
+		let text=label+' '+kind+' sh:'+Math.round(shift)+' pk:'+Math.round(peak)+lobes+' n:'+normNumber(norm);
+		setElText(el,text);
+		setClassToggle(el,'active',true);
+		setTooltip(el,'Mode 7 '+kind+' '+dc+': shift '+Math.round(shift)+', energy peak '+Math.round(peak)+', sum max idx '+normNumber(mx)+' value '+normNumber(mxv)+', sum min idx '+normNumber(mn)+' value '+normNumber(mnv)+', bipolar mid '+normNumber(mid)+', gap '+normNumber(gap)+', p2p '+normNumber(p2p)+', norm '+normNumber(norm)+', energy '+normNumber(energy)+', noise '+normNumber(noise)+'.');
+	}
+	function updateNormReadouts(f,showProd,mode){
+		if(Number(mode)===7&&playerState.playback){
+			setV7Readout('upperNorm',f&&f.v7_meta0,'V7');
+			setV7Readout('lowerNorm',f&&f.v7_meta1,'V7');
+			return;
+		}
+		if(!showProd||!f){
+			setNormReadout('upperNorm',null,'');
+			setNormReadout('lowerNorm',null,'');
+			return;
+		}
+		setNormReadout('upperNorm',f.prod_norm0,'N');
+		setNormReadout('lowerNorm',f.prod_norm1,'N');
+	}
+	function setScopeLegend(cardId,labels){
+		let card=byId(cardId),spans=card?card.querySelectorAll('.legend span'):[];
+		(labels||[]).forEach(function(label,idx){
+			let span=spans[idx];
+			if(!span)return;
+			let sw=span.querySelector('.sw');
+			span.textContent=String(label||'');
+			if(sw)span.insertBefore(sw,span.firstChild);
+		});
+	}
 	function applyModeVisibility(mode){mode=Number(mode)||0;let upper=byId('upperCard'),lower=byId('lowerCard'),scope=document.querySelector('.scope');setClassToggle(upper,'hidden',mode===2);setClassToggle(lower,'hidden',mode===1);setClassToggle(scope,'single',mode===1||mode===2);if(scope){scope.dataset.scopeMode=String(mode)}}
 	function playerArrayCopy(arr){if(!arr)return[];try{return Array.prototype.slice.call(arr)}catch(e){let out=[];for(let i=0;i<(arr.length||0);i++)out.push(Number(arr[i])||0);return out}}
-	function playerCompactFrame(f){if(!f||!f.available)return null;let out={ok:!!f.ok,available:!!f.available,base_buf_len:Number(f.base_buf_len)||0,step:Number(f.step)||1,count:Number(f.count)||((f.x||[]).length||0),last_frame_t:Number(f.last_frame_t)||0,_channels:f._channels||lastFrameChannels||'both',prod_norm0:f.prod_norm0||null,prod_norm1:f.prod_norm1||null};['x','data0_even','data0_odd','data1_even','data1_odd','prod0','prod1','prod0_normed','prod1_normed'].forEach(function(k){if(f[k])out[k]=playerArrayCopy(f[k])});return out}
+	function playerCompactFrame(f){
+		if(!f||!f.available)return null;
+		let out={ok:!!f.ok,available:!!f.available,base_buf_len:Number(f.base_buf_len)||0,step:Number(f.step)||1,count:Number(f.count)||((f.x||[]).length||0),last_frame_t:Number(f.last_frame_t)||0,_channels:f._channels||lastFrameChannels||'both',prod_norm0:f.prod_norm0||null,prod_norm1:f.prod_norm1||null,v7_meta0:f.v7_meta0||null,v7_meta1:f.v7_meta1||null};
+		['x','data0_even','data0_odd','data1_even','data1_odd','prod0','prod1','prod0_normed','prod1_normed','v7_sum0','v7_sum1','v7_product0','v7_product1','v7_energy0','v7_energy1'].forEach(function(k){if(f[k])out[k]=playerArrayCopy(f[k])});
+		return out;
+	}
 	function playerCompactStatus(s){s=s||{};let mode=s.mode||{},det=s.detector||{},tim2=s.tim2||{},sound=s.sound||{},win=s.working_window||null;return{t:Date.now(),mode_selected:Number(mode.selected)||0,stream_mode:Number(mode.stream_mode)||0,base_buf_len:Number(mode.base_buf_len)||0,freq_hz:Number(mode.freq_hz||mode.desired_freq)||0,avg_n:Number(mode.avg_n)||0,working_window:win,tx:!!tim2.enabled,sound:!!sound.enabled,detector:{enabled:!!det.enabled,active:!!det.active,thr0:Number(det.thr0)||0,thr1:Number(det.thr1)||0,lvl0:Number(det.lvl0)||0,lvl1:Number(det.lvl1)||0,display_scale:Number(det.display_scale)||detectorDisplayScale(det),display_unit:String(det.display_unit||'u16'),hold0:!!det.hold0,hold1:!!det.hold1,fire_seq0:detectorCount(det.fire_seq0),fire_seq1:detectorCount(det.fire_seq1),gate0:!!det.gate0,gate1:!!det.gate1,gate_reason0:String(det.gate_reason0||''),gate_reason1:String(det.gate_reason1||''),channels:det.channels||{}}}}
 	function playerTagTypeValue(value){let v=String(value||'').trim().toLowerCase().replace(/[^a-z0-9_-]+/g,'_');if(v==='tag_casino'||v==='casino_tag'||v==='cas')v='casino';if(v==='tag_barkhausen'||v==='bark'||v==='barkhausen_tag')v='barkhausen';if(v==='tag_microwire'||v==='micro'||v==='mic'||v==='microwire_tag')v='microwire';if(v==='tag_paper'||v==='paper_tag'||v==='pap')v='paper';return(v==='barkhausen'||v==='microwire'||v==='paper')?v:'casino'}
-	function playerTagChannelValue(value){let v=String(value||'').trim().toLowerCase();return(v==='lower'||v==='l'||v==='1'||v==='adc1'||v==='ch1')?'lower':((v==='upper'||v==='u'||v==='0'||v==='adc0'||v==='ch0')?'upper':'')}
+	function playerTagChannelValue(value){let v=String(value||'').trim().toLowerCase();if(v==='both'||v==='all'||v==='u+l'||v==='l+u'||v==='upper+lower'||v==='lower+upper'||v==='upper,lower'||v==='lower,upper'||v==='2')return'both';return(v==='lower'||v==='l'||v==='1'||v==='adc1'||v==='ch1')?'lower':((v==='upper'||v==='u'||v==='0'||v==='adc0'||v==='ch0')?'upper':'')}
+	function playerTagChannels(value){let ch=playerTagChannelValue(value);if(ch==='both')return['upper','lower'];return ch?[ch]:[]}
+	function playerTagChannelContains(value,channel){let ch=playerTagChannelValue(channel);if(ch==='both')return playerTagChannels(value).length===2;if(!ch)return false;return playerTagChannels(value).indexOf(ch)>=0}
+	function playerJoinTagChannels(channels){let seen={upper:false,lower:false};(channels||[]).forEach(function(ch){ch=playerTagChannelValue(ch);if(ch==='both'){seen.upper=true;seen.lower=true}else if(ch==='upper'||ch==='lower')seen[ch]=true});return seen.upper&&seen.lower?'both':(seen.lower?'lower':(seen.upper?'upper':''))}
 	function playerTagTypeLong(value){let v=playerTagTypeValue(value);return v==='barkhausen'?'Barkhausen':(v==='microwire'?'Microwire':(v==='paper'?'Paper':'Casino'))}
 	function playerTagTypeShort(value){let v=playerTagTypeValue(value);return v==='barkhausen'?'BARK':(v==='microwire'?'MICRO':(v==='paper'?'PAPER':'CASINO'))}
 	function playerMarkerLabel(marker){let raw=marker&&marker.tag_type;if(!raw)return 'TAG';return playerTagTypeShort(raw)}
@@ -2785,18 +3030,21 @@ function setNormReadout(id,stats,label){let el=byId(id);if(!el)return;if(!stats)
 			if(!m)return;
 			let kind=String(m.kind||'').toLowerCase();
 			if(!(kind==='tag'||kind==='det'||kind==='detect'||kind==='detection'||markerIsManual(m)))return;
-			let ch=playerTagChannelValue(m.channel)||'upper';
-			let tag=playerTagTypeValue(m.tag_type||rec.tag_type||playerState.tagType),seekMark=mark||'tag',hold=Math.max(0,Math.round(Number(m.hold_id||m.tag_hold_id)||0)),key=ch+':'+tag+':'+seekMark+':strong';
-			if(!seen[key]){
-				seen[key]=true;
-				out.push({channel:ch,tag:tag,mark:seekMark,weak:false,votes:0,hold_id:hold});
-			}
+			let channels=playerTagChannels(m.channel);
+			if(!channels.length)channels=['upper'];
+			channels.forEach(function(ch){
+				let tag=playerTagTypeValue(m.tag_type||rec.tag_type||playerState.tagType),seekMark=mark||'tag',hold=Math.max(0,Math.round(Number(m.hold_id||m.tag_hold_id)||0)),key=ch+':'+tag+':'+seekMark+':strong';
+				if(!seen[key]){
+					seen[key]=true;
+					out.push({channel:ch,tag:tag,mark:seekMark,weak:false,votes:0,hold_id:hold});
+				}
+			});
 		});
 		if(!out.length&&mark){
 			let tag=playerRecordTagType(rec)||playerTagTypeValue(rec.tag_type||playerState.tagType);
 			if(mark==='tag'){
-				let tagCh=playerTagChannelValue(rec.tag_channel||rec.channel),pos=String(rec.tag_position||rec.position||'unknown').toLowerCase(),scope=String(rec.tag_scope||rec.scope||'frame').toLowerCase(),votes=Math.max(0,Math.round(Number(rec.tag_votes)||0)),hold=Math.max(0,Math.round(Number(rec.tag_hold_id||rec.hold_id)||0));
-				if(tagCh)out.push({channel:tagCh,tag:tag,mark:mark,weak:(pos==='unknown'||scope==='frame'),votes:votes,hold_id:hold});
+				let tagChannels=playerTagChannels(rec.tag_channel||rec.channel),pos=String(rec.tag_position||rec.position||'unknown').toLowerCase(),scope=String(rec.tag_scope||rec.scope||'frame').toLowerCase(),votes=Math.max(0,Math.round(Number(rec.tag_votes)||0)),hold=Math.max(0,Math.round(Number(rec.tag_hold_id||rec.hold_id)||0));
+				tagChannels.forEach(function(tagCh){out.push({channel:tagCh,tag:tag,mark:mark,weak:(pos==='unknown'||scope==='frame'),votes:votes,hold_id:hold})});
 			}else{
 				out.push({channel:'upper',tag:tag,mark:mark,weak:false,votes:0,hold_id:0});
 				out.push({channel:'lower',tag:tag,mark:mark,weak:false,votes:0,hold_id:0});
@@ -2884,7 +3132,7 @@ function setNormReadout(id,stats,label){let el=byId(id);if(!el)return;if(!stats)
 	}
 	function playerSetTagType(value,applyCurrent){playerState.tagType=playerTagTypeValue(value);setSelectValue('playerTagType',playerState.tagType);if(applyCurrent){let rec=playerFrame(),changed=false;if(rec){if(String(rec.mark||'').toLowerCase()==='tag'&&String(rec.tag_type||'')!==playerState.tagType){rec.tag_type=playerState.tagType;changed=true}if(Array.isArray(rec.markers)){rec.markers.forEach(function(m){if(markerIsManual(m)&&String(m.tag_type||'')!==playerState.tagType){m.tag_type=playerState.tagType;changed=true}})}if(changed){playerState.dirty=true;if(rec.frame)renderFrame(rec.frame,true);updatePlayerUi()}}}return playerState.tagType}
 	function playerSyncTagTypeSelect(rec){let next=playerCurrentTagType(rec||playerFrame());playerSetTagType(next)}
-	function playerLabelText(mark,type,rec){let weak=rec&&String(rec.tag_position||rec.position||'').toLowerCase()==='unknown',ch=playerTagChannelValue(rec&&rec.tag_channel||rec&&rec.channel),chText=ch==='lower'?' L':(ch==='upper'?' U':''),votes=Math.max(0,Math.round(Number(rec&&rec.tag_votes)||0)),voteText=votes>1?(' x'+votes):'';return mark==='tag'?('TAG'+chText+(weak?'?:':':')+playerTagTypeLong(type||playerState.tagType)+voteText):(mark==='clean'?'CLEAN':(mark==='noise'?'NOISE':(mark==='interference'?'INTERF':(mark==='false'?'FALSE':'none'))))}
+	function playerLabelText(mark,type,rec){let weak=rec&&String(rec.tag_position||rec.position||'').toLowerCase()==='unknown',ch=playerTagChannelValue(rec&&rec.tag_channel||rec&&rec.channel),chText=ch==='both'?' U+L':(ch==='lower'?' L':(ch==='upper'?' U':'')),votes=Math.max(0,Math.round(Number(rec&&rec.tag_votes)||0)),voteText=votes>1?(' x'+votes):'';return mark==='tag'?('TAG'+chText+(weak?'?:':':')+playerTagTypeLong(type||playerState.tagType)+voteText):(mark==='clean'?'CLEAN':(mark==='noise'?'NOISE':(mark==='interference'?'INTERF':(mark==='false'?'FALSE':'none'))))}
 	function normalizationEnabled(){return !!(((lastStatus||{}).normalization||{}).enabled)}
 	function setNormalizationState(enabled){lastStatus=lastStatus||{};lastStatus.normalization=lastStatus.normalization||{};lastStatus.normalization.enabled=!!enabled;setActive('normBtn',!!enabled)}
 	function playerProdArray(f,name){if(!f)return[];if(playerState.playback&&normalizationEnabled()){let alt=f[name+'_normed'];if(alt&&alt.length)return alt}return f[name]||[]}
@@ -2918,21 +3166,62 @@ function setNormReadout(id,stats,label){let el=byId(id);if(!el)return;if(!stats)
 	}
 	function playerMissingTagChannelCount(){let n=0;playerState.frames.forEach(function(rec){if(rec&&String(rec.mark||'').trim().toLowerCase()==='tag'&&!playerTagChannelValue(rec.tag_channel||rec.channel))n++});return n}
 	function playerFrame(){return(playerState.idx>=0&&playerState.idx<playerState.frames.length)?playerState.frames[playerState.idx]:null}
-	function playerRenderMode(){let rec=playerFrame();return rec&&rec.status?Number(rec.status.mode_selected||6):statusMode()}
+	function playerRenderMode(){
+		let rec=playerFrame();
+		if(playerState.playback){
+			let requested=Number(lastRunMode)||0,frame=rec&&rec.frame;
+			if(requested===7&&frame&&(frame.v7_energy0||frame.v7_energy1))return 7;
+			if(requested>0&&requested<7)return requested;
+			if(requested===6)return 6;
+			return rec&&rec.status?Number(rec.status.mode_selected||6):6;
+		}
+		return statusMode();
+	}
 	function playerWorkingWindow(){let rec=playerFrame();return rec&&rec.status&&rec.status.working_window?rec.status.working_window:currentWorkingWindow}
 	function updatePlayerReserve(){let root=document.documentElement,panel=byId('playerPanel');if(playerState.open&&panel&&!panel.classList.contains('hidden')){let rect=panel.getBoundingClientRect();let reserve=Math.ceil(rect.height+(window.innerWidth<=560?12:22));root.setAttribute('data-player-panel','open');root.style.setProperty('--player-reserve',reserve+'px')}else{root.removeAttribute('data-player-panel');root.style.removeProperty('--player-reserve')}}
 	function playerMarkers(channel){let rec=playerFrame(),markers=(rec&&Array.isArray(rec.markers))?rec.markers:[];return markers.filter(function(m){return !m.channel||m.channel===channel})}
 	function playerEnsureMarkers(rec){if(!rec.markers||!Array.isArray(rec.markers))rec.markers=[];return rec.markers}
 	function playerManualizeMarker(m,channel){if(!m)return null;m.channel=channel;m.kind='tag';m.source='manual';m.editable=true;m.tag_type=playerTagTypeValue(m.tag_type||playerState.tagType);m.start=Math.max(0,Math.round(Number(m.start)||0));m.end=Math.max(m.start+1,Math.round(Number(m.end)||m.start+1));m.peak=Math.max(m.start,Math.min(m.end,Math.round(Number(m.peak)||((m.start+m.end)/2))));return m}
 	function playerEditedRanges(){let out=[];playerState.frames.forEach(function(rec,idx){if(!rec||!Array.isArray(rec.markers))return;let packet=Number(rec.packet_idx);if(!Number.isFinite(packet))packet=idx;packet=Math.max(0,Math.floor(packet));rec.markers.forEach(function(m){if(!markerIsManual(m))return;let start=Math.max(0,Math.round(Number(m.start)||0)),end=Math.max(0,Math.round(Number(m.end)||start+1));if(end<start){let t=start;start=end;end=t}if(end<=start)end=start+1;let peak=Math.max(start,Math.min(end,Math.round(Number(m.peak)||((start+end)/2))));out.push({packet_idx:packet,channel:String(m.channel||'upper')==='lower'?'lower':'upper',start:start,end:end,peak:peak,kind:'tag',tag_type:playerTagTypeValue(m.tag_type||rec.tag_type||playerState.tagType)})})});return out}
+	function playerDeletedRangeRecord(rec,marker,idx){if(!rec||!marker)return null;let packet=Number(rec.packet_idx);if(!Number.isFinite(packet))packet=idx;packet=Math.max(0,Math.floor(packet));let start=Math.max(0,Math.round(Number(marker.start)||0)),end=Math.max(0,Math.round(Number(marker.end)||start+1));if(end<start){let t=start;start=end;end=t}if(end<=start)end=start+1;let peak=Math.max(start,Math.min(end,Math.round(Number(marker.peak)||((start+end)/2)))),channel=playerTagChannelValue(marker.channel)||'upper',kind=String(marker.kind||'det').trim().toLowerCase()||'det';return{packet_idx:packet,channel:channel==='lower'?'lower':'upper',start:start,end:end,peak:peak,kind:kind,tol:2}}
+	function playerRememberDeletedRange(rec,marker){if(markerIsManual(marker))return;let idx=Math.max(0,playerState.idx),item=playerDeletedRangeRecord(rec,marker,idx);if(!item)return;if(!Array.isArray(rec.deleted_ranges))rec.deleted_ranges=[];let key=[item.packet_idx,item.channel,item.start,item.end,item.peak,item.kind].join(':');for(let i=0;i<rec.deleted_ranges.length;i++){let old=rec.deleted_ranges[i]||{},oldKey=[old.packet_idx,old.channel,old.start,old.end,old.peak,old.kind].join(':');if(oldKey===key)return}rec.deleted_ranges.push(item)}
+	function playerEditedDeletedRanges(){let out=[];playerState.frames.forEach(function(rec,idx){if(!rec||!Array.isArray(rec.deleted_ranges))return;rec.deleted_ranges.forEach(function(item){if(!item)return;let packet=Number(item.packet_idx);if(!Number.isFinite(packet))packet=Number(rec.packet_idx);if(!Number.isFinite(packet))packet=idx;packet=Math.max(0,Math.floor(packet));let start=Math.max(0,Math.round(Number(item.start)||0)),end=Math.max(0,Math.round(Number(item.end)||start+1));if(end<start){let t=start;start=end;end=t}if(end<=start)end=start+1;let peak=Math.max(start,Math.min(end,Math.round(Number(item.peak)||((start+end)/2)))),channel=playerTagChannelValue(item.channel)||'upper',kind=String(item.kind||'det').trim().toLowerCase()||'det',tol=Math.max(0,Math.round(Number(item.tol)||2));out.push({packet_idx:packet,channel:channel==='lower'?'lower':'upper',start:start,end:end,peak:peak,kind:kind,tol:tol})})});return out}
 	function playerPlotInfo(canvas,ev){let rec=playerFrame(),f=rec&&rec.frame;if(!canvas||!f||!f.available)return null;let r=canvas.getBoundingClientRect(),d=canvas.width/Math.max(1,r.width),labelH=Math.max(24*d,22),plotH=Math.max(24,canvas.height-labelH),plotHCss=plotH/d;if(ev&&((ev.clientY-r.top)<0||(ev.clientY-r.top)>plotHCss))return null;let count=Number(f.count)||Math.max((f.data0_even&&f.data0_even.length)||0,(f.data0_odd&&f.data0_odd.length)||0,(f.data1_even&&f.data1_even.length)||0,(f.data1_odd&&f.data1_odd.length)||0,(f.prod0&&f.prod0.length)||0,(f.prod1&&f.prod1.length)||0);let xs=f.x||makeFrameX(count,Number(f.step)||1);count=Math.max(count,(xs&&xs.length)||0);if(count<2)return null;let minX=(xs&&xs.length)?Number(xs[0])||0:0,maxX=(xs&&xs.length)?Number(xs[xs.length-1])||count-1:count-1;if(maxX<=minX)return null;let xCss=Math.max(0,Math.min(r.width,(ev?ev.clientX:r.left)-r.left)),sample=minX+(xCss/r.width)*(maxX-minX),tol=Math.max(2,(maxX-minX)*10/Math.max(1,r.width));return{rec:rec,frame:f,rect:r,minX:minX,maxX:maxX,sample:sample,tol:tol,channel:canvas.id==='lowerPlot'?'lower':'upper'}}
+	function playerRememberPlotInfo(info){if(!info)return;playerState.lastPlotChannel=info.channel;playerState.lastPlotSample=Number(info.sample)}
 	function playerRangeHit(info){let markers=playerMarkers(info.channel),best=null,bestDist=1e99;markers.forEach(function(m){let start=Number(m.start)||0,end=Number(m.end)||start+1,ds=Math.abs(info.sample-start),de=Math.abs(info.sample-end);if(ds<=info.tol&&ds<bestDist){best={marker:m,edge:'start'};bestDist=ds}if(de<=info.tol&&de<bestDist){best={marker:m,edge:'end'};bestDist=de}});return best}
+	function playerMarkerScore(marker,sample){let start=Number(marker.start)||0,end=Number(marker.end)||start+1,peak=Number(marker.peak);if(!Number.isFinite(peak))peak=(start+end)/2;if(Number.isFinite(sample))return Math.min(Math.abs(sample-start),Math.abs(sample-end),Math.abs(sample-peak),Math.abs(sample-((start+end)/2)));return markerIsManual(marker)?0.1:0.2}
+	function playerDeleteExactMark(channel,marker){
+		let rec=playerFrame();
+		if(!rec||!Array.isArray(rec.markers)||!rec.markers.length){setText('serviceState','no exact mark');updatePlayerUi();return}
+		let ch=playerTagChannelValue(channel||playerState.lastPlotChannel);
+		if(ch==='both')ch='';
+		let sample=Number(playerState.lastPlotSample),bestIdx=-1,bestScore=1e99;
+		rec.markers.forEach(function(m,i){
+			if(marker&&m!==marker)return;
+			let mch=playerTagChannelValue(m&&m.channel)||'upper';
+			if(ch&&mch!==ch)return;
+			let score=playerMarkerScore(m,Number.isFinite(sample)?sample:NaN);
+			if(score<bestScore){bestScore=score;bestIdx=i}
+		});
+		if(bestIdx<0&&ch&&!marker){
+			rec.markers.forEach(function(m,i){let score=playerMarkerScore(m,Number.isFinite(sample)?sample:NaN)+0.5;if(score<bestScore){bestScore=score;bestIdx=i}});
+		}
+		if(bestIdx<0){setText('serviceState','no exact mark');updatePlayerUi();return}
+		let removed=rec.markers[bestIdx];
+		playerRememberDeletedRange(rec,removed);
+		rec.markers.splice(bestIdx,1);
+		playerState.dirty=true;
+		setText('serviceState','exact mark deleted');
+		if(rec.frame)renderFrame(rec.frame,true);
+		updatePlayerUi();
+	}
 	function playerRangeSetEdge(marker,edge,sample){sample=Math.max(0,Math.round(Number(sample)||0));let start=Math.max(0,Math.round(Number(marker.start)||0)),end=Math.max(start+1,Math.round(Number(marker.end)||start+1));if(edge==='start')start=Math.min(sample,end-1);else end=Math.max(sample,start+1);marker.start=start;marker.end=end;marker.peak=Math.max(start,Math.min(end,Math.round((start+end)/2)));playerState.dirty=true}
-	function playerPlotPointerDown(ev){if(!playerState.playback)return;let info=playerPlotInfo(ev.currentTarget,ev);if(!info)return;ev.preventDefault();let hit=playerRangeHit(info),markers=playerEnsureMarkers(info.rec),marker=null,edge='end';if(hit){marker=playerManualizeMarker(hit.marker,info.channel);edge=hit.edge}else{let s=Math.max(0,Math.round(info.sample));marker={channel:info.channel,start:s,end:s+1,peak:s,kind:'tag',tag_type:playerTagTypeValue(playerState.tagType),source:'manual',editable:true};markers.push(marker);edge='end'}playerState.rangeDrag={canvas:ev.currentTarget,marker:marker,edge:edge,channel:info.channel,startSample:Math.round(info.sample)};try{ev.currentTarget.setPointerCapture(ev.pointerId)}catch(e){}playerRangeSetEdge(marker,edge,info.sample);renderFrame(info.frame,true);updatePlayerUi()}
-	function playerPlotPointerMove(ev){let drag=playerState.rangeDrag;if(drag){let info=playerPlotInfo(drag.canvas,ev);if(!info)return;ev.preventDefault();playerRangeSetEdge(drag.marker,drag.edge,info.sample);renderFrame(info.frame,true);updatePlayerUi();return}let info=playerPlotInfo(ev.currentTarget,ev);if(!info||!playerState.playback){ev.currentTarget.style.cursor='';return}ev.currentTarget.style.cursor=playerRangeHit(info)?'ew-resize':'crosshair'}
-	function playerPlotPointerUp(ev){let drag=playerState.rangeDrag;if(!drag)return;let info=playerPlotInfo(drag.canvas,ev);if(info){playerRangeSetEdge(drag.marker,drag.edge,info.sample);renderFrame(info.frame,true)}try{drag.canvas.releasePointerCapture(ev.pointerId)}catch(e){}playerState.rangeDrag=null;updatePlayerUi()}
-	function initPlayerPlotEditing(){['upperPlot','lowerPlot'].forEach(function(id){let c=byId(id);if(!c||c.dataset.playerRangeEdit==='1')return;c.dataset.playerRangeEdit='1';c.addEventListener('pointerdown',playerPlotPointerDown);c.addEventListener('pointermove',playerPlotPointerMove);c.addEventListener('pointerup',playerPlotPointerUp);c.addEventListener('pointercancel',playerPlotPointerUp);c.addEventListener('pointerleave',function(ev){if(!playerState.rangeDrag)c.style.cursor=''})})}
-	function updatePlayerUi(){let total=playerState.frames.length,rec=playerFrame(),idx=playerState.idx,raw=((lastStatus||{}).player_recorder)||{},mark=String((rec&&rec.mark)||'').toLowerCase(),tagCh=playerTagChannelValue(rec&&rec.tag_channel||rec&&rec.channel),liveCh=playerTagChannelValue(playerState.liveTagChannel);if(raw&&raw.recording&&!playerState.playback)playerState.recording=true;setClassToggle(byId('playerToggle'),'active',playerState.open);setClassToggle(byId('playerRecBtn'),'active',playerState.recording);setClassToggle(byId('playerPlayBtn'),'active',playerState.playing);setClassToggle(byId('playerLiveBtn'),'active',!playerState.playback&&freezeMode==='live');setElText(byId('playerRecBtn'),playerState.recording?'Stop':'Rec');setElText(byId('playerPlayBtn'),playerState.playing?'Pause':'Play');setClassToggle(byId('playerSaveBtn'),'active',playerState.dirty);setClassToggle(byId('playerMarkTagUpperBtn'),'active',(mark==='tag'&&tagCh==='upper')||liveCh==='upper');setClassToggle(byId('playerMarkTagLowerBtn'),'active',(mark==='tag'&&tagCh==='lower')||liveCh==='lower');setClassToggle(byId('playerMarkCleanBtn'),'active',mark==='clean');setClassToggle(byId('playerMarkNoiseBtn'),'active',mark==='noise');setClassToggle(byId('playerMarkInterfBtn'),'active',mark==='interference');setClassToggle(byId('playerMarkFalseBtn'),'active',mark==='false');setSelectValue('playerTagType',playerCurrentTagType(rec));let seek=byId('playerSeek');if(seek){seek.max=String(Math.max(0,total-1));seek.value=String(Math.max(0,idx))}playerUpdateSeekMarks(total);let markerCount=0;playerState.frames.forEach(function(x){if(x&&Array.isArray(x.markers))markerCount+=x.markers.length});let text=total+' frames';if(rec)text+=' | '+(idx+1)+'/'+total+' | '+playerLabelText(rec.mark,playerCurrentTagType(rec),rec);if(markerCount)text+=' | marks:'+markerCount;if(playerState.dirty)text+=' | unsaved';if(playerState.recording){text+=' | RAW '+(Number(raw.packet_count)||0)+' pkts';let liveMarks=Number(raw.live_mark_count)||0,liveVotes=Number(raw.live_tag_votes)||0;if(liveMarks||liveVotes)text+=' | live TAG '+liveMarks+'/'+liveVotes;if(liveCh)text+=' | HOLD '+liveCh.toUpperCase()}else if(playerState.playback)text+=' | PLAYBACK';if(playerState.savedFile)text+=' | '+playerState.savedFile;setElText(byId('playerStatus'),text);setTimeout(updatePlayerReserve,0)}
+	function playerPlotPointerDown(ev){if(!playerState.playback)return;let info=playerPlotInfo(ev.currentTarget,ev);if(!info)return;playerRememberPlotInfo(info);ev.preventDefault();let hit=playerRangeHit(info),markers=playerEnsureMarkers(info.rec),marker=null,edge='end';if(hit){playerRememberDeletedRange(info.rec,hit.marker);marker=playerManualizeMarker(hit.marker,info.channel);edge=hit.edge}else{let s=Math.max(0,Math.round(info.sample));marker={channel:info.channel,start:s,end:s+1,peak:s,kind:'tag',tag_type:playerTagTypeValue(playerState.tagType),source:'manual',editable:true};markers.push(marker);edge='end'}playerState.rangeDrag={canvas:ev.currentTarget,marker:marker,edge:edge,channel:info.channel,startSample:Math.round(info.sample)};try{ev.currentTarget.setPointerCapture(ev.pointerId)}catch(e){}playerRangeSetEdge(marker,edge,info.sample);renderFrame(info.frame,true);updatePlayerUi()}
+	function playerPlotPointerMove(ev){let drag=playerState.rangeDrag;if(drag){let info=playerPlotInfo(drag.canvas,ev);if(!info)return;playerRememberPlotInfo(info);ev.preventDefault();playerRangeSetEdge(drag.marker,drag.edge,info.sample);renderFrame(info.frame,true);updatePlayerUi();return}let info=playerPlotInfo(ev.currentTarget,ev);if(info)playerRememberPlotInfo(info);if(!info||!playerState.playback){ev.currentTarget.style.cursor='';return}ev.currentTarget.style.cursor=playerRangeHit(info)?'ew-resize':'crosshair'}
+	function playerPlotPointerUp(ev){let drag=playerState.rangeDrag;if(!drag)return;let info=playerPlotInfo(drag.canvas,ev);if(info){playerRememberPlotInfo(info);playerRangeSetEdge(drag.marker,drag.edge,info.sample);renderFrame(info.frame,true)}try{drag.canvas.releasePointerCapture(ev.pointerId)}catch(e){}playerState.rangeDrag=null;updatePlayerUi()}
+	function playerPlotContextMenu(ev){if(!playerState.playback)return;let info=playerPlotInfo(ev.currentTarget,ev);if(!info)return;playerRememberPlotInfo(info);let hit=playerRangeHit(info);if(!hit)return;ev.preventDefault();playerDeleteExactMark(info.channel,hit.marker);return false}
+	function initPlayerPlotEditing(){['upperPlot','lowerPlot'].forEach(function(id){let c=byId(id);if(!c||c.dataset.playerRangeEdit==='1')return;c.dataset.playerRangeEdit='1';c.addEventListener('pointerdown',playerPlotPointerDown);c.addEventListener('pointermove',playerPlotPointerMove);c.addEventListener('pointerup',playerPlotPointerUp);c.addEventListener('pointercancel',playerPlotPointerUp);c.addEventListener('contextmenu',playerPlotContextMenu);c.addEventListener('pointerleave',function(ev){if(!playerState.rangeDrag)c.style.cursor=''})})}
+	function updatePlayerUi(){let total=playerState.frames.length,rec=playerFrame(),idx=playerState.idx,raw=((lastStatus||{}).player_recorder)||{},mark=String((rec&&rec.mark)||'').toLowerCase(),tagChannels=playerTagChannels(rec&&rec.tag_channel||rec&&rec.channel),liveCh=playerTagChannelValue(playerState.liveTagChannel),liveUpper=liveCh==='upper'||liveCh==='both',liveLower=liveCh==='lower'||liveCh==='both';if(raw&&raw.recording&&!playerState.playback)playerState.recording=true;setClassToggle(byId('playerToggle'),'active',playerState.open);setClassToggle(byId('playerRecBtn'),'active',playerState.recording);setClassToggle(byId('playerPlayBtn'),'active',playerState.playing);setClassToggle(byId('playerLiveBtn'),'active',!playerState.playback&&freezeMode==='live');setElText(byId('playerRecBtn'),playerState.recording?'Stop':'Rec');setElText(byId('playerPlayBtn'),playerState.playing?'Pause':'Play');setClassToggle(byId('playerSaveBtn'),'active',playerState.dirty);setClassToggle(byId('playerMarkTagUpperBtn'),'active',(mark==='tag'&&tagChannels.indexOf('upper')>=0)||liveUpper);setClassToggle(byId('playerMarkTagLowerBtn'),'active',(mark==='tag'&&tagChannels.indexOf('lower')>=0)||liveLower);setClassToggle(byId('playerMarkCleanBtn'),'active',mark==='clean');setClassToggle(byId('playerMarkNoiseBtn'),'active',mark==='noise');setClassToggle(byId('playerMarkInterfBtn'),'active',mark==='interference');setClassToggle(byId('playerMarkFalseBtn'),'active',mark==='false');setSelectValue('playerTagType',playerCurrentTagType(rec));let seek=byId('playerSeek');if(seek){seek.max=String(Math.max(0,total-1));seek.value=String(Math.max(0,idx))}playerUpdateSeekMarks(total);let markerCount=0,deletedCount=0;playerState.frames.forEach(function(x){if(x&&Array.isArray(x.markers))markerCount+=x.markers.length;if(x&&Array.isArray(x.deleted_ranges))deletedCount+=x.deleted_ranges.length});let text=total+' frames';if(rec)text+=' | '+(idx+1)+'/'+total+' | '+playerLabelText(rec.mark,playerCurrentTagType(rec),rec);if(markerCount)text+=' | marks:'+markerCount;if(deletedCount)text+=' | deleted:'+deletedCount;if(playerState.dirty)text+=' | unsaved';if(playerState.recording){text+=' | RAW '+(Number(raw.packet_count)||0)+' pkts';let liveMarks=Number(raw.live_mark_count)||0,liveVotes=Number(raw.live_tag_votes)||0;if(liveMarks||liveVotes)text+=' | live TAG '+liveMarks+'/'+liveVotes;if(liveCh)text+=' | HOLD '+liveCh.toUpperCase()}else if(playerState.playback)text+=' | PLAYBACK';if(playerState.savedFile)text+=' | '+playerState.savedFile;setElText(byId('playerStatus'),text);setTimeout(updatePlayerReserve,0)}
 	function togglePlayerPanel(force){playerState.open=(typeof force==='boolean')?force:!playerState.open;setClassToggle(byId('playerPanel'),'hidden',!playerState.open);updatePlayerUi();updatePlayerReserve()}
 	function playerMaybeCapture(f,s){return}
 	function playerDownloadRecording(name,message){name=String(name||playerState.savedFile||'latest').trim()||'latest';let frame=byId('playerDownloadFrame');if(!frame){frame=document.createElement('iframe');frame.id='playerDownloadFrame';frame.hidden=true;document.body.appendChild(frame)}frame.src='/api/player-recording-download?name='+encodeURIComponent(name)+'&t='+encodeURIComponent(String(Date.now()));setText('serviceState',message||(name==='latest'?'latest download started':'download started'));return name}
@@ -2953,18 +3242,41 @@ function setNormReadout(id,stats,label){let el=byId(id);if(!el)return;if(!stats)
 	function playerMark(mark,channel){
 		let rec=playerFrame();
 		if(!rec)return;
-		let next=String(mark||''),tagCh=next==='tag'?playerTagChannelValue(channel):'';
+		let next=String(mark||'').trim().toLowerCase(),tagCh=next==='tag'?playerTagChannelValue(channel):'';
+		if(tagCh==='both')tagCh='';
 		if(next==='tag'&&!tagCh){setText('serviceState','tag error');setText('conn','tag channel is required');return}
-		let changed=String(rec.mark||'')!==next;
-		rec.mark=next;
+		let changed=false;
 		if(next==='tag'){
 			let tagType=playerTagTypeValue(playerState.tagType);
-			changed=changed||String(rec.tag_type||'')!==tagType||String(rec.tag_channel||rec.channel||'')!==tagCh||String(rec.tag_scope||rec.scope||'')!=='frame'||String(rec.tag_position||rec.position||'')!=='unknown'||!!rec.tag_hold_id;
-			rec.tag_type=tagType;
-			rec.tag_channel=tagCh;
-			rec.tag_scope='frame';
-			rec.tag_position='unknown';
-			if(rec.tag_hold_id)delete rec.tag_hold_id;
+			let channels=String(rec.mark||'').trim().toLowerCase()==='tag'?playerTagChannels(rec.tag_channel||rec.channel):[];
+			let pos=channels.indexOf(tagCh);
+			if(pos>=0)channels.splice(pos,1);else channels.push(tagCh);
+			let joined=playerJoinTagChannels(channels);
+			if(!joined){
+				changed=String(rec.mark||'')!==''||!!rec.tag_type||!!rec.tag_channel||!!rec.tag_scope||!!rec.tag_position||!!rec.tag_votes||!!rec.tag_confidence||!!rec.tag_source||!!rec.tag_hold_id||!!rec.hold_id;
+				rec.mark='';
+				if(rec.tag_type)delete rec.tag_type;
+				if(rec.tag_channel)delete rec.tag_channel;
+				if(rec.tag_scope)delete rec.tag_scope;
+				if(rec.tag_position)delete rec.tag_position;
+				if(rec.tag_votes)delete rec.tag_votes;
+				if(rec.tag_confidence)delete rec.tag_confidence;
+				if(rec.tag_source)delete rec.tag_source;
+				if(rec.tag_hold_id)delete rec.tag_hold_id;
+				if(rec.hold_id)delete rec.hold_id;
+			}else{
+				changed=String(rec.mark||'')!=='tag'||String(rec.tag_type||'')!==tagType||playerTagChannelValue(rec.tag_channel||rec.channel)!==joined||String(rec.tag_scope||rec.scope||'')!=='frame'||String(rec.tag_position||rec.position||'')!=='unknown'||!!rec.tag_votes||!!rec.tag_confidence||!!rec.tag_source||!!rec.tag_hold_id||!!rec.hold_id;
+				rec.mark='tag';
+				rec.tag_type=tagType;
+				rec.tag_channel=joined;
+				rec.tag_scope='frame';
+				rec.tag_position='unknown';
+				if(rec.tag_votes)delete rec.tag_votes;
+				if(rec.tag_confidence)delete rec.tag_confidence;
+				if(rec.tag_source)delete rec.tag_source;
+				if(rec.tag_hold_id)delete rec.tag_hold_id;
+				if(rec.hold_id)delete rec.hold_id;
+			}
 			if(Array.isArray(rec.markers)){
 				rec.markers.forEach(function(m){
 					if(markerIsManual(m)){
@@ -2974,6 +3286,8 @@ function setNormReadout(id,stats,label){let el=byId(id);if(!el)return;if(!stats)
 				});
 			}
 		}else{
+			changed=String(rec.mark||'')!==next;
+			rec.mark=next;
 			if(rec.tag_type){delete rec.tag_type;changed=true}
 			if(rec.tag_channel){delete rec.tag_channel;changed=true}
 			if(rec.tag_scope){delete rec.tag_scope;changed=true}
@@ -2982,6 +3296,7 @@ function setNormReadout(id,stats,label){let el=byId(id);if(!el)return;if(!stats)
 			if(rec.tag_confidence){delete rec.tag_confidence;changed=true}
 			if(rec.tag_source){delete rec.tag_source;changed=true}
 			if(rec.tag_hold_id){delete rec.tag_hold_id;changed=true}
+			if(rec.hold_id){delete rec.hold_id;changed=true}
 		}
 		if(!next&&Array.isArray(rec.markers)){
 			let before=rec.markers.length;
@@ -3042,7 +3357,7 @@ function setNormReadout(id,stats,label){let el=byId(id);if(!el)return;if(!stats)
 	function playerWeakClearHoldStop(ev){if(ev&&ev.preventDefault)ev.preventDefault();if(!playerState.weakClearPointer)return;if(playerState.weakClearTimer){clearTimeout(playerState.weakClearTimer);playerState.weakClearTimer=null;if(!playerState.weakClearHandled)playerClearWeakMark()}playerState.weakClearPointer=false;playerState.weakClearSuppressClick=true}
 	function playerWeakClearHoldCancel(ev){if(playerState.weakClearTimer){clearTimeout(playerState.weakClearTimer);playerState.weakClearTimer=null}playerState.weakClearPointer=false;playerState.weakClearHandled=false;playerState.weakClearSuppressClick=true}
 	function playerClearWeakClick(ev){if(playerState.weakClearSuppressClick){playerState.weakClearSuppressClick=false;playerState.weakClearHandled=false;if(ev&&ev.preventDefault)ev.preventDefault();return false}playerClearWeakMark();return false}
-	function playerSaveMarks(){if(!playerState.savedFile){setText('serviceState','save error');setText('conn','load a raw recording before saving labels');return Promise.resolve(null)}let missing=playerMissingTagChannelCount();if(missing>0){setText('serviceState','save error');setText('conn','tag channel is required for '+missing+' frame(s)');return Promise.resolve(null)}let marks=playerEditedMarks(),ranges=playerEditedRanges();setText('serviceState','saving labels');return cmd('player_record_save_marks',{name:playerState.savedFile,marks:marks,ranges:ranges}).then(function(j){playerState.dirty=false;setText('serviceState','labels saved');playerDownloadRecording(playerState.savedFile,'labels saved; download started');updatePlayerUi();return j}).catch(function(e){setText('serviceState','save error');setText('conn',String(e));updatePlayerUi();return null})}
+	function playerSaveMarks(){if(!playerState.savedFile){setText('serviceState','save error');setText('conn','load a raw recording before saving labels');return Promise.resolve(null)}let missing=playerMissingTagChannelCount();if(missing>0){setText('serviceState','save error');setText('conn','tag channel is required for '+missing+' frame(s)');return Promise.resolve(null)}let marks=playerEditedMarks(),ranges=playerEditedRanges(),deletedRanges=playerEditedDeletedRanges();setText('serviceState','saving labels');return cmd('player_record_save_marks',{name:playerState.savedFile,marks:marks,ranges:ranges,deleted_ranges:deletedRanges}).then(function(j){playerState.dirty=false;setText('serviceState','labels saved');playerDownloadRecording(playerState.savedFile,'labels saved; download started');updatePlayerUi();return j}).catch(function(e){setText('serviceState','save error');setText('conn',String(e));updatePlayerUi();return null})}
 	function playerApplyLoaded(data){let frames=Array.isArray(data&&data.frames)?data.frames:[];playerStopPlayback();playerState.recording=false;playerState.frames=frames.filter(function(x){return x&&x.frame&&x.frame.available});playerState.idx=playerState.frames.length?0:-1;playerState.playback=playerState.frames.length>0;playerState.dirty=false;playerState.savedFile=String((data&&data.file)||playerState.savedFile||'');togglePlayerPanel(true);if(playerState.playback)playerShow(0);else updatePlayerUi()}
 	function playerLoadFile(name){name=String(name||'latest');setText('serviceState','loading rec');return cmd('player_record_load',{name:name,max_points:FRAME_MAX_POINTS,max_frames:playerState.maxFrames}).then(function(j){playerApplyLoaded(j);setText('serviceState','online');return j}).catch(function(e){setText('serviceState','load error');setText('conn',String(e));updatePlayerUi();return null})}
 	function playerChooseLoadFile(){let input=byId('playerLoadInput');if(input)input.click()}
@@ -3052,8 +3367,32 @@ function setNormReadout(id,stats,label){let el=byId(id);if(!el)return;if(!stats)
 	function playerImportFile(file){if(!file)return;let reader=new FileReader();reader.onload=function(){try{let data=JSON.parse(String(reader.result||''));let frames=Array.isArray(data.frames)?data.frames:[];playerStopPlayback();playerState.recording=false;playerState.frames=frames.filter(function(x){return x&&x.frame&&x.frame.available});playerState.idx=playerState.frames.length?0:-1;playerState.playback=playerState.frames.length>0;playerState.savedFile='';playerState.dirty=false;togglePlayerPanel(true);if(playerState.playback)playerShow(0);else updatePlayerUi()}catch(e){setText('serviceState','import error');setText('conn',String(e))}};reader.readAsText(file)}
 	function syncRoleText(sync){sync=sync||{};let value=String(sync.value||'---').toLowerCase(),code=String(sync.code||'').trim(),label='Role ---';if(value==='master')label='Master';else if(value==='slave')label='Slave';else if(value==='off')label='Sync off';return label+(code?' ('+code+')':'')}
 function fpsFixedText(value){let v=Number(value||0);if(!Number.isFinite(v))v=0;return v.toFixed(1).padStart(5,' ')}
-function applyStatus(s){lastStatus=s||{};let mode=(s.mode||{}),conn=(s.connection||{}),fps=(s.fps||{}),det=(s.detector||{}),norm=(s.normalization||{}),opt=(s.optimize||{}),sync=(s.sync||{});let selected=Number(mode.selected||0),modeChanged=(lastSelectedMode!==selected);let nextWindow=s.working_window||null,nextWindowKey=stableKey(nextWindow);if(nextWindowKey!==lastWorkingWindowKey){frameRedrawNeeded=true;lastWorkingWindowKey=nextWindowKey}currentWorkingWindow=nextWindow;if(modeChanged){frameRedrawNeeded=true;lastSelectedMode=selected}if(selected>0)lastRunMode=selected;let freqValue=mode.desired_freq||mode.freq_hz||200,avgValue=mode.avg_n||24,fpsText=fpsFixedText(fps.a)+' / '+fpsFixedText(fps.b),connText=conn.connected?'connected':(conn.connecting?'connecting':'offline'),bufText=(mode.base_buf_len||0)+' samples @ '+(mode.freq_hz||mode.desired_freq||0)+' Hz',roleText=syncRoleText(sync);let statusUiKey=stableKey({ok:!!s.ok,conn:connText,selected:selected,buf:bufText,fps:fpsText,role:roleText,norm:!!norm.enabled,opt:!!(opt.dc_autotune_active||opt.fast_adapt_active),tx:!!((s.tim2||{}).enabled),sound:!!((s.sound||{}).enabled),freq:String(freqValue),avg:String(avgValue),runBusy:!!runBusy,freezeMode:String(freezeMode)});if(statusUiKey!==lastStatusUiKey){lastStatusUiKey=statusUiKey;for(let i=0;i<=9;i++)setActive('mode'+i,i===selected);setActive('normBtn',!!norm.enabled);setActive('optBtn',!!(opt.dc_autotune_active||opt.fast_adapt_active));applyModeVisibility(selected);setText('serviceState',(s.ok?'online':'offline'));setText('roleState',roleText);setText('conn',connText);setText('modeText',selected+' '+(MODE_LABELS[selected]||''));setText('bufText',bufText);setText('fpsText',fpsText);setActive('txBtn',!!((s.tim2||{}).enabled));setActive('soundBtn',!!((s.sound||{}).enabled));setSelectValue('freqSel',freqValue);setSelectValue('avgSel',avgValue)}renderDetector(det);updateDetectorThresholdControls(det);updateRunButton();updateFreezeButton();if(playerState.open||playerState.recording)updatePlayerUi()}
-	function renderFrame(f,force){lastFrame=f||null;let mode=playerState.playback?playerRenderMode():statusMode(),drawUpper=mode!==2,drawLower=mode!==1,showProd=mode>=6,normOn=normalizationEnabled(),win=playerState.playback?playerWorkingWindow():currentWorkingWindow,winKey=stableKey(win),rec=playerState.playback?playerFrame():null,frameMark=String(rec&&rec.mark||''),markersKey=stableKey(rec&&rec.markers||[]),key=stableKey({t:f&&f.last_frame_t||0,ch:f&&f._channels||'',mode:mode,win:winKey,available:!!(f&&f.available),prod:showProd,norm:normOn,n0:f&&f.prod_norm0||null,n1:f&&f.prod_norm1||null,playback:!!playerState.playback,idx:playerState.idx,mark:frameMark,tag_channel:String(rec&&rec.tag_channel||''),tag_scope:String(rec&&rec.tag_scope||''),tag_position:String(rec&&rec.tag_position||''),markers:markersKey});applyModeVisibility(mode);if(!force&&key===lastRenderedFrameKey)return;lastRenderedFrameKey=key;updateNormReadouts(showProd&&playerState.playback?{prod_norm0:playerNormStats(f,'prod_norm0'),prod_norm1:playerNormStats(f,'prod_norm1')}:f,showProd);if(!f||!f.available){if(drawUpper)drawPlot(byId('upperPlot'),byId('upperEmpty'),[],[],[],[],'#ffb86b','#00e5ff','#ffe066',null,[],frameMark);if(drawLower)drawPlot(byId('lowerPlot'),byId('lowerEmpty'),[],[],[],[],'#ff6b6b','#00ffd5','#35d7ff',null,[],frameMark);return}let xs=f.x||makeFrameX(Number(f.count)||Math.max((f.data0_even&&f.data0_even.length)||0,(f.data0_odd&&f.data0_odd.length)||0,(f.data1_even&&f.data1_even.length)||0,(f.data1_odd&&f.data1_odd.length)||0),Number(f.step)||1);if(drawUpper)drawPlot(byId('upperPlot'),byId('upperEmpty'),xs,f.data0_even||[],f.data0_odd||[],showProd?playerProdArray(f,'prod0'):[],'#ffb86b','#00e5ff','#ffe066',win,playerState.playback?playerMarkers('upper'):[],frameMark);if(drawLower)drawPlot(byId('lowerPlot'),byId('lowerEmpty'),xs,f.data1_even||[],f.data1_odd||[],showProd?playerProdArray(f,'prod1'):[],'#ff6b6b','#00ffd5','#35d7ff',win,playerState.playback?playerMarkers('lower'):[],frameMark)}
+function applyStatus(s){lastStatus=s||{};let mode=(s.mode||{}),conn=(s.connection||{}),fps=(s.fps||{}),det=(s.detector||{}),norm=(s.normalization||{}),opt=(s.optimize||{}),sync=(s.sync||{});let selected=Number(mode.selected||0),modeChanged=(lastSelectedMode!==selected);let nextWindow=s.working_window||null,nextWindowKey=stableKey(nextWindow);if(nextWindowKey!==lastWorkingWindowKey){frameRedrawNeeded=true;lastWorkingWindowKey=nextWindowKey}currentWorkingWindow=nextWindow;let detectorPlotKey=stableKey({tr0:Number(det.trigger0||det.thr0)||0,tr1:Number(det.trigger1||det.thr1)||0,n0:Number(det.noise_avg0)||0,n1:Number(det.noise_avg1)||0});if(detectorPlotKey!==lastDetectorPlotKey){frameRedrawNeeded=true;lastDetectorPlotKey=detectorPlotKey}if(modeChanged&&!playerState.playback){frameRedrawNeeded=true;lastSelectedMode=selected}if(selected>0&&!playerState.playback)lastRunMode=selected;let freqValue=mode.desired_freq||mode.freq_hz||200,avgValue=mode.avg_n||24,fpsText=fpsFixedText(fps.a)+' / '+fpsFixedText(fps.b),connText=conn.connected?'connected':(conn.connecting?'connecting':'offline'),bufText=(mode.base_buf_len||0)+' samples @ '+(mode.freq_hz||mode.desired_freq||0)+' Hz',roleText=syncRoleText(sync);let statusUiKey=stableKey({ok:!!s.ok,conn:connText,selected:selected,playback:!!playerState.playback,render_mode:playerState.playback?playerRenderMode():selected,buf:bufText,fps:fpsText,role:roleText,norm:!!norm.enabled,opt:!!(opt.dc_autotune_active||opt.fast_adapt_active),tx:!!((s.tim2||{}).enabled),sound:!!((s.sound||{}).enabled),freq:String(freqValue),avg:String(avgValue),runBusy:!!runBusy,freezeMode:String(freezeMode)});if(statusUiKey!==lastStatusUiKey){lastStatusUiKey=statusUiKey;let activeMode=playerState.playback?playerRenderMode():selected;for(let i=0;i<=9;i++)setActive('mode'+i,i===activeMode);setActive('normBtn',!!norm.enabled);setActive('optBtn',!!(opt.dc_autotune_active||opt.fast_adapt_active));applyModeVisibility(activeMode);setText('serviceState',(s.ok?'online':'offline'));setText('roleState',roleText);setText('conn',connText);setText('modeText',activeMode+' '+(MODE_LABELS[activeMode]||''));setText('bufText',bufText);setText('fpsText',fpsText);setActive('txBtn',!!((s.tim2||{}).enabled));setActive('soundBtn',!!((s.sound||{}).enabled));setSelectValue('freqSel',freqValue);setSelectValue('avgSel',avgValue)}renderDetector(det);updateDetectorThresholdControls(det);updateRunButton();updateFreezeButton();if(playerState.open||playerState.recording)updatePlayerUi()}
+	function renderFrame(f,force){
+		lastFrame=f||null;
+		let mode=playerState.playback?playerRenderMode():statusMode(),drawUpper=mode!==2,drawLower=mode!==1,showProd=mode>=6,showV7=mode===7&&playerState.playback,normOn=normalizationEnabled(),win=playerState.playback?playerWorkingWindow():currentWorkingWindow,winKey=stableKey(win),rec=playerState.playback?playerFrame():null,frameMark=String(rec&&rec.mark||''),markersKey=stableKey(rec&&rec.markers||[]);
+		let key=stableKey({t:f&&f.last_frame_t||0,ch:f&&f._channels||'',mode:mode,win:winKey,available:!!(f&&f.available),prod:showProd,v7:showV7,norm:normOn,n0:f&&f.prod_norm0||null,n1:f&&f.prod_norm1||null,v70:f&&f.v7_meta0||null,v71:f&&f.v7_meta1||null,playback:!!playerState.playback,idx:playerState.idx,mark:frameMark,tag_channel:String(rec&&rec.tag_channel||''),tag_scope:String(rec&&rec.tag_scope||''),tag_position:String(rec&&rec.tag_position||''),markers:markersKey});
+		applyModeVisibility(mode);
+		setScopeLegend('upperCard',showV7?['sum','product','energy']:(showProd?['1','0','det','thr']:['1','0','det']));
+		setScopeLegend('lowerCard',showV7?['sum','product','energy']:(showProd?['1','0','det','thr']:['1','0','det']));
+		if(!force&&key===lastRenderedFrameKey)return;
+		lastRenderedFrameKey=key;
+		updateNormReadouts(showProd&&playerState.playback?{prod_norm0:playerNormStats(f,'prod_norm0'),prod_norm1:playerNormStats(f,'prod_norm1'),v7_meta0:f&&f.v7_meta0||null,v7_meta1:f&&f.v7_meta1||null}:f,showProd,mode);
+		if(!f||!f.available){
+			if(drawUpper)drawPlot(byId('upperPlot'),byId('upperEmpty'),[],[],[],[],'#ffb86b','#00e5ff','#ffe066',null,[],frameMark);
+			if(drawLower)drawPlot(byId('lowerPlot'),byId('lowerEmpty'),[],[],[],[],'#ff6b6b','#00ffd5','#35d7ff',null,[],frameMark);
+			return;
+		}
+		let count=Number(f.count)||Math.max((f.data0_even&&f.data0_even.length)||0,(f.data0_odd&&f.data0_odd.length)||0,(f.data1_even&&f.data1_even.length)||0,(f.data1_odd&&f.data1_odd.length)||0,(f.v7_sum0&&f.v7_sum0.length)||0,(f.v7_energy0&&f.v7_energy0.length)||0,(f.v7_sum1&&f.v7_sum1.length)||0,(f.v7_energy1&&f.v7_energy1.length)||0);
+		let xs=f.x||makeFrameX(count,Number(f.step)||1);
+		if(showV7){
+			if(drawUpper)drawPlot(byId('upperPlot'),byId('upperEmpty'),xs,f.v7_sum0||[],f.v7_product0||[],f.v7_energy0||[],'#ffb86b','#00e5ff','#ffe066',win,playerState.playback?playerMarkers('upper'):[],frameMark);
+			if(drawLower)drawPlot(byId('lowerPlot'),byId('lowerEmpty'),xs,f.v7_sum1||[],f.v7_product1||[],f.v7_energy1||[],'#ff6b6b','#00ffd5','#35d7ff',win,playerState.playback?playerMarkers('lower'):[],frameMark);
+			return;
+		}
+		if(drawUpper)drawPlot(byId('upperPlot'),byId('upperEmpty'),xs,f.data0_even||[],f.data0_odd||[],showProd?playerProdArray(f,'prod0'):[],'#ffb86b','#00e5ff','#ffe066',win,playerState.playback?playerMarkers('upper'):[],frameMark,(showProd&&!playerState.playback)?detectorPlotThreshold('upper',f.prod_norm0):null,(showProd&&!playerState.playback)?detectorPlotThresholdLabel('upper'):null);
+		if(drawLower)drawPlot(byId('lowerPlot'),byId('lowerEmpty'),xs,f.data1_even||[],f.data1_odd||[],showProd?playerProdArray(f,'prod1'):[],'#ff6b6b','#00ffd5','#35d7ff',win,playerState.playback?playerMarkers('lower'):[],frameMark,(showProd&&!playerState.playback)?detectorPlotThreshold('lower',f.prod_norm1):null,(showProd&&!playerState.playback)?detectorPlotThresholdLabel('lower'):null);
+	}
 function frameChannels(){let m=statusMode();if(m===1)return'upper';if(m===2)return'lower';return'both'}
 function makeFrameX(count,step){let n=Math.max(0,Number(count)||0),s=Math.max(1,Number(step)||1),x=new Array(n);for(let i=0;i<n;i++)x[i]=i*s;return x}
 function parseFrameBinary(buf){let bytes=new Uint8Array(buf);if(bytes.length<8||bytes[0]!==66||bytes[1]!==77||bytes[2]!==70||bytes[3]!==49)throw new Error('bad frame binary');let dv=new DataView(buf);let headerLen=dv.getUint32(4,true);let headerBytes=new Uint8Array(buf,8,headerLen);let headerText=frameTextDecoder?frameTextDecoder.decode(headerBytes):String.fromCharCode.apply(null,Array.from(headerBytes));let f=JSON.parse(headerText);if(!f.available)return f;let count=Math.max(0,Number(f.count)||0),offset=(8+headerLen+1)&~1;f.x=makeFrameX(count,f.step);(f.arrays||[]).forEach(function(name){let bytesNeeded=count*2;if(offset+bytesNeeded<=buf.byteLength){f[name]=new Uint16Array(buf,offset,count)}offset+=bytesNeeded});return f}
@@ -3090,24 +3429,15 @@ def main() -> int:
     _apply_default_avg_n(scope)
     _apply_default_detector_settings(scope)
     try:
+        led_patterns = _load_group_led_patterns()
+        if hasattr(scope, "_set_group_led_patterns"):
+            scope._set_group_led_patterns(led_patterns)
+        else:
+            scope._group_led_patterns = led_patterns
+    except Exception as exc:
+        print(f"[BMI30.001] LED pattern map load failed: {exc}", flush=True)
+    try:
         orig_num_clicked = scope._num_clicked
-
-        def _restore_default_dc_after_startup(selected: int, reason: str = "") -> None:
-            try:
-                selected_i = int(selected)
-            except Exception:
-                selected_i = 0
-            try:
-                current = int(scope.num_group.checkedId())
-            except Exception:
-                current = 0
-            if selected_i == 5 and current != 5:
-                return
-            if selected_i >= 6 and current < 6:
-                return
-            profile = _dc_steady_profile_for_mode(selected_i)
-            if profile:
-                _apply_default_dc_config(scope, reason=f"{reason}:restore_{profile}", profile=profile)
 
         def _schedule_mode5_startup_dc(reason: str = "", attempt: int = 0) -> None:
             try:
@@ -3116,15 +3446,10 @@ def main() -> int:
                 selected = 0
             if selected != 5:
                 return
-            applied = _apply_default_dc_config(scope, reason=f"{reason}:try{attempt}", profile="startup")
+            applied = _apply_default_dc_config(scope, reason=f"{reason}:try{attempt}", profile="acquisition")
             if applied:
-                delay_s = _dc_startup_restore_delay_s()
                 try:
-                    scope._host_dc_startup_until = time.time() + max(0.2, delay_s)
-                except Exception:
-                    pass
-                try:
-                    _call_later_s(max(0.2, delay_s), lambda: _restore_default_dc_after_startup(5, reason))
+                    scope._host_dc_startup_until = 0.0
                 except Exception:
                     pass
                 return
@@ -3178,7 +3503,7 @@ def main() -> int:
             except Exception:
                 selected = 0
             if selected == 5:
-                return "work"
+                return "acquisition"
             if selected >= 6:
                 profile = str(getattr(scope, "_host_dc_desired_profile", "") or "").strip().lower()
                 if profile in {"acquisition", "detection", "detect"}:

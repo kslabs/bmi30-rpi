@@ -9,10 +9,15 @@ status.json
 *.npz.bak
 host/bmi30_faults.log
 host/bmi30_sel.json
+host/bmi30_firmware_release.env
+host/bmi30_active_runtime/
+host/.bmi30_active_runtime.*
+host/bmi30_split_bundles/
 
 backups/
 test_logs/
 .bmi30_cloud_sync/
+secrets/
 
 .vscode/launch.json
 .vscode/settings.json

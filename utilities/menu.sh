@@ -137,13 +137,14 @@ show_menu() {
     printf "10. Показать список утилит\n"
     printf "11. Открыть README утилит\n"
     printf "12. Задеплоить hotspot_info_server.py (обновить страницу)\n"
-    printf "13. Сделать backup сейчас в облако\n"
+    printf "13. Опубликовать текущую прошивку в облако\n"
     printf "14. Меню версий BMI30 split-системы\n"
     printf "15. Запустить BMI30 split-систему\n"
     printf "16. Остановить BMI30 split-систему\n"
-    printf "17. Синхронизировать проект сейчас\n"
-    printf "18. Показать подробный статус BMI30 split-системы\n"
-    printf "19. Проверить статус cloud sync\n"
+    printf "17. Проверить и установить последнюю прошивку из облака\n"
+    printf "18. Принудительно переустановить последнюю прошивку из облака\n"
+    printf "19. Показать подробный статус BMI30 split-системы\n"
+    printf "20. Проверить статус cloud sync\n"
     printf "0. Выход\n"
 }
 
@@ -209,7 +210,7 @@ while true; do
             '
             ;;
         13)
-            run_action "Backup проекта в облако" bash "$SCRIPT_DIR/backup_to_cloud.sh"
+            run_action "Публикация текущей прошивки в облако" bash "$SCRIPT_DIR/backup_to_cloud.sh" --force
             ;;
         14)
             run_action "Меню версий BMI30 split-системы" bash "$WORKSPACE_DIR/switch_bmi30_split_versions.sh"
@@ -221,12 +222,15 @@ while true; do
             run_core_service_action "Остановка BMI30 split-системы" stop
             ;;
         17)
-            run_action "Синхронизация проекта" bash "$SCRIPT_DIR/cloud_sync_now.sh" --today-only
+            run_action "Установка последней прошивки из облака" bash "$SCRIPT_DIR/cloud_sync_now.sh" --today-only
             ;;
         18)
-            run_action "Статус BMI30 split-системы" show_core_service_details
+            run_action "Принудительная переустановка последней прошивки из облака" bash "$SCRIPT_DIR/update_from_cloud.sh" --force
             ;;
         19)
+            run_action "Статус BMI30 split-системы" show_core_service_details
+            ;;
+        20)
             run_action "Статус backup" bash "$SCRIPT_DIR/backup_status.sh"
             ;;
         0|q|Q|exit)

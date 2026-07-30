@@ -19,6 +19,7 @@ fi
 
 DRY_RUN=0
 REQUIRE_TODAY=0
+PUBLISH_IF_CHANGED=0
 
 usage() {
     cat <<'EOF'
@@ -28,12 +29,15 @@ Usage:
 Options:
   --config <path>  Config file (default: ./utilities/backup_to_cloud.conf)
   --today-only     When reading from cloud, update only from today's archive
+  --publish-if-changed
+                   Explicitly publish local firmware if it changed today
   --dry-run        Show actions without creating/uploading/updating
   -h, --help       Show this help
 
 Logic:
-  If this project changed locally today, publish it to cloud and stop.
-  If there are no local changes today, read today's cloud version and update if needed.
+  By default this command only reads from cloud and installs the latest firmware.
+  Publishing is explicit: use backup_to_cloud.sh --force, or this command with
+  --publish-if-changed when this device is intentionally the release source.
 EOF
 }
 
@@ -70,6 +74,10 @@ parse_args() {
                 ;;
             --today-only)
                 REQUIRE_TODAY=1
+                shift
+                ;;
+            --publish-if-changed)
+                PUBLISH_IF_CHANGED=1
                 shift
                 ;;
             --dry-run)
@@ -117,7 +125,7 @@ project_changed_today() {
 
 run_publish() {
     local -a cmd
-    cmd=(bash "$SCRIPT_DIR/backup_to_cloud.sh" --if-changed)
+    cmd=(bash "$SCRIPT_DIR/backup_to_cloud.sh" --if-changed --allow-auto-publish)
     [[ "$DRY_RUN" -eq 1 ]] && cmd+=(--dry-run)
     "${cmd[@]}"
 }
@@ -138,19 +146,20 @@ main() {
     current_signature="$(project_signature)"
     known_signature="$(read_known_signature)"
 
-    if project_changed_today && [[ -z "$known_signature" || "${current_signature,,}" != "${known_signature,,}" ]]; then
-        log "Сегодня есть локальные изменения: сохраняю проект в облако и не выполняю обновление"
+    if [[ "$PUBLISH_IF_CHANGED" -eq 1 ]] && project_changed_today && [[ -z "$known_signature" || "${current_signature,,}" != "${known_signature,,}" ]]; then
+        log "Явно разрешена публикация: сегодня есть локальные изменения, сохраняю firmware release в облако"
         run_publish
         return
     fi
 
-    if [[ -n "$known_signature" && "${current_signature,,}" != "${known_signature,,}" ]]; then
-        log "Локальная версия отличается, но сегодняшних локальных изменений нет: проверяю облако"
-        run_update
-        return
+    if project_changed_today && [[ -z "$known_signature" || "${current_signature,,}" != "${known_signature,,}" ]]; then
+        log "Есть локальные изменения, но автопубликация отключена: проверяю и устанавливаю последнюю прошивку из облака"
+    elif [[ -n "$known_signature" && "${current_signature,,}" != "${known_signature,,}" ]]; then
+        log "Локальная версия отличается от известной: проверяю облако"
+    else
+        log "Проверяю последнюю прошивку в облаке"
     fi
 
-    log "Сегодняшних локальных изменений нет: проверяю сегодняшнюю версию в облаке"
     run_update
 }
 

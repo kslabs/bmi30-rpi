@@ -24,6 +24,82 @@
 ./utilities/list_tools.sh
 ```
 
+### create_bmi30_split_bundle.sh / switch_bmi30_split_versions.sh
+
+Назначение:
+Сохраняет и переключает BMI30 только полными совместимыми websplit-комплектами.
+
+В один комплект входят active core и его engine, GUI, portal, project/system
+`bmi30_config.json`, `bmi30_sel.json`, DC calibration, весь `usb_vendor` и
+player recordings. Для всех файлов записывается `SHA256SUMS`.
+
+Старые снимки, где сохранены только core/engine, остаются в `host/` как
+история, но не показываются как доступные для переключения: совместимость их
+общих GUI/portal/config/usb_stream подтвердить невозможно.
+
+Создать полный комплект текущей активной версии:
+```bash
+sudo ./utilities/create_bmi30_split_bundle.sh \
+  --id YYYY-MM-DD-HHMM-topic \
+  --label "Короткое описание" \
+  --origin "Источник и назначение"
+```
+
+Импортировать только активную версию проекта со смонтированного eMMC:
+```bash
+sudo ./utilities/create_bmi30_split_bundle.sh \
+  --id YYYY-MM-DD-HHMM-emmc-runtime \
+  --label "eMMC active runtime" \
+  --origin "Импорт с eMMC" \
+  --source-project /mnt/emmc-root/home/techaid/Documents \
+  --source-system-root /mnt/emmc-root
+```
+
+Показать и проверить безопасный список:
+```bash
+./switch_bmi30_split_versions.sh --list
+./switch_bmi30_split_versions.sh --validate
+```
+
+При выборе версия сначала проверяется по SHA-256 и компилируется в staging.
+Затем целиком разворачивается в `host/bmi30_active_runtime`, устанавливается
+соответствующая runtime-копия portal и BMI30 config, после чего одновременно
+перезапускаются core и portal. При ошибке переключатель возвращает предыдущий
+полный комплект.
+
+`host/bmi30_active_runtime` и исторические комплекты в
+`host/bmi30_split_bundles` являются локальными данными устройства и защищены от
+удаления через `rsync --delete`. Обычный firmware release публикует только один
+полный bundle, указанный в `host/bmi30_split_active_version.env`, проверяет его
+`SHA256SUMS` и после копирования атомарно разворачивает в active runtime. При
+облачной активации текущие локальные настройки целевого устройства сохраняются.
+
+Для переноса полного локального списка и настроек на другой Raspberry Pi
+используется отдельный recovery-архив:
+```bash
+./utilities/backup_bmi30_recovery_to_cloud.sh
+```
+
+Он загружается в облачный подкаталог `recovery/` вместе с SHA-256 и указателем
+`bmi30_project_recovery_latest.env`. Общий firmware latest при этом не меняется.
+
+Проверка скачанного архива:
+```bash
+./utilities/restore_bmi30_recovery_archive.sh \
+  bmi30_project_recovery_YYYYMMDD_HHMMSS.tar.gz --verify-only
+```
+
+Восстановление проекта и сохранённого активного комплекта:
+```bash
+sudo ./utilities/restore_bmi30_recovery_archive.sh \
+  bmi30_project_recovery_YYYYMMDD_HHMMSS.tar.gz \
+  --apply --activate saved --yes
+```
+
+Recovery специально не содержит `.git`, venv, системные пакеты, device
+identity, rclone credentials и `secrets/`; они на другом Raspberry Pi должны
+быть установлены или настроены отдельно.
+
 ### check_bootloader.sh
 
 Назначение:
@@ -187,58 +263,59 @@ sudo ./utilities/setup_ethernet_portal.sh remove
 ### backup_to_cloud.sh / cloud_sync_now.sh / update_from_cloud.sh
 
 Назначение:
-Синхронизирует проект BMI30 через общий Google Drive:
-- ведущее устройство не задаётся настройкой: ведущим становится то устройство, где сегодня есть локальные изменения проекта;
-- в 22:00 устройство сохраняет архив в облако только если его проект сегодня изменился и отличается от последнего известного состояния;
-- остальные устройства в 23:00 проверяют сегодняшнюю актуальную версию и обновляют проект;
-- ручная синхронизация сначала проверяет локальные изменения: если они есть, сохраняет их в облако и не обновляет проект.
-- изменение проекта определяется по `PROJECT_CONTENT_SIGNATURE`: в подпись не входят runtime-файлы устройства, локальные настройки GUI, конфиги, логи, кэши, документация, отчёты, тесты, захваты, обучающие/калибровочные данные и служебная папка `.bmi30_cloud_sync`.
+Доставляет одну общую прошивку BMI30 через общий Google Drive:
+- на облаке хранится один актуальный firmware release для всех устройств;
+- master/slave не имеют разных облачных версий проекта;
+- публикация release выполняется явно, командой оператора;
+- автоматическим является только скачивание, проверка и установка последней прошивки;
+- документация из `docs/`, а также файлы `*.md`, `*.txt`, `*.pdf` и `*.rst` обновляются вместе с прошивкой;
+- локальная identity устройства, секреты, runtime-файлы, логи, записи и рабочие настройки GUI не входят в firmware release.
 
 Что делает:
-1. Архивирует рабочую папку проекта.
-2. Для решения о публикации и применения обновления исключает `.git`, `.codex`, venv, кэши, логи, `backups`, `.bmi30_cloud_sync`, локальные конфиги, `docs`, `History`, Markdown/TXT/PDF-отчёты, `test_*.py`, захваты и обучающие/калибровочные данные.
-3. Называет архив по времени и аппаратному serial Raspberry Pi.
-4. Выгружает архив через `rclone` в Google Drive и обновляет указатель `bmi30_latest.env`.
-5. При обновлении скачивает указанный архив, проверяет SHA-256, создаёт локальный `pre_update_*.tar.gz` и применяет проект через `rsync --delete`.
-6. User systemd timers работают постоянно: проверка/публикация в 22:00, умная проверка/обновление в 23:00.
-7. Перед полным копированием системы через migration-утилиты сначала выполняется cloud backup, если проект изменился.
+1. Архивирует firmware-содержимое и документацию проекта, включая активный `host/bmi30_split_active_version.env` и ровно один выбранный полный websplit bundle.
+2. Исключает `.git`, `.codex`, venv, кэши, обычные и ротационные логи, `backups`, `.bmi30_cloud_sync`, `secrets`, локальный active runtime, временные stage/rollback, записи вне активного bundle, обучающие/калибровочные данные и локальные GUI runtime-файлы. Генерируемый `host/bmi30_split_active_version.env` передаётся устройствам, но не участвует в content-signature: изменение времени успешной активации не считается новой прошивкой.
+3. Перед упаковкой создаёт `host/bmi30_firmware_release.env`: точное время release и SHA-256 активных core/engine/GUI/portal.
+4. Называет общий архив `bmi30_backup_YYYYMMDD_HHMMSS.tar.gz` для совместимости со старыми updater; manifest однозначно помечает его как firmware release, серийный номер устройства в имя не входит.
+5. Выгружает архив через `rclone` в Google Drive и обновляет указатель `bmi30_latest.env`.
+6. При обновлении скачивает указанный архив, проверяет SHA-256, создаёт локальный `pre_update_*.tar.gz` и применяет проект через `rsync --delete`.
+7. После применения сверяет active env и SHA-256 всех четырёх компонентов с release manifest, обновляет systemd units, устанавливает portal с сохранением времени файла и проверяет runtime-копию побайтно.
+8. Портал показывает время firmware release и короткий SHA-256 работающей страницы; `/api/status` отдаётся с `no-store`.
+9. Локально сохраняются только последние 5 firmware-архивов, 3 pre-update снимка и 2 скачанных incoming-архива.
+10. User systemd timer обновления можно поставить на все устройства; timer публикации нужен только на устройстве, которое сознательно выпускает release.
 
 Конфигурация:
 ```bash
 cp utilities/backup_to_cloud.conf.example utilities/backup_to_cloud.conf
 ```
 
-Одинаковый конфиг можно копировать на все устройства. Роль выбирается автоматически по факту сегодняшних изменений проекта.
+Одинаковый конфиг можно копировать на все устройства. Роль устройства задаётся только локальной identity вне firmware release.
 
-Разовый backup с выгрузкой в облако:
+Опубликовать текущую прошивку в облако:
 ```bash
-./utilities/backup_to_cloud.sh
+./utilities/backup_to_cloud.sh --force
 ```
 
-Разовая публикация только при изменениях:
+Создать локальный firmware release без выгрузки:
 ```bash
-./utilities/backup_to_cloud.sh --if-changed
+./utilities/backup_to_cloud.sh --local-only
 ```
 
-Ручная умная синхронизация:
+Проверить и установить сегодняшнюю прошивку из облака:
 ```bash
 ./utilities/cloud_sync_now.sh --today-only
 ```
 
-Прямое обновление проекта из последнего облачного архива:
+Принудительно переустановить последнюю прошивку из облака:
 ```bash
-./utilities/update_from_cloud.sh
+./utilities/update_from_cloud.sh --force
 ```
 
-Переустановка автоматической публикации в 22:00:
-```bash
-./utilities/backup_to_cloud.sh --install-timer
-```
-
-Переустановка автоматической умной проверки в 23:00:
+Поставить автоматическую проверку и установку последнего доступного обновления на устройстве:
 ```bash
 ./utilities/update_from_cloud.sh --install-timer
 ```
+
+Автопубликация по умолчанию отключена. Готовый release публикуется вручную командой `./utilities/backup_to_cloud.sh --force`; таймер обновления ничего не отправляет в облако.
 
 Проверка состояния:
 ```bash

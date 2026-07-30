@@ -1,0 +1,60 @@
+BMI30 Google Sheets sync setup
+
+Files:
+docs/BMI30_version_registry_google_sheet.csv
+docs/BMI30_version_registry_apps_script.gs
+utilities/sync_bmi30_version_registry.py
+
+Google Apps Script setup:
+
+1. Open the Apps Script project for the deployed Web App.
+2. Replace Code.gs with the contents of:
+   docs/BMI30_version_registry_apps_script.gs
+3. In Apps Script, open Project Settings -> Script Properties.
+4. Add a property:
+   BMI30_SYNC_TOKEN = a long random secret token
+
+Important:
+Keep this Apps Script line exactly as written:
+const TOKEN_PROPERTY = 'BMI30_SYNC_TOKEN';
+
+Do not replace TOKEN_PROPERTY with the token value. The token value belongs only
+in Project Settings -> Script Properties, as the value of BMI30_SYNC_TOKEN.
+5. Deploy -> Manage deployments -> Edit -> New version -> Deploy.
+6. Keep using the /exec URL:
+   https://script.google.com/macros/s/AKfycbySnSSnTGsJmyMZFBrMHACiHDHRhBglk2zbpvCdjQiVd95ERR5MtiY65AO1lRIZ9YYh/exec
+
+Deployment settings:
+
+Execute as: Me
+Who has access: Anyone
+
+If "Who has access" is set to "Only myself", "Anyone within vinetabmi.cz", or
+"Anyone with Google account", the local updater will receive a Google Sign in
+HTML page instead of JSON.
+
+Local upload:
+
+Edit the local ignored file:
+secrets/bmi30_sheets.env
+
+Set:
+BMI30_SHEETS_TOKEN='the same token from Script Properties'
+
+Then run:
+python3 utilities/sync_bmi30_version_registry.py --dry-run
+python3 utilities/sync_bmi30_version_registry.py
+
+To make the Google Sheet exactly match the local CSV and remove stale rows:
+python3 utilities/sync_bmi30_version_registry.py --replace
+
+Notes:
+
+The Apps Script URL is not treated as a secret. The write protection is the
+BMI30_SYNC_TOKEN value, which should not be committed to git.
+
+The local token file secrets/bmi30_sheets.env is ignored by git.
+
+By default, the uploader performs an upsert by the "ID версии" column.
+Existing rows with the same "ID версии" are updated, and new IDs are appended.
+Use --replace when stale rows should be removed from the sheet.
