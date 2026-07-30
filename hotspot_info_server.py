@@ -114,6 +114,42 @@ DEVICE_STATE_MAX_AGE_S = max(1, int(os.getenv("BMI30_DEVICE_STATE_MAX_AGE_S", "3
 PORTAL_USB_STATUS_POLL = os.getenv("BMI30_PORTAL_USB_STATUS_POLL", "0").strip().lower() in {"1", "true", "yes", "on"}
 PAGE_REV = _initial_page_revision()
 PORTAL_RUNTIME_SHA256 = _sha256_file(__file__)
+FIRMWARE_WORKSPACE = pathlib.Path(
+    os.getenv("BMI30_FIRMWARE_WORKSPACE", "/home/techaid/Documents")
+).expanduser()
+FIRMWARE_CONFIG_FILE = pathlib.Path(
+    os.getenv(
+        "BMI30_FIRMWARE_CLOUD_CONFIG",
+        str(FIRMWARE_WORKSPACE / "utilities" / "backup_to_cloud.conf"),
+    )
+).expanduser()
+FIRMWARE_STATE_DIR = pathlib.Path(
+    os.getenv(
+        "BMI30_FIRMWARE_STATE_DIR",
+        str(FIRMWARE_WORKSPACE / ".bmi30_cloud_sync"),
+    )
+).expanduser()
+FIRMWARE_OPERATION_FILE = FIRMWARE_STATE_DIR / "portal_operation.json"
+FIRMWARE_ROLLBACK_FILE = FIRMWARE_STATE_DIR / "rollback_state.env"
+FIRMWARE_REMOTE_MARKER_FILE = FIRMWARE_STATE_DIR / "portal_remote_latest.env"
+FIRMWARE_OPERATION_SCRIPT = pathlib.Path(
+    os.getenv(
+        "BMI30_FIRMWARE_OPERATION_SCRIPT",
+        str(FIRMWARE_WORKSPACE / "utilities" / "portal_firmware_operation.sh"),
+    )
+).expanduser()
+FIRMWARE_RCLONE_CONFIG = pathlib.Path(
+    os.getenv("BMI30_RCLONE_CONFIG", "/home/techaid/.config/rclone/rclone.conf")
+).expanduser()
+FIRMWARE_CHECK_INTERVAL_S = max(
+    300,
+    int(os.getenv("BMI30_FIRMWARE_CHECK_INTERVAL_S", "3600")),
+)
+FIRMWARE_CHECK_TIMEOUT_S = max(
+    10,
+    int(os.getenv("BMI30_FIRMWARE_CHECK_TIMEOUT_S", "50")),
+)
+FIRMWARE_WORKSPACE_USER = os.getenv("BMI30_FIRMWARE_WORKSPACE_USER", "techaid").strip() or "techaid"
 TAGIT_LOGO_CANDIDATES = [
     os.getenv("BMI30_PORTAL_TAGIT_LOGO_PATH", "").strip(),
     os.path.join(os.path.dirname(__file__), "docs", "Tagit_Logo.png"),
@@ -180,6 +216,18 @@ _LAN_DEVICE_CACHE: dict[str, Any] = {"updated_at": 0.0, "sensor_updated_at": 0.0
 _LAN_DEVICE_LOCK = threading.Lock()
 _LAN_SENSOR_OPENERS: dict[str, Any] = {}
 _LAN_SENSOR_OPENERS_LOCK = threading.Lock()
+_FIRMWARE_CONTROL_LOCK = threading.Lock()
+_FIRMWARE_OPERATION_START_LOCK = threading.Lock()
+_FIRMWARE_CONTROL_WAKE = threading.Event()
+_FIRMWARE_CONTROL_STATE: dict[str, Any] = {
+    "checking": False,
+    "checked_at": 0,
+    "next_check_at": 0,
+    "online": False,
+    "available": False,
+    "error": "",
+    "cloud": {},
+}
 
 _PORTAL_CLIENTS: dict[str, float] = {}
 PORTAL_CLIENT_TTL_S = 15.0
@@ -814,6 +862,411 @@ def format_firmware_version_with_date(release: dict[str, Any]) -> str:
     if match:
         return match.group(1)
     return version or str(release.get("label") or "").strip()
+
+
+def _firmware_version_key(value: Any) -> tuple[int, int, int, int, int, int] | None:
+    text = str(value or "").strip()
+    match = re.search(
+        r"(\d{4})-(\d{2})-(\d{2})[-_](\d{2})(\d{2})(\d{2})?",
+        text,
+    )
+    if not match:
+        return None
+    try:
+        return tuple(int(part or 0) for part in match.groups())  # type: ignore[return-value]
+    except (TypeError, ValueError):
+        return None
+
+
+def _firmware_is_newer(remote_version: Any, current_version: Any) -> bool:
+    remote_key = _firmware_version_key(remote_version)
+    current_key = _firmware_version_key(current_version)
+    return bool(remote_key and current_key and remote_key > current_key)
+
+
+def _firmware_text(value: Any, limit: int = 600) -> str:
+    return str(value or "").replace("\x00", "").strip()[:limit]
+
+
+def _firmware_cloud_config() -> dict[str, str]:
+    config = _read_key_value_file(str(FIRMWARE_CONFIG_FILE))
+    return {
+        "remote": _firmware_text(config.get("REMOTE_TARGET"), 240),
+        "folder_id": _firmware_text(config.get("REMOTE_FOLDER_ID"), 240),
+        "marker": _firmware_text(config.get("REMOTE_LATEST_FILE"), 160) or "bmi30_latest.env",
+    }
+
+
+def _firmware_remote_join(remote: str, name: str) -> str:
+    return f"{remote}{name}" if remote.endswith(":") else f"{remote.rstrip('/')}/{name}"
+
+
+def _firmware_marker_metadata(marker: dict[str, str]) -> dict[str, str]:
+    return {
+        "release_kind": _firmware_text(marker.get("RELEASE_KIND"), 80) or "firmware",
+        "version": _firmware_text(marker.get("FIRMWARE_VERSION"), 120),
+        "bundle_id": _firmware_text(marker.get("FIRMWARE_BUNDLE_ID"), 160),
+        "label": _firmware_text(
+            marker.get("FIRMWARE_LABEL") or marker.get("BUNDLE_LABEL"),
+            300,
+        ),
+        "notes": _firmware_text(
+            marker.get("FIRMWARE_NOTES") or marker.get("BUNDLE_ORIGIN"),
+            600,
+        ),
+        "bundle_created_at": _firmware_text(marker.get("BUNDLE_CREATED_AT"), 120),
+        "created_at": _firmware_text(marker.get("CREATED_AT"), 120),
+        "archive_name": _firmware_text(marker.get("ARCHIVE_NAME"), 200),
+        "archive_sha256": _firmware_text(marker.get("ARCHIVE_SHA256"), 80),
+        "content_signature": _firmware_text(
+            marker.get("PROJECT_CONTENT_SIGNATURE") or marker.get("PROJECT_SIGNATURE"),
+            80,
+        ),
+        "signature_version": _firmware_text(marker.get("PROJECT_SIGNATURE_VERSION"), 40),
+        "source_device": _firmware_text(marker.get("DEVICE_SUFFIX"), 80),
+    }
+
+
+def _firmware_current_metadata() -> dict[str, Any]:
+    release = detect_bmi30_firmware_release()
+    split = detect_bmi30_split_system_version()
+    active_data = _read_key_value_file(
+        str(FIRMWARE_WORKSPACE / "host" / "bmi30_split_active_version.env")
+    )
+    return {
+        "version": _firmware_text(release.get("version") or split.get("version"), 160),
+        "label": _firmware_text(release.get("label") or split.get("label"), 300),
+        "created_at": _firmware_text(release.get("created_at"), 120),
+        "bundle_id": _firmware_text(active_data.get("BMI30_SPLIT_BUNDLE_ID"), 160),
+        "content_signature": _firmware_text(release.get("content_signature"), 80),
+    }
+
+
+def _read_firmware_operation_state() -> dict[str, Any]:
+    try:
+        with FIRMWARE_OPERATION_FILE.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            raise ValueError("operation state is not an object")
+    except Exception:
+        return {
+            "action": "",
+            "status": "idle",
+            "progress": 0,
+            "message": "",
+            "error": "",
+            "updated_at": 0,
+        }
+
+    action = str(data.get("action") or "")
+    status = str(data.get("status") or "idle")
+    try:
+        progress = max(0, min(100, int(data.get("progress") or 0)))
+    except (TypeError, ValueError):
+        progress = 0
+    try:
+        updated_at = int(data.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        updated_at = 0
+    if status in {"starting", "running"} and updated_at and (time.time() - updated_at) > 7200:
+        status = "failed"
+        data["error"] = "The firmware operation stopped reporting progress."
+    return {
+        "action": action if action in {"update", "rollback"} else "",
+        "status": status,
+        "progress": progress,
+        "message": _firmware_text(data.get("message"), 240),
+        "error": _firmware_text(data.get("error"), 500),
+        "updated_at": updated_at,
+    }
+
+
+def _firmware_operation_busy() -> bool:
+    return _read_firmware_operation_state().get("status") in {"starting", "running"}
+
+
+def _read_firmware_rollback_state() -> dict[str, Any]:
+    data = _read_key_value_file(str(FIRMWARE_ROLLBACK_FILE))
+    available = str(data.get("ROLLBACK_AVAILABLE") or "").strip() == "1"
+    bundle_id = _firmware_text(data.get("ROLLBACK_BUNDLE_ID"), 160)
+    bundle_dir = FIRMWARE_WORKSPACE / "host" / "bmi30_split_bundles" / bundle_id
+    available = bool(available and bundle_id and bundle_dir.is_dir())
+    return {
+        "available": available,
+        "version": _firmware_text(
+            data.get("ROLLBACK_FIRMWARE_VERSION") or data.get("ROLLBACK_BUNDLE_ID"),
+            160,
+        ),
+        "bundle_id": bundle_id,
+        "label": _firmware_text(data.get("ROLLBACK_LABEL"), 300),
+        "notes": _firmware_text(data.get("ROLLBACK_NOTES"), 600),
+        "created_at": _firmware_text(data.get("ROLLBACK_CREATED_AT"), 120),
+        "saved_at": _firmware_text(data.get("ROLLBACK_SAVED_AT"), 120),
+        "updated_to_version": _firmware_text(data.get("UPDATED_TO_VERSION"), 160),
+        "updated_to_bundle": _firmware_text(data.get("UPDATED_TO_BUNDLE_ID"), 160),
+    }
+
+
+def _write_firmware_operation_state(
+    action: str,
+    status: str,
+    progress: int,
+    message: str,
+    error: str = "",
+) -> None:
+    FIRMWARE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "action": action,
+        "status": status,
+        "progress": max(0, min(100, int(progress))),
+        "message": message,
+        "error": error,
+        "updated_at": int(time.time()),
+    }
+    temporary = FIRMWARE_OPERATION_FILE.with_name(
+        f".{FIRMWARE_OPERATION_FILE.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+    )
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+        handle.write("\n")
+    os.replace(temporary, FIRMWARE_OPERATION_FILE)
+
+
+def check_firmware_update_from_cloud() -> dict[str, Any]:
+    if _firmware_operation_busy():
+        return {"ok": False, "busy": True, "error": "A firmware operation is running."}
+
+    checked_at = int(time.time())
+    with _FIRMWARE_CONTROL_LOCK:
+        _FIRMWARE_CONTROL_STATE["checking"] = True
+        _FIRMWARE_CONTROL_STATE["error"] = ""
+
+    try:
+        config = _firmware_cloud_config()
+        remote = config["remote"]
+        if not remote:
+            raise RuntimeError("Cloud remote is not configured.")
+        if not FIRMWARE_RCLONE_CONFIG.is_file():
+            raise RuntimeError("The rclone configuration file is unavailable.")
+
+        FIRMWARE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        temporary = FIRMWARE_REMOTE_MARKER_FILE.with_name(
+            f".{FIRMWARE_REMOTE_MARKER_FILE.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+        )
+        remote_marker = _firmware_remote_join(remote, config["marker"])
+        command = [
+            "/usr/bin/nice",
+            "-n",
+            "15",
+            "/usr/bin/ionice",
+            "-c",
+            "3",
+            "/usr/bin/rclone",
+            "copyto",
+            remote_marker,
+            str(temporary),
+            "--config",
+            str(FIRMWARE_RCLONE_CONFIG),
+            "--contimeout",
+            "10s",
+            "--timeout",
+            "20s",
+            "--retries",
+            "1",
+            "--low-level-retries",
+            "1",
+            "--log-level",
+            "ERROR",
+        ]
+        if config["folder_id"]:
+            command.extend(["--drive-root-folder-id", config["folder_id"]])
+        proc = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=FIRMWARE_CHECK_TIMEOUT_S,
+        )
+        if proc.returncode != 0:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+            detail = (proc.stderr or proc.stdout or "rclone returned an error").strip()
+            raise RuntimeError(detail[-400:])
+        os.replace(temporary, FIRMWARE_REMOTE_MARKER_FILE)
+
+        marker = _read_key_value_file(str(FIRMWARE_REMOTE_MARKER_FILE))
+        cloud = _firmware_marker_metadata(marker)
+        if not cloud["version"]:
+            raise RuntimeError("The cloud marker does not contain a firmware version.")
+        if not re.fullmatch(r"(?:bmi30_backup|bmi30_firmware)_[A-Za-z0-9._-]+\.tar\.gz", cloud["archive_name"]):
+            raise RuntimeError("The cloud marker contains an invalid archive name.")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", cloud["archive_sha256"]):
+            raise RuntimeError("The cloud marker contains an invalid archive SHA-256.")
+
+        current = _firmware_current_metadata()
+        available = _firmware_is_newer(cloud["version"], current["version"])
+        with _FIRMWARE_CONTROL_LOCK:
+            _FIRMWARE_CONTROL_STATE.update(
+                {
+                    "checking": False,
+                    "checked_at": checked_at,
+                    "next_check_at": checked_at + FIRMWARE_CHECK_INTERVAL_S,
+                    "online": True,
+                    "available": available,
+                    "error": "",
+                    "cloud": cloud,
+                }
+            )
+        return {"ok": True, "available": available, "cloud": cloud}
+    except Exception as exc:
+        with _FIRMWARE_CONTROL_LOCK:
+            _FIRMWARE_CONTROL_STATE.update(
+                {
+                    "checking": False,
+                    "checked_at": checked_at,
+                    "next_check_at": checked_at + FIRMWARE_CHECK_INTERVAL_S,
+                    "online": False,
+                    "error": _firmware_text(exc, 500),
+                }
+            )
+        return {"ok": False, "error": _firmware_text(exc, 500)}
+
+
+def firmware_control_public_state() -> dict[str, Any]:
+    with _FIRMWARE_CONTROL_LOCK:
+        cloud_state = json.loads(json.dumps(_FIRMWARE_CONTROL_STATE))
+    current = _firmware_current_metadata()
+    cloud = cloud_state.get("cloud") if isinstance(cloud_state.get("cloud"), dict) else {}
+    available = bool(
+        cloud
+        and _firmware_is_newer(cloud.get("version"), current.get("version"))
+        and cloud_state.get("available")
+    )
+    operation = _read_firmware_operation_state()
+    rollback = _read_firmware_rollback_state()
+    busy = operation.get("status") in {"starting", "running"}
+    return {
+        "ok": True,
+        "current": current,
+        "cloud": {
+            **cloud,
+            "available": bool(available and not busy),
+            "checking": bool(cloud_state.get("checking")),
+            "online": bool(cloud_state.get("online")),
+            "checked_at": int(cloud_state.get("checked_at") or 0),
+            "next_check_at": int(cloud_state.get("next_check_at") or 0),
+            "error": _firmware_text(cloud_state.get("error"), 500),
+        },
+        "rollback": {**rollback, "available": bool(rollback.get("available") and not busy)},
+        "operation": operation,
+    }
+
+
+def launch_firmware_operation(action: str) -> tuple[bool, str]:
+    if action not in {"update", "rollback"}:
+        return False, "Unsupported firmware operation."
+
+    with _FIRMWARE_OPERATION_START_LOCK:
+        state = firmware_control_public_state()
+        operation = state["operation"]
+        if operation.get("status") in {"starting", "running"}:
+            return False, "Another firmware operation is already running."
+        if action == "update" and not state["cloud"].get("available"):
+            return False, "No newer cloud firmware is available."
+        if action == "rollback" and not state["rollback"].get("available"):
+            return False, "No saved rollback version is available."
+        if not FIRMWARE_OPERATION_SCRIPT.is_file():
+            return False, "The firmware operation worker is unavailable."
+
+        _write_firmware_operation_state(
+            action,
+            "starting",
+            1,
+            "Starting update…" if action == "update" else "Starting rollback…",
+        )
+        unit = f"bmi30-portal-firmware-{action}-{int(time.time())}-{os.getpid()}"
+        command = [
+            "/usr/bin/systemd-run",
+            "--quiet",
+            "--collect",
+            f"--unit={unit}",
+            "--property=Type=exec",
+            "--property=Nice=10",
+            f"--working-directory={FIRMWARE_WORKSPACE}",
+            f"--setenv=RCLONE_CONFIG={FIRMWARE_RCLONE_CONFIG}",
+            str(FIRMWARE_OPERATION_SCRIPT),
+            action,
+        ]
+        try:
+            proc = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=12.0,
+            )
+        except Exception as exc:
+            message = _firmware_text(exc, 500)
+            _write_firmware_operation_state(action, "failed", 1, "Unable to start.", message)
+            return False, message
+        if proc.returncode != 0:
+            message = _firmware_text(
+                proc.stderr or proc.stdout or "systemd-run returned an error",
+                500,
+            )
+            _write_firmware_operation_state(action, "failed", 1, "Unable to start.", message)
+            return False, message
+        return True, "Firmware operation started."
+
+
+def firmware_control_background() -> None:
+    while True:
+        if _firmware_operation_busy():
+            _FIRMWARE_CONTROL_WAKE.wait(10.0)
+            _FIRMWARE_CONTROL_WAKE.clear()
+            continue
+        check_firmware_update_from_cloud()
+        _FIRMWARE_CONTROL_WAKE.wait(float(FIRMWARE_CHECK_INTERVAL_S))
+        _FIRMWARE_CONTROL_WAKE.clear()
+
+
+def disable_legacy_firmware_auto_update_timer() -> None:
+    """Best-effort migration from unattended installs to Portal-controlled installs."""
+    try:
+        uid_proc = subprocess.run(
+            ["/usr/bin/id", "-u", FIRMWARE_WORKSPACE_USER],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+        uid = uid_proc.stdout.strip()
+        if uid_proc.returncode != 0 or not uid.isdigit():
+            return
+        subprocess.run(
+            [
+                "/usr/sbin/runuser",
+                "-u",
+                FIRMWARE_WORKSPACE_USER,
+                "--",
+                "/usr/bin/env",
+                f"XDG_RUNTIME_DIR=/run/user/{uid}",
+                f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+                "/usr/bin/systemctl",
+                "--user",
+                "disable",
+                "--now",
+                "bmi30-cloud-update.timer",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+    except Exception:
+        pass
 
 
 def _format_active_app_version(path: str) -> str:
@@ -6256,7 +6709,7 @@ def render_portal_page(
     h2{{font-size:20px;line-height:1.25;margin-bottom:10px}}
     h3{{font-size:15px;line-height:1.25;margin-bottom:8px}}
     p{{font-size:16px;line-height:1.6;color:var(--muted);max-width:34rem}}
-    .session-tag{{display:inline-flex;align-items:center;gap:8px;margin:0 0 14px;padding:8px 12px;border-radius:999px;
+    .session-tag{{display:inline-flex;align-items:center;gap:8px;margin:0;padding:8px 12px;border-radius:999px;
                   background:var(--accent-soft);color:var(--text);font-size:12px;font-weight:600}}
     .portal-side{{display:grid;justify-items:end;align-content:start;gap:8px;max-width:min(760px,100%);min-width:min(360px,100%)}}
     .language-switch{{grid-column:1;grid-row:1 / span 2;align-self:center;display:block;width:38px;height:26px;padding:0;
@@ -6268,6 +6721,30 @@ def render_portal_page(
     .language-switch-flag{{display:block;width:38px;height:26px}}
     .language-switch-flag[hidden]{{display:none}}
     .session-block{{display:grid;justify-items:end;align-content:start;gap:8px;max-width:min(540px,100%)}}
+    .session-row{{display:flex;justify-content:flex-end;align-items:center;gap:8px;flex-wrap:wrap;max-width:100%}}
+    .firmware-actions{{display:flex;align-items:center;gap:6px}}
+    .firmware-action{{position:relative;display:inline-flex;outline:none}}
+    .firmware-action-btn{{--firmware-progress:0%;position:relative;isolation:isolate;min-width:94px;min-height:32px;
+                          overflow:hidden;border:1px solid var(--line);border-radius:999px;padding:6px 11px;
+                          background:var(--note-bg);color:var(--text);font:inherit;font-size:11px;font-weight:800;
+                          letter-spacing:.01em;cursor:pointer;transition:border-color .14s ease,transform .14s ease,opacity .14s ease}}
+    .firmware-action-btn::before{{content:"";position:absolute;z-index:-1;inset:0 auto 0 0;width:var(--firmware-progress);
+                                  background:color-mix(in srgb,var(--accent) 26%,transparent);transition:width .3s ease}}
+    .firmware-action-btn:not(:disabled):hover{{border-color:var(--accent);transform:translateY(-1px)}}
+    .firmware-action-btn:disabled{{cursor:not-allowed;opacity:.42}}
+    .firmware-action-btn.is-available{{border-color:var(--accent);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 38%,transparent)}}
+    .firmware-action-btn.is-running{{cursor:wait;opacity:1;border-color:var(--accent)}}
+    .firmware-tooltip{{position:absolute;z-index:90;right:0;top:calc(100% + 9px);width:min(420px,calc(100vw - 32px));
+                       padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:var(--panel-fallback);
+                       color:var(--text);box-shadow:0 14px 34px rgba(0,0,0,.28);font-size:11px;line-height:1.42;
+                       text-align:left;white-space:pre-wrap;overflow-wrap:anywhere;pointer-events:none;
+                       opacity:0;visibility:hidden;transform:translateY(-3px);
+                       transition:opacity .12s ease,visibility .12s ease,transform .12s ease}}
+    .firmware-tooltip::before{{content:"";position:absolute;right:24px;top:-5px;width:9px;height:9px;
+                              background:var(--panel-fallback);border-left:1px solid var(--line);
+                              border-top:1px solid var(--line);transform:rotate(45deg)}}
+    .firmware-action:hover .firmware-tooltip,.firmware-action:focus-within .firmware-tooltip{{
+      opacity:1;visibility:visible;transform:translateY(0)}}
     .session-notice-slot{{width:min(540px,100%);min-height:0}}
     .session-notice-slot .notice{{margin:0}}
     .session-notice-slot .notice-error{{margin:0}}
@@ -6288,8 +6765,11 @@ def render_portal_page(
     .portal-title{{min-width:min(240px,100%)}}
     @media (max-width:720px){{
       .portal-side,.session-block{{justify-items:start;min-width:0;width:100%}}
+      .session-row{{justify-content:flex-start}}
       .device-meta{{justify-content:start;max-width:100%}}
       .device-meta .identity-value{{max-width:100%}}
+      .firmware-tooltip{{left:0;right:auto}}
+      .firmware-tooltip::before{{left:24px;right:auto}}
     }}
     .portal-shell{{display:grid;grid-template-columns:minmax(190px,260px) minmax(0,1fr);gap:clamp(14px,1.7vw,28px);align-items:start;min-width:0}}
     .portal-menu{{display:grid;gap:8px;position:sticky;top:18px}}
@@ -6712,7 +7192,19 @@ def render_portal_page(
           <span class="identity-label">STM32</span><span class="identity-value" data-sensor-text="header-stm32">{stm32_identity_text}</span>
         </p>
         <div class="session-block">
-          <p class="session-tag" data-header-session data-username="{signed_in_as or 'authorized user'}" data-role="{session_role}">Signed in as {signed_in_as or "authorized user"} · {access_label}</p>
+          <div class="session-row">
+            <p class="session-tag" data-header-session data-username="{signed_in_as or 'authorized user'}" data-role="{session_role}">Signed in as {signed_in_as or "authorized user"} · {access_label}</p>
+            <div class="firmware-actions" id="firmware-actions" aria-label="Firmware version controls">
+              <span class="firmware-action" tabindex="0">
+                <button class="firmware-action-btn" id="firmware-update-btn" type="button" disabled aria-describedby="firmware-update-tooltip">↓ Update</button>
+                <span class="firmware-tooltip" id="firmware-update-tooltip" role="tooltip">Checking the cloud for a newer firmware release…</span>
+              </span>
+              <span class="firmware-action" tabindex="0">
+                <button class="firmware-action-btn" id="firmware-rollback-btn" type="button" disabled aria-describedby="firmware-rollback-tooltip">↶ Rollback</button>
+                <span class="firmware-tooltip" id="firmware-rollback-tooltip" role="tooltip">Rollback becomes available after a successful firmware update.</span>
+              </span>
+            </div>
+          </div>
           <div class="session-notice-slot">{notice_html}</div>
         </div>
       </div>
@@ -7452,6 +7944,197 @@ def render_portal_page(
         }});
       }}
       setHeaderLanguage(storedLanguage(), false);
+    }})();
+  </script>
+  <script>
+    (function () {{
+      var updateButton = document.getElementById('firmware-update-btn');
+      var rollbackButton = document.getElementById('firmware-rollback-btn');
+      var updateTooltip = document.getElementById('firmware-update-tooltip');
+      var rollbackTooltip = document.getElementById('firmware-rollback-tooltip');
+      var pollTimer = null;
+      var requestInFlight = false;
+      var operationRunning = false;
+      if (!updateButton || !rollbackButton || !updateTooltip || !rollbackTooltip) {{ return; }}
+
+      function text(value, fallback) {{
+        var result = String(value === undefined || value === null ? '' : value).trim();
+        return result || (fallback || '—');
+      }}
+      function timestamp(value) {{
+        var seconds = Number(value || 0);
+        if (!seconds) {{ return '—'; }}
+        try {{ return new Date(seconds * 1000).toLocaleString('en-GB'); }} catch (error) {{ return String(seconds); }}
+      }}
+      function details(title, rows) {{
+        var lines = [title];
+        rows.forEach(function (row) {{
+          if (row[1] !== undefined && row[1] !== null && String(row[1]).trim() !== '') {{
+            lines.push(row[0] + ': ' + String(row[1]).trim());
+          }}
+        }});
+        return lines.join('\\n');
+      }}
+      function setButton(button, label, enabled, progress, running) {{
+        button.textContent = label;
+        button.disabled = !enabled;
+        button.classList.toggle('is-available', Boolean(enabled && !running));
+        button.classList.toggle('is-running', Boolean(running));
+        button.style.setProperty('--firmware-progress', String(Math.max(0, Math.min(100, Number(progress || 0)))) + '%');
+      }}
+      function renderFirmwareState(data) {{
+        data = data || {{}};
+        var current = data.current || {{}};
+        var cloud = data.cloud || {{}};
+        var rollback = data.rollback || {{}};
+        var operation = data.operation || {{}};
+        var running = operation.status === 'starting' || operation.status === 'running';
+        var recentSuccess = operation.status === 'succeeded' &&
+          (Date.now() / 1000 - Number(operation.updated_at || 0)) < 120;
+        operationRunning = running;
+
+        if (running) {{
+          var progress = Number(operation.progress || 0);
+          var isUpdate = operation.action === 'update';
+          setButton(
+            updateButton,
+            isUpdate ? ('Updating ' + progress + '%') : '↓ Update',
+            false,
+            isUpdate ? progress : 0,
+            isUpdate
+          );
+          setButton(
+            rollbackButton,
+            isUpdate ? '↶ Rollback' : ('Rolling back ' + progress + '%'),
+            false,
+            isUpdate ? 0 : progress,
+            !isUpdate
+          );
+        }} else {{
+          var updateLabel = recentSuccess && operation.action === 'update' ? '✓ Updated 100%' : '↓ Update';
+          var rollbackLabel = recentSuccess && operation.action === 'rollback' ? '✓ Rolled back 100%' : '↶ Rollback';
+          if (operation.status === 'failed' && operation.action === 'update') {{ updateLabel = '↻ Retry update'; }}
+          if (operation.status === 'failed' && operation.action === 'rollback') {{ rollbackLabel = '↻ Retry rollback'; }}
+          setButton(updateButton, updateLabel, Boolean(cloud.available), recentSuccess && operation.action === 'update' ? 100 : 0, false);
+          setButton(rollbackButton, rollbackLabel, Boolean(rollback.available), recentSuccess && operation.action === 'rollback' ? 100 : 0, false);
+        }}
+
+        if (cloud.available) {{
+          updateTooltip.textContent = details('New cloud firmware is available', [
+            ['Version', cloud.version],
+            ['Bundle', cloud.bundle_id],
+            ['Release label', cloud.label],
+            ['Release notes', cloud.notes],
+            ['Bundle created', cloud.bundle_created_at],
+            ['Published', cloud.created_at],
+            ['Archive', cloud.archive_name],
+            ['Archive SHA-256', cloud.archive_sha256],
+            ['Content signature', cloud.content_signature],
+            ['Signature format', cloud.signature_version],
+            ['Source device', cloud.source_device],
+            ['Currently running', current.version],
+            ['Last cloud check', timestamp(cloud.checked_at)]
+          ]);
+        }} else if (cloud.checking) {{
+          updateTooltip.textContent = 'Checking the cloud for a newer firmware release…\\nCurrently running: ' + text(current.version);
+        }} else if (cloud.error) {{
+          updateTooltip.textContent = details('Cloud firmware check is temporarily unavailable', [
+            ['Currently running', current.version],
+            ['Last attempt', timestamp(cloud.checked_at)],
+            ['Error', cloud.error],
+            ['Next automatic check', timestamp(cloud.next_check_at)]
+          ]);
+        }} else {{
+          updateTooltip.textContent = details('Firmware is up to date', [
+            ['Currently running', current.version],
+            ['Latest cloud version', cloud.version],
+            ['Last cloud check', timestamp(cloud.checked_at)],
+            ['Next automatic check', timestamp(cloud.next_check_at)]
+          ]);
+        }}
+
+        if (rollback.available) {{
+          rollbackTooltip.textContent = details('Saved rollback firmware', [
+            ['Version', rollback.version],
+            ['Bundle', rollback.bundle_id],
+            ['Release label', rollback.label],
+            ['Release notes', rollback.notes],
+            ['Release created', rollback.created_at],
+            ['Saved before update', rollback.saved_at],
+            ['Update target version', rollback.updated_to_version],
+            ['Update target bundle', rollback.updated_to_bundle]
+          ]);
+        }} else {{
+          rollbackTooltip.textContent = 'Rollback becomes available after a successful firmware update.';
+        }}
+        if (running) {{
+          var operationText = details(
+            operation.action === 'rollback' ? 'Rollback in progress' : 'Firmware update in progress',
+            [
+              ['Progress', String(operation.progress || 0) + '%'],
+              ['Stage', operation.message],
+              ['Started action', operation.action]
+            ]
+          );
+          if (operation.action === 'update') {{ updateTooltip.textContent = operationText; }}
+          else {{ rollbackTooltip.textContent = operationText; }}
+        }} else if (operation.status === 'failed' && operation.error) {{
+          var failed = '\\n\\nLast operation failed: ' + operation.error;
+          if (operation.action === 'update') {{ updateTooltip.textContent += failed; }}
+          else {{ rollbackTooltip.textContent += failed; }}
+        }}
+      }}
+      function schedulePoll(delay) {{
+        if (pollTimer) {{ window.clearTimeout(pollTimer); }}
+        pollTimer = window.setTimeout(pollState, delay);
+      }}
+      function pollState() {{
+        fetch('/api/firmware-control', {{cache:'no-store', credentials:'same-origin'}})
+          .then(function (response) {{
+            if (!response.ok) {{ throw new Error('Firmware status request failed'); }}
+            return response.json();
+          }})
+          .then(function (data) {{
+            renderFirmwareState(data);
+            schedulePoll(operationRunning ? 1500 : 15000);
+          }})
+          .catch(function () {{
+            if (operationRunning) {{
+              schedulePoll(1500);
+            }} else {{
+              schedulePoll(15000);
+            }}
+          }});
+      }}
+      function startOperation(action) {{
+        if (requestInFlight || operationRunning) {{ return; }}
+        requestInFlight = true;
+        var button = action === 'update' ? updateButton : rollbackButton;
+        setButton(button, action === 'update' ? 'Starting update…' : 'Starting rollback…', false, 1, true);
+        fetch(action === 'update' ? '/api/firmware-update' : '/api/firmware-rollback', {{
+          method:'POST',
+          cache:'no-store',
+          credentials:'same-origin',
+          headers:{{'Content-Type':'application/json'}},
+          body:'{{}}'
+        }})
+          .then(function (response) {{
+            return response.json().then(function (data) {{
+              if (!response.ok || !data.ok) {{ throw new Error(data.message || 'Unable to start firmware operation'); }}
+              return data;
+            }});
+          }})
+          .then(function () {{ schedulePoll(250); }})
+          .catch(function (error) {{
+            var target = action === 'update' ? updateTooltip : rollbackTooltip;
+            target.textContent += '\\n\\nUnable to start: ' + String(error && error.message ? error.message : error);
+            schedulePoll(1000);
+          }})
+          .finally(function () {{ requestInFlight = false; }});
+      }}
+      updateButton.addEventListener('click', function () {{ startOperation('update'); }});
+      rollbackButton.addEventListener('click', function () {{ startOperation('rollback'); }});
+      pollState();
     }})();
   </script>
   <script>
@@ -9583,6 +10266,22 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             content_length = 0
         return self.rfile.read(max(content_length, 0))
 
+    def _send_json_response(
+        self,
+        data: dict[str, Any],
+        status: HTTPStatus = HTTPStatus.OK,
+        *,
+        send_body: bool = True,
+    ) -> None:
+        payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if send_body:
+            self.wfile.write(payload)
+
     def _read_cookie(self, name: str) -> str:
         raw_cookie = self.headers.get("Cookie", "")
         if not raw_cookie:
@@ -9807,6 +10506,17 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
             return
 
         # JSON API
+        if path == "/api/firmware-control":
+            if self._get_portal_session() is None:
+                self._send_json_response(
+                    {"ok": False, "error": "Not authorized."},
+                    HTTPStatus.FORBIDDEN,
+                    send_body=send_body,
+                )
+                return
+            self._send_json_response(firmware_control_public_state(), send_body=send_body)
+            return
+
         if path == "/api/status":
             if self._get_portal_session() is not None:
                 remember_portal_client(self.client_address[0] if self.client_address else "")
@@ -10213,6 +10923,22 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path in {"/api/firmware-update", "/api/firmware-rollback"}:
+            if self._get_portal_session() is None:
+                self._send_json_response(
+                    {"ok": False, "error": "Not authorized."},
+                    HTTPStatus.FORBIDDEN,
+                )
+                return
+            self._read_raw_post_body()
+            action = "update" if path.endswith("-update") else "rollback"
+            ok, message = launch_firmware_operation(action)
+            self._send_json_response(
+                {"ok": ok, "action": action, "message": message},
+                HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT,
+            )
+            return
+
         if path.startswith("/portal-core/") or path == "/portal-core":
             if self._require_portal_session() is None:
                 return
@@ -10964,6 +11690,15 @@ class HotspotInfoHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     global HTTPS_RUNTIME_ENABLED
+
+    disable_legacy_firmware_auto_update_timer()
+
+    firmware_control_thread = threading.Thread(
+        target=firmware_control_background,
+        name="bmi30-firmware-cloud-check",
+        daemon=True,
+    )
+    firmware_control_thread.start()
 
     # Запускаем фоновый процесс обновления PDF документов
     pdf_update_thread = threading.Thread(target=update_pdf_documents_background, daemon=True)

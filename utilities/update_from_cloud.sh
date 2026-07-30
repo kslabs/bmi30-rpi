@@ -21,6 +21,8 @@ BMI30_CORE_SERVICE="${BMI30_CORE_SERVICE:-bmi30-core.service}"
 BMI30_PORTAL_SERVICE="${BMI30_PORTAL_SERVICE:-bmi30-hotspot-info.service}"
 BMI30_PORTAL_DST="${BMI30_PORTAL_DST:-/usr/local/bin/bmi30-hotspot-info-server.py}"
 COMMON_LIB="$SCRIPT_DIR/cloud_sync_common.sh"
+PROGRESS_FILE="${BMI30_PROGRESS_FILE:-}"
+PROGRESS_ACTION="${BMI30_PROGRESS_ACTION:-update}"
 
 if [[ -f "$COMMON_LIB" ]]; then
     # shellcheck source=/dev/null
@@ -37,6 +39,7 @@ REQUIRE_TODAY=0
 
 APPLY_TEMP_DIR=""
 PREVIOUS_ACTIVE_ENV_BACKUP=""
+PREVIOUS_RELEASE_MANIFEST_BACKUP=""
 
 usage() {
     cat <<'EOF'
@@ -48,8 +51,8 @@ Options:
   --output-dir <path>        Local archive/snapshot directory (default: ./backups)
   --remote <rclone-remote>   Cloud target, for example: gdrive:
   --remote-folder-id <id>    Google Drive folder ID
-  --install-timer            Install a per-user systemd update timer
-  --on-calendar <expr>       Timer schedule (default: *-*-* 23:00:00)
+  --install-timer            Compatibility command: disable the legacy auto-install timer
+  --on-calendar <expr>       Legacy compatibility option (Portal checks hourly)
   --config <path>            Config file (default: ./utilities/backup_to_cloud.conf)
   --today-only               Update only from an archive published today
   --no-restart               Do not restart BMI30 runtime after applying an update
@@ -59,7 +62,7 @@ Options:
 
 Examples:
   ./utilities/update_from_cloud.sh
-  ./utilities/update_from_cloud.sh --install-timer
+  ./utilities/update_from_cloud.sh --install-timer  # disables legacy unattended installs
 EOF
 }
 
@@ -74,6 +77,35 @@ warn() {
 fail() {
     printf '[ERROR] %s\n' "$*" >&2
     exit 1
+}
+
+json_escape() {
+    local value="${1:-}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '%s' "$value"
+}
+
+write_progress() {
+    [[ -n "$PROGRESS_FILE" ]] || return 0
+    local progress="$1"
+    local message="$2"
+    local progress_dir temporary
+    progress_dir="$(dirname -- "$PROGRESS_FILE")"
+    mkdir -p "$progress_dir"
+    temporary="$progress_dir/.portal_operation.update.$$"
+    {
+        printf '{"action":"%s","status":"running","progress":%d,' \
+            "$(json_escape "$PROGRESS_ACTION")" \
+            "$progress"
+        printf '"message":"%s","error":"","updated_at":%d}\n' \
+            "$(json_escape "$message")" \
+            "$(date +%s)"
+    } > "$temporary"
+    mv -f -- "$temporary" "$PROGRESS_FILE"
 }
 
 cleanup() {
@@ -142,55 +174,14 @@ validate_settings() {
 }
 
 install_user_timer() {
-    local unit_dir service_file timer_file script_path config_abs
-    unit_dir="$HOME/.config/systemd/user"
-    service_file="$unit_dir/bmi30-cloud-update.service"
-    timer_file="$unit_dir/bmi30-cloud-update.timer"
-    script_path="$SCRIPT_DIR/cloud_sync_now.sh"
-    config_abs="$CONFIG_FILE"
-
-    if [[ "$config_abs" != /* ]]; then
-        config_abs="$(cd -- "$(dirname -- "$config_abs")" && pwd)/$(basename -- "$config_abs")"
-    fi
-
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        log "[dry-run] Сгенерировал бы unit-файлы: $service_file и $timer_file"
-        log "[dry-run] Service: ExecStart=$script_path, CONFIG_FILE=$config_abs"
-        log "[dry-run] Timer: OnCalendar=$ON_CALENDAR"
+        log "[dry-run] Автоматический install timer не устанавливается; Portal проверяет marker раз в час"
         return
     fi
-
-    mkdir -p "$unit_dir"
-
-    cat > "$service_file" <<EOF
-[Unit]
-Description=BMI30 cloud firmware update
-
-[Service]
-Type=oneshot
-WorkingDirectory=$WORKSPACE_DIR
-Environment=CONFIG_FILE=$config_abs
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=$script_path
-EOF
-
-    cat > "$timer_file" <<EOF
-[Unit]
-Description=Install latest BMI30 firmware release
-
-[Timer]
-OnCalendar=$ON_CALENDAR
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    systemctl --user daemon-reload
-    systemctl --user enable --now bmi30-cloud-update.timer
-
-    log "Таймер обновления установлен: bmi30-cloud-update.timer"
-    log "Проверить: systemctl --user status bmi30-cloud-update.timer"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user disable --now bmi30-cloud-update.timer >/dev/null 2>&1 || true
+    fi
+    log "Автоматическая установка отключена. Portal проверяет cloud marker в фоне, а release ставится только кнопкой Update."
 }
 
 parse_args() {
@@ -433,7 +424,7 @@ apply_archive() {
 
     [[ -n "$extracted" && -d "$extracted" ]] || fail "Не удалось найти корень проекта в архиве"
 
-    local archive_bundle_id bundle_dir current_active_env
+    local archive_bundle_id bundle_dir current_active_env current_release_manifest
     archive_bundle_id="$(bmi30_active_bundle_id "$extracted" || true)"
     bundle_dir="$extracted/host/bmi30_split_bundles/$archive_bundle_id"
     if [[ -n "${FIRMWARE_BUNDLE_ID:-}" ]]; then
@@ -449,6 +440,12 @@ apply_archive() {
         mkdir -p "$STATE_DIR"
         PREVIOUS_ACTIVE_ENV_BACKUP="$STATE_DIR/active_env.before_update"
         install -m 0644 "$current_active_env" "$PREVIOUS_ACTIVE_ENV_BACKUP"
+    fi
+    current_release_manifest="$SOURCE_DIR/host/bmi30_firmware_release.env"
+    if [[ -f "$current_release_manifest" ]]; then
+        mkdir -p "$STATE_DIR"
+        PREVIOUS_RELEASE_MANIFEST_BACKUP="$STATE_DIR/firmware_release.before_update.env"
+        install -m 0644 "$current_release_manifest" "$PREVIOUS_RELEASE_MANIFEST_BACKUP"
     fi
 
     local -a rsync_args
@@ -691,14 +688,16 @@ install_systemd_units_after_update() {
 enforce_cloud_timer_policy() {
     command -v systemctl >/dev/null 2>&1 || return 0
     if ! systemctl --user list-unit-files >/dev/null 2>&1; then
-        warn "systemd --user недоступен: политика cloud-таймеров не изменена"
+        log "Portal выполняет только фоновую проверку marker; автоматическая установка firmware не включалась"
         return 0
     fi
 
-    if install_user_timer; then
-        log "Автоматическая проверка и установка последнего release включена"
-    else
-        warn "Не удалось обновить user timer автоматической установки"
+    if systemctl --user list-unit-files bmi30-cloud-update.timer >/dev/null 2>&1; then
+        if systemctl --user disable --now bmi30-cloud-update.timer >/dev/null 2>&1; then
+            log "Старый таймер автоматической установки отключён; обновление выполняется только кнопкой Portal"
+        else
+            warn "Не удалось отключить старый bmi30-cloud-update.timer"
+        fi
     fi
 
     if [[ -f "$HOME/.config/systemd/user/bmi30-cloud-backup.timer" ]]; then
@@ -806,6 +805,66 @@ restart_runtime_after_update() {
     fi
 }
 
+write_rollback_state() {
+    [[ -f "$PREVIOUS_ACTIVE_ENV_BACKUP" ]] || return 0
+
+    local rollback_state="$STATE_DIR/rollback_state.env"
+    local previous_bundle_id previous_version previous_label previous_notes previous_created_at
+    local bundle_manifest
+
+    unset BMI30_SPLIT_BUNDLE_ID BMI30_SPLIT_VERSION BMI30_SPLIT_LABEL BMI30_BUNDLE_ORIGIN
+    # shellcheck source=/dev/null
+    source "$PREVIOUS_ACTIVE_ENV_BACKUP"
+    previous_bundle_id="${BMI30_SPLIT_BUNDLE_ID:-}"
+    [[ "$previous_bundle_id" =~ ^[A-Za-z0-9._-]+$ ]] || {
+        warn "Предыдущий bundle ID некорректен; portal rollback не включён"
+        return 0
+    }
+    [[ -d "$SOURCE_DIR/host/bmi30_split_bundles/$previous_bundle_id" ]] || {
+        warn "Предыдущий bundle отсутствует; portal rollback не включён: $previous_bundle_id"
+        return 0
+    }
+
+    previous_version="${BMI30_SPLIT_VERSION:-$previous_bundle_id}"
+    previous_label="${BMI30_SPLIT_LABEL:-}"
+    previous_notes="${BMI30_BUNDLE_ORIGIN:-}"
+    previous_created_at=""
+
+    bundle_manifest="$SOURCE_DIR/host/bmi30_split_bundles/$previous_bundle_id/manifest.env"
+    if [[ -f "$bundle_manifest" ]]; then
+        unset BMI30_BUNDLE_LABEL BMI30_BUNDLE_ORIGIN BMI30_BUNDLE_CREATED_AT
+        # shellcheck source=/dev/null
+        source "$bundle_manifest"
+        previous_label="${BMI30_BUNDLE_LABEL:-$previous_label}"
+        previous_notes="${BMI30_BUNDLE_ORIGIN:-$previous_notes}"
+        previous_created_at="${BMI30_BUNDLE_CREATED_AT:-}"
+    fi
+
+    if [[ -f "$PREVIOUS_RELEASE_MANIFEST_BACKUP" ]]; then
+        unset BMI30_FIRMWARE_VERSION BMI30_FIRMWARE_LABEL BMI30_FIRMWARE_CREATED_AT
+        # shellcheck source=/dev/null
+        source "$PREVIOUS_RELEASE_MANIFEST_BACKUP"
+        previous_version="${BMI30_FIRMWARE_VERSION:-$previous_version}"
+        previous_label="${previous_label:-${BMI30_FIRMWARE_LABEL:-}}"
+        previous_created_at="${previous_created_at:-${BMI30_FIRMWARE_CREATED_AT:-}}"
+    fi
+
+    {
+        printf 'ROLLBACK_AVAILABLE=1\n'
+        printf 'ROLLBACK_BUNDLE_ID=%q\n' "$previous_bundle_id"
+        printf 'ROLLBACK_FIRMWARE_VERSION=%q\n' "$previous_version"
+        printf 'ROLLBACK_LABEL=%q\n' "$previous_label"
+        printf 'ROLLBACK_NOTES=%q\n' "$previous_notes"
+        printf 'ROLLBACK_CREATED_AT=%q\n' "$previous_created_at"
+        printf 'ROLLBACK_SAVED_AT=%q\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'UPDATED_TO_VERSION=%q\n' "${FIRMWARE_VERSION:-}"
+        printf 'UPDATED_TO_BUNDLE_ID=%q\n' "${FIRMWARE_BUNDLE_ID:-}"
+        printf 'UPDATED_ARCHIVE_NAME=%q\n' "${ARCHIVE_NAME:-}"
+        printf 'UPDATED_ARCHIVE_SHA256=%q\n' "${ARCHIVE_SHA256:-}"
+    } > "$rollback_state"
+    log "Portal rollback сохранён: $previous_bundle_id"
+}
+
 write_update_state() {
     local update_state="$STATE_DIR/update_state.env"
     local publish_state="$STATE_DIR/publish_state.env"
@@ -839,6 +898,8 @@ write_update_state() {
         printf 'DEVICE_SUFFIX=%q\n' "$(detect_serial_suffix)"
         printf 'PUBLISHED_AT=%q\n' "${CREATED_AT:-}"
     } > "$publish_state"
+
+    write_rollback_state
 }
 
 prune_files_by_count() {
@@ -880,8 +941,10 @@ main() {
 
     local marker_path current_signature archive_path new_signature remote_signature signature_kind
     local previous_archive previous_archive_hash marker_changed
+    write_progress 5 "Checking the cloud release marker…"
     marker_path="$(download_latest_marker)"
     load_latest_marker "$marker_path"
+    write_progress 12 "Comparing firmware versions and signatures…"
 
     if [[ "$REQUIRE_TODAY" -eq 1 ]] && ! marker_is_today; then
         local installed_archive=""
@@ -924,7 +987,9 @@ main() {
         fi
         if [[ "$marker_changed" -eq 1 ]]; then
             log "Указатель облачного архива изменился при той же подписи; применяю новый release manifest"
+            write_progress 35 "Downloading the firmware archive…"
             archive_path="$(download_archive)"
+            write_progress 60 "Applying the verified firmware archive…"
             apply_archive "$archive_path"
             if [[ "$DRY_RUN" -eq 1 ]]; then
                 return
@@ -936,21 +1001,28 @@ main() {
             fi
             [[ "${new_signature,,}" == "${remote_signature,,}" ]] \
                 || fail "После применения release manifest изменилась подпись проекта"
+            write_progress 80 "Activating the new firmware runtime…"
             restart_runtime_after_update
+            write_progress 96 "Saving update and rollback state…"
             write_update_state
         else
             if [[ "$RESTART_AFTER_UPDATE" == "1" ]] && ! active_runtime_matches_release; then
                 log "Проект обновлён, но active runtime не соответствует release; выполняю активацию"
+                write_progress 80 "Activating the new firmware runtime…"
                 restart_runtime_after_update
             fi
+            write_progress 96 "Saving update state…"
             write_update_state
         fi
         cleanup_update_artifacts
         return
     fi
 
+    write_progress 20 "Saving the current firmware for rollback…"
     create_pre_update_snapshot
+    write_progress 35 "Downloading the firmware archive…"
     archive_path="$(download_archive)"
+    write_progress 60 "Applying the verified firmware archive…"
     apply_archive "$archive_path"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -970,7 +1042,9 @@ main() {
         return 5
     fi
 
+    write_progress 80 "Activating the new firmware runtime…"
     restart_runtime_after_update
+    write_progress 96 "Saving update and rollback state…"
     write_update_state
     cleanup_update_artifacts
     log "Готово"

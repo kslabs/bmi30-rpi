@@ -71,7 +71,7 @@ show_timer_status() {
 printf "BMI30 Cloud Sync Status\n"
 printf "=======================\n\n"
 printf "Config:      %s\n" "$CONFIG_FILE"
-printf "Mode:        one firmware release; auto update only, publish explicit\n"
+printf "Mode:        one firmware release; Portal checks hourly, install/publish explicit\n"
 printf "Backup dir:  %s\n" "$BACKUP_ROOT"
 printf "Remote:      %s\n" "${REMOTE_TARGET:-local only}"
 printf "Folder ID:   %s\n" "${REMOTE_FOLDER_ID:-not set}"
@@ -110,4 +110,4 @@ fi
 printf "\n"
 
 show_timer_status "Publish timer (optional/manual source)" "$PUBLISH_TIMER_NAME" "$PUBLISH_SERVICE_NAME"
-show_timer_status "Update timer" "$UPDATE_TIMER_NAME" "$UPDATE_SERVICE_NAME"
+show_timer_status "Legacy auto-install timer (must be disabled)" "$UPDATE_TIMER_NAME" "$UPDATE_SERVICE_NAME"

@@ -52,7 +52,7 @@ def _product_display_scale() -> float:
 SERVICE_VERSION = "001"
 HOST_DIR = Path(__file__).resolve().parent
 REPO_DIR = HOST_DIR.parent
-DEFAULT_ENGINE_FILE = HOST_DIR / "BMI30.200.py.2026-07-30-0930"
+DEFAULT_ENGINE_FILE = HOST_DIR / "BMI30.200.py.2026-07-30-1324-portal-cloud-update-rollback"
 ENGINE_FILE = Path(os.getenv("BMI30_ENGINE_SOURCE", str(DEFAULT_ENGINE_FILE))).expanduser()
 API_HOST = os.getenv("BMI30_SERVICE_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("BMI30_SERVICE_PORT", "8765"))
