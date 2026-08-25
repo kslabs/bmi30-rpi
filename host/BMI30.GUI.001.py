@@ -66,11 +66,6 @@ class RemoteGui:
         self.status.setWordWrap(True)
         top.addWidget(self.status, 1)
 
-        self.freq_box = QtWidgets.QComboBox()
-        self.freq_box.addItems(["200 Hz", "204 Hz", "205 Hz", "208 Hz", "210 Hz", "220 Hz", "225 Hz", "240 Hz", "250 Hz"])
-        self.freq_box.currentTextChanged.connect(self._freq_changed)
-        top.addWidget(self.freq_box)
-
         self.avg_box = QtWidgets.QComboBox()
         self.avg_box.addItems(["8", "16", "24", "32", "40", "48", "56", "64"])
         self.avg_box.currentTextChanged.connect(self._avg_changed)
@@ -148,14 +143,6 @@ class RemoteGui:
             return
         self._send("mode", idx=int(idx))
 
-    def _freq_changed(self, text: str) -> None:
-        if self._syncing:
-            return
-        try:
-            self._send("frequency", hz=int(text.split()[0]))
-        except Exception:
-            pass
-
     def _avg_changed(self, text: str) -> None:
         if self._syncing:
             return
@@ -195,8 +182,6 @@ class RemoteGui:
         try:
             if 0 <= selected < len(self.mode_buttons):
                 self.mode_buttons[selected].setChecked(True)
-            freq = int(mode.get("desired_freq") or mode.get("freq_hz") or 200)
-            self.freq_box.setCurrentText(f"{freq} Hz")
             avg = int(mode.get("avg_n") or 24)
             self.avg_box.setCurrentText(str(avg))
             ratio = float(mode.get("det_ratio") or 2.0)

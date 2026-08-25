@@ -4,6 +4,23 @@
 
 ## Утилиты
 
+### install_bmi30_reverse_tunnel.sh
+
+Готовит уникальный исходящий reverse-SSH-туннель Portal к центральному серверу.
+Приватный ключ создаётся только локально в home пользователя `techaid` и не
+попадает в firmware/cloud archive. Сначала установщик печатает enrollment для
+добавления ограниченного публичного ключа на сервер, а после подтверждения
+server host-key запускает постоянную systemd-службу с автоматическим reconnect.
+
+Серверная архитектура, временный открытый dashboard и готовое задание для
+серверного ChatGPT/Codex описаны в
+`docs/BMI30_REMOTE_TUNNEL_SERVER_TASK_RU.md`.
+
+```bash
+sudo ./utilities/install_bmi30_reverse_tunnel.sh
+sudo ./utilities/install_bmi30_reverse_tunnel.sh --scan-host-key --enable
+```
+
 ### menu.sh
 
 Назначение:
@@ -154,10 +171,23 @@ sudo ./utilities/migrate_system_to_usb.sh --yes
 
 Что делает:
 1. Определяет USB как источник, eMMC как цель.
-2. Переразбивает и форматирует eMMC.
-3. Копирует boot и root через rsync с прогрессом.
-4. Правит cmdline.txt и fstab на eMMC под новые PARTUUID.
-5. Настраивает XRDP на один общий рабочий стол `:0` через `bmi30-x11vnc`.
+2. До форматирования проверяет старую BMI30 identity на eMMC. Если
+   `bound_raspberry_serial`, SSH-ключ и token принадлежат аппаратному serial
+   текущей Raspberry, временно сохраняет их без вывода секретов.
+3. Переразбивает и форматирует eMMC.
+4. Копирует boot и root через rsync с прогрессом, не перенося архивы чужих
+   BMI30 credentials из `/var/backups/bmi30-agent`.
+5. Возвращает на eMMC сохранённую identity этой Raspberry. Если eMMC новая,
+   принимает identity источника только при совпадении с аппаратным serial;
+   иначе удаляет чужие credentials и оставляет первое enrollment агенту.
+   Identity с последним ответом Hub `HTTP 401/409` считается конфликтной и не
+   имеет приоритета над рабочей identity источника.
+6. Правит cmdline.txt и fstab на eMMC под новые PARTUUID.
+7. Создаёт на eMMC обязательный каталог `/var/backups/bmi30-agent`, ставит
+   правило `systemd-tmpfiles` для его самовосстановления и включает
+   `bmi30-agent.service`. После загрузки агент автоматически делает check-in и
+   при ответе Hub `approved` запускает production-туннель.
+8. Настраивает XRDP на один общий рабочий стол `:0` через `bmi30-x11vnc`.
 
 Пример запуска:
 ```bash
@@ -166,6 +196,19 @@ sudo ./utilities/migrate_system_to_emmc.sh --yes
 
 Важно:
 Этот скрипт нужно запускать из системы, загруженной не с eMMC, иначе цель будет занята текущим root.
+Перед копированием на eMMC в секции `[all]` файла `/boot/firmware/config.txt`
+должен быть параметр `dtparam=sd_cqe=0`, после его добавления нужна перезагрузка.
+Скрипт проверяет `cmdq_en` до форматирования и безопасно прекращает работу, если
+Command Queueing ещё включена.
+
+Таким образом, повторное копирование USB → eMMC на той же физической Raspberry
+не меняет её SSH-ключ/API token и не создаёт конфликт `HTTP 409` на Hub.
+Ручная переустановка Agent после загрузки с eMMC не требуется: локальная
+identity той же платы сохраняется, агент включается автоматически, а каталог,
+необходимый его systemd sandbox, создаётся ещё до первой загрузки.
+Совершенно новая плата всё равно проходит однократное состояние `pending` и
+требует подтверждения администратором: аппаратный serial является стабильным
+Device ID, но не заменяет секретную аутентификацию.
 
 ### migrate_system_between_disks.sh
 
@@ -274,16 +317,33 @@ sudo ./utilities/setup_ethernet_portal.sh remove
 
 Что делает:
 1. Архивирует firmware-содержимое и документацию проекта, включая активный `host/bmi30_split_active_version.env` и ровно один выбранный полный websplit bundle.
-2. Исключает `.git`, `.codex`, venv, кэши, обычные и ротационные логи, `backups`, `.bmi30_cloud_sync`, `secrets`, локальный active runtime, временные stage/rollback, записи вне активного bundle, обучающие/калибровочные данные и локальные GUI runtime-файлы. Генерируемый `host/bmi30_split_active_version.env` передаётся устройствам, но не участвует в content-signature: изменение времени успешной активации не считается новой прошивкой.
-3. Перед упаковкой создаёт `host/bmi30_firmware_release.env`: точное время release и SHA-256 активных core/engine/GUI/portal.
+2. Исключает `.git`, `.codex`, venv, кэши, обычные и ротационные логи, `backups`, `.bmi30_cloud_sync`, `secrets`, локальный active runtime, временные stage/rollback, записи вне активного bundle, обучающие/калибровочные данные и локальные GUI runtime-файлы. Генерируемый `host/bmi30_split_active_version.env` передаётся устройствам, но не участвует в content-signature: изменение времени успешной активации не считается новой прошивкой. Журнал `docs/BMI30_version_registry_google_sheet.csv` также передаётся в архиве, но исключён из content-signature, чтобы обязательная запись уже созданной версии не порождала следующую версию рекурсивно.
+3. Перед упаковкой создаёт `host/bmi30_firmware_release.env`: неизменяемое время
+   версии кода, content-signature и SHA-256 активных core/engine/GUI/portal.
 4. Называет общий архив `bmi30_backup_YYYYMMDD_HHMMSS.tar.gz` для совместимости со старыми updater; manifest однозначно помечает его как firmware release, серийный номер устройства в имя не входит.
 5. Выгружает архив через `rclone` в Google Drive и обновляет указатель `bmi30_latest.env`.
-6. Фоновая проверка Portal сравнивает датированные версии marker и текущего release. До появления строго более новой версии кнопки `Update` и `Rollback` неактивны.
-7. При ручном обновлении отдельный systemd worker скачивает указанный архив, проверяет SHA-256, создаёт локальный `pre_update_*.tar.gz` и применяет проект через `rsync --delete`; этап и процент видны прямо на кнопке.
-8. После применения сверяет active env и SHA-256 всех четырёх компонентов с release manifest, обновляет systemd units, устанавливает portal с сохранением времени файла и проверяет runtime-копию побайтно.
-9. После успешного обновления Portal разрешает одношаговый `Rollback` к полному bundle, работавшему непосредственно перед обновлением; версия, label, notes и даты показываются в английской hover-подсказке.
-10. Локально сохраняются только последние 5 firmware-архивов, 3 pre-update снимка и 2 скачанных incoming-архива.
-11. Старый user systemd timer автоматической установки отключается при запуске Portal; timer публикации нужен только на устройстве, которое сознательно выпускает release.
+6. Дата/время firmware version обозначает изменение содержимого кода. Повторное
+   копирование, восстановление или принудительное архивирование побайтно
+   одинакового проекта сохраняет прежние `BMI30_FIRMWARE_VERSION` и
+   `BMI30_FIRMWARE_CREATED_AT`; меняется только служебное время/имя нового
+   архива. На скопированном Raspberry Pi `--if-changed` использует сохранённую
+   content-signature из release manifest и не публикует копию как новый код.
+7. Фоновая проверка Portal сравнивает датированные версии marker и текущего release. До появления строго более новой версии кнопки `Update` и `Rollback` неактивны.
+8. При ручном обновлении отдельный systemd worker скачивает указанный архив, проверяет SHA-256, создаёт локальный `pre_update_*.tar.gz` и применяет проект через `rsync --delete`; этап и процент видны прямо на кнопке.
+9. После применения сверяет active env и SHA-256 всех четырёх компонентов с release manifest, обновляет systemd units, устанавливает portal с сохранением времени файла и проверяет runtime-копию побайтно.
+10. После успешного обновления Portal разрешает одношаговый `Rollback` к полному bundle, работавшему непосредственно перед обновлением; версия, label, notes и даты показываются в английской hover-подсказке.
+11. Локально сохраняются только последние 5 firmware-архивов, 3 pre-update снимка и 2 скачанных incoming-архива.
+12. Старый user systemd timer автоматической установки отключается при запуске Portal; timer публикации нужен только на устройстве, которое сознательно выпускает release.
+13. До проверки cloud marker новый updater запускает
+    `install_bmi30_agent_from_project.sh`: проверяет package по `SHA256SUMS`,
+    обновляет `/opt/bmi30-agent` и systemd units, но сохраняет индивидуальные
+    `/etc/bmi30-agent` и `/var/lib/bmi30-agent` целевого Raspberry.
+14. Для первого перехода старых клонов marker содержит совместимую project
+    signature v8 и отдельную строгую release signature текущего формата.
+    Updater v8 получает новый switcher и ставит Agent в том же проходе. Updater
+    v2 сначала заменяет файлы проекта; при следующем штатном запуске уже новый
+    updater ставит Agent до сетевой части. Если старый `rsync` исключил
+    `SHA256SUMS.txt`, helper берёт целостный `BMI30_Agent_<version>.zip`.
 
 Конфигурация:
 ```bash
@@ -294,7 +354,9 @@ cp utilities/backup_to_cloud.conf.example utilities/backup_to_cloud.conf
 
 Опубликовать текущую прошивку в облако:
 ```bash
-./utilities/backup_to_cloud.sh --force
+./utilities/backup_to_cloud.sh --force \
+  --label "Cloud Agent bootstrap for cloned Raspberry devices" \
+  --notes "Agent 0.2.5; v8 one-pass migration; v2 staged migration"
 ```
 
 Создать локальный firmware release без выгрузки:
@@ -326,6 +388,13 @@ cp utilities/backup_to_cloud.conf.example utilities/backup_to_cloud.conf
 
 Важно:
 Для облачной синхронизации нужен настроенный `rclone` remote, например `gdrive:`. Папка Google Drive задаётся через `REMOTE_FOLDER_ID`.
+
+Общие сценарии публикации и обновления используют один закрытый
+`/home/techaid/.config/rclone/rclone.conf`. Перед облачной операцией и после неё
+они проверяют владельца `techaid:techaid` и права `0600`. Это важно для Portal:
+его фоновая проверка запускается от `root`, а обновление OAuth-токена в старых
+версиях могло переписать конфигурацию владельцем `root` и затем блокировать
+пункт обновления, запущенный из терминального меню от `techaid`.
 
 ## Рекомендуемый порядок работы
 

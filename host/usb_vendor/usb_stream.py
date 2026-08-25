@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import copy
 import usb.core, usb.util, struct, time, threading, queue, sys, os, json, math, re
 from collections import deque
 
@@ -593,6 +594,12 @@ class USBStream:
         self._ep0_lock = threading.RLock()
         self._close_lock = threading.Lock()
         self._rs485_ident_lock = threading.Lock()
+        # EP0 status can arrive during constructor-time alt-setting setup, well
+        # before the Bulk reader starts.  Initialise the cache publisher here so
+        # those early updates are retained, but start its I/O worker only after
+        # USB setup succeeds.
+        self.device_state_cache = {}
+        self._init_device_state_cache_writer()
         self.dev=None
         self.intf=None
         self.profile = profile
@@ -875,7 +882,7 @@ class USBStream:
         self.last_stat = None
         self.last_stat_t = 0.0
         self.last_evt1 = None
-        self.device_state_cache = {}
+        self.device_state_cache = getattr(self, "device_state_cache", {}) or {}
         self.last_service_t = 0.0
         self.last_evt1_t = 0.0
         self.service_packets = 0
@@ -1090,16 +1097,20 @@ class USBStream:
         self._working_seen = False
         self.keepalive_last = self.connected_t
         self.restart_attempts = 0
+        self._start_device_state_cache_writer()
         try:
             self.host_rx_ack_enabled = str(os.getenv('BMI30_HOST_RX_ACK', '1')).lower() not in ('0', 'false', 'no')
         except Exception:
             self.host_rx_ack_enabled = True
         try:
-            self.host_rx_ack_interval = max(0.2, float(os.getenv('BMI30_HOST_RX_ACK_INTERVAL', '1.0')))
+            self.host_rx_ack_interval = max(0.1, float(os.getenv('BMI30_HOST_RX_ACK_INTERVAL', '0.25')))
         except Exception:
-            self.host_rx_ack_interval = 1.0
+            self.host_rx_ack_interval = 0.25
         self.host_rx_ack_last = 0.0
         self.host_rx_ack_fail = 0
+        self.host_rx_ack_write_t = 0.0
+        self.host_rx_ack_write_total_frames = 0
+        self.host_rx_ack_write_count = 0
         self._host_rx_ack_stop = False
         self._host_rx_ack_q = queue.Queue(maxsize=1)
         self._host_rx_ack_th = threading.Thread(target=self._host_rx_ack_loop, daemon=True)
@@ -1265,13 +1276,42 @@ class USBStream:
                 pass
 
     def _host_rx_ack_loop(self):
+        """Write coalesced host acknowledgements outside the Bulk reader.
+
+        Firmware defines this as an acknowledgement of *newly parsed* A/B
+        frames, not a free-running keepalive.  Repeating an unchanged counter
+        would falsely report HOST_RX_ALIVE during a real ADC stall, so timer
+        wakeups only coalesce genuine counter progress.
+        """
+        try:
+            last_ack_total = int(getattr(self, 'host_rx_ack_write_total_frames', 0) or 0)
+        except Exception:
+            last_ack_total = 0
         while (not bool(getattr(self, '_host_rx_ack_stop', False))) and getattr(self, '_running', True):
             try:
-                total_frames = self._host_rx_ack_q.get(timeout=0.2)
+                interval = max(0.1, float(getattr(self, 'host_rx_ack_interval', 0.25) or 0.25))
             except Exception:
+                interval = 0.25
+            total_frames = None
+            try:
+                total_frames = self._host_rx_ack_q.get(timeout=max(0.05, min(0.2, interval * 0.5)))
+            except queue.Empty:
+                try:
+                    total_frames = int(getattr(self, 'rx_cnt_ch0', 0) or 0) + int(getattr(self, 'rx_cnt_ch1', 0) or 0)
+                except Exception:
+                    total_frames = 0
+            except Exception:
+                total_frames = None
+            if total_frames is None:
                 continue
             try:
-                self._write_host_rx_ack(int(total_frames))
+                last_write = float(getattr(self, 'host_rx_ack_write_t', 0.0) or 0.0)
+                total_i = int(total_frames)
+                if total_i == int(last_ack_total):
+                    continue
+                if last_write <= 0.0 or (time.time() - last_write) >= interval:
+                    if bool(self._write_host_rx_ack(total_i)):
+                        last_ack_total = total_i
             except Exception:
                 pass
 
@@ -1314,9 +1354,9 @@ class USBStream:
         """Worker-side write for HOST_RX_ACK. Never called from the reader hot path."""
         try:
             if not bool(getattr(self, 'host_rx_ack_enabled', True)):
-                return
+                return False
             if (not getattr(self, '_running', True)) or bool(getattr(self, 'disconnected', False)):
-                return
+                return False
             pkt = bytes([CMD_HOST_RX_ACK]) + struct.pack('<I', int(total_frames) & 0xFFFFFFFF)
             try:
                 timeout_ms = int(os.getenv('BMI30_HOST_RX_ACK_TIMEOUT_MS', '20'))
@@ -1326,6 +1366,10 @@ class USBStream:
             with self._ep_out_lock:
                 self.dev.write(EP_OUT, pkt, timeout=timeout_ms)
             self.host_rx_ack_fail = 0
+            self.host_rx_ack_write_t = time.time()
+            self.host_rx_ack_write_total_frames = int(total_frames) & 0xFFFFFFFF
+            self.host_rx_ack_write_count = int(getattr(self, 'host_rx_ack_write_count', 0) or 0) + 1
+            return True
         except Exception as e:
             try:
                 self.host_rx_ack_fail = int(getattr(self, 'host_rx_ack_fail', 0) or 0) + 1
@@ -1340,6 +1384,7 @@ class USBStream:
                     self.disconnected = True
                 except Exception:
                     pass
+            return False
 
     def _clear_halt_eps(self):
         try:
@@ -1540,6 +1585,16 @@ class USBStream:
                 th = getattr(self, 'th', None)
                 if th is not None and th.is_alive() and th is not threading.current_thread():
                     th.join(timeout=1.5)
+            except Exception:
+                pass
+
+            # RX and RS485 are the cache producers.  Stop the cache writer only
+            # after they have exited so its shutdown snapshot contains their
+            # last service/device update and no disk I/O can outlive close().
+            try:
+                cache_stopped = self._stop_device_state_cache_writer(timeout=2.0)
+                if not cache_stopped:
+                    print("[cache] device-state writer did not stop before close timeout", flush=True)
             except Exception:
                 pass
 
@@ -2292,8 +2347,192 @@ class USBStream:
     def _device_state_path(self) -> str:
         return os.getenv("BMI30_DEVICE_STATE_JSON", DEVICE_STATE_JSON)
 
+    def _init_device_state_cache_writer(self):
+        """Initialise the coalescing cache publisher without starting I/O."""
+        if getattr(self, "_device_state_cache_cv", None) is not None:
+            return
+        lock = threading.RLock()
+        self._device_state_cache_lock = lock
+        self._device_state_cache_cv = threading.Condition(lock)
+        self._device_state_cache_generation = 0
+        self._device_state_cache_persisted_generation = 0
+        self._device_state_cache_dirty = False
+        self._device_state_cache_writer_stop = False
+        self._device_state_cache_accepting = True
+        self._device_state_cache_last_attempt_mono = 0.0
+        self._device_state_cache_write_count = 0
+        self._device_state_cache_write_fail = 0
+        self._device_state_cache_writer_thread = None
+        try:
+            interval = float(os.getenv("BMI30_DEVICE_STATE_WRITE_INTERVAL_S", "0.5"))
+        except Exception:
+            interval = 0.5
+        # Device state is diagnostic persistence, not part of the USB data
+        # path.  Clamp it to 1..2 writes/s even if an unsafe environment value
+        # is supplied.
+        self._device_state_cache_write_interval_s = max(0.5, min(1.0, interval))
+        if not isinstance(getattr(self, "device_state_cache", None), dict):
+            self.device_state_cache = {}
+
+    def _start_device_state_cache_writer(self) -> bool:
+        self._init_device_state_cache_writer()
+        cv = self._device_state_cache_cv
+        with cv:
+            thread = getattr(self, "_device_state_cache_writer_thread", None)
+            if thread is not None and thread.is_alive():
+                return True
+            if bool(getattr(self, "_device_state_cache_writer_stop", False)):
+                return False
+            thread = threading.Thread(
+                target=self._device_state_cache_writer_loop,
+                name="bmi30-device-state-cache",
+                daemon=True,
+            )
+            self._device_state_cache_writer_thread = thread
+            thread.start()
+            return True
+
+    def _persist_device_state_snapshot(self, payload: dict) -> bool:
+        """Atomically persist one immutable worker-owned cache snapshot."""
+        tmp = ""
+        try:
+            path = self._device_state_path()
+            directory = os.path.dirname(path) or "."
+            os.makedirs(directory, exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp, path)
+            return True
+        except Exception:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+            return False
+
+    def _persist_device_state_generation(self, payload: dict, generation: int) -> bool:
+        """Persist a snapshot and publish actual write metadata back to RAM."""
+        written_at = time.time()
+        written_iso = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(written_at))
+        payload["cache_written_at"] = written_at
+        payload["cache_written_iso"] = written_iso
+        try:
+            success = bool(self._persist_device_state_snapshot(payload))
+        except Exception:
+            success = False
+        finished_mono = time.monotonic()
+        cv = self._device_state_cache_cv
+        with cv:
+            self._device_state_cache_last_attempt_mono = finished_mono
+            if success:
+                self._device_state_cache_persisted_generation = max(
+                    int(getattr(self, "_device_state_cache_persisted_generation", 0) or 0),
+                    int(generation),
+                )
+                self._device_state_cache_write_count = int(
+                    getattr(self, "_device_state_cache_write_count", 0) or 0
+                ) + 1
+                self._device_state_cache_write_fail = 0
+                # A newer update may have arrived while the snapshot was on
+                # disk.  Merge only persistence metadata into that newer RAM
+                # state; do not mark it as another user/device update.
+                self.device_state_cache = _merge_dict(
+                    getattr(self, "device_state_cache", {}) or {},
+                    {
+                        "cache_written_at": written_at,
+                        "cache_written_iso": written_iso,
+                    },
+                )
+            else:
+                self._device_state_cache_write_fail = int(
+                    getattr(self, "_device_state_cache_write_fail", 0) or 0
+                ) + 1
+        return success
+
+    def _device_state_cache_writer_loop(self):
+        """Persist the latest full cache snapshot at a bounded rate."""
+        cv = self._device_state_cache_cv
+        while True:
+            with cv:
+                while (
+                    not bool(getattr(self, "_device_state_cache_dirty", False))
+                    and not bool(getattr(self, "_device_state_cache_writer_stop", False))
+                ):
+                    cv.wait()
+
+                stopping = bool(getattr(self, "_device_state_cache_writer_stop", False))
+                generation = int(getattr(self, "_device_state_cache_generation", 0) or 0)
+                persisted = int(getattr(self, "_device_state_cache_persisted_generation", 0) or 0)
+                if stopping and generation <= persisted:
+                    return
+
+                if not stopping:
+                    interval = float(getattr(self, "_device_state_cache_write_interval_s", 0.5) or 0.5)
+                    last_attempt = float(getattr(self, "_device_state_cache_last_attempt_mono", 0.0) or 0.0)
+                    remaining = (last_attempt + interval) - time.monotonic()
+                    if remaining > 0.0:
+                        # Further publishers only replace the pending full
+                        # state, so they do not wake this timed wait repeatedly.
+                        cv.wait(timeout=remaining)
+                        continue
+
+                generation = int(getattr(self, "_device_state_cache_generation", 0) or 0)
+                payload = copy.deepcopy(getattr(self, "device_state_cache", {}) or {})
+                self._device_state_cache_dirty = False
+
+            success = self._persist_device_state_generation(payload, generation)
+
+            with cv:
+                current_generation = int(getattr(self, "_device_state_cache_generation", 0) or 0)
+                persisted = int(getattr(self, "_device_state_cache_persisted_generation", 0) or 0)
+                if (not success) or current_generation > persisted:
+                    self._device_state_cache_dirty = True
+                stopping = bool(getattr(self, "_device_state_cache_writer_stop", False))
+                if stopping:
+                    # On shutdown, drain every update that raced the snapshot.
+                    # A failed final atomic write cannot be repaired here
+                    # indefinitely, so leave dirty=true for diagnostics and exit.
+                    if not success:
+                        return
+                    if current_generation <= persisted:
+                        return
+
+    def _stop_device_state_cache_writer(self, timeout: float = 2.0) -> bool:
+        """Reject new cache updates, flush the latest generation, and join."""
+        self._init_device_state_cache_writer()
+        cv = self._device_state_cache_cv
+        with cv:
+            self._device_state_cache_accepting = False
+            self._device_state_cache_writer_stop = True
+            cv.notify_all()
+            thread = getattr(self, "_device_state_cache_writer_thread", None)
+
+        # A partially constructed object may never have started the worker.
+        # Preserve the same final-flush guarantee without holding the cache lock.
+        if thread is None or not thread.is_alive():
+            with cv:
+                generation = int(getattr(self, "_device_state_cache_generation", 0) or 0)
+                persisted = int(getattr(self, "_device_state_cache_persisted_generation", 0) or 0)
+                if generation <= persisted:
+                    return True
+                payload = copy.deepcopy(getattr(self, "device_state_cache", {}) or {})
+                self._device_state_cache_dirty = False
+            success = self._persist_device_state_generation(payload, generation)
+            if not success:
+                with cv:
+                    self._device_state_cache_dirty = True
+            return success
+
+        if thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, float(timeout)))
+        return not thread.is_alive()
+
     def _write_device_state_cache(self, patch: dict):
         try:
+            self._init_device_state_cache_writer()
             now = time.time()
             now_iso = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
             patch = dict(patch or {})
@@ -2336,24 +2575,26 @@ class USBStream:
             if service_patch:
                 patch["service"] = _merge_dict(patch.get("service") if isinstance(patch.get("service"), dict) else {}, service_patch)
 
-            payload = _merge_dict(getattr(self, "device_state_cache", {}) or {}, patch)
-            payload["schema"] = 1
-            payload["cache_written_at"] = now
-            payload["cache_written_iso"] = now_iso
-            if (not host_only) or not payload.get("updated_at"):
-                payload["updated_at"] = now
-                payload["updated_iso"] = now_iso
-            self.device_state_cache = payload
-            path = self._device_state_path()
-            directory = os.path.dirname(path) or "."
-            os.makedirs(directory, exist_ok=True)
-            tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, sort_keys=True)
-                f.write("\n")
-            os.replace(tmp, path)
+            cv = self._device_state_cache_cv
+            with cv:
+                if not bool(getattr(self, "_device_state_cache_accepting", True)):
+                    return False
+                payload = _merge_dict(getattr(self, "device_state_cache", {}) or {}, patch)
+                payload["schema"] = 1
+                if (not host_only) or not payload.get("updated_at"):
+                    payload["updated_at"] = now
+                    payload["updated_iso"] = now_iso
+                self.device_state_cache = payload
+                self._device_state_cache_generation = int(
+                    getattr(self, "_device_state_cache_generation", 0) or 0
+                ) + 1
+                was_dirty = bool(getattr(self, "_device_state_cache_dirty", False))
+                self._device_state_cache_dirty = True
+                if not was_dirty:
+                    cv.notify()
+            return True
         except Exception:
-            pass
+            return False
 
     def _parse_stat_device_state(self, packet: bytes) -> dict:
         bs = bytes(packet or b"")

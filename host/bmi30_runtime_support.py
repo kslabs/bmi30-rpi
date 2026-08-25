@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
+from importlib.machinery import SourceFileLoader
 import json
 import os
 import sys
@@ -8,7 +10,75 @@ import threading
 import time
 
 
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+def run_rt_detector_process(
+    engine_path: str,
+    max_samples: int,
+    req_q,
+    res_q,
+    stop_event,
+    initial_generation: int,
+    initial_stream_token: int,
+    ready_event=None,
+    shared_generation=None,
+    shared_stream_token=None,
+    stop_ack_event=None,
+):
+    """Spawn-safe entry point for the isolated realtime detector.
+
+    The active BMI30 engine is loaded from a timestamped filename, so its
+    worker function is not directly importable by ``multiprocessing.spawn``.
+    This stable helper is importable in a fresh child and loads that exact
+    engine copy there.  A spawned child inherits no live Qt/libusb threads or
+    USB descriptors from the service process.
+    """
+    # Keep the detector child deliberately small.  NumPy/OpenBLAS defaults can
+    # otherwise create a pool of native workers in every spawned detector and
+    # compete with the latency-sensitive USB reader on the Raspberry Pi.
+    detector_threads = str(os.environ.get("BMI30_RT_DET_BLAS_THREADS", "1") or "1").strip()
+    if not detector_threads.isdigit() or int(detector_threads) < 1:
+        detector_threads = "1"
+    for env_name in (
+        "OPENBLAS_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[env_name] = detector_threads
+    path = os.path.abspath(os.path.expanduser(str(engine_path)))
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"BMI30 detector engine not found: {path}")
+    module_name = f"_bmi30_detector_engine_{os.getpid()}"
+    loader = SourceFileLoader(module_name, path)
+    spec = importlib.util.spec_from_loader(module_name, loader)
+    if spec is None:
+        raise RuntimeError(f"Cannot load BMI30 detector engine: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    loader.exec_module(module)
+    worker_main = getattr(module, "_rt_detector_process_main", None)
+    if not callable(worker_main):
+        raise RuntimeError("BMI30 detector worker entry point is missing")
+    if ready_event is not None:
+        ready_event.set()
+    return worker_main(
+        [],
+        int(max_samples),
+        req_q,
+        res_q,
+        stop_event,
+        True,
+        int(initial_generation),
+        int(initial_stream_token),
+        shared_generation,
+        shared_stream_token,
+        stop_ack_event,
+    )
+
+
+CONFIG_FILE = os.path.abspath(os.path.expanduser(
+    os.getenv("BMI30_CONFIG_JSON", "").strip()
+    or os.path.join(os.path.dirname(__file__), "bmi30_config.json")
+))
 
 
 def import_gpio_module(module_name: str):

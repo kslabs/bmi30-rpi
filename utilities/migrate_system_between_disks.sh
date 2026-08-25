@@ -11,12 +11,24 @@ SYNC_ONLY=0
 FORCE_FORMAT_AND_RETRY=0
 PAUSE_SOURCE_SERVICES=1
 BMI30_CORE_SERVICE="${BMI30_CORE_SERVICE:-bmi30-core.service}"
-SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 declare -a PAUSED_SOURCE_SERVICES=()
+declare -a BMI30_IDENTITY_FILES=(
+    etc/bmi30-agent/id_ed25519
+    etc/bmi30-agent/id_ed25519.pub
+    etc/bmi30-agent/known_hosts
+    etc/bmi30-agent/tunnel.env
+    var/lib/bmi30-agent/device_api_token
+    var/lib/bmi30-agent/bound_raspberry_serial
+    var/lib/bmi30-agent/state.json
+)
+BMI30_IDENTITY_PRESERVED=0
+BMI30_IDENTITY_STATUS="not-applicable"
+BMI30_HARDWARE_SERIAL=""
 
 SCRIPT_NAME="$(basename "$0")"
-TOTAL_STEPS=13
+TOTAL_STEPS=14
 CURRENT_STEP=0
 
 RED='\033[0;31m'
@@ -76,7 +88,7 @@ require_root() {
 require_cmds() {
     local missing=()
     local cmd
-    for cmd in lsblk findmnt blkid mountpoint rsync sfdisk wipefs partprobe udevadm mkfs.vfat mkfs.ext4 awk sed grep sync sort df du numfmt timeout; do
+    for cmd in lsblk findmnt blkid mount mountpoint umount rsync sfdisk wipefs partprobe udevadm mkfs.vfat mkfs.ext4 ssh-keygen awk sed grep sync sort df du numfmt timeout; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing+=("$cmd")
         fi
@@ -279,6 +291,224 @@ partition_path() {
     fi
 }
 
+read_current_raspberry_serial() {
+    local serial=""
+
+    if [[ -r /proc/cpuinfo ]]; then
+        serial="$(awk -F: 'tolower($1) ~ /^serial/ {gsub(/[[:space:]]/, "", $2); print toupper($2); exit}' /proc/cpuinfo)"
+    fi
+    [[ "$serial" =~ ^[0-9A-F]{16}$ ]] || return 1
+    printf '%s\n' "$serial"
+}
+
+validate_bmi30_identity_root() {
+    local root="${1%/}"
+    local serial="$2"
+    local private_key="$root/etc/bmi30-agent/id_ed25519"
+    local public_key="$root/etc/bmi30-agent/id_ed25519.pub"
+    local token_file="$root/var/lib/bmi30-agent/device_api_token"
+    local bound_file="$root/var/lib/bmi30-agent/bound_raspberry_serial"
+    local expected_comment="BMI30-${serial}@bmi30-tunnel"
+    local bound_serial key_comment derived_key public_key_data path
+
+    for path in "$private_key" "$public_key" "$token_file" "$bound_file"; do
+        [[ -f "$path" && ! -L "$path" ]] || return 1
+    done
+
+    bound_serial="$(tr -d '[:space:]' < "$bound_file" | tr '[:lower:]' '[:upper:]')"
+    [[ "$bound_serial" == "$serial" ]] || return 1
+
+    key_comment="$(awk 'NF >= 3 {print $3; exit}' "$public_key")"
+    [[ "$key_comment" == "$expected_comment" ]] || return 1
+
+    if ! awk '
+        NR == 1 && length($0) >= 40 && length($0) <= 512 && $0 !~ /[[:space:]]/ { valid = 1 }
+        NR > 1 { valid = 0 }
+        END { exit(valid ? 0 : 1) }
+    ' "$token_file"; then
+        return 1
+    fi
+
+    derived_key="$(ssh-keygen -y -f "$private_key" 2>/dev/null | awk 'NF >= 2 {print $1, $2; exit}')" || return 1
+    public_key_data="$(awk 'NF >= 2 {print $1, $2; exit}' "$public_key")"
+    [[ "$derived_key" == "$public_key_data" ]] || return 1
+}
+
+bmi30_identity_has_auth_conflict() {
+    local root="${1%/}"
+    local state_file="$root/var/lib/bmi30-agent/state.json"
+
+    [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
+    grep -Eq '"http_status"[[:space:]]*:[[:space:]]*(401|409)([[:space:]]*,|[[:space:]]*})' \
+        "$state_file"
+}
+
+preserve_target_bmi30_identity() {
+    local target_root_dev target_root_type identity_root mounted_here=0
+    local preserved_root rel source_path target_path
+
+    [[ "$TARGET_ROLE" == "internal" ]] || return 0
+
+    BMI30_HARDWARE_SERIAL="$(read_current_raspberry_serial)" || \
+        die "Не удалось прочитать аппаратный serial Raspberry; безопасное сохранение BMI30 identity невозможно"
+    BMI30_IDENTITY_STATUS="new-enrollment"
+    target_root_dev="$(partition_path "$TARGET_DISK" 2)"
+
+    if [[ ! -b "$target_root_dev" ]]; then
+        info "На новой eMMC ещё нет root-раздела с BMI30 identity"
+        return 0
+    fi
+    target_root_type="$(blkid -s TYPE -o value "$target_root_dev" 2>/dev/null || true)"
+    if [[ "$target_root_type" != "ext4" ]]; then
+        info "На eMMC нет существующего ext4 root с BMI30 identity"
+        return 0
+    fi
+
+    identity_root="$(findmnt -rn -S "$target_root_dev" -o TARGET 2>/dev/null | awk 'NR == 1 {print; exit}' || true)"
+    if [[ -z "$identity_root" ]]; then
+        identity_root="$WORKDIR/target-identity"
+        mkdir -p "$identity_root"
+        mount -o ro "$target_root_dev" "$identity_root" || \
+            die "Не удалось безопасно проверить прежнюю BMI30 identity на $target_root_dev"
+        mounted_here=1
+    fi
+
+    if validate_bmi30_identity_root "$identity_root" "$BMI30_HARDWARE_SERIAL"; then
+        if bmi30_identity_has_auth_conflict "$identity_root"; then
+            BMI30_IDENTITY_STATUS="rejected-emmc-auth-conflict"
+            warn "BMI30 identity eMMC принадлежит этой Raspberry, но её последний check-in получил HTTP 401/409; конфликтные credentials не сохраняю"
+        else
+            preserved_root="$WORKDIR/preserved-bmi30-identity"
+            mkdir -m 0700 -p "$preserved_root"
+            for rel in "${BMI30_IDENTITY_FILES[@]}"; do
+                source_path="$identity_root/$rel"
+                [[ -f "$source_path" && ! -L "$source_path" ]] || continue
+                target_path="$preserved_root/$rel"
+                mkdir -p "$(dirname "$target_path")"
+                cp -a -- "$source_path" "$target_path"
+            done
+            BMI30_IDENTITY_PRESERVED=1
+            BMI30_IDENTITY_STATUS="preserved-from-emmc"
+            ok "Сохранена BMI30 identity eMMC для BMI30-$BMI30_HARDWARE_SERIAL; ключ и token не выводятся"
+        fi
+    elif [[ -e "$identity_root/etc/bmi30-agent/id_ed25519" || \
+            -e "$identity_root/var/lib/bmi30-agent/device_api_token" || \
+            -e "$identity_root/var/lib/bmi30-agent/bound_raspberry_serial" ]]; then
+        warn "Существующая BMI30 identity eMMC не принадлежит текущей Raspberry или повреждена; она не будет использована"
+    else
+        info "На eMMC нет ранее зарегистрированной BMI30 identity"
+    fi
+
+    if (( mounted_here == 1 )); then
+        umount "$identity_root"
+    fi
+}
+
+remove_target_bmi30_identity_files() {
+    local rel
+
+    for rel in "${BMI30_IDENTITY_FILES[@]}"; do
+        rm -f -- "$TARGET_ROOT_MNT/$rel"
+    done
+    rm -f -- "$TARGET_ROOT_MNT/var/lib/bmi30-agent/identity.lock"
+}
+
+restore_or_initialize_target_bmi30_identity() {
+    local preserved_root rel source_path target_path
+
+    [[ "$TARGET_ROLE" == "internal" ]] || return 0
+    [[ "$BMI30_HARDWARE_SERIAL" =~ ^[0-9A-F]{16}$ ]] || \
+        die "Аппаратный serial Raspberry потерян во время миграции"
+
+    mkdir -p "$TARGET_ROOT_MNT/etc/bmi30-agent" "$TARGET_ROOT_MNT/var/lib/bmi30-agent"
+
+    if (( BMI30_IDENTITY_PRESERVED == 1 )); then
+        preserved_root="$WORKDIR/preserved-bmi30-identity"
+        remove_target_bmi30_identity_files
+        for rel in "${BMI30_IDENTITY_FILES[@]}"; do
+            source_path="$preserved_root/$rel"
+            [[ -f "$source_path" && ! -L "$source_path" ]] || continue
+            target_path="$TARGET_ROOT_MNT/$rel"
+            mkdir -p "$(dirname "$target_path")"
+            cp -a -- "$source_path" "$target_path"
+        done
+        chown -R root:root "$TARGET_ROOT_MNT/etc/bmi30-agent" "$TARGET_ROOT_MNT/var/lib/bmi30-agent"
+        chmod 0700 "$TARGET_ROOT_MNT/etc/bmi30-agent" "$TARGET_ROOT_MNT/var/lib/bmi30-agent"
+        chmod 0600 \
+            "$TARGET_ROOT_MNT/etc/bmi30-agent/id_ed25519" \
+            "$TARGET_ROOT_MNT/var/lib/bmi30-agent/device_api_token" \
+            "$TARGET_ROOT_MNT/var/lib/bmi30-agent/bound_raspberry_serial"
+        chmod 0644 "$TARGET_ROOT_MNT/etc/bmi30-agent/id_ed25519.pub"
+        for target_path in \
+            "$TARGET_ROOT_MNT/etc/bmi30-agent/known_hosts" \
+            "$TARGET_ROOT_MNT/etc/bmi30-agent/tunnel.env" \
+            "$TARGET_ROOT_MNT/var/lib/bmi30-agent/state.json"
+        do
+            [[ -f "$target_path" ]] && chmod 0600 "$target_path"
+        done
+        validate_bmi30_identity_root "$TARGET_ROOT_MNT" "$BMI30_HARDWARE_SERIAL" || \
+            die "Восстановленная BMI30 identity не прошла проверку"
+        ok "BMI30 identity текущей Raspberry возвращена на eMMC после копирования"
+        return 0
+    fi
+
+    if validate_bmi30_identity_root "$TARGET_ROOT_MNT" "$BMI30_HARDWARE_SERIAL"; then
+        BMI30_IDENTITY_STATUS="copied-current-board-identity"
+        ok "Источник уже содержит BMI30 identity текущей Raspberry; сохраняю её без изменения"
+        return 0
+    fi
+
+    remove_target_bmi30_identity_files
+    chmod 0700 "$TARGET_ROOT_MNT/etc/bmi30-agent" "$TARGET_ROOT_MNT/var/lib/bmi30-agent"
+    BMI30_IDENTITY_STATUS="new-enrollment"
+    warn "Чужая identity с USB удалена с eMMC; при первом запуске будет создана identity для BMI30-$BMI30_HARDWARE_SERIAL"
+}
+
+prepare_target_bmi30_agent_boot() {
+    local backup_dir tmpfiles_src tmpfiles_dir tmpfiles_dst wants_dir
+    local agent_unit tunnel_unit agent_program tunnel_program agent_config
+
+    [[ "$TARGET_ROLE" == "internal" ]] || return 0
+
+    backup_dir="$TARGET_ROOT_MNT/var/backups/bmi30-agent"
+    tmpfiles_src="$SCRIPT_DIR/bmi30-agent-tmpfiles.conf"
+    tmpfiles_dir="$TARGET_ROOT_MNT/etc/tmpfiles.d"
+    tmpfiles_dst="$tmpfiles_dir/bmi30-agent.conf"
+    wants_dir="$TARGET_ROOT_MNT/etc/systemd/system/multi-user.target.wants"
+    agent_unit="$TARGET_ROOT_MNT/etc/systemd/system/bmi30-agent.service"
+    tunnel_unit="$TARGET_ROOT_MNT/etc/systemd/system/bmi30-tunnel.service"
+    agent_program="$TARGET_ROOT_MNT/opt/bmi30-agent/bmi30_agent.py"
+    tunnel_program="$TARGET_ROOT_MNT/opt/bmi30-agent/run_bmi30_tunnel.sh"
+    agent_config="$TARGET_ROOT_MNT/etc/bmi30-agent/config.json"
+
+    [[ -f "$tmpfiles_src" ]] || \
+        die "Не найдено правило восстановления каталога BMI30 Agent: $tmpfiles_src"
+    for required_path in \
+        "$agent_unit" \
+        "$tunnel_unit" \
+        "$agent_program" \
+        "$tunnel_program" \
+        "$agent_config"
+    do
+        [[ -f "$required_path" && ! -L "$required_path" ]] || \
+            die "На целевой eMMC отсутствует обязательный файл BMI30 Agent: $required_path"
+    done
+
+    # Архивы credentials намеренно не копируются с исходного носителя. Сам
+    # каталог при этом обязателен для ReadWritePaths= в bmi30-agent.service:
+    # если его нет, systemd не сможет создать sandbox и не запустит Agent.
+    install -d -m 0700 "$backup_dir"
+    install -d -m 0755 "$tmpfiles_dir" "$wants_dir"
+    install -m 0644 "$tmpfiles_src" "$tmpfiles_dst"
+
+    # Агент выполняет check-in при каждой загрузке и сам запускает туннель
+    # только после approved-ответа Hub. Отдельно включать tunnel unit нельзя:
+    # на новой плате он не должен стартовать со скопированным назначением.
+    ln -sfn ../bmi30-agent.service "$wants_dir/bmi30-agent.service"
+
+    ok "BMI30 Agent включён на eMMC; каталог backup будет восстановлен до старта службы"
+}
+
 pause_source_services() {
     local service
 
@@ -307,7 +537,13 @@ pause_source_services() {
     if timeout 30s systemctl stop "$service"; then
         PAUSED_SOURCE_SERVICES+=("$service")
         info "Сбрасываю файловые буферы перед rootfs-копией"
-        sync
+        # Flush only the source filesystems. A global sync also waits for the
+        # freshly formatted target and can hide a target-device I/O lockup at
+        # this otherwise source-only preparation step.
+        sync -f "$SOURCE_ROOT_COPY_MNT"
+        if [[ "$SOURCE_BOOT_COPY_MNT" != "$SOURCE_ROOT_COPY_MNT" ]]; then
+            sync -f "$SOURCE_BOOT_COPY_MNT"
+        fi
     else
         warn "Не удалось остановить $service за 30 секунд; продолжаю копирование живой системы"
     fi
@@ -335,6 +571,9 @@ resume_source_services() {
 cleanup() {
     set +e
     resume_source_services
+    if [[ -n "${WORKDIR:-}" ]] && mountpoint -q "$WORKDIR/target-identity" 2>/dev/null; then
+        umount "$WORKDIR/target-identity"
+    fi
     if mountpoint -q "$TARGET_BOOT_MNT" 2>/dev/null; then
         umount "$TARGET_BOOT_MNT"
     fi
@@ -516,6 +755,21 @@ detect_source_and_target() {
     fi
 }
 
+check_target_emmc_command_queue() {
+    local target_name cmdq_path cmdq_enabled
+
+    [[ "$TARGET_DISK" =~ ^/dev/mmcblk[0-9]+$ ]] || return 0
+
+    target_name="${TARGET_DISK##*/}"
+    cmdq_path="/sys/block/$target_name/device/cmdq_en"
+    [[ -r "$cmdq_path" ]] || return 0
+
+    cmdq_enabled="$(cat "$cmdq_path" 2>/dev/null || true)"
+    [[ "$cmdq_enabled" == "1" ]] || return 0
+
+    die "На целевом eMMC включена Command Queueing (cmdq_en=1). На этой системе очередь может полностью зависнуть при параллельной записи. Добавьте 'dtparam=sd_cqe=0' в секцию [all] файла /boot/firmware/config.txt, перезагрузите систему и повторите миграцию"
+}
+
 confirm_plan() {
     local source_size target_size
     source_size="$(lsblk -dnro SIZE "$SOURCE_DISK")"
@@ -641,7 +895,11 @@ EOF
     [[ -b "$TARGET_BOOT_DEV" && -b "$TARGET_ROOT_DEV" ]] || die "После разметки не найдены целевые разделы"
 
     mkfs.vfat -F 32 -n BOOTFS "$TARGET_BOOT_DEV"
-    mkfs.ext4 -F -L rootfs -m 0 "$TARGET_ROOT_DEV"
+    # Finish inode-table and journal initialisation before mounting. This keeps
+    # ext4lazyinit from competing with the boot copy for eMMC requests.
+    mkfs.ext4 -F -L rootfs -m 0 \
+        -E lazy_itable_init=0,lazy_journal_init=0 \
+        "$TARGET_ROOT_DEV"
     partprobe "$TARGET_DISK"
     udevadm settle
 
@@ -763,6 +1021,7 @@ copy_root_files() {
         --exclude=/run/* \
         --exclude=/mnt/* \
         --exclude=/media/* \
+        --exclude=/var/backups/bmi30-agent/*** \
         --exclude=/home/*/.cache/gvfs \
         --exclude=/home/*/.cache/gvfs/ \
         --exclude=/home/*/.cache/gvfs/*** \
@@ -1098,6 +1357,10 @@ show_summary() {
     printf "  Диск:        %s\n" "$TARGET_DISK"
     printf "  Boot раздел: %s (PARTUUID=%s)\n" "$TARGET_BOOT_DEV" "$TARGET_BOOT_PARTUUID"
     printf "  Root раздел: %s (PARTUUID=%s)\n" "$TARGET_ROOT_DEV" "$TARGET_ROOT_PARTUUID"
+    if [[ "$TARGET_ROLE" == "internal" ]]; then
+        printf "  BMI30 identity: %s (hardware BMI30-%s)\n" \
+            "$BMI30_IDENTITY_STATUS" "$BMI30_HARDWARE_SERIAL"
+    fi
 
     if [[ "$TARGET_ROLE" == "usb" ]]; then
         printf "  BOOT_ORDER:  USB-first (%s), если EEPROM шаг не был пропущен\n" "$BOOT_ORDER_USB_FIRST"
@@ -1137,6 +1400,8 @@ main() {
 
     step "Проверка исходного и целевого диска"
     confirm_plan
+    check_target_emmc_command_queue
+    preserve_target_bmi30_identity
 
     step "Local project snapshot перед полным копированием"
     if (( FORCE_FORMAT_AND_RETRY == 1 )); then
@@ -1185,8 +1450,12 @@ main() {
         fi
     fi
 
-    step "Обновление cmdline.txt и fstab на цели"
+    step "Восстановление BMI30 identity и обновление cmdline.txt/fstab на цели"
+    restore_or_initialize_target_bmi30_identity
     rewrite_target_config
+
+    step "Подготовка автоматического восстановления связи BMI30 Agent на цели"
+    prepare_target_bmi30_agent_boot
 
     step "Подготовка автокоррекции сетевой идентичности на целевой системе"
     install_boot_network_identity_refresh
@@ -1203,4 +1472,6 @@ main() {
     show_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -43,10 +43,18 @@ RELEASE_BUNDLE_ID=""
 RELEASE_LABEL=""
 RELEASE_NOTES=""
 RELEASE_BUNDLE_CREATED_AT=""
+RELEASE_LABEL_OVERRIDE="${BMI30_RELEASE_LABEL_OVERRIDE:-}"
+RELEASE_NOTES_OVERRIDE="${BMI30_RELEASE_NOTES_OVERRIDE:-}"
 REQUIRED_RELEASE_DOCS=(
     "host/README_VENDOR_HOST.md"
     "host/HOST_RPI.md"
 )
+
+cleanup() {
+    bmi30_restore_rclone_config_owner || true
+}
+
+trap cleanup EXIT
 
 usage() {
     cat <<'EOF'
@@ -64,6 +72,8 @@ Options:
   --on-calendar <expr>       Timer schedule (default: *-*-* 22:00:00)
   --config <path>            Config file (default: ./utilities/backup_to_cloud.conf)
   --local-only               Create local firmware release and skip cloud upload
+  --label <text>             Override the release label without changing the runtime bundle
+  --notes <text>             Override the release notes without changing the runtime bundle
   --if-changed               Publish only if changed; requires ALLOW_AUTO_PUBLISH=1
   --allow-auto-publish       Permit --if-changed auto publish for an approved release device
   --force                    Create/upload even when --if-changed would skip
@@ -244,6 +254,24 @@ prepare_release_manifest() {
     local active_env="$SOURCE_DIR/host/bmi30_split_active_version.env"
     local manifest="$SOURCE_DIR/host/bmi30_firmware_release.env"
     local core_rel gui_rel portal_rel engine_rel core_path engine_name label required_doc bundle_manifest
+    local previous_version="" previous_label="" previous_notes="" previous_created_at=""
+    local previous_signature="" previous_signature_version="" previous_bundle_id=""
+    local reused_identity=0
+
+    if [[ -f "$manifest" ]]; then
+        unset BMI30_FIRMWARE_VERSION BMI30_FIRMWARE_LABEL BMI30_FIRMWARE_NOTES
+        unset BMI30_FIRMWARE_CREATED_AT BMI30_FIRMWARE_CONTENT_SIGNATURE
+        unset BMI30_FIRMWARE_SIGNATURE_VERSION BMI30_FIRMWARE_BUNDLE_ID
+        # shellcheck source=/dev/null
+        source "$manifest"
+        previous_version="${BMI30_FIRMWARE_VERSION:-}"
+        previous_label="${BMI30_FIRMWARE_LABEL:-}"
+        previous_notes="${BMI30_FIRMWARE_NOTES:-}"
+        previous_created_at="${BMI30_FIRMWARE_CREATED_AT:-}"
+        previous_signature="${BMI30_FIRMWARE_CONTENT_SIGNATURE:-}"
+        previous_signature_version="${BMI30_FIRMWARE_SIGNATURE_VERSION:-}"
+        previous_bundle_id="${BMI30_FIRMWARE_BUNDLE_ID:-}"
+    fi
 
     [[ -f "$active_env" ]] || fail "Не найден active websplit env: $active_env"
     for required_doc in "${REQUIRED_RELEASE_DOCS[@]}"; do
@@ -275,9 +303,7 @@ prepare_release_manifest() {
         fi
     fi
 
-    RELEASE_BUILD_ID="$(date +%Y-%m-%d-%H%M%S)"
     RELEASE_ARCHIVE_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-    RELEASE_CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     label="$(date '+%Y-%m-%d %H:%M:%S %Z')"
     bundle_manifest="$SOURCE_DIR/host/bmi30_split_bundles/$RELEASE_BUNDLE_ID/manifest.env"
     if [[ -f "$bundle_manifest" ]]; then
@@ -288,10 +314,33 @@ prepare_release_manifest() {
         RELEASE_NOTES="${BMI30_BUNDLE_ORIGIN:-}"
         RELEASE_BUNDLE_CREATED_AT="${BMI30_BUNDLE_CREATED_AT:-}"
     fi
-    RELEASE_LABEL="${RELEASE_LABEL:-$label}"
+
+    if [[ "$previous_version" =~ ^[A-Za-z0-9._-]+$ ]] \
+        && bmi30_signature_is_valid "$previous_signature" \
+        && [[ "${previous_signature,,}" == "${content_signature,,}" ]] \
+        && [[ "$previous_signature_version" == "$BMI30_PROJECT_SIGNATURE_VERSION" ]] \
+        && [[ -z "$previous_bundle_id" || "$previous_bundle_id" == "$RELEASE_BUNDLE_ID" ]]
+    then
+        RELEASE_BUILD_ID="$previous_version"
+        RELEASE_CREATED_AT="${previous_created_at:-${RELEASE_BUNDLE_CREATED_AT:-}}"
+        RELEASE_LABEL="${previous_label:-${RELEASE_LABEL:-$previous_version}}"
+        RELEASE_NOTES="${previous_notes:-${RELEASE_NOTES:-}}"
+        reused_identity=1
+    else
+        RELEASE_BUILD_ID="$(date +%Y-%m-%d-%H%M%S)"
+        RELEASE_CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        RELEASE_LABEL="${RELEASE_LABEL:-$label}"
+    fi
+    RELEASE_CREATED_AT="${RELEASE_CREATED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+    [[ -z "$RELEASE_LABEL_OVERRIDE" ]] || RELEASE_LABEL="$RELEASE_LABEL_OVERRIDE"
+    [[ -z "$RELEASE_NOTES_OVERRIDE" ]] || RELEASE_NOTES="$RELEASE_NOTES_OVERRIDE"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        log "[dry-run] Создал бы release manifest: $manifest ($RELEASE_BUILD_ID)"
+        if (( reused_identity == 1 )); then
+            log "[dry-run] Сохранил бы версию неизменного кода: $RELEASE_BUILD_ID"
+        else
+            log "[dry-run] Создал бы новую версию изменённого кода: $RELEASE_BUILD_ID"
+        fi
         return
     fi
 
@@ -312,16 +361,36 @@ prepare_release_manifest() {
         printf 'BMI30_FIRMWARE_GUI_SHA256=%q\n' "$(release_file_hash "$gui_rel")"
         printf 'BMI30_FIRMWARE_PORTAL_PATH=%q\n' "$portal_rel"
         printf 'BMI30_FIRMWARE_PORTAL_SHA256=%q\n' "$(release_file_hash "$portal_rel")"
+        printf 'BMI30_FIRMWARE_TAG_FILTERS_PATH=%q\n' 'host/bmi30_active_runtime/project/host/tag_response_filters'
         printf 'BMI30_FIRMWARE_VENDOR_DOC_PATH=%q\n' "${REQUIRED_RELEASE_DOCS[0]}"
         printf 'BMI30_FIRMWARE_VENDOR_DOC_SHA256=%q\n' "$(release_file_hash "${REQUIRED_RELEASE_DOCS[0]}")"
         printf 'BMI30_FIRMWARE_HOST_DOC_PATH=%q\n' "${REQUIRED_RELEASE_DOCS[1]}"
         printf 'BMI30_FIRMWARE_HOST_DOC_SHA256=%q\n' "$(release_file_hash "${REQUIRED_RELEASE_DOCS[1]}")"
     } > "$manifest"
-    log "Release manifest создан: $RELEASE_BUILD_ID"
+    if (( reused_identity == 1 )); then
+        log "Код не изменился; версия сохранена: $RELEASE_BUILD_ID"
+    else
+        log "Код изменился; создана новая версия: $RELEASE_BUILD_ID"
+    fi
 }
 
 read_known_signature() {
-    local state_file
+    local state_file manifest="$SOURCE_DIR/host/bmi30_firmware_release.env"
+
+    # The release manifest travels with a copied/restored project and describes
+    # its current bytes.  Local state may legitimately lag behind after a
+    # manual release, so prefer the portable manifest when it is trustworthy.
+    if [[ -f "$manifest" ]]; then
+        unset BMI30_FIRMWARE_CONTENT_SIGNATURE BMI30_FIRMWARE_SIGNATURE_VERSION
+        # shellcheck source=/dev/null
+        source "$manifest"
+        if [[ "${BMI30_FIRMWARE_SIGNATURE_VERSION:-}" == "$BMI30_PROJECT_SIGNATURE_VERSION" ]] \
+            && bmi30_signature_is_valid "${BMI30_FIRMWARE_CONTENT_SIGNATURE:-}"
+        then
+            printf '%s' "$BMI30_FIRMWARE_CONTENT_SIGNATURE"
+            return
+        fi
+    fi
 
     for state_file in "$STATE_DIR/publish_state.env" "$STATE_DIR/update_state.env"; do
         [[ -f "$state_file" ]] || continue
@@ -469,6 +538,16 @@ parse_args() {
                 LOCAL_ONLY=1
                 shift
                 ;;
+            --label)
+                require_value "$1" "${2:-}"
+                RELEASE_LABEL_OVERRIDE="$2"
+                shift 2
+                ;;
+            --notes)
+                require_value "$1" "${2:-}"
+                RELEASE_NOTES_OVERRIDE="$2"
+                shift 2
+                ;;
             --if-changed)
                 UPLOAD_IF_CHANGED=1
                 shift
@@ -588,6 +667,7 @@ upload_archive() {
     [[ -n "$legacy_signature" ]] || legacy_signature="$(legacy_project_signature)"
 
     local archive_name archive_hash created_at device_suffix marker_path remote_archive remote_marker
+    local compatibility_signature
     local archive_bytes marker_bytes
     archive_name="$(basename -- "$archive_path")"
     created_at="${RELEASE_CREATED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
@@ -612,6 +692,7 @@ upload_archive() {
     fi
 
     archive_hash="$(sha256sum "$archive_path" | awk '{print $1}')"
+    compatibility_signature="$(bmi30_v8_project_signature "$SOURCE_DIR")"
 
     archive_bytes="$(bmi30_file_size_bytes "$archive_path")"
     if ! run_bounded_cloud_copy "Выгрузка архива в облако" "$archive_bytes" "${cmd[@]}"; then
@@ -624,8 +705,12 @@ upload_archive() {
         printf 'ARCHIVE_NAME=%q\n' "$archive_name"
         printf 'ARCHIVE_SHA256=%q\n' "$archive_hash"
         printf 'PROJECT_SIGNATURE=%q\n' "$legacy_signature"
-        printf 'PROJECT_CONTENT_SIGNATURE=%q\n' "$content_signature"
-        printf 'PROJECT_SIGNATURE_VERSION=%q\n' "$BMI30_PROJECT_SIGNATURE_VERSION"
+        # v8 fields let portal-update capable older clones complete their first
+        # migration. Current clients use the separate release signature below.
+        printf 'PROJECT_CONTENT_SIGNATURE=%q\n' "$compatibility_signature"
+        printf 'PROJECT_SIGNATURE_VERSION=%q\n' "8"
+        printf 'RELEASE_CONTENT_SIGNATURE=%q\n' "$content_signature"
+        printf 'RELEASE_SIGNATURE_VERSION=%q\n' "$BMI30_PROJECT_SIGNATURE_VERSION"
         printf 'FIRMWARE_VERSION=%q\n' "${RELEASE_BUILD_ID:-}"
         printf 'FIRMWARE_BUNDLE_ID=%q\n' "$RELEASE_BUNDLE_ID"
         printf 'FIRMWARE_LABEL=%q\n' "${RELEASE_LABEL:-}"
@@ -750,6 +835,12 @@ main() {
     if [[ "$INSTALL_TIMER" -eq 1 ]]; then
         install_user_timer
         return
+    fi
+
+    if [[ "$DRY_RUN" -ne 1 && "$LOCAL_ONLY" -ne 1 && -n "$REMOTE_TARGET" ]]; then
+        command -v rclone >/dev/null 2>&1 || fail "rclone не установлен"
+        bmi30_prepare_rclone_config \
+            || fail "Не удалось подготовить безопасный доступ к rclone.conf"
     fi
 
     local archive upload_status content_signature legacy_signature last_signature

@@ -5,7 +5,97 @@
 # Runtime state, local device settings, logs, caches, captures, and learned data
 # are intentionally ignored so running devices do not become false leaders.
 
-BMI30_PROJECT_SIGNATURE_VERSION="8"
+BMI30_PROJECT_SIGNATURE_VERSION="9"
+BMI30_RCLONE_CONFIG_PREPARED=0
+
+bmi30_rclone_config_path() {
+    if [[ -n "${RCLONE_CONFIG:-}" ]]; then
+        printf '%s' "$RCLONE_CONFIG"
+    elif [[ -n "${BMI30_RCLONE_CONFIG:-}" ]]; then
+        printf '%s' "$BMI30_RCLONE_CONFIG"
+    elif [[ -f /home/techaid/.config/rclone/rclone.conf ]]; then
+        printf '%s' /home/techaid/.config/rclone/rclone.conf
+    else
+        printf '%s/.config/rclone/rclone.conf' "${HOME:-/home/techaid}"
+    fi
+}
+
+bmi30_rclone_config_owner() {
+    local config_path="$1"
+
+    if [[ -n "${BMI30_RCLONE_CONFIG_OWNER:-}" ]]; then
+        printf '%s' "$BMI30_RCLONE_CONFIG_OWNER"
+    elif [[ "$config_path" =~ ^/home/([^/]+)/ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    elif [[ -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != root ]]; then
+        printf '%s' "$SUDO_USER"
+    else
+        id -un
+    fi
+}
+
+bmi30_run_privileged_quietly() {
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        "$@"
+        return
+    fi
+    command -v sudo >/dev/null 2>&1 || return 127
+    if [[ -t 0 && -t 1 ]]; then
+        sudo "$@"
+    else
+        sudo -n "$@"
+    fi
+}
+
+bmi30_prepare_rclone_config() {
+    local config_path owner_user owner_group owner_uid owner_gid current_uid current_gid current_mode
+    config_path="$(bmi30_rclone_config_path)"
+    [[ -f "$config_path" ]] || {
+        bmi30_copy_log_warn "Конфигурация rclone не найдена: $config_path"
+        return 1
+    }
+
+    owner_user="$(bmi30_rclone_config_owner "$config_path")"
+    id "$owner_user" >/dev/null 2>&1 || {
+        bmi30_copy_log_warn "Пользователь-владелец rclone не найден: $owner_user"
+        return 1
+    }
+    owner_group="$(id -gn "$owner_user")"
+    owner_uid="$(id -u "$owner_user")"
+    owner_gid="$(id -g "$owner_user")"
+    current_uid="$(stat -c '%u' "$config_path" 2>/dev/null || true)"
+    current_gid="$(stat -c '%g' "$config_path" 2>/dev/null || true)"
+    current_mode="$(stat -c '%a' "$config_path" 2>/dev/null || true)"
+
+    if [[ "$current_uid" != "$owner_uid" || "$current_gid" != "$owner_gid" ]]; then
+        if ! bmi30_run_privileged_quietly chown "$owner_user:$owner_group" "$config_path"; then
+            bmi30_copy_log_warn "Не удалось вернуть владельца rclone.conf: $owner_user:$owner_group"
+            return 1
+        fi
+        bmi30_copy_log_info "Исправлен владелец rclone.conf: $owner_user:$owner_group"
+    fi
+    if [[ "$current_mode" != "600" ]]; then
+        if ! bmi30_run_privileged_quietly chmod 600 "$config_path"; then
+            bmi30_copy_log_warn "Не удалось установить безопасные права 0600 для rclone.conf"
+            return 1
+        fi
+    fi
+
+    export RCLONE_CONFIG="$config_path"
+    BMI30_RCLONE_CONFIG_PREPARED=1
+    [[ -r "$config_path" ]] || {
+        bmi30_copy_log_warn "Конфигурация rclone недоступна для чтения: $config_path"
+        return 1
+    }
+}
+
+bmi30_restore_rclone_config_owner() {
+    [[ "${BMI30_RCLONE_CONFIG_PREPARED:-0}" == "1" ]] || return 0
+    bmi30_prepare_rclone_config || {
+        bmi30_copy_log_warn "Не удалось восстановить владельца rclone.conf после облачной операции"
+        return 1
+    }
+}
 
 bmi30_copy_format_duration() {
     local total_s="${1:-0}"
@@ -167,6 +257,7 @@ bmi30_project_find_files0() {
         -o -name "__pycache__" \) -prune \
         -o -type f \
         ! -path "$source_abs/utilities/backup_to_cloud.conf" \
+        ! -path "$source_abs/docs/BMI30_version_registry_google_sheet.csv" \
         ! -path "$source_abs/host/bmi30_firmware_release.env" \
         ! -path "$source_abs/host/bmi30_config.json" \
         ! -path "$source_abs/host/bmi30_sel.json" \
@@ -287,6 +378,31 @@ bmi30_project_signature() {
     bmi30_signature_from_find0 "$source_abs" bmi30_firmware_project_find_files0
 }
 
+# Cloud updater generation 8 is installed on the first portal-update capable
+# clones.  Its content signature differs from v9 only because it still counted
+# the Google Sheet export.  Keep this exact compatibility signature so those
+# devices can finish their first migration in one pass.  New clients verify the
+# separate current release signature from the marker.
+bmi30_v8_project_signature() {
+    local source_dir="$1"
+    local source_abs registry_path
+    source_abs="$(cd -- "$source_dir" && pwd)"
+    registry_path="$source_abs/docs/BMI30_version_registry_google_sheet.csv"
+    {
+        bmi30_firmware_project_find_files0 "$source_abs"
+        [[ -f "$registry_path" ]] && printf '%s\0' "$registry_path"
+    } \
+        | LC_ALL=C sort -zu \
+        | while IFS= read -r -d '' file; do
+            local rel file_hash
+            rel="${file#$source_abs/}"
+            file_hash="$(sha256sum "$file" | awk '{print $1}')"
+            printf '%s  %s\n' "$file_hash" "$rel"
+        done \
+        | sha256sum \
+        | awk '{print $1}'
+}
+
 bmi30_legacy_project_signature() {
     local source_dir="$1"
     local source_abs
@@ -376,6 +492,7 @@ bmi30_add_project_tar_excludes() {
         --exclude="*codex-broken-backup*"
         --exclude="*restore-backup*"
         --exclude=".DS_Store"
+        --exclude=".lgd-*"
         --exclude="full_mismatch_*"
         --exclude="udo netstat*"
     )
@@ -443,6 +560,7 @@ bmi30_add_project_rsync_excludes() {
         --exclude='*codex-broken-backup*'
         --exclude='*restore-backup*'
         --exclude='.DS_Store'
+        --exclude='.lgd-*'
         --exclude='/full_mismatch_*'
         --exclude='/udo netstat*'
     )

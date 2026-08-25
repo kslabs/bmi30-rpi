@@ -31,7 +31,7 @@ usage() {
 
 Скрипт читает host/bmi30_split_active_version.env источника и сохраняет:
 core, engine, GUI, portal, project/system BMI30 config, bmi30_sel,
-DC calibration, usb_vendor и (по умолчанию) player recordings.
+DC calibration, tag_response_filters, usb_vendor и (по умолчанию) player recordings.
 EOF
 }
 
@@ -149,7 +149,8 @@ write_release_manifest() {
         printf 'BMI30_FIRMWARE_VERSION=%q\n' "$BUNDLE_ID"
         printf 'BMI30_FIRMWARE_LABEL=%q\n' "$BUNDLE_LABEL"
         printf 'BMI30_FIRMWARE_CREATED_AT=%q\n' "$created_at"
-        printf 'BMI30_FIRMWARE_SIGNATURE_VERSION=8\n'
+        printf 'BMI30_FIRMWARE_SIGNATURE_VERSION=9\n'
+        printf 'BMI30_FIRMWARE_BUNDLE_ID=%q\n' "$BUNDLE_ID"
         printf 'BMI30_FIRMWARE_CORE_PATH=%q\n' "$core_rel"
         printf 'BMI30_FIRMWARE_CORE_SHA256=%q\n' "$(sha256sum "$bundle_tmp/project/host/$core_name" | awk '{print $1}')"
         printf 'BMI30_FIRMWARE_ENGINE_PATH=%q\n' "$engine_rel"
@@ -160,6 +161,7 @@ write_release_manifest() {
         printf 'BMI30_FIRMWARE_PORTAL_SHA256=%q\n' "$(sha256sum "$bundle_tmp/project/hotspot_info_server.py" | awk '{print $1}')"
         printf 'BMI30_FIRMWARE_CONFIG_PATH=%q\n' 'host/bmi30_active_runtime/project/host/bmi30_config.json'
         printf 'BMI30_FIRMWARE_CONFIG_SHA256=%q\n' "$(sha256sum "$bundle_tmp/project/host/bmi30_config.json" | awk '{print $1}')"
+        printf 'BMI30_FIRMWARE_TAG_FILTERS_PATH=%q\n' 'host/bmi30_active_runtime/project/host/tag_response_filters'
         printf 'BMI30_FIRMWARE_USB_STREAM_PATH=%q\n' 'host/bmi30_active_runtime/project/host/usb_vendor/usb_stream.py'
         printf 'BMI30_FIRMWARE_USB_STREAM_SHA256=%q\n' "$(sha256sum "$bundle_tmp/project/host/usb_vendor/usb_stream.py" | awk '{print $1}')"
     } > "$release"
@@ -227,6 +229,14 @@ main() {
     copy_optional_file "$engine_dir/USB_config.json" "$tmp_dir/project/host/USB_config.json"
     copy_optional_file "$engine_dir/plot_config.json" "$tmp_dir/project/host/plot_config.json"
 
+    local tag_filters_dir="$engine_dir/tag_response_filters"
+    [[ -d "$tag_filters_dir" ]] || tag_filters_dir="$SOURCE_PROJECT/host/tag_response_filters"
+    [[ -d "$tag_filters_dir" ]] || die "Не найдена обязательная папка tag_response_filters"
+    rsync -a --exclude='__pycache__/' --exclude='*.pyc' \
+        "$tag_filters_dir/" "$tmp_dir/project/host/tag_response_filters/"
+    find "$tmp_dir/project/host/tag_response_filters" -maxdepth 1 -type f -name '*.json' -print -quit \
+        | grep -q . || die "В комплект не попали JSON-файлы tag response filters"
+
     [[ -d "$engine_dir/usb_vendor" ]] || die "Не найден обязательный usb_vendor: $engine_dir/usb_vendor"
     rsync -a --exclude='__pycache__/' --exclude='*.pyc' \
         "$engine_dir/usb_vendor/" "$tmp_dir/project/host/usb_vendor/"
@@ -264,6 +274,7 @@ main() {
         printf 'BMI30_BUNDLE_PROJECT_CONFIG_REL=%q\n' 'project/host/bmi30_config.json'
         printf 'BMI30_BUNDLE_SYSTEM_CONFIG_REL=%q\n' 'system/etc/bmi30/portal_config.json'
         printf 'BMI30_BUNDLE_INSTALLED_CONFIG_REL=%q\n' 'system/usr/local/bin/host/bmi30_config.json'
+        printf 'BMI30_BUNDLE_TAG_FILTERS_REL=%q\n' 'project/host/tag_response_filters'
         printf 'BMI30_BUNDLE_USB_VENDOR_REL=%q\n' 'project/host/usb_vendor'
         printf 'BMI30_BUNDLE_PLAYER_REL=%q\n' 'project/host/player_recordings'
         printf 'BMI30_BUNDLE_RELEASE_REL=%q\n' 'project/host/bmi30_firmware_release.env'

@@ -1,0 +1,118 @@
+BMI30 TUNNEL HUB — ИНСТРУКЦИЯ ДЛЯ RASPBERRY PI
+Дата: 2026-08-07
+
+ВАЖНО
+Я не определял DEVICE_ID через сеть. Значение BMI30-ABDD2DBC9775FBAE было передано ранее в данных enrollment вместе с REMOTE_PORT=29476 и PUBLIC_KEY. На сервере сейчас зарегистрирован только этот первый ключ. Остальные три Raspberry сначала должны создать собственные enrollment-данные.
+
+============================================================
+A. ПЕРВАЯ RASPBERRY: BMI30-ABDD2DBC9775FBAE / ПОРТ 29476
+============================================================
+
+1. Откройте терминал именно на Raspberry Pi.
+
+2. Проверьте наличие установочного скрипта:
+
+cd /home/techaid/Documents
+ls -l ./utilities/install_bmi30_reverse_tunnel.sh
+
+3. Не запускайте пока установку без параметров. Сначала проверьте уже созданный публичный ключ:
+
+sudo test -f /home/techaid/.ssh/id_ed25519_bmi30_tunnel.pub \
+  && echo "PUBLIC_KEY_EXISTS" \
+  || echo "PUBLIC_KEY_MISSING"
+
+sudo cat /home/techaid/.ssh/id_ed25519_bmi30_tunnel.pub
+
+sudo ssh-keygen -lf \
+  /home/techaid/.ssh/id_ed25519_bmi30_tunnel.pub \
+  -E sha256
+
+Ожидается:
+- комментарий ключа заканчивается на:
+  BMI30-ABDD2DBC9775FBAE@bmi30-tunnel
+- fingerprint ключа устройства:
+  SHA256:ouBmBC1+vPVJPqh24hkjgBZXmd2Gq35KrDnxSC9b1do
+
+Если файла нет или fingerprint другой — ОСТАНОВИТЕСЬ. Не создавайте новый ключ и не запускайте --enable. Передайте вывод серверному агенту.
+
+4. Отдельно проверьте ED25519 host key сервера:
+
+HOSTKEY_TMP="$(mktemp)"
+ssh-keyscan -T 5 -t ed25519 65.21.225.43 2>/dev/null > "$HOSTKEY_TMP"
+ssh-keygen -lf "$HOSTKEY_TMP" -E sha256
+rm -f "$HOSTKEY_TMP"
+
+Ожидаемый ED25519 fingerprint сервера:
+SHA256:ktISpZKvrrPcwYLyAiNtDHuoRMaFKehWq1cP+E9yZuE
+
+Если fingerprint отличается или ключ не получен — ОСТАНОВИТЕСЬ и передайте вывод.
+
+5. Если оба fingerprint совпали, установите и включите службу туннеля:
+
+cd /home/techaid/Documents
+sudo ./utilities/install_bmi30_reverse_tunnel.sh --scan-host-key --enable
+
+6. Проверьте службу:
+
+sudo systemctl is-enabled bmi30-reverse-tunnel.service
+sudo systemctl is-active bmi30-reverse-tunnel.service
+sudo systemctl --no-pager --full status bmi30-reverse-tunnel.service
+sudo journalctl -u bmi30-reverse-tunnel.service -n 100 --no-pager
+
+Ожидается:
+- is-enabled: enabled
+- is-active: active
+- в журнале нет Permission denied, Host key verification failed, Connection refused или Connection timed out.
+
+7. На Windows-сервере после успешного подключения проверить:
+
+Get-NetTCPConnection -State Listen -LocalPort 29476 |
+    Format-Table LocalAddress,LocalPort,OwningProcess,State
+
+curl.exe -sS -i --max-time 2 http://127.0.0.1:29476/api/status
+
+Ожидается listener на порту 29476. Вывод /api/status нужен для разработки автоматической регистрации устройств в BMI30 Portal.
+
+============================================================
+B. ОСТАЛЬНЫЕ ТРИ RASPBERRY
+============================================================
+
+На каждой Raspberry выполнять отдельно, по одной за раз.
+
+1. Создать enrollment без включения службы:
+
+cd /home/techaid/Documents
+sudo ./utilities/install_bmi30_reverse_tunnel.sh
+
+2. Скопировать и передать серверному агенту ровно три напечатанные строки:
+
+DEVICE_ID=...
+REMOTE_PORT=...
+PUBLIC_KEY=ssh-ed25519 ...
+
+3. Не запускать --enable, пока соответствующий ключ и порт не добавлены на сервер.
+
+4. После подтверждения от серверного агента на каждой Raspberry выполнить:
+
+cd /home/techaid/Documents
+sudo ./utilities/install_bmi30_reverse_tunnel.sh --scan-host-key --enable
+
+5. Проверить:
+
+sudo systemctl --no-pager --full status bmi30-reverse-tunnel.service
+sudo journalctl -u bmi30-reverse-tunnel.service -n 100 --no-pager
+
+============================================================
+ЧТО ПЕРЕДАТЬ ПОСЛЕ ПЕРВОГО ЗАПУСКА
+============================================================
+
+1. Вывод fingerprint локального публичного ключа устройства.
+2. Вывод проверки ED25519 host key сервера.
+3. Полный вывод команды install_bmi30_reverse_tunnel.sh --scan-host-key --enable.
+4. Вывод systemctl status.
+5. При ошибке — последние 100 строк journalctl.
+6. Для остальных трёх Raspberry — DEVICE_ID, REMOTE_PORT и PUBLIC_KEY каждой.
+
+Не передавать и не показывать содержимое файла:
+/home/techaid/.ssh/id_ed25519_bmi30_tunnel
+Это приватный ключ.

@@ -112,6 +112,7 @@ cleanup() {
     if [[ -n "$APPLY_TEMP_DIR" && -d "$APPLY_TEMP_DIR" ]]; then
         rm -rf "$APPLY_TEMP_DIR"
     fi
+    bmi30_restore_rclone_config_owner || true
 }
 
 trap cleanup EXIT
@@ -290,7 +291,9 @@ download_latest_marker() {
 
 load_latest_marker() {
     local marker_path="$1"
-    unset RELEASE_KIND ARCHIVE_NAME ARCHIVE_SHA256 PROJECT_SIGNATURE PROJECT_CONTENT_SIGNATURE PROJECT_SIGNATURE_VERSION FIRMWARE_VERSION FIRMWARE_BUNDLE_ID DEVICE_SUFFIX CREATED_AT SOURCE_BASENAME
+    unset RELEASE_KIND ARCHIVE_NAME ARCHIVE_SHA256 PROJECT_SIGNATURE PROJECT_CONTENT_SIGNATURE PROJECT_SIGNATURE_VERSION
+    unset RELEASE_CONTENT_SIGNATURE RELEASE_SIGNATURE_VERSION
+    unset FIRMWARE_VERSION FIRMWARE_BUNDLE_ID DEVICE_SUFFIX CREATED_AT SOURCE_BASENAME
 
     [[ -f "$marker_path" ]] || fail "Указатель архива не найден: $marker_path"
     # shellcheck source=/dev/null
@@ -301,6 +304,43 @@ load_latest_marker() {
     bmi30_signature_is_valid "${PROJECT_SIGNATURE:-}" || fail "Некорректная совместимая подпись проекта в $marker_path"
     if [[ -n "${PROJECT_CONTENT_SIGNATURE:-}" ]]; then
         bmi30_signature_is_valid "$PROJECT_CONTENT_SIGNATURE" || fail "Некорректная подпись содержимого проекта в $marker_path"
+    fi
+    if [[ -n "${RELEASE_CONTENT_SIGNATURE:-}" ]]; then
+        bmi30_signature_is_valid "$RELEASE_CONTENT_SIGNATURE" || fail "Некорректная release-подпись в $marker_path"
+    fi
+}
+
+marker_remote_signature() {
+    if [[ -n "${RELEASE_CONTENT_SIGNATURE:-}" ]]; then
+        printf '%s' "$RELEASE_CONTENT_SIGNATURE"
+    elif [[ -n "${PROJECT_CONTENT_SIGNATURE:-}" ]]; then
+        printf '%s' "$PROJECT_CONTENT_SIGNATURE"
+    else
+        printf '%s' "$PROJECT_SIGNATURE"
+    fi
+}
+
+marker_local_signature() {
+    if [[ -n "${RELEASE_CONTENT_SIGNATURE:-}" ]]; then
+        [[ "${RELEASE_SIGNATURE_VERSION:-}" == "$BMI30_PROJECT_SIGNATURE_VERSION" ]] \
+            || fail "Release marker требует неподдерживаемую signature version: ${RELEASE_SIGNATURE_VERSION:-<empty>}"
+        project_signature
+    elif [[ -n "${PROJECT_CONTENT_SIGNATURE:-}" && "${PROJECT_SIGNATURE_VERSION:-}" == "8" ]]; then
+        bmi30_v8_project_signature "$SOURCE_DIR"
+    elif [[ -n "${PROJECT_CONTENT_SIGNATURE:-}" ]]; then
+        project_signature
+    else
+        legacy_project_signature
+    fi
+}
+
+marker_signature_kind() {
+    if [[ -n "${RELEASE_CONTENT_SIGNATURE:-}" ]]; then
+        printf 'release v%s' "${RELEASE_SIGNATURE_VERSION:-unknown}"
+    elif [[ -n "${PROJECT_CONTENT_SIGNATURE:-}" ]]; then
+        printf 'project v%s' "${PROJECT_SIGNATURE_VERSION:-unknown}"
+    else
+        printf 'legacy'
     fi
 }
 
@@ -395,6 +435,24 @@ download_archive() {
     printf '%s' "$archive_path"
 }
 
+save_previous_release_state() {
+    local current_active_env current_release_manifest
+
+    current_active_env="$SOURCE_DIR/host/bmi30_split_active_version.env"
+    if [[ -z "$PREVIOUS_ACTIVE_ENV_BACKUP" && -f "$current_active_env" ]]; then
+        mkdir -p "$STATE_DIR"
+        PREVIOUS_ACTIVE_ENV_BACKUP="$STATE_DIR/active_env.before_update"
+        install -m 0644 "$current_active_env" "$PREVIOUS_ACTIVE_ENV_BACKUP"
+    fi
+
+    current_release_manifest="$SOURCE_DIR/host/bmi30_firmware_release.env"
+    if [[ -z "$PREVIOUS_RELEASE_MANIFEST_BACKUP" && -f "$current_release_manifest" ]]; then
+        mkdir -p "$STATE_DIR"
+        PREVIOUS_RELEASE_MANIFEST_BACKUP="$STATE_DIR/firmware_release.before_update.env"
+        install -m 0644 "$current_release_manifest" "$PREVIOUS_RELEASE_MANIFEST_BACKUP"
+    fi
+}
+
 apply_archive() {
     local archive_path="$1"
     local extracted source_name
@@ -424,7 +482,7 @@ apply_archive() {
 
     [[ -n "$extracted" && -d "$extracted" ]] || fail "Не удалось найти корень проекта в архиве"
 
-    local archive_bundle_id bundle_dir current_active_env current_release_manifest
+    local archive_bundle_id bundle_dir
     archive_bundle_id="$(bmi30_active_bundle_id "$extracted" || true)"
     bundle_dir="$extracted/host/bmi30_split_bundles/$archive_bundle_id"
     if [[ -n "${FIRMWARE_BUNDLE_ID:-}" ]]; then
@@ -435,18 +493,7 @@ apply_archive() {
         archive_bundle_id=""
     fi
 
-    current_active_env="$SOURCE_DIR/host/bmi30_split_active_version.env"
-    if [[ -f "$current_active_env" ]]; then
-        mkdir -p "$STATE_DIR"
-        PREVIOUS_ACTIVE_ENV_BACKUP="$STATE_DIR/active_env.before_update"
-        install -m 0644 "$current_active_env" "$PREVIOUS_ACTIVE_ENV_BACKUP"
-    fi
-    current_release_manifest="$SOURCE_DIR/host/bmi30_firmware_release.env"
-    if [[ -f "$current_release_manifest" ]]; then
-        mkdir -p "$STATE_DIR"
-        PREVIOUS_RELEASE_MANIFEST_BACKUP="$STATE_DIR/firmware_release.before_update.env"
-        install -m 0644 "$current_release_manifest" "$PREVIOUS_RELEASE_MANIFEST_BACKUP"
-    fi
+    save_previous_release_state
 
     local -a rsync_args
     rsync_args=(-a --delete)
@@ -534,6 +581,7 @@ verify_firmware_manifest() {
     unset BMI30_FIRMWARE_ENGINE_PATH BMI30_FIRMWARE_ENGINE_SHA256
     unset BMI30_FIRMWARE_GUI_PATH BMI30_FIRMWARE_GUI_SHA256
     unset BMI30_FIRMWARE_PORTAL_PATH BMI30_FIRMWARE_PORTAL_SHA256
+    unset BMI30_FIRMWARE_TAG_FILTERS_PATH
     unset BMI30_FIRMWARE_VENDOR_DOC_PATH BMI30_FIRMWARE_VENDOR_DOC_SHA256
     unset BMI30_FIRMWARE_HOST_DOC_PATH BMI30_FIRMWARE_HOST_DOC_SHA256
     # shellcheck source=/dev/null
@@ -543,8 +591,10 @@ verify_firmware_manifest() {
     if [[ -n "${FIRMWARE_VERSION:-}" ]]; then
         [[ "$BMI30_FIRMWARE_VERSION" == "$FIRMWARE_VERSION" ]] || fail "Firmware version marker/manifest не совпадает"
     fi
-    if [[ -n "${PROJECT_CONTENT_SIGNATURE:-}" ]]; then
-        [[ "${BMI30_FIRMWARE_CONTENT_SIGNATURE,,}" == "${PROJECT_CONTENT_SIGNATURE,,}" ]] || fail "Content signature marker/manifest не совпадает"
+    local expected_release_signature
+    expected_release_signature="${RELEASE_CONTENT_SIGNATURE:-${PROJECT_CONTENT_SIGNATURE:-}}"
+    if [[ -n "$expected_release_signature" ]]; then
+        [[ "${BMI30_FIRMWARE_CONTENT_SIGNATURE,,}" == "${expected_release_signature,,}" ]] || fail "Content signature marker/manifest не совпадает"
     fi
     if [[ -n "${FIRMWARE_BUNDLE_ID:-}" ]]; then
         [[ "${BMI30_FIRMWARE_BUNDLE_ID:-}" == "$FIRMWARE_BUNDLE_ID" ]] || fail "Bundle ID marker/manifest не совпадает"
@@ -557,6 +607,13 @@ verify_firmware_manifest() {
     verify_manifest_component "engine" "${BMI30_FIRMWARE_ENGINE_PATH:-}" "${BMI30_FIRMWARE_ENGINE_SHA256:-}" "$engine_rel"
     verify_manifest_component "GUI" "${BMI30_FIRMWARE_GUI_PATH:-}" "${BMI30_FIRMWARE_GUI_SHA256:-}" "$gui_rel"
     verify_manifest_component "portal" "${BMI30_FIRMWARE_PORTAL_PATH:-}" "${BMI30_FIRMWARE_PORTAL_SHA256:-}" "$portal_rel"
+    if [[ -n "${BMI30_FIRMWARE_TAG_FILTERS_PATH:-}" ]]; then
+        local tag_filters_path
+        tag_filters_path="$(resolve_release_path "$BMI30_FIRMWARE_TAG_FILTERS_PATH")"
+        [[ -d "$tag_filters_path" ]] || fail "Release не содержит папку tag response filters: $BMI30_FIRMWARE_TAG_FILTERS_PATH"
+        find "$tag_filters_path" -maxdepth 1 -type f -name '*.json' -print -quit | grep -q . \
+            || fail "Release не содержит JSON-файлы tag response filters"
+    fi
     if [[ "${BMI30_FIRMWARE_SIGNATURE_VERSION:-}" =~ ^[0-9]+$ ]] \
         && (( BMI30_FIRMWARE_SIGNATURE_VERSION >= 5 )); then
         verify_manifest_component "vendor documentation" \
@@ -685,6 +742,19 @@ install_systemd_units_after_update() {
     fi
 }
 
+install_project_agent_from_cloud() {
+    local helper="$SOURCE_DIR/utilities/install_bmi30_agent_from_project.sh"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        log "[dry-run] Проверил бы и установил BMI30 Agent из cloud release: $helper"
+        return 0
+    fi
+    [[ -x "$helper" ]] || fail "Cloud release не содержит установщик BMI30 Agent: $helper"
+    log "Проверяю BMI30 Agent до обновления runtime"
+    run_privileged "$helper" \
+        || fail "Не удалось установить BMI30 Agent из cloud release"
+    export BMI30_AGENT_BOOTSTRAPPED=1
+}
+
 enforce_cloud_timer_policy() {
     command -v systemctl >/dev/null 2>&1 || return 0
     if ! systemctl --user list-unit-files >/dev/null 2>&1; then
@@ -731,6 +801,10 @@ restart_runtime_after_update() {
             || fail "Release bundle не установлен в проект: $bundle_id"
         [[ -x "$switcher" ]] || fail "Переключатель полного runtime не найден: $switcher"
         [[ -f "$release_manifest" ]] || fail "Release manifest не найден перед активацией: $release_manifest"
+        # A runtime-only reactivation (for example Update after Rollback) does
+        # not call apply_archive(). Preserve the version active immediately
+        # before every activation so Rollback always returns to that version.
+        save_previous_release_state
         log "Активирую полный runtime bundle из облачного release: $bundle_id"
         if ! BMI30_ACTIVATE_PRESERVE_CONFIG=1 \
             BMI30_RELEASE_MANIFEST_OVERRIDE="$release_manifest" \
@@ -868,15 +942,17 @@ write_rollback_state() {
 write_update_state() {
     local update_state="$STATE_DIR/update_state.env"
     local publish_state="$STATE_DIR/publish_state.env"
-    local local_content_signature
+    local local_content_signature installed_remote_signature installed_signature_version
     local_content_signature="$(project_signature)"
+    installed_remote_signature="${RELEASE_CONTENT_SIGNATURE:-${PROJECT_CONTENT_SIGNATURE:-$local_content_signature}}"
+    installed_signature_version="${RELEASE_SIGNATURE_VERSION:-${PROJECT_SIGNATURE_VERSION:-legacy}}"
     mkdir -p "$STATE_DIR"
 
     {
         printf 'RELEASE_KIND=%q\n' "${RELEASE_KIND:-firmware}"
         printf 'REMOTE_PROJECT_SIGNATURE=%q\n' "$PROJECT_SIGNATURE"
-        printf 'REMOTE_PROJECT_CONTENT_SIGNATURE=%q\n' "${PROJECT_CONTENT_SIGNATURE:-$local_content_signature}"
-        printf 'PROJECT_SIGNATURE_VERSION=%q\n' "${PROJECT_SIGNATURE_VERSION:-legacy}"
+        printf 'REMOTE_PROJECT_CONTENT_SIGNATURE=%q\n' "$installed_remote_signature"
+        printf 'PROJECT_SIGNATURE_VERSION=%q\n' "$installed_signature_version"
         printf 'FIRMWARE_VERSION=%q\n' "${FIRMWARE_VERSION:-}"
         printf 'FIRMWARE_BUNDLE_ID=%q\n' "${FIRMWARE_BUNDLE_ID:-}"
         printf 'ARCHIVE_NAME=%q\n' "$ARCHIVE_NAME"
@@ -889,8 +965,8 @@ write_update_state() {
     {
         printf 'RELEASE_KIND=%q\n' "${RELEASE_KIND:-firmware}"
         printf 'PROJECT_SIGNATURE=%q\n' "$PROJECT_SIGNATURE"
-        printf 'PROJECT_CONTENT_SIGNATURE=%q\n' "${PROJECT_CONTENT_SIGNATURE:-$local_content_signature}"
-        printf 'PROJECT_SIGNATURE_VERSION=%q\n' "${PROJECT_SIGNATURE_VERSION:-legacy}"
+        printf 'PROJECT_CONTENT_SIGNATURE=%q\n' "$installed_remote_signature"
+        printf 'PROJECT_SIGNATURE_VERSION=%q\n' "$installed_signature_version"
         printf 'FIRMWARE_VERSION=%q\n' "${FIRMWARE_VERSION:-}"
         printf 'FIRMWARE_BUNDLE_ID=%q\n' "${FIRMWARE_BUNDLE_ID:-}"
         printf 'ARCHIVE_NAME=%q\n' "$ARCHIVE_NAME"
@@ -939,6 +1015,14 @@ main() {
 
     validate_settings
 
+    write_progress 2 "Updating the device connectivity agent…"
+    install_project_agent_from_cloud
+
+    if [[ "$DRY_RUN" -ne 1 ]]; then
+        bmi30_prepare_rclone_config \
+            || fail "Не удалось подготовить безопасный доступ к rclone.conf"
+    fi
+
     local marker_path current_signature archive_path new_signature remote_signature signature_kind
     local previous_archive previous_archive_hash marker_changed
     write_progress 5 "Checking the cloud release marker…"
@@ -963,15 +1047,9 @@ main() {
         log "Обнаружен ещё не установленный облачный release; продолжаю обновление независимо от даты публикации"
     fi
 
-    if [[ -n "${PROJECT_CONTENT_SIGNATURE:-}" ]]; then
-        remote_signature="$PROJECT_CONTENT_SIGNATURE"
-        current_signature="$(project_signature)"
-        signature_kind="содержимого проекта"
-    else
-        remote_signature="$PROJECT_SIGNATURE"
-        current_signature="$(legacy_project_signature)"
-        signature_kind="legacy"
-    fi
+    remote_signature="$(marker_remote_signature)"
+    current_signature="$(marker_local_signature)"
+    signature_kind="$(marker_signature_kind)"
 
     if [[ "$FORCE_UPDATE" -eq 0 && "${current_signature,,}" == "${remote_signature,,}" ]]; then
         log "Проект уже соответствует последнему облачному архиву: $ARCHIVE_NAME"
@@ -994,11 +1072,7 @@ main() {
             if [[ "$DRY_RUN" -eq 1 ]]; then
                 return
             fi
-            if [[ -n "${PROJECT_CONTENT_SIGNATURE:-}" ]]; then
-                new_signature="$(project_signature)"
-            else
-                new_signature="$(legacy_project_signature)"
-            fi
+            new_signature="$(marker_local_signature)"
             [[ "${new_signature,,}" == "${remote_signature,,}" ]] \
                 || fail "После применения release manifest изменилась подпись проекта"
             write_progress 80 "Activating the new firmware runtime…"
@@ -1030,11 +1104,7 @@ main() {
         return
     fi
 
-    if [[ -n "${PROJECT_CONTENT_SIGNATURE:-}" ]]; then
-        new_signature="$(project_signature)"
-    else
-        new_signature="$(legacy_project_signature)"
-    fi
+    new_signature="$(marker_local_signature)"
     if [[ "${new_signature,,}" != "${remote_signature,,}" ]]; then
         warn "После обновления подпись проекта отличается от облачной ($signature_kind)"
         warn "Локальная: $new_signature"
