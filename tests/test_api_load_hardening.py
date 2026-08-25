@@ -13,7 +13,7 @@ import hotspot_info_server as portal
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CORE_PATH = ROOT / "host" / "BMI30.001.py.2026-08-25-1153"
+CORE_PATH = ROOT / "host" / "BMI30.001.py.2026-08-25-1221"
 
 
 def _load_source(name: str, path: Path):
@@ -138,7 +138,7 @@ class ScopeApiLoadHardeningTests(unittest.TestCase):
 
     def test_buffer_rate_is_fixed_at_200_and_has_no_web_selector(self) -> None:
         source = CORE_PATH.read_text(encoding="utf-8")
-        engine = (ROOT / "host" / "BMI30.200.py.2026-08-25-1153").read_text(encoding="utf-8")
+        engine = (ROOT / "host" / "BMI30.200.py.2026-08-25-1221").read_text(encoding="utf-8")
         remote_gui = (ROOT / "host" / "BMI30.GUI.001.py").read_text(encoding="utf-8")
 
         self.assertIn('requested != 200', source)

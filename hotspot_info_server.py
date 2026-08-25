@@ -7559,7 +7559,6 @@ def render_portal_page(
     #panel-group .group-matrix .group-dev-ctl{{padding:4px 10px}}
     #panel-group .group-matrix .group-ctl-select{{height:24px;min-height:24px;font-size:12px;line-height:20px;padding:1px 4px}}
     #panel-group .group-role-control{{display:flex;align-items:center;justify-content:center;gap:6px;min-height:24px;white-space:nowrap}}
-    #panel-group .group-role-assigned{{font-size:10px;line-height:12px;color:var(--muted,#888)}}
     #panel-group .group-role-feedback{{font-size:10px;line-height:12px;color:#2ecc71;white-space:nowrap}}
     #panel-group .group-role-feedback:empty{{display:none}}
     #panel-group .group-role-feedback.is-error{{color:#e74c3c}}
@@ -8358,16 +8357,13 @@ def render_portal_page(
                 </thead>
                 <tbody>
                   <tr data-group-row="indicator"><th class="group-param">State optic</th></tr>
-                  <tr data-group-row="role"><th class="group-param">Current role</th></tr>
                   <tr data-group-row="syncctl"><th class="group-param">Role assignment</th></tr>
                   <tr data-group-row="node"><th class="group-param">RS485 ID</th></tr>
                   <tr data-group-row="stm32"><th class="group-param">STM32 UID</th></tr>
                   <tr data-group-row="ip"><th class="group-param">IP address</th></tr>
-                  <tr data-group-row="optic"><th class="group-param">Optic sensor</th></tr>
                   <tr data-group-row="detadc1"><th class="group-param">DetADC1 (modulation)</th></tr>
                   <tr data-group-row="detadc2"><th class="group-param">DetADC2 (modulation)</th></tr>
                   <tr data-group-row="tx"><th class="group-param">TX</th></tr>
-                  <tr data-group-row="online"><th class="group-param">RS485 online</th></tr>
                   <tr data-group-row="reaction"><th class="group-param">Own optic → sound/LED/relay</th></tr>
                   <tr data-group-row="neighbor-reaction"><th class="group-param">RS485 neighbor optics → sound / LED / relay</th></tr>
                   <tr data-group-row="hold"><th class="group-param">Optic trigger hold (sec)</th></tr>
@@ -10073,7 +10069,6 @@ def render_portal_page(
           }});
           d._syncRole = localSyncControlRole;
           d._syncAssign = assignedRole || localSyncControlRole;
-          d._assignedRole = assignedRole || '';
           d._rs485Id = localNode;
           d._idAssigned = idAssigned;
         }}
@@ -10118,7 +10113,6 @@ def render_portal_page(
     var _groupLocalDesiredHold = null;
     var _groupLocalSyncRole = null;
     var _groupLocalSyncStatus = null;
-    var _groupLocalAssignedRole = null;
     var _groupLocalRs485Id = null;
     var _groupLocalRs485IdStatus = null;
     var _groupLocalApplyT = 0;
@@ -10189,11 +10183,8 @@ def render_portal_page(
           return data;
         }});
       }}).then(function (data) {{
-        if (_groupLocalAssignedRole) {{
-          _groupLocalAssignedRole.textContent = 'Assigned: ' + _capitalizeRole(role);
-        }}
         if (_groupLocalSyncStatus) {{
-          _groupLocalSyncStatus.textContent = data.message || ('Assigned: ' + _capitalizeRole(role));
+          _groupLocalSyncStatus.textContent = 'Saved';
           _groupLocalSyncStatus.classList.remove('is-error');
         }}
       }}).catch(function (err) {{
@@ -10232,7 +10223,7 @@ def render_portal_page(
         }});
       }}).then(function (data) {{
         if (_groupLocalRs485IdStatus) {{
-          _groupLocalRs485IdStatus.textContent = data.message || ('Assigned: ' + _padNode2(deviceId));
+          _groupLocalRs485IdStatus.textContent = 'Saved';
           _groupLocalRs485IdStatus.classList.remove('is-error');
         }}
         _groupRefreshIdentity(true);
@@ -10348,22 +10339,16 @@ def render_portal_page(
         }});
         sel.addEventListener('change', _groupApplySyncRole);
         wrap.appendChild(sel);
-        var assignedLabel = document.createElement('span');
-        assignedLabel.className = 'group-role-assigned';
-        assignedLabel.textContent = d._assignedRole ? ('Assigned: ' + _capitalizeRole(d._assignedRole)) : 'Assigned: ---';
-        wrap.appendChild(assignedLabel);
         var status = document.createElement('span');
         status.className = 'group-role-feedback';
         status.setAttribute('aria-live', 'polite');
         wrap.appendChild(status);
         td.appendChild(wrap);
         td._ctlSelect = sel;
-        td._assignedLabel = assignedLabel;
         _groupLocalSyncRole = sel;
         _groupLocalSyncStatus = status;
-        _groupLocalAssignedRole = assignedLabel;
       }} else {{
-        td.textContent = '\u2014';
+        _groupSetText(td, _capitalizeRole(d.role));
       }}
       return td;
     }}
@@ -10388,17 +10373,12 @@ def render_portal_page(
       if (!d._idAssigned) {{ sel.selectedIndex = -1; }}
       sel.addEventListener('change', _groupApplyRs485Id);
       wrap.appendChild(sel);
-      var assignedLabel = document.createElement('span');
-      assignedLabel.className = 'group-role-assigned';
-      assignedLabel.textContent = d._idAssigned ? ('Assigned: ' + _padNode2(d._rs485Id)) : 'Assigned: ---';
-      wrap.appendChild(assignedLabel);
       var status = document.createElement('span');
       status.className = 'group-role-feedback';
       status.setAttribute('aria-live', 'polite');
       wrap.appendChild(status);
       td.appendChild(wrap);
       td._ctlSelect = sel;
-      td._assignedLabel = assignedLabel;
       _groupLocalRs485Id = sel;
       _groupLocalRs485IdStatus = status;
       return td;
@@ -10506,23 +10486,19 @@ def render_portal_page(
       _groupLocalHold = null;
       _groupLocalSyncRole = null;
       _groupLocalSyncStatus = null;
-      _groupLocalAssignedRole = null;
       _groupLocalRs485Id = null;
       _groupLocalRs485IdStatus = null;
       devices.forEach(function (d) {{
         var col = {{is_local: d.is_local, cells: {{}}}};
         if (_groupRows.head) {{ var h = _groupMakeHead(d); _groupRows.head.appendChild(h); col.head = h; }}
         if (_groupRows.indicator) {{ var stc = _groupMakeStateCell(d); _groupSetState(stc, d); _groupRows.indicator.appendChild(stc); col.cells.indicator = stc; }}
-        if (_groupRows.role) {{ var rc = _groupMakeTextCell(d); _groupSetText(rc, _capitalizeRole(d.role)); _groupRows.role.appendChild(rc); col.cells.role = rc; }}
         if (_groupRows.syncctl) {{ var sc = _groupMakeSyncRoleCell(d); _groupRows.syncctl.appendChild(sc); col.cells.syncctl = sc; }}
         if (_groupRows.node) {{ var nc = _groupMakeRs485IdCell(d); _groupRows.node.appendChild(nc); col.cells.node = nc; }}
         if (_groupRows.stm32) {{ var uc = _groupMakeTextCell(d); _groupSetText(uc, d.stm32_id); _groupRows.stm32.appendChild(uc); col.cells.stm32 = uc; }}
         if (_groupRows.ip) {{ var ipc = _groupMakeIpCell(d); _groupRows.ip.appendChild(ipc); col.cells.ip = ipc; }}
-        if (_groupRows.optic) {{ var oc = _groupMakeBoolCell(d); _groupSetBool(oc, d.optic_active); _groupRows.optic.appendChild(oc); col.cells.optic = oc; }}
         if (_groupRows.detadc1) {{ var c1 = _groupMakeBoolCell(d); _groupSetBool(c1, d.detadc1); _groupRows.detadc1.appendChild(c1); col.cells.detadc1 = c1; }}
         if (_groupRows.detadc2) {{ var c2 = _groupMakeBoolCell(d); _groupSetBool(c2, d.detadc2); _groupRows.detadc2.appendChild(c2); col.cells.detadc2 = c2; }}
         if (_groupRows.tx) {{ var tc = _groupMakeBoolCell(d); _groupSetBool(tc, d.tx_enabled); _groupRows.tx.appendChild(tc); col.cells.tx = tc; }}
-        if (_groupRows.online) {{ var lc = _groupMakeBoolCell(d); _groupSetBool(lc, d.online); _groupRows.online.appendChild(lc); col.cells.online = lc; }}
         if (_groupRows.reaction) {{ var rcl = _groupMakeReactionCell(d, false); _groupRows.reaction.appendChild(rcl); col.cells.reaction = rcl; }}
         if (_groupRows['neighbor-reaction']) {{ var nrcl = _groupMakeReactionCell(d, true); _groupRows['neighbor-reaction'].appendChild(nrcl); col.cells.neighborReaction = nrcl; }}
         if (_groupRows.hold) {{ var hcl = _groupMakeHoldCell(d); _groupRows.hold.appendChild(hcl); col.cells.hold = hcl; }}
@@ -10553,15 +10529,13 @@ def render_portal_page(
           }}
         }}
         if (col.cells.indicator) {{ _groupSetState(col.cells.indicator, d); }}
-        if (col.cells.role) {{ _groupSetText(col.cells.role, _capitalizeRole(d.role)); }}
+        if (!d.is_local && col.cells.syncctl) {{ _groupSetText(col.cells.syncctl, _capitalizeRole(d.role)); }}
         if (!d.is_local && col.cells.node) {{ _groupSetText(col.cells.node, d.node_id === null ? '--' : _padNode2(d.node_id)); }}
         if (col.cells.stm32) {{ _groupSetText(col.cells.stm32, d.stm32_id); }}
         if (col.cells.ip) {{ _groupSetIpCell(col.cells.ip, d); }}
-        if (col.cells.optic) {{ _groupSetBool(col.cells.optic, d.optic_active); }}
         if (col.cells.detadc1) {{ _groupSetBool(col.cells.detadc1, d.detadc1); }}
         if (col.cells.detadc2) {{ _groupSetBool(col.cells.detadc2, d.detadc2); }}
         if (col.cells.tx) {{ _groupSetBool(col.cells.tx, d.tx_enabled); }}
-        if (col.cells.online) {{ _groupSetBool(col.cells.online, d.online); }}
         if (d.is_local && !recent) {{
           var rc = col.cells.reaction;
           if (rc && rc._ctlInput && document.activeElement !== rc._ctlInput) {{ rc._ctlInput.checked = !!d._reaction; }}
@@ -10579,18 +10553,12 @@ def render_portal_page(
           var assignedRole = String(d._syncAssign || d._syncRole || 'slave');
           if (assignedRole !== 'master' && assignedRole !== 'slave') {{ assignedRole = 'slave'; }}
           if (sc && sc._ctlSelect && document.activeElement !== sc._ctlSelect) {{ sc._ctlSelect.value = assignedRole; }}
-          if (sc && sc._assignedLabel) {{
-            sc._assignedLabel.textContent = d._assignedRole ? ('Assigned: ' + _capitalizeRole(d._assignedRole)) : 'Assigned: ---';
-          }}
         }}
         if (d.is_local && !idRecent) {{
           var nc = col.cells.node;
           if (nc && nc._ctlSelect && document.activeElement !== nc._ctlSelect) {{
             nc._ctlSelect.value = d._idAssigned ? String(d._rs485Id) : '';
             if (!d._idAssigned) {{ nc._ctlSelect.selectedIndex = -1; }}
-          }}
-          if (nc && nc._assignedLabel) {{
-            nc._assignedLabel.textContent = d._idAssigned ? ('Assigned: ' + _padNode2(d._rs485Id)) : 'Assigned: ---';
           }}
         }}
       }});

@@ -7,7 +7,7 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CORE_PATH = ROOT / "host" / "BMI30.001.py.2026-08-25-1153"
+CORE_PATH = ROOT / "host" / "BMI30.001.py.2026-08-25-1221"
 
 
 def _load_source(name: str, path: Path):
@@ -110,6 +110,21 @@ class DcLightningCompensationTests(unittest.TestCase):
         self.assertGreaterEqual(source.count("flex:0 0 auto;white-space:nowrap"), 2)
         self.assertIn(".group-led-feedback{{display:flex", source)
         self.assertIn("flex-wrap:wrap", source)
+
+    def test_group_table_uses_single_role_and_optic_status_rows(self) -> None:
+        source = (ROOT / "hotspot_info_server.py").read_text(encoding="utf-8")
+
+        self.assertIn('data-group-row="indicator"', source)
+        self.assertIn('data-group-row="syncctl"', source)
+        self.assertIn('data-group-row="node"', source)
+        self.assertNotIn('data-group-row="role"', source)
+        self.assertNotIn('data-group-row="optic"', source)
+        self.assertNotIn('data-group-row="online"', source)
+        self.assertNotIn("Current role", source)
+        self.assertNotIn("Optic sensor", source)
+        self.assertNotIn("RS485 online", source)
+        self.assertNotIn("Assigned:", source)
+        self.assertIn("_groupSetText(td, _capitalizeRole(d.role));", source)
 
 
 if __name__ == "__main__":

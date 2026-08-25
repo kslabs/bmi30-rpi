@@ -64,7 +64,7 @@ class HostRxAckContractTests(unittest.TestCase):
 
     def test_production_default_matches_firmware_ack_window(self) -> None:
         source = (ROOT / "host" / "usb_vendor" / "usb_stream.py").read_text(encoding="utf-8")
-        engine = (ROOT / "host" / "BMI30.200.py.2026-08-25-1153").read_text(encoding="utf-8")
+        engine = (ROOT / "host" / "BMI30.200.py.2026-08-25-1221").read_text(encoding="utf-8")
         self.assertIn("BMI30_HOST_RX_ACK_INTERVAL', '0.25'", source)
         self.assertIn('"BMI30_HOST_RX_ACK_INTERVAL": "0.25"', engine)
 

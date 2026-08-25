@@ -10,8 +10,8 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CORE_PATH = ROOT / "host" / "BMI30.001.py.2026-08-25-1153"
-ENGINE_PATH = ROOT / "host" / "BMI30.200.py.2026-08-25-1153"
+CORE_PATH = ROOT / "host" / "BMI30.001.py.2026-08-25-1221"
+ENGINE_PATH = ROOT / "host" / "BMI30.200.py.2026-08-25-1221"
 PORTAL_PATH = ROOT / "hotspot_info_server.py"
 
 
